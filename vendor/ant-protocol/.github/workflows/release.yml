@@ -1,0 +1,124 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to release (e.g., v2.0.0)"
+        required: true
+      dry_run:
+        description: "Dry run (no actual publish or release)"
+        type: boolean
+        default: false
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
+
+permissions:
+  contents: write
+
+jobs:
+  validate:
+    name: Validate Release
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      version_number: ${{ steps.version.outputs.version_number }}
+      is_prerelease: ${{ steps.version.outputs.is_prerelease }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Extract version
+        id: version
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            VERSION="${{ github.event.inputs.version }}"
+          else
+            VERSION="${GITHUB_REF#refs/tags/}"
+          fi
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+
+          VERSION_NUMBER="${VERSION#v}"
+          echo "version_number=$VERSION_NUMBER" >> $GITHUB_OUTPUT
+
+          # Any SemVer pre-release identifier (anything after a `-`) counts
+          # as a pre-release. Previously this only matched `alpha|beta|rc`
+          # and silently treated `v2.0.0-pre`, `-dev`, `-snapshot`, numeric
+          # pre-releases, etc. as stable.
+          if [[ "$VERSION_NUMBER" == *-* ]]; then
+            echo "is_prerelease=true" >> $GITHUB_OUTPUT
+          else
+            echo "is_prerelease=false" >> $GITHUB_OUTPUT
+          fi
+
+          echo "Version: $VERSION (number: $VERSION_NUMBER)"
+
+      - name: Validate version format
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          VERSION_REGEX="^v[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9.-]+)?(\+[a-zA-Z0-9.-]+)?$"
+          if ! [[ "$VERSION" =~ $VERSION_REGEX ]]; then
+            echo "::error::Invalid version format: $VERSION (expected SemVer-shaped vX.Y.Z[-prerelease][+build])"
+            exit 1
+          fi
+
+      - name: Check Cargo.toml version
+        run: |
+          # Use cargo metadata rather than grep so quoting style / stray
+          # `version` keys in sub-tables can't trick the check.
+          CARGO_VERSION=$(cargo metadata --no-deps --format-version 1 | python3 -c 'import json,sys;print(json.load(sys.stdin)["packages"][0]["version"])')
+          EXPECTED="${{ steps.version.outputs.version_number }}"
+          if [[ "$CARGO_VERSION" != "$EXPECTED" ]]; then
+            echo "::error::Cargo.toml version mismatch"
+            echo "::error::Expected $EXPECTED but found $CARGO_VERSION"
+            exit 1
+          fi
+
+  publish-crate:
+    name: Publish to crates.io
+    needs: [validate]
+    runs-on: ubuntu-latest
+    # Skip publish on pre-releases (any SemVer identifier after `-`, see
+    # validate.is_prerelease) and on manual dry runs.
+    if: github.event.inputs.dry_run != 'true' && needs.validate.outputs.is_prerelease != 'true'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Verify crate
+        run: cargo publish --dry-run
+      - name: Publish to crates.io
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
+        run: cargo publish
+
+  release:
+    name: Create GitHub Release
+    needs: [validate, publish-crate]
+    if: ${{ always() && !cancelled() && needs.validate.result == 'success' && (needs.publish-crate.result == 'success' || needs.publish-crate.result == 'skipped') && github.event.inputs.dry_run != 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.validate.outputs.version }}
+          name: ant-protocol ${{ needs.validate.outputs.version }}
+          body: |
+            ## ant-protocol ${{ needs.validate.outputs.version }}
+
+            Wire protocol for the Autonomi decentralized network.
+
+            Published to [crates.io](https://crates.io/crates/ant-protocol/${{ needs.validate.outputs.version_number }}).
+
+            See [CHANGELOG.md](./CHANGELOG.md) for details.
+          draft: false
+          prerelease: ${{ needs.validate.outputs.is_prerelease }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -1,4 +1,9 @@
 [workspace]
 members = ["ant-core", "ant-cli"]
+exclude = ["vendor"]
 resolver = "2"
 
+
+# Autonomi's protocol crate with our price multiplier; see vendor/ant-protocol/VENDORED.md.
+[patch.crates-io]
+ant-protocol = { path = "vendor/ant-protocol" }
