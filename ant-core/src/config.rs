@@ -146,20 +146,60 @@ pub fn resolve_bootstrap_peers(
         .collect())
 }
 
+/// Our network's payment chain, bundled into the binary. Switching tokens
+/// means editing this file and rebuilding.
+const BUNDLED_PAYMENT_NETWORK: &str = include_str!("../resources/payment_network.toml");
+
+#[derive(serde::Deserialize)]
+struct PaymentNetworkConfig {
+    rpc_url: String,
+    payment_token_address: String,
+    payment_vault_address: String,
+}
+
+/// The payment chain this client uses unless told otherwise.
+pub fn bundled_payment_network() -> Result<EvmNetwork> {
+    let config: PaymentNetworkConfig = toml::from_str(BUNDLED_PAYMENT_NETWORK)
+        .map_err(|e| Error::InvalidEvmManifest(format!("bundled payment network: {e}")))?;
+    custom_network(
+        &config.rpc_url,
+        &config.payment_token_address,
+        &config.payment_vault_address,
+    )
+}
+
+fn custom_network(rpc_url: &str, token: &str, vault: &str) -> Result<EvmNetwork> {
+    let rpc_url: reqwest::Url = rpc_url
+        .parse()
+        .map_err(|e| Error::InvalidEvmManifest(format!("invalid RPC URL: {e}")))?;
+    let payment_token_address: EvmAddress = token
+        .parse()
+        .map_err(|e| Error::InvalidEvmManifest(format!("invalid payment token address: {e}")))?;
+    let payment_vault_address: EvmAddress = vault
+        .parse()
+        .map_err(|e| Error::InvalidEvmManifest(format!("invalid payment vault address: {e}")))?;
+    Ok(EvmNetwork::Custom(CustomNetwork {
+        rpc_url_http: rpc_url,
+        payment_token_address,
+        payment_vault_address,
+    }))
+}
+
 /// Resolve the EVM network for payment operations.
 ///
 /// `name` is the frontend's network selector (e.g. the CLI's
-/// `--evm-network` flag): `arbitrum-one`, `arbitrum-sepolia`, or `local`,
-/// which reads the RPC URL and contract addresses from the devnet
-/// manifest's `evm` block.
+/// `--evm-network` flag): `robinhood` (our network, bundled), the upstream
+/// presets `arbitrum-one` and `arbitrum-sepolia`, or `local`, which reads
+/// the RPC URL and contract addresses from the devnet manifest's `evm`
+/// block.
 ///
-/// With no selector, the default is Arbitrum One (mainnet) — **unless**
-/// the devnet manifest carries an `evm` block. Defaulting to mainnet
-/// used to silently discard that config: the mainnet vault address
-/// doesn't exist on other chains, so payments "succeeded" as no-op
-/// transactions and every subsequent chunk PUT failed verification
-/// (V2-471). In that one ambiguous case the caller must choose
-/// explicitly or get [`Error::EvmNetworkAmbiguous`].
+/// With no selector, the default is our bundled network — **unless** the
+/// devnet manifest carries an `evm` block. Defaulting there used to
+/// silently discard that config: the default vault address doesn't exist
+/// on other chains, so payments "succeeded" as no-op transactions and every
+/// subsequent chunk PUT failed verification (V2-471). In that one ambiguous
+/// case the caller must choose explicitly or get
+/// [`Error::EvmNetworkAmbiguous`].
 pub fn resolve_evm_network(
     name: Option<&str>,
     manifest: Option<&DevnetManifest>,
@@ -169,32 +209,21 @@ pub fn resolve_evm_network(
             if manifest.is_some_and(|m| m.evm.is_some()) {
                 Err(Error::EvmNetworkAmbiguous)
             } else {
-                Ok(EvmNetwork::ArbitrumOne)
+                bundled_payment_network()
             }
         }
         Some("arbitrum-one") => Ok(EvmNetwork::ArbitrumOne),
         Some("arbitrum-sepolia") => Ok(EvmNetwork::ArbitrumSepoliaTest),
+        Some("robinhood") => bundled_payment_network(),
         Some("local") => {
             let evm = manifest
                 .and_then(|m| m.evm.as_ref())
                 .ok_or(Error::EvmManifestRequired)?;
-            let rpc_url: reqwest::Url = evm
-                .rpc_url
-                .parse()
-                .map_err(|e| Error::InvalidEvmManifest(format!("invalid RPC URL: {e}")))?;
-            let payment_token_address: EvmAddress =
-                evm.payment_token_address.parse().map_err(|e| {
-                    Error::InvalidEvmManifest(format!("invalid payment token address: {e}"))
-                })?;
-            let payment_vault_address: EvmAddress =
-                evm.payment_vault_address.parse().map_err(|e| {
-                    Error::InvalidEvmManifest(format!("invalid payment vault address: {e}"))
-                })?;
-            Ok(EvmNetwork::Custom(CustomNetwork {
-                rpc_url_http: rpc_url,
-                payment_token_address,
-                payment_vault_address,
-            }))
+            custom_network(
+                &evm.rpc_url,
+                &evm.payment_token_address,
+                &evm.payment_vault_address,
+            )
         }
         Some(other) => Err(Error::UnsupportedEvmNetwork(other.to_string())),
     }
@@ -273,16 +302,20 @@ mod tests {
     }
 
     #[test]
-    fn resolve_evm_network_defaults_to_mainnet_without_manifest_evm() {
+    fn resolve_evm_network_defaults_to_bundled_network_without_manifest_evm() {
         assert!(matches!(
             resolve_evm_network(None, None),
-            Ok(EvmNetwork::ArbitrumOne)
+            Ok(EvmNetwork::Custom(_))
         ));
         let no_evm = test_manifest(vec![]);
         assert!(matches!(
             resolve_evm_network(None, Some(&no_evm)),
-            Ok(EvmNetwork::ArbitrumOne)
+            Ok(EvmNetwork::Custom(_))
         ));
+        assert_eq!(
+            resolve_evm_network(Some("robinhood"), None).ok(),
+            resolve_evm_network(None, None).ok()
+        );
     }
 
     #[test]
