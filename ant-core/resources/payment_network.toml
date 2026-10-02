@@ -2,8 +2,10 @@
 # robinhood). Switching tokens means changing the two addresses here and
 # rebuilding; the nodes take the same values from their node.env.
 #
-# Robinhood Chain mainnet (chain ID 4663). The public RPC is rate-limited;
+# Robinhood Chain mainnet (chain ID 4663), through PublicNode's free RPC. Robinhood's
+# own public RPC load-balances over servers at different heights and failed
+# mid-payment in testing;
 # heavy users can point at their own provider with a devnet manifest.
-rpc_url = "https://rpc.mainnet.chain.robinhood.com"
+rpc_url = "https://robinhood-rpc.publicnode.com"
 payment_token_address = "0x96ca806d020bf2a2c6b7ea62e0a1b318112ae180"
 payment_vault_address = "0x69C5BB60dB609F0B9a5AE48F08d3dc98092b566C"
