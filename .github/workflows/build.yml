@@ -16,7 +16,9 @@ permissions:
 
 jobs:
   linux-x64:
-    runs-on: ubuntu-latest
+    # Pinned to the servers' Ubuntu release: a binary built against a newer
+    # glibc will not run on an older one.
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
 
