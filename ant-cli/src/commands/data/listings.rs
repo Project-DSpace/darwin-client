@@ -28,6 +28,9 @@ struct ListingJson {
     block_timestamp: u64,
     log_index: u64,
     tx_hash: String,
+    /// The file's data map, hex-encoded, for listings that pass their checks:
+    /// what a client needs to read the file without the envelope.
+    data_map: Option<String>,
     valid: bool,
     problem: Option<String>,
 }
@@ -49,17 +52,18 @@ impl ListingsArgs {
         let listings = client.collect_listings(from).await?;
 
         let mut listed = HashSet::new();
-        let mut rows: Vec<(Listing, Option<String>)> = Vec::new();
+        let mut rows: Vec<(Listing, Result<Vec<u8>, String>)> = Vec::new();
         for listing in listings {
             if listed.contains(&listing.address) {
                 continue;
             }
             match client.check_listing(&listing, chain).await {
-                Ok(()) => {
+                Ok(envelope) => {
                     listed.insert(listing.address);
-                    rows.push((listing, None));
+                    let data_map = envelope.data_map_bytes().to_vec();
+                    rows.push((listing, Ok(data_map)));
                 }
-                Err(problem) if self.all => rows.push((listing, Some(problem))),
+                Err(problem) if self.all => rows.push((listing, Err(problem))),
                 Err(_) => {}
             }
         }
@@ -67,7 +71,7 @@ impl ListingsArgs {
         if json {
             let out: Vec<ListingJson> = rows
                 .into_iter()
-                .map(|(listing, problem)| ListingJson {
+                .map(|(listing, checked)| ListingJson {
                     address: hex::encode(listing.address),
                     name: listing.metadata.name,
                     content_type: listing.metadata.content_type,
@@ -76,8 +80,9 @@ impl ListingsArgs {
                     block_timestamp: listing.payment.block_timestamp,
                     log_index: listing.payment.log_index,
                     tx_hash: format!("0x{}", hex::encode(listing.payment.tx_hash)),
-                    valid: problem.is_none(),
-                    problem,
+                    valid: checked.is_ok(),
+                    data_map: checked.as_ref().ok().map(hex::encode),
+                    problem: checked.err(),
                 })
                 .collect();
             println!("{}", serde_json::to_string(&out)?);
@@ -88,7 +93,7 @@ impl ListingsArgs {
             println!("No listings found.");
             return Ok(());
         }
-        for (listing, problem) in &rows {
+        for (listing, checked) in &rows {
             let size = listing
                 .size
                 .map_or_else(|| "-".to_string(), |size| format!("{size} B"));
@@ -100,7 +105,7 @@ impl ListingsArgs {
                 listing.metadata.content_type.as_deref().unwrap_or("-"),
                 listing.metadata.name.as_deref().unwrap_or("-"),
             );
-            if let Some(problem) = problem {
+            if let Err(problem) = checked {
                 println!("    not valid: {problem}");
             }
         }

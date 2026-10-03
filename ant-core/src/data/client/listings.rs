@@ -88,7 +88,8 @@ impl Client {
     }
 
     /// Check a listing: its envelope is on the network and matches it, and its
-    /// payment is on chain.
+    /// payment is on chain. Returns the envelope, which carries the file's data
+    /// map.
     ///
     /// # Errors
     ///
@@ -97,7 +98,7 @@ impl Client {
         &self,
         listing: &Listing,
         chain: &ListingChain,
-    ) -> std::result::Result<(), String> {
+    ) -> std::result::Result<Envelope, String> {
         let chunk = self
             .chunk_get(&listing.address)
             .await
@@ -112,7 +113,8 @@ impl Client {
             .payment(&listing.payment.tx_hash)
             .await?
             .ok_or("the payment transaction is not on chain")?;
-        verify_listing(listing, &receipt, timestamp, &chain.vault).map_err(|e| e.to_string())
+        verify_listing(listing, &receipt, timestamp, &chain.vault).map_err(|e| e.to_string())?;
+        Ok(envelope)
     }
 
     /// The nodes to ask: those connected, plus those found by a few random
