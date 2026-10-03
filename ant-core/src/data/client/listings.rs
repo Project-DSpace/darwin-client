@@ -56,8 +56,10 @@ impl Client {
                 "no nodes found to ask for listings".into(),
             ));
         }
-        let per_peer: Vec<Vec<Listing>> = stream::iter(&peers)
-            .map(|peer| self.listings_from(peer, from))
+        // Owned peer IDs, so the futures don't borrow across a higher-ranked
+        // lifetime: callers such as web handlers need this future to be Send.
+        let per_peer: Vec<Vec<Listing>> = stream::iter(peers.iter().copied())
+            .map(|peer| async move { self.listings_from(&peer, from).await })
             .buffer_unordered(PEER_CONCURRENCY)
             .collect()
             .await;
@@ -139,12 +141,11 @@ impl Client {
         let network = self.network();
         let mut peers: HashSet<PeerId> = network.connected_peers().await.into_iter().collect();
         let targets: Vec<[u8; 32]> = (0..CRAWL_LOOKUPS).map(|_| rand::random()).collect();
-        let lookups = futures::future::join_all(
-            targets
-                .iter()
-                .map(|target| network.find_closest_peers(target, CRAWL_WIDTH)),
-        )
-        .await;
+        let lookups =
+            futures::future::join_all(targets.into_iter().map(|target| async move {
+                network.find_closest_peers(&target, CRAWL_WIDTH).await
+            }))
+            .await;
         for lookup in lookups {
             match lookup {
                 Ok(found) => peers.extend(found.into_iter().map(|(peer, _)| peer)),
