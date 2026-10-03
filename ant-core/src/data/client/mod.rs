@@ -17,6 +17,8 @@ pub mod data;
 #[cfg(feature = "native")]
 pub mod diagnostics;
 pub mod file;
+#[cfg(feature = "native")]
+pub mod listings;
 pub mod merkle;
 #[cfg(feature = "native")]
 mod native_payment;

@@ -841,6 +841,7 @@ name = "ant-core"
 version = "0.11.0"
 dependencies = [
  "alloy",
+ "ant-listings",
  "ant-node",
  "ant-protocol",
  "anyhow",
@@ -897,6 +898,19 @@ dependencies = [
  "windows-sys 0.61.2",
  "xor_name",
  "zip",
+]
+
+[[package]]
+name = "ant-listings"
+version = "0.1.0"
+source = "git+https://github.com/Project-DSpace/ant-listings?rev=a135dfe6fa36581e9086e569ec5462edae279868#a135dfe6fa36581e9086e569ec5462edae279868"
+dependencies = [
+ "ant-protocol",
+ "postcard",
+ "rmp-serde",
+ "self_encryption",
+ "serde",
+ "thiserror 2.0.18",
 ]
 
 [[package]]

@@ -30,7 +30,23 @@ pub(crate) fn public_map_record(map: &DataMap) -> Result<([u8; 32], Bytes), Stri
     Ok((ant_protocol::compute_address(&bytes), bytes))
 }
 
+/// Wrap and address a DataMap for a listed upload.
+pub(crate) fn listed_map_record(
+    map: &DataMap,
+    metadata: &ant_listings::Metadata,
+) -> Result<([u8; 32], Bytes), String> {
+    let envelope = ant_listings::Envelope::new(map, metadata.clone())
+        .map_err(|e| format!("Failed to build listing envelope: {e}"))?;
+    Ok((envelope.address(), Bytes::from(envelope.to_bytes())))
+}
+
 pub(crate) fn decode_map(bytes: &[u8]) -> Result<DataMap, String> {
+    // A listed file's address holds its data map inside an envelope.
+    if ant_listings::is_envelope(bytes) {
+        return ant_listings::Envelope::from_bytes(bytes)
+            .map(|envelope| envelope.data_map().clone())
+            .map_err(|e| format!("Failed to read listing envelope: {e}"));
+    }
     rmp_serde::from_slice(bytes).map_err(|e| format!("Failed to deserialize DataMap: {e}"))
 }
 
@@ -335,6 +351,29 @@ mod tests {
             .map(|chunk| (*blake3::hash(&chunk.content).as_bytes(), chunk.content))
             .collect();
         (content, map, records)
+    }
+
+    #[test]
+    fn listed_records_decode_to_the_same_data_map() {
+        let (_, map, _) = fixture();
+        let metadata = ant_listings::Metadata {
+            content_type: Some("application/octet-stream".into()),
+            name: Some("fixture.bin".into()),
+        };
+        let (listed_address, listed) = listed_map_record(&map, &metadata).unwrap();
+        let (unlisted_address, unlisted) = public_map_record(&map).unwrap();
+        assert!(ant_listings::is_envelope(&listed));
+        assert_eq!(listed_address, ant_protocol::compute_address(&listed));
+        assert_ne!(listed_address, unlisted_address);
+        assert!(decode_map(&listed).unwrap() == map);
+        assert!(decode_map(&unlisted).unwrap() == map);
+    }
+
+    #[test]
+    fn a_broken_envelope_is_an_error() {
+        let (_, map, _) = fixture();
+        let (_, listed) = listed_map_record(&map, &ant_listings::Metadata::default()).unwrap();
+        assert!(decode_map(&listed[..12]).is_err());
     }
 
     #[tokio::test(flavor = "current_thread")]

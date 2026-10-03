@@ -15,6 +15,8 @@ mod client_engine;
 #[cfg(feature = "native")]
 pub mod config;
 pub mod data;
+/// Listed files: the envelope format, listings and the listings protocol.
+pub use ant_listings;
 #[cfg(feature = "native")]
 pub mod datamap_file;
 #[cfg(feature = "native")]

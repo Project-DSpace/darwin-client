@@ -1206,6 +1206,16 @@ impl std::fmt::Debug for ExternalChunkStore {
     }
 }
 
+/// The payment mode for an upload. A listed upload always pays per chunk: the
+/// nodes that keep listings find a listing's payment from a single-node proof.
+fn listed_payment_mode(visibility: &Visibility, mode: PaymentMode) -> PaymentMode {
+    if matches!(visibility, Visibility::Listed(_)) {
+        PaymentMode::Single
+    } else {
+        mode
+    }
+}
+
 /// Prepared upload ready for external payment.
 ///
 /// Contains everything needed to construct the on-chain payment transaction
@@ -1916,6 +1926,7 @@ impl Client {
         mode: PaymentMode,
         progress: Option<mpsc::Sender<UploadEvent>>,
     ) -> Result<PreparedUpload> {
+        let mode = listed_payment_mode(&visibility, mode);
         debug!(
             "Preparing file upload for external signing (visibility={visibility:?}, mode={mode:?}): {}",
             path.display()
@@ -1946,6 +1957,18 @@ impl Client {
                         .map_err(Error::Serialization)?;
                 info!(
                     "Public upload: bundling DataMap chunk ({} bytes) at address {}",
+                    serialized.len(),
+                    hex::encode(address)
+                );
+                spill.push(&serialized)?;
+                Some(address)
+            }
+            Visibility::Listed(ref metadata) => {
+                let (address, serialized) =
+                    crate::client_engine::files::listed_map_record(&data_map, metadata)
+                        .map_err(Error::Serialization)?;
+                info!(
+                    "Listed upload: bundling envelope chunk ({} bytes) at address {}",
                     serialized.len(),
                     hex::encode(address)
                 );
@@ -2809,6 +2832,26 @@ impl Client {
             .await
     }
 
+    /// Listed file upload with progress events.
+    ///
+    /// Stores the data map in a listing envelope carrying `metadata`, so nodes
+    /// that keep listings list the file. Always paid per chunk: those nodes find
+    /// a listing's payment from a single-node proof.
+    pub async fn file_upload_listed_with_progress(
+        &self,
+        path: &Path,
+        metadata: ant_listings::Metadata,
+        progress: Option<mpsc::Sender<UploadEvent>>,
+    ) -> Result<FileUploadResult> {
+        self.file_upload_with_visibility_and_progress(
+            path,
+            PaymentMode::Single,
+            Visibility::Listed(metadata),
+            progress,
+        )
+        .await
+    }
+
     /// Public file upload with progress events.
     ///
     /// Same as [`Client::file_upload_public_with_mode`] but sends
@@ -2832,6 +2875,7 @@ impl Client {
         visibility: Visibility,
         progress: Option<mpsc::Sender<UploadEvent>>,
     ) -> Result<FileUploadResult> {
+        let mode = listed_payment_mode(&visibility, mode);
         debug!(
             "Streaming file upload with mode {mode:?}, visibility {visibility:?}: {}",
             path.display()
@@ -2853,6 +2897,18 @@ impl Client {
                         .map_err(Error::Serialization)?;
                 info!(
                     "Public upload: adding DataMap chunk ({} bytes) at address {} to payment batch",
+                    serialized.len(),
+                    hex::encode(address)
+                );
+                spill.push(&serialized)?;
+                Some(address)
+            }
+            Visibility::Listed(ref metadata) => {
+                let (address, serialized) =
+                    crate::client_engine::files::listed_map_record(&data_map, metadata)
+                        .map_err(Error::Serialization)?;
+                info!(
+                    "Listed upload: adding envelope chunk ({} bytes) at address {} to payment batch",
                     serialized.len(),
                     hex::encode(address)
                 );

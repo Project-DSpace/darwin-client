@@ -10,6 +10,8 @@ pub mod network;
 pub mod peer_cache;
 
 pub use client::cache::ChunkCache;
+#[cfg(feature = "native")]
+pub use client::listings::ListingChain;
 pub use client::{Client, ClientConfig};
 pub use error::{Error, Result};
 pub use network::{Network, NetworkHealth, REBOOTSTRAP_THRESHOLD};

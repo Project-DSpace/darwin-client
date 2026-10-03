@@ -116,7 +116,13 @@ pub enum FileChunkPeerStatus {
 /// A public upload additionally stores the serialized `DataMap` as a chunk on
 /// the network, yielding a single chunk address that anyone can use to
 /// retrieve the `DataMap` (via [`crate::data::Client::data_map_fetch`]) and then the file.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+///
+/// A listed upload stores the data map inside an envelope with optional
+/// metadata. Nodes that support listings record the envelope's payment and
+/// serve it on the listings topic, so the file can be found without its
+/// address. Its payment is always a single-node payment, which nodes need to
+/// find it.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum Visibility {
     /// Keep the data map local; only the holder can retrieve the file.
     #[default]
@@ -124,6 +130,8 @@ pub enum Visibility {
     /// Publish the data map as a network chunk so anyone with the returned
     /// address can retrieve and decrypt the file.
     Public,
+    /// Publish the data map in a listing envelope, with the given metadata.
+    Listed(ant_listings::Metadata),
 }
 
 /// Confidence attached to an [`UploadCostEstimate`]'s `storage_cost_atto`.

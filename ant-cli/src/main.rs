@@ -176,6 +176,15 @@ async fn run() -> anyhow::Result<()> {
             client.save_adaptive_snapshot();
             result?;
         }
+        Commands::Listings(args) => {
+            let client = build_data_client(&data_ctx, false, json, None, None).await?;
+            let (network, _) = resolve_evm_network_and_manifest(&data_ctx)?;
+            let chain = ant_core::data::ListingChain::new(&network)?;
+            let result = args.execute(&client, &chain, json).await;
+            client.save_peer_cache().await;
+            client.save_adaptive_snapshot();
+            result?;
+        }
         Commands::Update(args) => {
             args.execute(json).await?;
         }

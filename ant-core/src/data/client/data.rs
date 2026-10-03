@@ -193,6 +193,18 @@ impl Client {
                 chunk_contents.push(bytes);
                 Some(address)
             }
+            Visibility::Listed(ref metadata) => {
+                let (address, bytes) =
+                    crate::client_engine::files::listed_map_record(&data_map, metadata)
+                        .map_err(Error::Serialization)?;
+                info!(
+                    "Listed upload: bundling envelope chunk ({} bytes) at address {}",
+                    bytes.len(),
+                    hex::encode(address)
+                );
+                chunk_contents.push(bytes);
+                Some(address)
+            }
         };
 
         let chunk_count = chunk_contents.len();

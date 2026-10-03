@@ -11,12 +11,23 @@ use tracing::info;
 use ant_core::data::{
     spawn_download_diagnostics_writer, Client, CollisionPolicy, CostEstimateConfidence,
     DownloadEvent, Error as DataError, FileChunkPeerReport, FileChunkPeerReportPeer,
-    FileChunkPeerStatus, FileChunkPeerSweepReport, PaymentMode, UploadEvent,
+    FileChunkPeerStatus, FileChunkPeerSweepReport, PaymentMode, UploadEvent, Visibility,
 };
 use ant_core::datamap_file::{original_name_from_datamap, read_datamap, write_datamap};
 
 use super::chunk::{parse_address, xor_distance_decimal};
 use crate::progress;
+
+/// Values of `ant file upload --visibility`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+pub enum VisibilityArg {
+    /// Only the holder of the data map can read the file.
+    Private,
+    /// Anyone with the address can read the file.
+    Unlisted,
+    /// Anyone can read the file, and it appears in the listings index.
+    Listed,
+}
 
 /// File subcommands.
 #[derive(Subcommand, Debug)]
@@ -29,6 +40,19 @@ pub enum FileAction {
         /// address can download). Default is private (data map saved locally).
         #[arg(long)]
         public: bool,
+        /// Who can find the file: `private` (the default; the data map is saved
+        /// locally), `unlisted` (the data map is stored, so anyone with the
+        /// address can read the file) or `listed` (it also appears in the
+        /// listings index, paid per chunk). `--public` means `unlisted`.
+        #[arg(long, value_enum, conflicts_with = "public")]
+        visibility: Option<VisibilityArg>,
+        /// For listed files: a name to show in the index. Public and permanent.
+        #[arg(long)]
+        name: Option<String>,
+        /// For listed files: a content type to show in the index, such as
+        /// `application/pdf`. Public and permanent.
+        #[arg(long)]
+        content_type: Option<String>,
         /// Force merkle batch payment regardless of chunk count (min 2 chunks).
         /// Reduces gas costs for batches by paying in a single transaction.
         #[arg(long, conflicts_with = "no_merkle")]
@@ -142,6 +166,9 @@ impl FileAction {
             FileAction::Upload {
                 path,
                 public,
+                visibility,
+                name,
+                content_type,
                 merkle,
                 no_merkle,
                 store_timeout: _,
@@ -160,7 +187,8 @@ impl FileAction {
                 } else {
                     CollisionPolicy::NumericSuffix
                 };
-                handle_file_upload(client, &path, public, mode, policy, json).await
+                let visibility = upload_visibility(public, visibility, name, content_type)?;
+                handle_file_upload(client, &path, visibility, mode, policy, json).await
             }
             FileAction::Download {
                 address,
@@ -201,10 +229,37 @@ impl FileAction {
     }
 }
 
+/// The visibility the upload flags ask for. `--name` and `--content-type` only
+/// apply to listed files.
+fn upload_visibility(
+    public: bool,
+    visibility: Option<VisibilityArg>,
+    name: Option<String>,
+    content_type: Option<String>,
+) -> anyhow::Result<Visibility> {
+    let visibility = match visibility {
+        Some(VisibilityArg::Listed) => {
+            let metadata = ant_core::ant_listings::Metadata { content_type, name };
+            metadata
+                .validate()
+                .map_err(|e| anyhow::anyhow!("Invalid listing metadata: {e}"))?;
+            return Ok(Visibility::Listed(metadata));
+        }
+        Some(VisibilityArg::Unlisted) => Visibility::Public,
+        Some(VisibilityArg::Private) => Visibility::Private,
+        None if public => Visibility::Public,
+        None => Visibility::Private,
+    };
+    if name.is_some() || content_type.is_some() {
+        anyhow::bail!("--name and --content-type are only for --visibility listed");
+    }
+    Ok(visibility)
+}
+
 async fn handle_file_upload(
     client: &Client,
     path: &Path,
-    public: bool,
+    visibility: Visibility,
     mode: PaymentMode,
     collision_policy: CollisionPolicy,
     json_output: bool,
@@ -220,12 +275,18 @@ async fn handle_file_upload(
         path.display()
     );
 
+    let public = !matches!(visibility, Visibility::Private);
+    let listed = matches!(visibility, Visibility::Listed(_));
     let upload_outcome = if json_output {
         // No progress bars in JSON mode.
-        if public {
-            client.file_upload_public_with_mode(path, mode).await
-        } else {
-            client.file_upload_with_mode(path, mode).await
+        match visibility {
+            Visibility::Listed(metadata) => {
+                client
+                    .file_upload_listed_with_progress(path, metadata, None)
+                    .await
+            }
+            Visibility::Public => client.file_upload_public_with_mode(path, mode).await,
+            Visibility::Private => client.file_upload_with_mode(path, mode).await,
         }
     } else {
         // Set up progress channel and drive progress bars
@@ -236,12 +297,18 @@ async fn handle_file_upload(
             file_size,
         ));
 
-        let upload_result = if public {
-            client
-                .file_upload_public_with_progress(path, mode, Some(tx))
-                .await
-        } else {
-            client.file_upload_with_progress(path, mode, Some(tx)).await
+        let upload_result = match visibility {
+            Visibility::Listed(metadata) => {
+                client
+                    .file_upload_listed_with_progress(path, metadata, Some(tx))
+                    .await
+            }
+            Visibility::Public => {
+                client
+                    .file_upload_public_with_progress(path, mode, Some(tx))
+                    .await
+            }
+            Visibility::Private => client.file_upload_with_progress(path, mode, Some(tx)).await,
         };
 
         // Wait for progress display to finish (sender dropped → receiver exits)
@@ -298,7 +365,7 @@ async fn handle_file_upload(
             let out = UploadJsonResult {
                 address: Some(hex_addr.clone()),
                 datamap: None,
-                mode: "public".into(),
+                mode: if listed { "listed" } else { "public" }.into(),
                 chunks: total_chunks,
                 total_chunks,
                 chunks_stored: result.chunks_stored,
@@ -316,6 +383,9 @@ async fn handle_file_upload(
             println!();
             println!("Upload complete!");
             println!("  Address: {hex_addr}");
+            if listed {
+                println!("  Listed:  yes (see `ant listings`)");
+            }
             println!("  Chunks:  {total_chunks} ({} + 1 data map)", data_chunks);
             println!("  Size:    {}", format_size(file_size));
             println!("  Cost:    {cost_display}");
