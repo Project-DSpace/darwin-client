@@ -231,7 +231,10 @@ Anyone can download this file with:
 
 | Flag | Description |
 |------|-------------|
-| `--public` | Store the DataMap on-network (anyone with the address can download). Without this flag, the DataMap is saved to a local `.datamap` file (private). |
+| `--visibility <private\|unlisted\|listed>` | Who can read the file. `private` (default): the DataMap is saved to a local `.datamap` file. `unlisted`: the DataMap is stored on-network and anyone with the address can download. `listed`: as `unlisted`, and the file also appears in the network's listings index (see `ant listings`). |
+| `--public` | Same as `--visibility unlisted`. |
+| `--name <NAME>` | Listed files only: a name to show in the index (1–255 bytes, no control characters or path separators). Public and permanent. |
+| `--content-type <TYPE>` | Listed files only: a content type to show in the index, as `type/subtype`. Public and permanent. |
 | `--merkle` | Force merkle batch payment (single EVM transaction for all chunks). Reduces gas costs for multi-chunk uploads. |
 | `--no-merkle` | Disable merkle, always use per-chunk payments. |
 
@@ -240,7 +243,8 @@ Anyone can download this file with:
 2. Each encrypted chunk is stored on the network at its XOR content address.
 3. Payment is made per-chunk or via a merkle batch transaction (auto-selected by default when >= 64 chunks).
 4. A `DataMap` is produced that records which chunks compose the file.
-5. In `--public` mode, the DataMap itself is stored as a chunk; the returned address is the DataMap's content address. In private mode, the DataMap is saved to `<filename>.datamap` on disk.
+5. In unlisted mode, the DataMap itself is stored as a chunk; the returned address is the DataMap's content address. In private mode, the DataMap is saved to `<filename>.datamap` on disk.
+6. In listed mode, the DataMap is stored inside an envelope chunk that also carries the optional name and content type; the returned address is the envelope's. Listed uploads are always paid per chunk. Every node that stores the envelope records a listing with the on-chain payment, so the listing can be checked and can't be forged. **Listed files are public and permanent, and the payment transaction shows the paying wallet.**
 
 #### `ant file download [ADDRESS]`
 
@@ -273,6 +277,22 @@ Download complete!
 | `ADDRESS` | Hex-encoded public DataMap address (64 hex chars). |
 | `--datamap <PATH>` | Path to a local `.datamap` file (for private downloads). |
 | `-o, --output <PATH>` | Output file path (default: `downloaded_file`). |
+
+### `ant listings` — The Listings Index
+
+```
+$ ant listings
+$ ant listings --from-block 78978000 --json
+```
+
+Collects listings from every node the client can find, checks each one (the envelope is on the network and matches the listing; the payment is on chain, for this address, with a valid quote signature) and prints them oldest first, in payment order: address, name, content type, size, payment time, block and transaction.
+
+| Flag | Description |
+|------|-------------|
+| `--from-block <N>` | Only listings paid in block `N` or later. |
+| `--all` | Also show listings that fail their checks, with the reason. |
+
+With `--json`, each listing also carries its `data_map` (hex), which is enough to read the file without fetching the envelope. Download a listed file with `ant file download <ADDRESS>`.
 
 ### `ant chunk` — Single-Chunk Operations
 
