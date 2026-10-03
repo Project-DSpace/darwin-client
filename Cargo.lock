@@ -823,6 +823,7 @@ dependencies = [
  "bytes",
  "clap",
  "colored",
+ "futures",
  "hex",
  "indicatif",
  "rand 0.8.6",

@@ -14,6 +14,7 @@ use ant_listings::{
 use ant_protocol::evm::Network as EvmNetwork;
 use ant_protocol::transport::{P2PEvent, PeerId};
 use ant_protocol::XorName;
+use futures::stream::{self, StreamExt};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
@@ -33,6 +34,10 @@ const CRAWL_WIDTH: usize = 20;
 /// The most pages read from one node in one collection.
 const MAX_PAGES_PER_NODE: usize = 1_000;
 
+/// Nodes asked at once. A node that doesn't answer (an older one, or one that
+/// is down) costs one request timeout, paid alongside the others.
+const PEER_CONCURRENCY: usize = 64;
+
 impl Client {
     /// Collect listings with keys from `from` onwards from every node this
     /// client can find, oldest first.
@@ -51,30 +56,16 @@ impl Client {
                 "no nodes found to ask for listings".into(),
             ));
         }
+        let per_peer: Vec<Vec<Listing>> = stream::iter(&peers)
+            .map(|peer| self.listings_from(peer, from))
+            .buffer_unordered(PEER_CONCURRENCY)
+            .collect()
+            .await;
         let mut by_address: HashMap<XorName, Vec<Listing>> = HashMap::new();
-        for peer in &peers {
-            let mut next = from;
-            for _ in 0..MAX_PAGES_PER_NODE {
-                let request = ListingsBody::ListRequest {
-                    from: next,
-                    limit: MAX_LIST_LIMIT,
-                };
-                let Some(ListingsBody::ListResponse { listings, more }) =
-                    self.ask_for_listings(peer, request).await
-                else {
-                    break;
-                };
-                let last = listings.last().map(Listing::key);
-                for listing in listings {
-                    let candidates = by_address.entry(listing.address).or_default();
-                    if !candidates.contains(&listing) {
-                        candidates.push(listing);
-                    }
-                }
-                match last {
-                    Some(key) if more => next = key.next(),
-                    _ => break,
-                }
+        for listing in per_peer.into_iter().flatten() {
+            let candidates = by_address.entry(listing.address).or_default();
+            if !candidates.contains(&listing) {
+                candidates.push(listing);
             }
         }
         let mut listings: Vec<Listing> = by_address.into_values().flatten().collect();
@@ -117,14 +108,45 @@ impl Client {
         Ok(envelope)
     }
 
+    /// Every listing `peer` holds from `from` onwards, a page at a time. Empty
+    /// if the peer doesn't answer.
+    async fn listings_from(&self, peer: &PeerId, from: ListingKey) -> Vec<Listing> {
+        let mut collected = Vec::new();
+        let mut next = from;
+        for _ in 0..MAX_PAGES_PER_NODE {
+            let request = ListingsBody::ListRequest {
+                from: next,
+                limit: MAX_LIST_LIMIT,
+            };
+            let Some(ListingsBody::ListResponse { listings, more }) =
+                self.ask_for_listings(peer, request).await
+            else {
+                break;
+            };
+            let last = listings.last().map(Listing::key);
+            collected.extend(listings);
+            match last {
+                Some(key) if more => next = key.next(),
+                _ => break,
+            }
+        }
+        collected
+    }
+
     /// The nodes to ask: those connected, plus those found by a few random
     /// lookups.
     async fn listing_peers(&self) -> Vec<PeerId> {
         let network = self.network();
         let mut peers: HashSet<PeerId> = network.connected_peers().await.into_iter().collect();
-        for _ in 0..CRAWL_LOOKUPS {
-            let target: [u8; 32] = rand::random();
-            match network.find_closest_peers(&target, CRAWL_WIDTH).await {
+        let targets: Vec<[u8; 32]> = (0..CRAWL_LOOKUPS).map(|_| rand::random()).collect();
+        let lookups = futures::future::join_all(
+            targets
+                .iter()
+                .map(|target| network.find_closest_peers(target, CRAWL_WIDTH)),
+        )
+        .await;
+        for lookup in lookups {
+            match lookup {
                 Ok(found) => peers.extend(found.into_iter().map(|(peer, _)| peer)),
                 Err(e) => debug!("Listing crawl lookup failed: {e}"),
             }

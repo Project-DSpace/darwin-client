@@ -5,7 +5,12 @@ use std::collections::HashSet;
 use ant_core::ant_listings::{Listing, ListingKey};
 use ant_core::data::{Client, ListingChain};
 use clap::Args;
+use futures::stream::{self, StreamExt};
 use serde::Serialize;
+
+/// Listings checked at once. Each check fetches the envelope and reads the
+/// payment from the chain.
+const CHECK_CONCURRENCY: usize = 8;
 
 /// Arguments of `ant listings`.
 #[derive(Args)]
@@ -51,13 +56,24 @@ impl ListingsArgs {
         };
         let listings = client.collect_listings(from).await?;
 
+        // Checked concurrently but kept in order, so the first listing that
+        // passes for an address is still the one shown.
+        let checked: Vec<_> = stream::iter(listings)
+            .map(|listing| async move {
+                let result = client.check_listing(&listing, chain).await;
+                (listing, result)
+            })
+            .buffered(CHECK_CONCURRENCY)
+            .collect()
+            .await;
+
         let mut listed = HashSet::new();
         let mut rows: Vec<(Listing, Result<Vec<u8>, String>)> = Vec::new();
-        for listing in listings {
+        for (listing, result) in checked {
             if listed.contains(&listing.address) {
                 continue;
             }
-            match client.check_listing(&listing, chain).await {
+            match result {
                 Ok(envelope) => {
                     listed.insert(listing.address);
                     let data_map = envelope.data_map_bytes().to_vec();
