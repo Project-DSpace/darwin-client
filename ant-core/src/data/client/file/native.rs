@@ -19,9 +19,9 @@ use crate::data::client::chunk::{ChunkFetchDiagnostics, ChunkPeerGetResult};
 use crate::data::client::classify_error;
 use crate::data::client::diagnostics::DownloadDiagnosticsSender;
 use crate::data::client::merkle::{
-    finalize_merkle_batch, merge_merkle_batch_results, merkle_batch_sizes, merkle_billable_leaves,
-    merkle_deferred_retry, merkle_store_with_retry, should_use_merkle, MerkleBatchPaymentResult,
-    PaymentMode, PreparedMerkleBatch, DEFERRED_ROUND_DELAYS_SECS,
+    finalize_merkle_batch, merge_merkle_batch_results, merkle_deferred_retry,
+    merkle_store_with_retry, merkle_upload_billable_units, merkle_upload_split, should_use_merkle,
+    MerkleBatchPaymentResult, PaymentMode, PreparedMerkleBatch, DEFERRED_ROUND_DELAYS_SECS,
 };
 use crate::data::client::Client;
 use crate::data::error::{Error, PartialUploadSpend, Result};
@@ -1943,11 +1943,13 @@ impl Client {
         let chunk_count_u64 = u64::try_from(chunk_count).unwrap_or(u64::MAX);
         // Merkle settles per *padded* leaf, not per chunk: the contract charges
         // `median16 × 2^depth` per batch and the tree rounds up to a power of
-        // two, so a 65-chunk batch pays for 128 leaves. The leaf total is
-        // summed over the batches the payment path really builds
-        // (`merkle_batch_sizes`), so the estimate cannot drift from execution.
+        // two, so a 65-chunk batch pays for 128 leaves. The total is summed
+        // over the batches the upload engine really builds, plus the remainder
+        // it pays per chunk (`merkle_upload_split`), so the estimate cannot
+        // drift from execution.
+        let merkle_split = merkle_upload_split(chunk_count, chunk_count);
         let billable_units = if uses_merkle {
-            merkle_billable_leaves(chunk_count_u64)
+            merkle_upload_billable_units(chunk_count_u64)
         } else {
             chunk_count_u64
         };
@@ -1964,18 +1966,20 @@ impl Client {
         //   per-wave figure of 150k was closer to a single-entry transfer
         //   and understated cost by 5–10x for full waves.
         // - Merkle mode: one tx per sub-batch that verifies a merkle tree
-        //   and posts a pool commitment (GAS_PER_MERKLE_TX ≈ 500k each).
+        //   and posts a pool commitment (GAS_PER_MERKLE_TX ≈ 500k each),
+        //   plus one wave tx when a remainder is paid per chunk.
         //
         // Gas is priced at ARBITRUM_GAS_PRICE_WEI (~0.1 gwei, a typical
         // Arbitrum baseline). Treat the result as advisory, not a commitment.
         let waves = u128::try_from(chunk_count.div_ceil(UPLOAD_WAVE_SIZE)).unwrap_or(u128::MAX);
-        // One tx per batch the payment path builds — same partition the leaf
+        // One tx per batch the upload engine builds — same split the unit
         // total above is derived from.
-        let merkle_batches =
-            u128::try_from(merkle_batch_sizes(chunk_count).len()).unwrap_or(u128::MAX);
+        let merkle_batches = u128::try_from(merkle_split.batches.len()).unwrap_or(u128::MAX);
+        let remainder_waves = u128::from(merkle_split.per_chunk > 0);
         let estimated_gas: u128 = if uses_merkle {
             merkle_batches
                 .saturating_mul(GAS_PER_MERKLE_TX)
+                .saturating_add(remainder_waves.saturating_mul(GAS_PER_WAVE_TX))
                 .saturating_mul(ARBITRUM_GAS_PRICE_WEI)
         } else {
             waves
@@ -4174,20 +4178,23 @@ mod tests {
         assert_eq!(distributed_sample_indices(5, 5), vec![0, 1, 2, 3, 4]);
     }
 
-    /// The estimator bills the padded tree, and the leaf total it bills comes
-    /// from the batches the payment path really builds — a `[255, 2]` split of
-    /// 257 chunks, not a `[256, 1]` one that could never be paid.
+    /// The estimator bills what the upload engine pays: each batch's padded
+    /// tree plus the remainder paid per chunk, from the same split.
     #[test]
-    fn estimator_leaf_total_is_the_padded_payment_partition() {
-        for chunks in [2u64, 64, 65, 100, 129, 255, 256, 257, 300, 512, 513, 769] {
-            let from_partition: u64 = merkle_batch_sizes(chunks as usize)
-                .into_iter()
+    fn estimator_units_are_the_upload_engine_split() {
+        for chunks in [
+            2u64, 9, 31, 32, 64, 65, 100, 129, 130, 255, 256, 257, 300, 512, 513, 769,
+        ] {
+            let split = merkle_upload_split(chunks as usize, chunks as usize);
+            let leaves: u64 = split
+                .batches
+                .iter()
                 .map(|size| size.next_power_of_two() as u64)
                 .sum();
             assert_eq!(
-                merkle_billable_leaves(chunks),
-                from_partition,
-                "{chunks} chunks must be billed for the partition the payment path pays"
+                merkle_upload_billable_units(chunks),
+                leaves + split.per_chunk as u64,
+                "{chunks} chunks must be billed for the split the upload engine pays"
             );
         }
     }

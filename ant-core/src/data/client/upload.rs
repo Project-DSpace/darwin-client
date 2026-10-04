@@ -58,6 +58,9 @@ pub trait AdapterBounds {}
 impl<T> AdapterBounds for T {}
 
 /// Only byte loading, wallet submission, endpoint admission, and persistence vary by platform.
+// async_trait marks each method `#[must_use]` on a boxed future that already
+// is, which clippy's `double_must_use` flags.
+#[allow(clippy::double_must_use)]
 #[cfg_attr(not(feature = "native"), async_trait::async_trait(?Send))]
 #[cfg_attr(feature = "native", async_trait::async_trait)]
 pub trait UploadAdapter: AdapterBounds {
@@ -778,7 +781,9 @@ impl Client {
         mode: PaymentMode,
         outcome: &mut UploadOutcome,
     ) -> Result<()> {
-        use super::merkle::{finalize_merkle_batch, merkle_batch_partitions, should_use_merkle};
+        use super::merkle::{
+            finalize_merkle_batch, merkle_upload_partitions, merkle_upload_split, should_use_merkle,
+        };
         if state.pending_merkle.as_ref().is_some_and(|batch| {
             !super::upload_state::merkle_fresh(
                 batch.merkle_payment_timestamp,
@@ -836,6 +841,14 @@ impl Client {
         if !should_use_merkle(unpaid.len(), mode) {
             return Ok(());
         }
+        // Only the remainder paid per chunk is left, as when an upload resumes
+        // after its batches were paid; the per-chunk waves pay it.
+        if merkle_upload_split(quote_total, unpaid.len())
+            .batches
+            .is_empty()
+        {
+            return Ok(());
+        }
         let entries = unpaid.iter().map(|r| (r.address, r.size)).collect();
         adapter.checked(0, unpaid.len());
         let plan = match self
@@ -872,7 +885,9 @@ impl Client {
         if !should_use_merkle(plan.to_upload.len(), mode) {
             return Ok(());
         }
-        let batches = merkle_batch_partitions(&plan.to_upload);
+        // Exact power-of-two batches. The chunks after them stay unpaid here
+        // and are paid per chunk once the batches are stored.
+        let batches = merkle_upload_partitions(quote_total, &plan.to_upload);
         for (batch_index, addresses) in batches.iter().enumerate() {
             adapter.preparing(&format!(
                 "Preparing Merkle payment batch {}/{}: collecting candidate quotes",

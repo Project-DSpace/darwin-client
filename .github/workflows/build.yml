@@ -1,5 +1,5 @@
-# Runs the unit tests, then builds the Linux `ant` client binary on every push
-# to main and uploads it as a workflow artifact.
+# Checks formatting and lints, runs the unit tests, then builds the Linux `ant`
+# client binary on every push to main and uploads it as a workflow artifact.
 #
 # Replaces upstream's workflows, which run Autonomi's test matrix, PR checks
 # and signed multi-platform releases.
@@ -15,6 +15,27 @@ permissions:
   contents: read
 
 jobs:
+  fmt:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all -- --check
+
+  clippy:
+    runs-on: ubuntu-24.04
+    env:
+      RUSTFLAGS: "-D warnings"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --locked --all-targets --all-features -- -D warnings
+
   linux-x64:
     # Pinned to the servers' Ubuntu release: a binary built against a newer
     # glibc will not run on an older one.

@@ -44,8 +44,10 @@ Each chunk stored on the network requires a one-time payment to the nodes that s
 
 Two payment modes are available:
 - **Single** — One EVM transaction per chunk. Simple but costly for many chunks.
-- **Merkle** — A single EVM transaction covers a batch of chunks via a merkle tree proof. This
-  reduces gas costs significantly for multi-chunk uploads (e.g., files).
+- **Merkle** — A single EVM transaction covers a batch of up to 256 chunks via a merkle tree
+  proof. This reduces gas costs significantly for multi-chunk uploads (e.g., files). The vault
+  charges a batch for the next power of two of its chunks, so the upload engine pays exact
+  power-of-two batches (256, 128, 64, 32) and pays a remainder under 32 chunks per chunk.
 - **Auto** (default) — Uses merkle when >= 64 chunks, otherwise per-chunk.
 
 ## Client API

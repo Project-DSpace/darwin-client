@@ -235,16 +235,16 @@ Anyone can download this file with:
 | `--public` | Same as `--visibility unlisted`. |
 | `--name <NAME>` | Listed files only: a name to show in the index (1–255 bytes, no control characters or path separators). Public and permanent. |
 | `--content-type <TYPE>` | Listed files only: a content type to show in the index, as `type/subtype`. Public and permanent. |
-| `--merkle` | Force merkle batch payment (single EVM transaction for all chunks). Reduces gas costs for multi-chunk uploads. |
+| `--merkle` | Force merkle batch payment from 2 chunks, instead of from 64. Reduces gas costs for multi-chunk uploads. |
 | `--no-merkle` | Disable merkle, always use per-chunk payments. |
 
 **How it works:**
 1. The file is streamed through self-encryption in 8KB reads (never fully loaded into memory).
 2. Each encrypted chunk is stored on the network at its XOR content address.
-3. Payment is made per-chunk or via a merkle batch transaction (auto-selected by default when >= 64 chunks).
+3. Payment is made per-chunk or via merkle batch transactions (auto-selected by default when >= 64 chunks). The payment vault charges a batch for the next power of two of its chunks, so an upload is paid in exact power-of-two batches (256, 128, 64 and 32 chunks), and a remainder under 32 chunks is paid per chunk.
 4. A `DataMap` is produced that records which chunks compose the file.
 5. In unlisted mode, the DataMap itself is stored as a chunk; the returned address is the DataMap's content address. In private mode, the DataMap is saved to `<filename>.datamap` on disk.
-6. In listed mode, the DataMap is stored inside an envelope chunk that also carries the optional name and content type; the returned address is the envelope's. Listed uploads are always paid per chunk. Every node that stores the envelope records a listing with the on-chain payment, so the listing can be checked and can't be forged. **Listed files are public and permanent, and the payment transaction shows the paying wallet.**
+6. In listed mode, the DataMap is stored inside an envelope chunk that also carries the optional name and content type; the returned address is the envelope's. The content is paid like any file; the envelope is paid per chunk, and stored only after the content is complete. Every node that stores the envelope records a listing with the on-chain payment, so the listing can be checked and can't be forged. **Listed files are public and permanent, and the payment transaction shows the paying wallet.**
 
 #### `ant file download [ADDRESS]`
 

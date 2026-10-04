@@ -619,6 +619,91 @@ pub fn merkle_batch_partitions_with_cap(addresses: &[[u8; 32]], cap: usize) -> V
     partitions
 }
 
+/// Smallest merkle batch the upload engine splits off an upload. Fewer chunks
+/// than this, left over after the larger batches, are paid per chunk.
+pub const MERKLE_EXACT_MIN_BATCH: usize = 32;
+
+/// How the upload engine pays for chunks with merkle payment.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MerkleUploadSplit {
+    /// Merkle batch sizes, largest first.
+    pub batches: Vec<usize>,
+    /// Chunks left over, paid per chunk.
+    pub per_chunk: usize,
+}
+
+/// Split the `unpaid` chunks of an upload of `upload_chunks` chunks into the
+/// merkle batches the upload engine pays, and a remainder paid per chunk.
+///
+/// The vault charges a batch for the next power of two of its leaves, so
+/// [`merkle_batch_sizes`] can pay for up to 127 chunks that don't exist (a
+/// 130-chunk upload is billed as 256). An upload of at least
+/// [`MERKLE_EXACT_MIN_BATCH`] chunks is instead paid in exact power-of-two
+/// batches: as many full `MAX_LEAVES` batches as fit, then one each of 128,
+/// 64 and 32 where the count's binary form has them. What is left (under 32)
+/// is paid per chunk, costing at most 31 per-chunk payments' gas instead of
+/// up to 127 padded leaves.
+///
+/// The split depends only on the upload's size and the count still unpaid,
+/// and paying the batches in order leaves a count whose split is the rest of
+/// the same list. So an upload resumed after some batches were paid asks for
+/// the same remaining payments, and one with only the remainder left goes
+/// straight to per-chunk payment.
+///
+/// A smaller upload (only possible under [`PaymentMode::Merkle`]) keeps one
+/// padded batch per [`merkle_batch_sizes`], as the caller asked for merkle
+/// payment.
+#[must_use]
+pub fn merkle_upload_split(upload_chunks: usize, unpaid: usize) -> MerkleUploadSplit {
+    if upload_chunks < MERKLE_EXACT_MIN_BATCH {
+        let batches = merkle_batch_sizes(unpaid);
+        let per_chunk = if batches.is_empty() { unpaid } else { 0 };
+        return MerkleUploadSplit { batches, per_chunk };
+    }
+    let mut batches = vec![MAX_LEAVES; unpaid / MAX_LEAVES];
+    let mut size = MAX_LEAVES / 2;
+    while size >= MERKLE_EXACT_MIN_BATCH {
+        if (unpaid & size) != 0 {
+            batches.push(size);
+        }
+        size /= 2;
+    }
+    MerkleUploadSplit {
+        batches,
+        per_chunk: unpaid % MERKLE_EXACT_MIN_BATCH,
+    }
+}
+
+/// Split `addresses`, the unpaid chunks of an upload of `upload_chunks`
+/// chunks, into the merkle batches [`merkle_upload_split`] describes. The
+/// addresses after the last batch are the remainder paid per chunk.
+#[must_use]
+pub fn merkle_upload_partitions(upload_chunks: usize, addresses: &[[u8; 32]]) -> Vec<&[[u8; 32]]> {
+    let mut partitions = Vec::new();
+    let mut rest = addresses;
+    for size in merkle_upload_split(upload_chunks, addresses.len()).batches {
+        let (batch, tail) = rest.split_at(size);
+        partitions.push(batch);
+        rest = tail;
+    }
+    partitions
+}
+
+/// Units an upload of `chunk_count` chunks paid through the upload engine is
+/// billed for: each merkle batch's padded leaves, plus each chunk paid per
+/// chunk. Both are priced from the same median quote and multiplier.
+#[must_use]
+pub fn merkle_upload_billable_units(chunk_count: u64) -> u64 {
+    let total = usize::try_from(chunk_count).unwrap_or(usize::MAX);
+    let split = merkle_upload_split(total, total);
+    let leaves = split
+        .batches
+        .into_iter()
+        .map(padded_leaf_count)
+        .fold(0u64, u64::saturating_add);
+    leaves.saturating_add(u64::try_from(split.per_chunk).unwrap_or(u64::MAX))
+}
+
 /// Fold per-batch [`MerkleBatchPaymentResult`]s into one combined receipt.
 ///
 /// Mirrors the fold `pay_for_merkle_multi_batch` performs on the wallet path:
@@ -672,11 +757,12 @@ fn padded_leaf_count(batch_size: usize) -> u64 {
     u64::try_from(padded).unwrap_or(u64::MAX)
 }
 
-/// Leaves a merkle upload of `chunk_count` chunks is actually billed for.
+/// Leaves [`Client::pay_for_merkle_batch`] bills `chunk_count` addresses for.
 ///
 /// Summed over the batches [`merkle_batch_sizes`] will really pay for, so the
 /// estimate and the execution path share one batching model rather than two
-/// that can drift. Billing the raw chunk count would under-quote a
+/// that can drift. Uploads through the upload engine are split differently;
+/// see [`merkle_upload_billable_units`]. Billing the raw chunk count would under-quote a
 /// non-power-of-two batch by up to 2×, and an under-quote is the harmful
 /// direction: a caller sizing its wallet from the estimate runs dry
 /// mid-upload.
@@ -2965,6 +3051,165 @@ mod tests {
             assert!(
                 merkle_billable_leaves(chunks) >= chunks,
                 "{chunks} chunks must never be billed as fewer leaves"
+            );
+        }
+    }
+
+    /// `(upload chunks, merkle batches, chunks paid per chunk)`: whole
+    /// `MAX_LEAVES` batches, then 128, 64 and 32 from the count's binary form,
+    /// and the rest (under 32) per chunk.
+    const UPLOAD_SPLIT_CASES: [(usize, &[usize], usize); 12] = [
+        (32, &[32], 0),
+        (33, &[32], 1),
+        (63, &[32], 31),
+        (64, &[64], 0),
+        (100, &[64, 32], 4),
+        (130, &[128], 2),
+        (255, &[128, 64, 32], 31),
+        (256, &[256], 0),
+        (257, &[256], 1),
+        (300, &[256, 32], 12),
+        (640, &[256, 256, 128], 0),
+        (1283, &[256, 256, 256, 256, 256], 3),
+    ];
+
+    #[test]
+    fn merkle_upload_split_pays_exact_batches_and_a_remainder_per_chunk() {
+        for (chunks, batches, per_chunk) in UPLOAD_SPLIT_CASES {
+            assert_eq!(
+                merkle_upload_split(chunks, chunks),
+                MerkleUploadSplit {
+                    batches: batches.to_vec(),
+                    per_chunk,
+                },
+                "{chunks} chunks"
+            );
+        }
+    }
+
+    #[test]
+    fn merkle_upload_split_covers_every_chunk_with_unpadded_batches() {
+        for chunks in MERKLE_EXACT_MIN_BATCH..=(4 * MAX_LEAVES + 40) {
+            let split = merkle_upload_split(chunks, chunks);
+            assert_eq!(
+                split.batches.iter().sum::<usize>() + split.per_chunk,
+                chunks,
+                "{chunks} chunks: the split must cover every chunk once"
+            );
+            assert!(
+                split.per_chunk < MERKLE_EXACT_MIN_BATCH,
+                "{chunks}: {split:?}"
+            );
+            assert!(
+                split.batches.windows(2).all(|pair| pair[0] >= pair[1]),
+                "{chunks}: batches largest first: {split:?}"
+            );
+            for size in &split.batches {
+                assert!(
+                    size.is_power_of_two() && (MERKLE_EXACT_MIN_BATCH..=MAX_LEAVES).contains(size),
+                    "{chunks} chunks produced a padded or out-of-range batch: {split:?}"
+                );
+            }
+        }
+    }
+
+    /// A resumed upload, or a store retried after some batches were paid,
+    /// must be asked for the rest of the same payments: never a new padded
+    /// batch for the remainder.
+    #[test]
+    fn merkle_upload_split_resumes_with_the_rest_of_the_same_split() {
+        for chunks in MERKLE_EXACT_MIN_BATCH..=(4 * MAX_LEAVES + 40) {
+            let split = merkle_upload_split(chunks, chunks);
+            let mut unpaid = chunks;
+            for paid in 0..split.batches.len() {
+                assert_eq!(
+                    merkle_upload_split(chunks, unpaid),
+                    MerkleUploadSplit {
+                        batches: split.batches[paid..].to_vec(),
+                        per_chunk: split.per_chunk,
+                    },
+                    "{chunks} chunks with {paid} batches paid"
+                );
+                unpaid -= split.batches[paid];
+            }
+            assert_eq!(unpaid, split.per_chunk);
+            assert_eq!(
+                merkle_upload_split(chunks, unpaid),
+                MerkleUploadSplit {
+                    batches: Vec::new(),
+                    per_chunk: split.per_chunk,
+                },
+                "{chunks} chunks with only the remainder left"
+            );
+        }
+    }
+
+    /// Below the smallest exact batch only a forced merkle upload gets here;
+    /// it keeps one padded batch, as before.
+    #[test]
+    fn merkle_upload_split_keeps_one_padded_batch_for_small_uploads() {
+        assert_eq!(merkle_upload_split(9, 9).batches, vec![9]);
+        assert_eq!(merkle_upload_split(31, 31).batches, vec![31]);
+        assert_eq!(merkle_upload_split(31, 5).batches, vec![5]);
+        assert_eq!(merkle_upload_split(31, 31).per_chunk, 0);
+        assert_eq!(
+            merkle_upload_split(1, 1),
+            MerkleUploadSplit {
+                batches: Vec::new(),
+                per_chunk: 1,
+            }
+        );
+        assert_eq!(
+            merkle_upload_split(0, 0),
+            MerkleUploadSplit {
+                batches: Vec::new(),
+                per_chunk: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn merkle_upload_partitions_build_trees_and_leave_the_remainder() {
+        for (chunks, batches, per_chunk) in UPLOAD_SPLIT_CASES {
+            let addrs = make_test_addresses(chunks);
+            let partitions = merkle_upload_partitions(chunks, &addrs);
+            let sizes: Vec<usize> = partitions.iter().map(|batch| batch.len()).collect();
+            assert_eq!(sizes, batches, "{chunks} chunks");
+            assert_eq!(
+                partitions.concat(),
+                addrs[..chunks - per_chunk],
+                "{chunks} chunks: batches take the addresses in order, the remainder is left"
+            );
+            for batch in partitions {
+                let xornames: Vec<XorName> = batch.iter().map(|a| XorName(*a)).collect();
+                assert!(
+                    MerkleTree::from_xornames(xornames).is_ok(),
+                    "{chunks} chunks: batch of {} cannot build a tree",
+                    batch.len()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn merkle_upload_billable_units_carry_no_padding_from_32_chunks() {
+        // 130 chunks were billed as 256 leaves; now 128 leaves and 2 chunks.
+        assert_eq!(merkle_billable_leaves(130), 256);
+        assert_eq!(merkle_upload_billable_units(130), 130);
+        for chunks in MERKLE_EXACT_MIN_BATCH as u64..2000 {
+            assert_eq!(
+                merkle_upload_billable_units(chunks),
+                chunks,
+                "{chunks} chunks"
+            );
+        }
+        // A forced merkle upload under 32 chunks still pays one padded tree.
+        assert_eq!(merkle_upload_billable_units(9), 16);
+        assert_eq!(merkle_upload_billable_units(0), 0);
+        for chunks in 1..2000u64 {
+            assert!(
+                merkle_upload_billable_units(chunks) >= chunks,
+                "{chunks} chunks"
             );
         }
     }
