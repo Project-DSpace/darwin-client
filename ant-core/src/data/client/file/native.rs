@@ -1206,6 +1206,87 @@ impl std::fmt::Debug for ExternalChunkStore {
     }
 }
 
+/// Open the checkpoint for uploading `records` on `network`: its path, the
+/// lock held while the upload runs, and the state an earlier, interrupted
+/// attempt saved (`None` if there was none).
+async fn open_upload_checkpoint(
+    network: &ant_protocol::evm::Network,
+    records: &[super::super::upload::UploadRecord],
+) -> Result<(
+    PathBuf,
+    std::fs::File,
+    Option<super::super::upload_state::UploadState>,
+)> {
+    let scope = rmp_serde::to_vec(&(
+        network,
+        records
+            .iter()
+            .map(|r| (r.address, r.size))
+            .collect::<Vec<_>>(),
+    ))
+    .map_err(|e| Error::Serialization(e.to_string()))?;
+    let cache_dir = crate::config::data_dir()
+        .map_err(|e| Error::Config(e.to_string()))?
+        .join("payments/upload");
+    std::fs::create_dir_all(&cache_dir)?;
+    let cache_path = cache_dir.join(format!(
+        "{}.msgpack",
+        hex::encode(blake3::hash(&scope).as_bytes())
+    ));
+    let lock_path = cache_path.with_extension("lock");
+    let lock = tokio::task::spawn_blocking(move || -> std::io::Result<std::fs::File> {
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(lock_path)?;
+        fs2::FileExt::lock_exclusive(&file)?;
+        Ok(file)
+    })
+    .await
+    .map_err(|e| Error::Io(std::io::Error::other(e.to_string())))??;
+    let saved = match std::fs::read(&cache_path) {
+        Ok(bytes) => Some(super::super::upload_state::UploadState::restore(&bytes)?),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(Error::Io(error)),
+    };
+    Ok((cache_path, lock, saved))
+}
+
+/// Delete a completed upload's checkpoint.
+fn remove_upload_checkpoint(path: &Path) -> Result<()> {
+    std::fs::remove_file(path).or_else(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            Ok(())
+        } else {
+            Err(Error::Io(error))
+        }
+    })
+}
+
+/// A listed upload's result: the content's, plus the envelope record stored
+/// after it, whose address is the file's address.
+fn listed_result(
+    content: FileUploadResult,
+    envelope_address: [u8; 32],
+    envelope: &super::super::upload::UploadOutcome,
+) -> FileUploadResult {
+    let content_cost = content
+        .storage_cost_atto
+        .parse::<Amount>()
+        .unwrap_or(Amount::ZERO);
+    FileUploadResult {
+        chunks_stored: content.chunks_stored + envelope.addresses.len(),
+        total_chunks: content.total_chunks + 1,
+        storage_cost_atto: content_cost.saturating_add(envelope.amount).to_string(),
+        gas_cost_wei: content.gas_cost_wei.saturating_add(envelope.gas),
+        data_map_address: Some(envelope_address),
+        chunk_attempts_total: content.chunk_attempts_total + envelope.stats.chunk_attempts_total,
+        ..content
+    }
+}
+
 /// The payment mode for an upload. A listed upload always pays per chunk: the
 /// nodes that keep listings find a listing's payment from a single-node proof.
 fn listed_payment_mode(visibility: &Visibility, mode: PaymentMode) -> PaymentMode {
@@ -1502,18 +1583,73 @@ impl Drop for TempDownload {
     }
 }
 
+/// Pays for an upload from outside the client, for example an agent paying
+/// from its own wallet. [`Client::file_upload_with_payer`] uses it in place of
+/// the client's wallet.
+///
+/// The upload engine saves its state before it asks for a payment. After a
+/// restart it asks again, with the same plans or batch, to recover a payment
+/// that may already have been made. Implementations must therefore look for an
+/// earlier payment of exactly this request before asking for a new one.
+#[async_trait::async_trait]
+pub trait UploadPayer: Send + Sync {
+    /// Pay every non-zero quote in `plans` with `payForQuotes`. Returns the
+    /// transaction that paid each quote hash and the total paid, which must
+    /// equal the plans' total.
+    async fn pay_quotes(
+        &self,
+        plans: &[crate::data::client::batch::ChunkPaymentPlan],
+    ) -> Result<super::super::upload::UploadPayment>;
+
+    /// Pay `batch` with one `payForMerkleTree` transaction. Returns the
+    /// winning pool and the amount paid.
+    async fn pay_merkle(
+        &self,
+        batch: &PreparedMerkleBatch,
+    ) -> Result<super::super::upload::MerkleUploadPayment>;
+}
+
+/// Where an upload's record bytes come from.
+enum ChunkSource<'a> {
+    /// A file's encrypted chunks, spilled to disk.
+    Spill(&'a ChunkSpill),
+    /// One record held in memory, such as a listing envelope.
+    Record(&'a Bytes),
+}
+
+impl ChunkSource<'_> {
+    fn load(&self, address: &[u8; 32]) -> Result<Bytes> {
+        match self {
+            Self::Spill(spill) => spill.read_chunk(address),
+            Self::Record(bytes) => Ok((*bytes).clone()),
+        }
+    }
+
+    fn len(&self) -> usize {
+        match self {
+            Self::Spill(spill) => spill.len(),
+            Self::Record(_) => 1,
+        }
+    }
+}
+
+/// Uploads records from a [`ChunkSource`], paying through `payer` when there
+/// is one and through the client's wallet otherwise.
 struct SpillUploadAdapter<'a> {
     client: &'a Client,
-    spill: &'a ChunkSpill,
+    source: ChunkSource<'a>,
     progress: Option<&'a mpsc::Sender<UploadEvent>>,
     checkpoint: &'a Path,
+    payer: Option<&'a dyn UploadPayer>,
 }
 
 #[async_trait::async_trait]
 impl super::super::upload::UploadAdapter for SpillUploadAdapter<'_> {
     #[cfg(feature = "native")]
     fn initialize_payment_attempt(&self, attempt: &mut super::super::upload_state::PaymentAttempt) {
-        super::super::native_payment::initialize(attempt);
+        if self.payer.is_none() {
+            super::super::native_payment::initialize(attempt);
+        }
     }
     #[cfg(feature = "native")]
     async fn submit_payment(
@@ -1521,7 +1657,10 @@ impl super::super::upload::UploadAdapter for SpillUploadAdapter<'_> {
         plans: &[crate::data::client::batch::ChunkPaymentPlan],
         state: &mut crate::data::client::upload_state::UploadState,
     ) -> Result<super::super::upload::UploadPayment> {
-        super::super::native_payment::pay(self.client, self, plans, state).await
+        match self.payer {
+            Some(payer) => payer.pay_quotes(plans).await,
+            None => super::super::native_payment::pay(self.client, self, plans, state).await,
+        }
     }
     #[cfg(feature = "native")]
     async fn reconcile_payment(
@@ -1529,7 +1668,10 @@ impl super::super::upload::UploadAdapter for SpillUploadAdapter<'_> {
         plans: &[crate::data::client::batch::ChunkPaymentPlan],
         state: &mut crate::data::client::upload_state::UploadState,
     ) -> Result<super::super::upload::UploadPayment> {
-        super::super::native_payment::pay(self.client, self, plans, state).await
+        match self.payer {
+            Some(payer) => payer.pay_quotes(plans).await,
+            None => super::super::native_payment::pay(self.client, self, plans, state).await,
+        }
     }
     #[cfg(feature = "native")]
     async fn submit_merkle_payment(
@@ -1537,7 +1679,10 @@ impl super::super::upload::UploadAdapter for SpillUploadAdapter<'_> {
         batch: &super::super::merkle::PreparedMerkleBatch,
         state: &mut crate::data::client::upload_state::UploadState,
     ) -> Result<super::super::upload::MerkleUploadPayment> {
-        super::super::native_payment::pay_merkle(self.client, self, batch, state).await
+        match self.payer {
+            Some(payer) => payer.pay_merkle(batch).await,
+            None => super::super::native_payment::pay_merkle(self.client, self, batch, state).await,
+        }
     }
     #[cfg(feature = "native")]
     async fn reconcile_merkle_payment(
@@ -1545,21 +1690,27 @@ impl super::super::upload::UploadAdapter for SpillUploadAdapter<'_> {
         batch: &super::super::merkle::PreparedMerkleBatch,
         state: &mut crate::data::client::upload_state::UploadState,
     ) -> Result<super::super::upload::MerkleUploadPayment> {
-        super::super::native_payment::pay_merkle(self.client, self, batch, state).await
+        match self.payer {
+            Some(payer) => payer.pay_merkle(batch).await,
+            None => super::super::native_payment::pay_merkle(self.client, self, batch, state).await,
+        }
     }
     async fn load(&self, record: super::super::upload::UploadRecord) -> Result<Bytes> {
-        self.spill.read_chunk(&record.address)
+        self.source.load(&record.address)
     }
     async fn pay(
         &self,
         plans: &[crate::data::client::batch::ChunkPaymentPlan],
     ) -> Result<super::super::upload::UploadPayment> {
+        if let Some(payer) = self.payer {
+            return payer.pay_quotes(plans).await;
+        }
         let adapter = super::super::upload::MemoryUploadAdapter {
             client: self.client,
             chunks: &[],
             progress: self.progress,
             stored_offset: 0,
-            file_total: self.spill.len(),
+            file_total: self.source.len(),
             resume_key: None,
         };
         adapter.pay(plans).await
@@ -1568,12 +1719,15 @@ impl super::super::upload::UploadAdapter for SpillUploadAdapter<'_> {
         &self,
         batch: &PreparedMerkleBatch,
     ) -> Result<super::super::upload::MerkleUploadPayment> {
+        if let Some(payer) = self.payer {
+            return payer.pay_merkle(batch).await;
+        }
         let adapter = super::super::upload::MemoryUploadAdapter {
             client: self.client,
             chunks: &[],
             progress: self.progress,
             stored_offset: 0,
-            file_total: self.spill.len(),
+            file_total: self.source.len(),
             resume_key: None,
         };
         adapter.pay_merkle(batch).await
@@ -2835,21 +2989,112 @@ impl Client {
     /// Listed file upload with progress events.
     ///
     /// Stores the data map in a listing envelope carrying `metadata`, so nodes
-    /// that keep listings list the file. Always paid per chunk: those nodes find
-    /// a listing's payment from a single-node proof.
+    /// that keep listings list the file. The content is uploaded first, paid
+    /// like any file (a batch payment from 64 chunks); the envelope is then
+    /// uploaded on its own, paid per chunk (nodes record a listing only from a
+    /// single-node payment), so a listing never points at missing content.
     pub async fn file_upload_listed_with_progress(
         &self,
         path: &Path,
         metadata: ant_listings::Metadata,
         progress: Option<mpsc::Sender<UploadEvent>>,
     ) -> Result<FileUploadResult> {
-        self.file_upload_with_visibility_and_progress(
-            path,
-            PaymentMode::Single,
-            Visibility::Listed(metadata),
+        self.upload_listed(path, metadata, PaymentMode::Auto, progress, None)
+            .await
+    }
+
+    /// Upload a file paid by `payer` instead of the client's wallet, for
+    /// example an agent paying from its own account. The client needs an EVM
+    /// network ([`Client::with_evm_network`]) but no wallet.
+    ///
+    /// Uses the same engine as the wallet uploads: chunks are spilled to disk,
+    /// and a checkpoint saved before every payment lets an interrupted upload
+    /// resume (the payer is then asked to recover the same payment) without
+    /// paying twice. In [`PaymentMode::Merkle`] a network too small for a batch
+    /// payment fails before any payment; [`PaymentMode::Auto`] falls back to
+    /// per-chunk payments.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the file cannot be read or encrypted, a payment
+    /// fails, or any chunk cannot be stored.
+    pub async fn file_upload_with_payer(
+        &self,
+        path: &Path,
+        visibility: Visibility,
+        mode: PaymentMode,
+        payer: &dyn UploadPayer,
+        progress: Option<mpsc::Sender<UploadEvent>>,
+    ) -> Result<FileUploadResult> {
+        match visibility {
+            Visibility::Listed(metadata) => {
+                self.upload_listed(path, metadata, mode, progress, Some(payer))
+                    .await
+            }
+            visibility => {
+                self.upload_file(path, mode, visibility, progress, Some(payer))
+                    .await
+            }
+        }
+    }
+
+    /// A listed upload in two steps: the content as a private file, then the
+    /// envelope holding its data map as a one-record upload paid per chunk.
+    async fn upload_listed(
+        &self,
+        path: &Path,
+        metadata: ant_listings::Metadata,
+        mode: PaymentMode,
+        progress: Option<mpsc::Sender<UploadEvent>>,
+        payer: Option<&dyn UploadPayer>,
+    ) -> Result<FileUploadResult> {
+        let content = self
+            .upload_file(path, mode, Visibility::Private, progress.clone(), payer)
+            .await?;
+        let (address, envelope) =
+            crate::client_engine::files::listed_map_record(&content.data_map, &metadata)
+                .map_err(Error::Serialization)?;
+        info!(
+            "Listed upload: content stored; storing the envelope at {}",
+            hex::encode(address)
+        );
+        let stored = self
+            .upload_record(envelope, payer, progress.as_ref())
+            .await?;
+        Ok(listed_result(content, address, &stored))
+    }
+
+    /// Upload one record held in memory (stored as it is, not
+    /// self-encrypted), paid per chunk by `payer` or else by the wallet.
+    async fn upload_record(
+        &self,
+        content: Bytes,
+        payer: Option<&dyn UploadPayer>,
+        progress: Option<&mpsc::Sender<UploadEvent>>,
+    ) -> Result<super::super::upload::UploadOutcome> {
+        let network = match payer {
+            Some(_) => self.require_evm_network()?,
+            None => self.require_wallet()?.network(),
+        };
+        let records = vec![super::super::upload::UploadRecord {
+            address: compute_address(&content),
+            size: content.len() as u64,
+            index: 0,
+        }];
+        let (cache_path, _lock, saved) = open_upload_checkpoint(network, &records).await?;
+        let mut state = saved.unwrap_or_default();
+        let adapter = SpillUploadAdapter {
+            client: self,
+            source: ChunkSource::Record(&content),
             progress,
-        )
-        .await
+            checkpoint: &cache_path,
+            payer,
+        };
+        let outcome = self
+            .upload_records(records, &mut state, &adapter, PaymentMode::Single)
+            .await?;
+        remove_upload_checkpoint(&cache_path)?;
+        Ok(outcome)
     }
 
     /// Public file upload with progress events.
@@ -2867,13 +3112,27 @@ impl Client {
             .await
     }
 
-    #[allow(clippy::too_many_lines)]
     async fn file_upload_with_visibility_and_progress(
         &self,
         path: &Path,
         mode: PaymentMode,
         visibility: Visibility,
         progress: Option<mpsc::Sender<UploadEvent>>,
+    ) -> Result<FileUploadResult> {
+        self.upload_file(path, mode, visibility, progress, None)
+            .await
+    }
+
+    /// Upload a file through the upload engine, paid by `payer` or else by
+    /// the client's wallet.
+    #[allow(clippy::too_many_lines)]
+    async fn upload_file(
+        &self,
+        path: &Path,
+        mode: PaymentMode,
+        visibility: Visibility,
+        progress: Option<mpsc::Sender<UploadEvent>>,
+        payer: Option<&dyn UploadPayer>,
     ) -> Result<FileUploadResult> {
         let mode = listed_payment_mode(&visibility, mode);
         debug!(
@@ -2945,39 +3204,14 @@ impl Client {
                 },
             )
             .collect::<Vec<_>>();
-        let wallet = self.require_wallet()?;
-        let scope = rmp_serde::to_vec(&(
-            wallet.network(),
-            records
-                .iter()
-                .map(|r| (r.address, r.size))
-                .collect::<Vec<_>>(),
-        ))
-        .map_err(|e| Error::Serialization(e.to_string()))?;
-        let cache_dir = crate::config::data_dir()
-            .map_err(|e| Error::Config(e.to_string()))?
-            .join("payments/upload");
-        std::fs::create_dir_all(&cache_dir)?;
-        let cache_path = cache_dir.join(format!(
-            "{}.msgpack",
-            hex::encode(blake3::hash(&scope).as_bytes())
-        ));
-        let lock_path = cache_path.with_extension("lock");
-        let _lock = tokio::task::spawn_blocking(move || -> std::io::Result<std::fs::File> {
-            let file = std::fs::OpenOptions::new()
-                .create(true)
-                .truncate(false)
-                .read(true)
-                .write(true)
-                .open(lock_path)?;
-            fs2::FileExt::lock_exclusive(&file)?;
-            Ok(file)
-        })
-        .await
-        .map_err(|e| Error::Io(std::io::Error::other(e.to_string())))??;
-        let mut state = match std::fs::read(&cache_path) {
-            Ok(bytes) => super::super::upload_state::UploadState::restore(&bytes)?,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+        let network = match payer {
+            Some(_) => self.require_evm_network()?,
+            None => self.require_wallet()?.network(),
+        };
+        let (cache_path, _lock, saved) = open_upload_checkpoint(network, &records).await?;
+        let mut state = match saved {
+            Some(state) => state,
+            None => {
                 let mut proofs =
                     crate::data::client::cached_single::try_load_for_file(&file_path_key)
                         .map(|(_, receipt)| receipt.proofs)
@@ -2989,24 +3223,18 @@ impl Client {
                 }
                 super::super::upload_state::UploadState::from_proofs(proofs)
             }
-            Err(error) => return Err(Error::Io(error)),
         };
         let adapter = SpillUploadAdapter {
             client: self,
-            spill: &spill,
+            source: ChunkSource::Spill(&spill),
             progress: progress.as_ref(),
             checkpoint: &cache_path,
+            payer,
         };
         let result = self
             .upload_records(records, &mut state, &adapter, mode)
             .await?;
-        std::fs::remove_file(&cache_path).or_else(|error| {
-            if error.kind() == std::io::ErrorKind::NotFound {
-                Ok(())
-            } else {
-                Err(error)
-            }
-        })?;
+        remove_upload_checkpoint(&cache_path)?;
         crate::data::client::cached_single::try_delete_for_file(&file_path_key);
         crate::data::client::cached_merkle::try_delete_for_file(&file_path_key);
         Ok(FileUploadResult {
@@ -4753,5 +4981,71 @@ impl Client {
             batch_result.gas_cost_wei,
             agg_stats,
         ))
+    }
+}
+
+#[cfg(test)]
+mod payer_tests {
+    use super::*;
+    use crate::data::client::batch::ChunkPaymentPlan;
+    use crate::data::client::upload::{MerkleUploadPayment, UploadOutcome, UploadPayment};
+
+    /// A payer that refuses everything, to show errors reach the caller.
+    struct RefusingPayer;
+
+    #[async_trait::async_trait]
+    impl UploadPayer for RefusingPayer {
+        async fn pay_quotes(&self, _plans: &[ChunkPaymentPlan]) -> Result<UploadPayment> {
+            Err(Error::Payment("refused".into()))
+        }
+
+        async fn pay_merkle(&self, _batch: &PreparedMerkleBatch) -> Result<MerkleUploadPayment> {
+            Err(Error::Payment("refused".into()))
+        }
+    }
+
+    #[tokio::test]
+    async fn a_payer_works_as_a_trait_object() {
+        let payer: &dyn UploadPayer = &RefusingPayer;
+        let result = payer.pay_quotes(&[]).await;
+        assert!(matches!(result, Err(Error::Payment(reason)) if reason == "refused"));
+    }
+
+    #[test]
+    fn a_record_source_returns_its_bytes() {
+        let bytes = Bytes::from_static(b"envelope bytes");
+        let source = ChunkSource::Record(&bytes);
+        assert_eq!(source.len(), 1);
+        assert_eq!(source.load(&[0; 32]).unwrap(), bytes);
+    }
+
+    #[test]
+    fn a_listed_result_counts_the_envelope_and_takes_its_address() {
+        let content = FileUploadResult {
+            data_map: DataMap::new(Vec::new()),
+            chunks_stored: 129,
+            chunks_failed: 0,
+            total_chunks: 129,
+            payment_mode_used: PaymentMode::Merkle,
+            storage_cost_atto: "1000".into(),
+            gas_cost_wei: 20,
+            data_map_address: None,
+            chunk_attempts_total: 130,
+            store_durations_ms: vec![1, 2],
+            retries_histogram: [1, 0, 0, 0],
+        };
+        let envelope = UploadOutcome {
+            addresses: vec![[7; 32]],
+            amount: Amount::from(5u64),
+            gas: 3,
+            ..Default::default()
+        };
+        let result = listed_result(content, [7; 32], &envelope);
+        assert_eq!(result.chunks_stored, 130);
+        assert_eq!(result.total_chunks, 130);
+        assert_eq!(result.storage_cost_atto, "1005");
+        assert_eq!(result.gas_cost_wei, 23);
+        assert_eq!(result.data_map_address, Some([7; 32]));
+        assert_eq!(result.payment_mode_used, PaymentMode::Merkle);
     }
 }

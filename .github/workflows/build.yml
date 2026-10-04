@@ -1,5 +1,5 @@
-# Builds the Linux `ant` client binary on every push to main and uploads it
-# as a workflow artifact.
+# Runs the unit tests, then builds the Linux `ant` client binary on every push
+# to main and uploads it as a workflow artifact.
 #
 # Replaces upstream's workflows, which run Autonomi's test matrix, PR checks
 # and signed multi-platform releases.
@@ -26,6 +26,9 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - uses: Swatinem/rust-cache@v2
+
+      - name: Unit tests
+        run: cargo test --locked -p ant-core --lib && cargo test --locked -p ant-cli
 
       - name: Build
         run: cargo build --release --locked -p ant-cli --bin ant

@@ -11,7 +11,7 @@ use ant_protocol::XorName as ChunkAddress;
 #[cfg(feature = "native")]
 pub use native::{
     ExternalChunkStore, ExternalPaymentInfo, FinalizeOutcome, FinalizeResume, MerkleFinalizeResume,
-    PreparedUpload, WaveFinalizeResume,
+    PreparedUpload, UploadPayer, WaveFinalizeResume,
 };
 use self_encryption::DataMap;
 

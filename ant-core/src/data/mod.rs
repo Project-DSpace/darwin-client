@@ -31,7 +31,8 @@ pub use ant_protocol::pqc::api::{ml_dsa_65, MlDsaPublicKey, MlDsaSecretKey};
 
 // Re-export client data types
 pub use client::batch::{
-    finalize_batch_payment, PaidChunk, PaymentIntent, PreparedChunk, SingleNodeQuotePayment,
+    finalize_batch_payment, ChunkPaymentPlan, PaidChunk, PaymentIntent, PreparedChunk,
+    SingleNodeQuotePayment,
 };
 pub use client::data::DataUploadResult;
 #[cfg(feature = "native")]
@@ -47,12 +48,13 @@ pub use client::file::{
 #[cfg(feature = "native")]
 pub use client::file::{
     ExternalChunkStore, ExternalPaymentInfo, FinalizeOutcome, FinalizeResume, MerkleFinalizeResume,
-    PreparedUpload, WaveFinalizeResume,
+    PreparedUpload, UploadPayer, WaveFinalizeResume,
 };
 pub use client::merkle::{
     finalize_merkle_batch, MerkleBatchPaymentResult, PaymentMode, PreparedMerkleBatch,
     DEFAULT_MERKLE_THRESHOLD,
 };
+pub use client::upload::{MerkleUploadPayment, UploadPayment};
 
 // Re-export self-encryption types
 pub use self_encryption::DataMap;
