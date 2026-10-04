@@ -1591,6 +1591,10 @@ impl Drop for TempDownload {
 /// restart it asks again, with the same plans or batch, to recover a payment
 /// that may already have been made. Implementations must therefore look for an
 /// earlier payment of exactly this request before asking for a new one.
+// `async_trait` marks the generated methods `#[must_use]` while their boxed
+// futures already are, which clippy's `double_must_use` flags (as it does on
+// `UploadAdapter`).
+#[allow(clippy::double_must_use)]
 #[async_trait::async_trait]
 pub trait UploadPayer: Send + Sync {
     /// Pay every non-zero quote in `plans` with `payForQuotes`. Returns the
@@ -3647,7 +3651,10 @@ impl Client {
         let diagnostics_for_closure = diagnostics.clone();
 
         let fetch_limiter_outer = self.controller().fetch.clone();
-        let usable_memory = usable_memory_bytes();
+        let usable_memory = self
+            .config()
+            .download_memory_bytes
+            .or_else(usable_memory_bytes);
         let configured_batch_floor = stream_decrypt_batch_size();
         let fetch_cap = fetch_limiter_outer.current();
         let decrypt_batch_size = adaptive_stream_decrypt_batch_size(

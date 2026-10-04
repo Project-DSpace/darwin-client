@@ -520,6 +520,12 @@ pub struct ClientConfig {
     /// callers should leave it `None` — a lower cap only means more payment
     /// transactions for the same chunks.
     pub merkle_external_batch_cap: Option<usize>,
+    /// Memory, in bytes, that a streaming download plans its decrypt batches
+    /// around. `None` (the default) uses the memory free when the download
+    /// starts, which suits one client on its own machine. A server running
+    /// several transfers at once should set a fixed budget, so downloads
+    /// don't each claim a share of whatever is free.
+    pub download_memory_bytes: Option<u64>,
 }
 
 impl Default for ClientConfig {
@@ -536,6 +542,7 @@ impl Default for ClientConfig {
             allow_loopback: false,
             ipv6: true,
             merkle_external_batch_cap: None,
+            download_memory_bytes: None,
         }
     }
 }
