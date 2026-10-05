@@ -210,7 +210,38 @@ impl Client {
         adapter: &A,
         mode: PaymentMode,
     ) -> Result<UploadOutcome> {
-        let original = records.iter().map(|r| r.address).collect::<Vec<_>>();
+        self.upload_records_and_last(records, None, state, adapter, mode)
+            .await
+    }
+
+    /// As [`Client::upload_records`], with `last` stored after every other
+    /// record. `last` is always paid per chunk: in the same payment as the
+    /// records paid per chunk (all of them below the Merkle threshold, else
+    /// those left after the Merkle batches), or alone if there are none. It
+    /// is stored only once every other record is stored, so a listing
+    /// envelope never points at missing content; if any record fails, it is
+    /// left unstored (its payment stays in `state` for a retry).
+    pub async fn upload_records_then<A: UploadAdapter>(
+        &self,
+        records: Vec<UploadRecord>,
+        last: UploadRecord,
+        state: &mut UploadState,
+        adapter: &A,
+        mode: PaymentMode,
+    ) -> Result<UploadOutcome> {
+        self.upload_records_and_last(records, Some(last), state, adapter, mode)
+            .await
+    }
+
+    async fn upload_records_and_last<A: UploadAdapter>(
+        &self,
+        records: Vec<UploadRecord>,
+        last: Option<UploadRecord>,
+        state: &mut UploadState,
+        adapter: &A,
+        mode: PaymentMode,
+    ) -> Result<UploadOutcome> {
+        let mut original = records.iter().map(|r| r.address).collect::<Vec<_>>();
         let mut sizes = HashMap::new();
         let mut unique = Vec::new();
         for record in records {
@@ -224,8 +255,16 @@ impl Client {
                 None => unique.push(record),
             }
         }
+        if let Some(last) = last {
+            if sizes.contains_key(&last.address) {
+                return Err(Error::InvalidData(
+                    "the record stored last is also among the others".into(),
+                ));
+            }
+            original.push(last.address);
+        }
         match self
-            .upload_unique_records(unique, state, adapter, mode)
+            .upload_unique_records(unique, last, state, adapter, mode)
             .await
         {
             Ok(mut result) => {
@@ -281,7 +320,8 @@ impl Client {
 
     async fn upload_unique_records<A: UploadAdapter>(
         &self,
-        records: Vec<UploadRecord>,
+        mut records: Vec<UploadRecord>,
+        last: Option<UploadRecord>,
         state: &mut UploadState,
         adapter: &A,
         mode: PaymentMode,
@@ -290,10 +330,11 @@ impl Client {
             mode: PaymentMode::Single,
             ..Default::default()
         };
-        match self
-            .upload_unique_records_inner(&records, state, adapter, mode, &mut outcome)
-            .await
-        {
+        let result = self
+            .upload_unique_records_inner(&records, last, state, adapter, mode, &mut outcome)
+            .await;
+        records.extend(last);
+        match result {
             Err(error @ Error::PartialUpload { .. }) => Err(error),
             Err(error)
                 if outcome.amount != Amount::ZERO
@@ -332,6 +373,7 @@ impl Client {
     async fn upload_unique_records_inner<A: UploadAdapter>(
         &self,
         records: &[UploadRecord],
+        last: Option<UploadRecord>,
         state: &mut UploadState,
         adapter: &A,
         mode: PaymentMode,
@@ -340,7 +382,7 @@ impl Client {
         // Preflight every byte source before any payment, including Merkle batches.
         // Read one record at a time so files remain bounded by record size, not file size.
         // The adapter retains its staging session for the lifetime of this operation.
-        for record in records {
+        for record in records.iter().chain(last.iter()) {
             let bytes = adapter.load(*record).await?;
             if bytes.len() as u64 != record.size {
                 return Err(Error::InvalidData(
@@ -349,7 +391,7 @@ impl Client {
             }
             crate::record::verify(&record.address, &bytes).map_err(Error::InvalidData)?;
         }
-        let total = records.len();
+        let total = records.len() + usize::from(last.is_some());
         let mut unique = records.to_vec();
         let preparation = async {
             self.reconcile_upload_payment(state, adapter).await?;
@@ -394,11 +436,14 @@ impl Client {
             (Err(error), Ok(())) | (Ok(()), Err(error)) => return Err(error),
             (Ok(()), Ok(())) => {}
         }
+        // Never in a Merkle batch: always paid per chunk, in the last wave.
+        unique.extend(last);
         let waves = unique
             .chunks(super::batch::PAYMENT_WAVE_SIZE)
             .collect::<Vec<_>>();
         let mut prefetched = None;
         let mut failed = Vec::new();
+        let mut held = None;
         for (wave_index, wave) in waves.iter().enumerate() {
             let plans = match prefetched.take() {
                 Some(plans) => plans?,
@@ -418,6 +463,10 @@ impl Client {
                     outcome.addresses.push(record.address);
                     adapter.stored(outcome.addresses.len(), total);
                 }
+            }
+            if last.is_some() {
+                // The envelope's log must not be the last of its payment.
+                order_by_quote_hash(&mut payable);
             }
             adapter.checkpoint(state, None).await?;
             let payment = if payable.is_empty() {
@@ -462,10 +511,18 @@ impl Client {
             let max_size = wave.iter().map(|r| r.size as usize).max().unwrap_or(1);
             let recovery = &*state;
             let live_stored = std::sync::atomic::AtomicUsize::new(outcome.addresses.len());
+            let mut to_store = Vec::with_capacity(plans.len());
+            for (record, plan) in plans {
+                match plan {
+                    Some(plan) if Some(record.address) == last.map(|l| l.address) => {
+                        held = Some((record, plan));
+                    }
+                    Some(plan) => to_store.push((record, plan)),
+                    None => {}
+                }
+            }
             let stores = crate::client_engine::rolling_unordered(
-                plans
-                    .into_iter()
-                    .filter_map(|(record, plan)| plan.map(|plan| (record, plan))),
+                to_store,
                 |(record, plan)| {
                     let live_stored = &live_stored;
                     async move {
@@ -529,6 +586,34 @@ impl Client {
             }
             if fatal {
                 break;
+            }
+        }
+        // Sent only once every other record is stored.
+        if let Some((record, plan)) = release_last(held, |(record, _)| record.address, &mut failed)
+        {
+            let result = async {
+                let bytes = adapter.load(record).await?;
+                let prepared = plan.with_content(bytes)?;
+                let paid: PaidChunk = state
+                    .reuse_prepared(&prepared, crate::runtime::system_time())
+                    .ok_or_else(|| Error::Payment("paid proof expired before storage".into()))?;
+                Ok::<_, Error>(
+                    self.store_paid_chunks_with_events(vec![paid], None, 0, total)
+                        .await,
+                )
+            }
+            .await;
+            match result {
+                Ok(result) => {
+                    if result.stored.contains(&record.address) {
+                        adapter.record_stored(record.index + 1, total);
+                    }
+                    outcome.stats.absorb(&result);
+                    outcome.addresses.extend(result.stored);
+                    failed.extend(result.failed);
+                    adapter.stored(outcome.addresses.len(), total);
+                }
+                Err(error) => failed.push((record.address, error.to_string())),
             }
         }
         if !failed.is_empty() {
@@ -953,6 +1038,44 @@ impl Client {
     }
 }
 
+/// Why the record stored last (an envelope) was not sent.
+pub(crate) const HELD_BACK: &str = "not stored, since other records failed to store";
+
+/// Decide whether the record held back to be stored last (an envelope) may
+/// be sent: only once every other record is stored, so it never points at
+/// missing content. If any failed (`failed` is not empty), it is reported
+/// failed with [`HELD_BACK`], its payment kept for a resume, and never sent.
+pub(crate) fn release_last<T>(
+    held: Option<T>,
+    address: impl Fn(&T) -> [u8; 32],
+    failed: &mut Vec<([u8; 32], String)>,
+) -> Option<T> {
+    let held = held?;
+    if failed.is_empty() {
+        Some(held)
+    } else {
+        failed.push((address(&held), HELD_BACK.into()));
+        None
+    }
+}
+
+/// Put a payment's plans in the order of the quote hashes they pay. The
+/// vault emits one `DataPaymentMade` log per paid quote, in the order paid,
+/// so a record always paid last (an envelope) would have the last log of its
+/// transaction, and anyone reading the transaction would know its log index.
+/// In quote-hash order its log is one of the payment's, told apart only by
+/// its quote, which an envelope can hide.
+pub(crate) fn order_by_quote_hash(plans: &mut [ChunkPaymentPlan]) {
+    plans.sort_by_key(|plan| {
+        plan.payment
+            .quotes
+            .iter()
+            .filter(|quote| !quote.amount.is_zero())
+            .map(|quote| quote.quote_hash)
+            .min()
+    });
+}
+
 fn validate_payment_total(plans: &[ChunkPaymentPlan], payment: &UploadPayment) -> Result<()> {
     let expected = plans.iter().try_fold(Amount::ZERO, |sum, plan| {
         sum.checked_add(plan.payment.total_amount())
@@ -1108,5 +1231,88 @@ fn merge_stats(total: &mut WaveAggregateStats, next: WaveAggregateStats) {
         .zip(next.retries_histogram)
     {
         *total = total.saturating_add(next);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A plan for `address` paying one quote, with `hash`, and two unpaid
+    /// ones.
+    fn plan(address: u8, hash: u8) -> ChunkPaymentPlan {
+        use ant_protocol::evm::RewardsAddress;
+        use ant_protocol::payment::QuotePaymentInfo;
+        let quote = |hash: u8, amount: u64| QuotePaymentInfo {
+            quote_hash: QuoteHash::from([hash; 32]),
+            rewards_address: RewardsAddress::ZERO,
+            amount: Amount::from(amount),
+            price: Amount::from(1u64),
+        };
+        ChunkPaymentPlan {
+            address: [address; 32],
+            data_size: 1,
+            quoted_peers: Vec::new(),
+            payment: super::super::batch::SingleNodeQuotePayment {
+                quotes: vec![quote(0x00, 0), quote(hash, 3), quote(0xff, 0)],
+            },
+            peer_quotes: Vec::new(),
+            commitment_sidecars: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn a_payment_is_in_quote_hash_order_so_the_envelope_is_not_always_last() {
+        // Content in index order, then the envelope (address 9), as the
+        // engine plans a wave.
+        let mut plans = vec![plan(1, 0x30), plan(2, 0x10), plan(3, 0x50), plan(9, 0x20)];
+        order_by_quote_hash(&mut plans);
+        let addresses: Vec<u8> = plans.iter().map(|plan| plan.address[0]).collect();
+        assert_eq!(addresses, vec![2, 9, 1, 3]);
+        // The vault pays, and logs, the paid quotes in this order: the
+        // envelope's log is wherever its quote hash falls, not last.
+        let paid: Vec<QuoteHash> = plans
+            .iter()
+            .flat_map(|plan| plan.payment.quotes.iter())
+            .filter(|quote| !quote.amount.is_zero())
+            .map(|quote| quote.quote_hash)
+            .collect();
+        let mut sorted = paid.clone();
+        sorted.sort();
+        assert_eq!(paid, sorted);
+        // The order doesn't depend on the order planned.
+        let mut reversed = vec![plan(9, 0x20), plan(3, 0x50), plan(2, 0x10), plan(1, 0x30)];
+        order_by_quote_hash(&mut reversed);
+        let again: Vec<u8> = reversed.iter().map(|plan| plan.address[0]).collect();
+        assert_eq!(again, addresses);
+    }
+
+    #[test]
+    fn the_last_record_is_sent_only_when_every_other_record_stored() {
+        let address = |record: &(u8, &str)| [record.0; 32];
+        // Nothing held: nothing to send, nothing reported.
+        let mut failed = Vec::new();
+        assert_eq!(release_last(None::<(u8, &str)>, address, &mut failed), None);
+        assert!(failed.is_empty());
+        // Every other record stored: the held one is sent.
+        assert_eq!(
+            release_last(Some((7, "envelope")), address, &mut failed),
+            Some((7, "envelope"))
+        );
+        assert!(failed.is_empty());
+        // A content record failed: the held one is never sent, and is
+        // reported failed (its payment kept for a resume), after the others.
+        let mut failed = vec![([1; 32], "timed out".to_string())];
+        assert_eq!(
+            release_last(Some((7, "envelope")), address, &mut failed),
+            None
+        );
+        assert_eq!(
+            failed,
+            vec![
+                ([1; 32], "timed out".to_string()),
+                ([7; 32], HELD_BACK.to_string())
+            ]
+        );
     }
 }

@@ -1,203 +1,1659 @@
-//! Reading the listings index.
+//! Reading the listings index, and checking listings and upload proofs.
 //!
-//! Nodes that support listings answer requests on [`ant_listings::TOPIC`]. A
-//! client collects listings from every node it can find, then checks each one
-//! before trusting it: the envelope must be on the network and match the
-//! listing, and the payment must be on chain ([`Client::check_listing`]).
+//! Nodes that support listings answer requests on [`ant_listings::TOPIC`]
+//! (`listings.v2`). A listing shows only the payment fields its uploader
+//! chose, so it is checked as far as they allow:
+//!
+//! - one that shows its quote is checked against the chain, tied to its
+//!   address, and is [`CheckLevel::Verified`];
+//! - one that hides it is [`CheckLevel::Reported`]: its shown fields are
+//!   checked against the chain, and it counts only when a quorum of the
+//!   nodes nearest its address serve it.
+//!
+//! Each node records its own `first_seen` for a listing in the index that
+//! hides its time, so copies are merged across nodes
+//! ([`ant_listings::merge_copies`]) and dated as the nodes date them: only
+//! the values of the nodes nearest the address count, and a listing a quorum
+//! of them serve is dated so that a quorum of them date it then or earlier
+//! ([`quorum_listing`]). So nodes fewer than a quorum can't move its date
+//! earlier, however few others answer.
+//!
+//! [`Client::index_listings`] reads the whole index; [`Client::listing`]
+//! reads one listing, in the index or not. [`ListingChain`] reads payments
+//! from the chain, for these and for upload proofs
+//! ([`ListingChain::check_proof`]).
+//!
+//! A node's pages are only shape-checked, so a node can serve as many
+//! made-up listings as it likes. An index read therefore walks every node
+//! with [`IndexWalk`], which reads each node for as long as other nodes back
+//! what it sends, and does work for an address (fetching its envelope,
+//! asking nodes, reading the chain) only where at least
+//! [`QUORUM_THRESHOLD`] of the [`NEAREST_NODES`] nodes nearest it serve a
+//! listing for it. Listings fewer nodes serve cost nothing but their pages,
+//! and wait for a later read, so no fixed number limits the index. A walk
+//! stopped early carries on in the next read ([`WalkState`]), and a read
+//! never says a listing it didn't decide is gone ([`ListingsIndex::carry`]).
 
 use crate::data::client::Client;
 use crate::data::error::{Error, Result};
+#[cfg(doc)]
+use ant_listings::choose_verified;
+pub use ant_listings::{check_copies, listing_to_check, quorum_listing};
 use ant_listings::{
-    verify_listing, Envelope, Listing, ListingKey, ListingsBody, ListingsMessage, PaymentLog,
-    PaymentReceipt, MAX_LIST_LIMIT, TOPIC,
+    check_get_response, check_offline, merge_copies, nearest_by_distance, payment_lookup,
+    quorum_needed, verify_listing_receipts, AddressWalk, CheckLevel, Envelope, EnvelopeProof,
+    IndexWalk, Listing, ListingCheck, ListingKey, ListingPayment, ListingsBody, ListingsMessage,
+    Lookup, MergedListing, NodeReport, PaidAt, PaymentError, PaymentLog, PaymentReceipt,
+    ProvenUpload, WalkOutcome, WalkResult, CLOCK_MARGIN, DATA_PAYMENT_MADE_TOPIC,
+    FIRST_SEEN_ROUNDING, MAX_LIST_LIMIT, QUORUM_THRESHOLD, TOPIC,
 };
 use ant_protocol::evm::Network as EvmNetwork;
-use ant_protocol::transport::{P2PEvent, PeerId};
-use ant_protocol::XorName;
-use futures::stream::{self, StreamExt};
+use ant_protocol::transport::{MultiAddr, P2PEvent, P2PNode, PeerId};
+use ant_protocol::{XorName, CLOSE_GROUP_SIZE};
+use futures::stream::{self, FuturesUnordered, StreamExt};
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::fmt;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::broadcast::error::RecvError;
+use tokio::sync::oneshot;
 use tokio::time::Instant;
 use tracing::debug;
 
 /// How long to wait for a node to answer a listings request.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Random lookups made to find nodes beyond the ones already connected.
+/// Random lookups made to find nodes beyond those in the routing table.
 const CRAWL_LOOKUPS: usize = 8;
 
 /// Nodes asked for per lookup.
 const CRAWL_WIDTH: usize = 20;
 
-/// The most pages read from one node in one collection.
-const MAX_PAGES_PER_NODE: usize = 1_000;
+/// How long the lookups that find nodes to walk may take.
+const CRAWL_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Nodes asked at once. A node that doesn't answer (an older one, or one that
-/// is down) costs one request timeout, paid alongside the others.
+/// Requests in flight at once, to different nodes. A node that doesn't
+/// answer (an older one, or one that is down) costs one request timeout,
+/// paid alongside the others.
 const PEER_CONCURRENCY: usize = 64;
 
-impl Client {
-    /// Collect listings with keys from `from` onwards from every node this
-    /// client can find, oldest first.
-    ///
-    /// The result is unchecked: a node can send anything. Exact duplicates are
-    /// merged; different listings claiming the same address are all returned,
-    /// for [`Client::check_listing`] to tell apart.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error only if no node can be found.
-    pub async fn collect_listings(&self, from: ListingKey) -> Result<Vec<Listing>> {
-        let peers = self.listing_peers().await;
-        if peers.is_empty() {
-            return Err(Error::InsufficientPeers(
-                "no nodes found to ask for listings".into(),
-            ));
-        }
-        // Owned peer IDs, so the futures don't borrow across a higher-ranked
-        // lifetime: callers such as web handlers need this future to be Send.
-        let per_peer: Vec<Vec<Listing>> = stream::iter(peers.iter().copied())
-            .map(|peer| async move { self.listings_from(&peer, from).await })
-            .buffer_unordered(PEER_CONCURRENCY)
-            .collect()
-            .await;
-        let mut by_address: HashMap<XorName, Vec<Listing>> = HashMap::new();
-        for listing in per_peer.into_iter().flatten() {
-            let candidates = by_address.entry(listing.address).or_default();
-            if !candidates.contains(&listing) {
-                candidates.push(listing);
-            }
-        }
-        let mut listings: Vec<Listing> = by_address.into_values().flatten().collect();
-        listings.sort_by_key(Listing::key);
-        debug!(
-            "Collected {} listings from {} nodes",
-            listings.len(),
-            peers.len()
-        );
-        Ok(listings)
-    }
+/// Addresses decided at once. Each fetches its envelope from the nodes that
+/// served it and reads the payment from the chain.
+const CHECK_CONCURRENCY: usize = 8;
 
-    /// Check a listing: its envelope is on the network and matches it, and its
-    /// payment is on chain. Returns the envelope, which carries the file's data
-    /// map.
-    ///
-    /// # Errors
-    ///
-    /// Returns why the listing can't be trusted.
-    pub async fn check_listing(
-        &self,
-        listing: &Listing,
-        chain: &ListingChain,
-    ) -> std::result::Result<Envelope, String> {
-        let chunk = self
-            .chunk_get(&listing.address)
-            .await
-            .map_err(|e| format!("could not fetch the envelope: {e}"))?
-            .ok_or("the envelope is not on the network")?;
-        let envelope =
-            Envelope::from_bytes(&chunk.content).map_err(|e| format!("bad envelope: {e}"))?;
-        if !listing.matches(&envelope) {
-            return Err("the listing doesn't match its envelope".into());
-        }
-        let (receipt, timestamp) = chain
-            .payment(&listing.payment.tx_hash)
-            .await?
-            .ok_or("the payment transaction is not on chain")?;
-        verify_listing(listing, &receipt, timestamp, &chain.vault).map_err(|e| e.to_string())?;
-        Ok(envelope)
-    }
+/// The walk phase of a read lasts at most this, or [`WALK_PHASE_FACTOR`]
+/// times as long as half the walks took, whichever is longer: a node that
+/// stalls can't hold a read open, and walks it stops carry on in the next
+/// read.
+const WALK_PHASE_MIN: Duration = Duration::from_secs(60);
 
-    /// Every listing `peer` holds from `from` onwards, a page at a time. Empty
-    /// if the peer doesn't answer.
-    async fn listings_from(&self, peer: &PeerId, from: ListingKey) -> Vec<Listing> {
-        let mut collected = Vec::new();
-        let mut next = from;
-        for _ in 0..MAX_PAGES_PER_NODE {
-            let request = ListingsBody::ListRequest {
-                from: next,
-                limit: MAX_LIST_LIMIT,
-            };
-            let Some(ListingsBody::ListResponse { listings, more }) =
-                self.ask_for_listings(peer, request).await
-            else {
-                break;
-            };
-            let last = listings.last().map(Listing::key);
-            collected.extend(listings);
-            match last {
-                Some(key) if more => next = key.next(),
-                _ => break,
-            }
-        }
-        collected
-    }
+/// See [`WALK_PHASE_MIN`].
+const WALK_PHASE_FACTOR: u32 = 4;
 
-    /// The nodes to ask: those connected, plus those found by a few random
-    /// lookups.
-    async fn listing_peers(&self) -> Vec<PeerId> {
-        let network = self.network();
-        let mut peers: HashSet<PeerId> = network.connected_peers().await.into_iter().collect();
-        let targets: Vec<[u8; 32]> = (0..CRAWL_LOOKUPS).map(|_| rand::random()).collect();
-        let lookups =
-            futures::future::join_all(targets.into_iter().map(|target| async move {
-                network.find_closest_peers(&target, CRAWL_WIDTH).await
-            }))
-            .await;
-        for lookup in lookups {
-            match lookup {
-                Ok(found) => peers.extend(found.into_iter().map(|(peer, _)| peer)),
-                Err(e) => debug!("Listing crawl lookup failed: {e}"),
-            }
-        }
-        peers.into_iter().collect()
-    }
+/// The longest the walk phase lasts however the walks go.
+const WALK_PHASE_MAX: Duration = Duration::from_secs(30 * 60);
 
-    /// Send one listings request to `peer` and wait for its answer.
-    async fn ask_for_listings(&self, peer: &PeerId, body: ListingsBody) -> Option<ListingsBody> {
-        let node = self.network().node();
-        let request_id: u64 = rand::random();
-        let request = ListingsMessage { request_id, body }.encode().ok()?;
+/// How long to wait for one node to hand over an envelope before asking the
+/// next node that served its listing too.
+const ENVELOPE_HEDGE: Duration = Duration::from_secs(1);
 
-        // Subscribe before sending, so the answer can't be missed.
-        let mut events = node.subscribe_events();
-        if let Err(e) = node.send_message(peer, TOPIC, request, &[]).await {
-            debug!("Could not ask {peer} for listings: {e}");
-            return None;
-        }
-        let deadline = Instant::now() + REQUEST_TIMEOUT;
-        loop {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                debug!("{peer} did not answer a listings request");
-                return None;
-            }
-            match tokio::time::timeout(remaining, events.recv()).await {
-                Ok(Ok(P2PEvent::Message {
-                    topic,
-                    source: Some(source),
-                    data,
-                    ..
-                })) if topic == TOPIC && source == *peer => match ListingsMessage::decode(&data) {
-                    Ok(response) if response.request_id == request_id => {
-                        return Some(response.body);
-                    }
-                    _ => {}
-                },
-                Ok(Ok(_) | Err(RecvError::Lagged(_))) => {}
-                Ok(Err(RecvError::Closed)) | Err(_) => return None,
-            }
+/// How many recent reads' node counts [`WalkState`] keeps: a read that finds
+/// far fewer nodes than recent ones decides nothing.
+const RECENT_READS: usize = 10;
+
+/// How many nodes nearest an address count for its listing.
+pub const NEAREST_NODES: usize = CLOSE_GROUP_SIZE;
+
+/// How long one RPC call to the payment chain may take.
+const RPC_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// The fewest blocks one `eth_getLogs` call is narrowed to when the chain
+/// refuses a wider range.
+const MIN_LOG_RANGE: u64 = 64;
+
+/// The most `eth_getLogs` calls one search for a quote's payment makes.
+const MAX_LOG_CALLS: usize = 64;
+
+/// The fewest blocks each `eth_getLogs` call covers when a search for a
+/// quote's payment looks back from the quote's time, unless the chain
+/// already refused a wider range.
+const BACK_LOG_RANGE: u64 = 10_000;
+
+/// What one lookup on the chain found: each receipt with its block's
+/// timestamp, as [`ant_listings::verify_listing_receipts`] takes them.
+pub type Fetched = Vec<(Option<PaymentReceipt>, Option<u64>)>;
+
+/// How one node's walk went in an index read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WalkReport {
+    /// The node.
+    pub peer: PeerId,
+    /// How the walk ended.
+    pub outcome: WalkOutcome,
+    /// Why a page was refused, for [`WalkOutcome::BadPage`].
+    pub problem: Option<String>,
+    /// Pages the node answered.
+    pub pages: usize,
+    /// Listings those pages held.
+    pub listings: usize,
+    /// Listings it sent whose addresses a quorum of their nearest nodes
+    /// serve, which earn it more pages.
+    pub backed: usize,
+    /// Where the next read carries on this node's walk, for a walk stopped
+    /// before the end.
+    pub resume: Option<ListingKey>,
+}
+
+impl From<&NodeReport<PeerId>> for WalkReport {
+    fn from(report: &NodeReport<PeerId>) -> Self {
+        Self {
+            peer: report.peer,
+            outcome: report.outcome,
+            problem: report.problem.clone(),
+            pages: report.pages,
+            listings: report.listings,
+            backed: report.backed,
+            resume: report.resume(),
         }
     }
 }
 
-/// Reads payments from the payment chain, for checking listings.
+/// What index reads keep from one read to the next: where to carry on walks
+/// that stopped early, and how many nodes recent reads found. Save it
+/// between reads (it serialises) and pass it to
+/// [`Client::index_listings_with`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WalkState {
+    /// Where to carry on each node's walk: the node's id and the key, each
+    /// as hex.
+    #[serde(default)]
+    resume: BTreeMap<String, String>,
+    /// How many nodes each recent read found, the latest last.
+    #[serde(default)]
+    recent_nodes: Vec<usize>,
+}
+
+impl WalkState {
+    /// Where to carry on `peer`'s walk, if its last walk stopped early.
+    fn resume_for(&self, peer: &PeerId) -> Option<ListingKey> {
+        let key = self.resume.get(&hex::encode(peer.as_bytes()))?;
+        ListingKey::from_bytes(&hex::decode(key).ok()?)
+    }
+
+    /// The most nodes a recent read found.
+    fn recent_max(&self) -> usize {
+        self.recent_nodes.iter().copied().max().unwrap_or(0)
+    }
+
+    /// Note a read: how many nodes it found, and where each walk carries on.
+    /// Only the nodes this read walked are kept: one that is back after a
+    /// read without it is walked from the start.
+    fn record(&mut self, nodes: usize, walks: &[WalkReport]) {
+        self.recent_nodes.push(nodes);
+        let excess = self.recent_nodes.len().saturating_sub(RECENT_READS);
+        self.recent_nodes.drain(..excess);
+        self.resume = walks
+            .iter()
+            .filter_map(|walk| {
+                let key = walk.resume?;
+                Some((
+                    hex::encode(walk.peer.as_bytes()),
+                    hex::encode(key.to_bytes()),
+                ))
+            })
+            .collect();
+    }
+
+    /// The nodes whose walks carry on in the next read.
+    #[must_use]
+    pub fn resuming(&self) -> usize {
+        self.resume.len()
+    }
+}
+
+/// What to do with a listing published from an earlier read, given this one
+/// ([`ListingsIndex::carry`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Carry {
+    /// This read decided its address: publish what it found instead, the
+    /// listing it lists or nothing if it rejected the address.
+    Decided,
+    /// This read didn't decide its address: keep the entry as it is.
+    Keep,
+    /// Every node nearest its address walked past where it would be, late
+    /// enough to have stored it, without serving it: the network no longer
+    /// stores its file. Drop the entry. The payment stays on chain, and the
+    /// uploader's proof still proves it.
+    NoLongerServed,
+}
+
+/// What a read covered, for [`ListingsIndex::carry`].
+#[derive(Debug, Clone, Default)]
+struct Coverage {
+    /// Each node walked, as [`IndexWalk`] gave them.
+    walks: Vec<NodeReport<PeerId>>,
+    /// The nodes' ids, in the same order.
+    ids: Vec<[u8; 32]>,
+    /// Addresses at least one of their nearest nodes served.
+    served: HashSet<XorName>,
+    /// Addresses this read decided.
+    decided: HashSet<XorName>,
+}
+
+/// A listing that passed its checks.
+#[derive(Debug, Clone)]
+pub struct CheckedListing {
+    /// The listing, with `first_seen` (if it has one) set by the nearest
+    /// nodes' values as [`check_copies`] sets it.
+    pub listing: Listing,
+    /// The envelope at the listing's address.
+    pub envelope: Envelope,
+    /// How far the payment was checked.
+    pub level: CheckLevel,
+    /// How many of the nodes nearest the address serve this listing.
+    pub nodes: usize,
+    /// How many nearest nodes were considered: [`NEAREST_NODES`] unless the
+    /// network is smaller.
+    pub nearest: usize,
+    /// Whether `nodes` reaches [`ant_listings::quorum_needed`] of the nearest
+    /// nodes there should be ([`expected_nearest`]), however many a lookup
+    /// found. Always true for a reported listing (it is dropped otherwise). A verified listing
+    /// without one is the earliest of several payments for its address, none
+    /// of which a quorum serves: a node asked to quote could have paid first.
+    pub quorum: bool,
+}
+
+/// A listing that failed its checks, with why.
+#[derive(Debug, Clone)]
+pub struct RejectedListing {
+    /// The listing as the nearest nodes (or any node) sent it.
+    pub listing: Listing,
+    /// Why it doesn't count.
+    pub problem: String,
+    /// How many of the nodes nearest its address serve it.
+    pub nodes: usize,
+    /// How many nearest nodes were considered, as for a
+    /// [`CheckedListing`]: [`NEAREST_NODES`] unless the network is smaller
+    /// or the lookup came back short.
+    pub nearest: usize,
+    /// Whether nothing final was decided, so a later read may list it: too
+    /// few of its nearest nodes serve it yet, or the chain or its nodes
+    /// couldn't be read.
+    pub again: bool,
+}
+
+/// The index as read from the network.
+#[derive(Debug, Clone, Default)]
+pub struct ListingsIndex {
+    /// Listings that passed their checks, in index order.
+    pub listings: Vec<CheckedListing>,
+    /// Listings that didn't, in index order. Those [`RejectedListing::again`]
+    /// marks may still count.
+    pub rejected: Vec<RejectedListing>,
+    /// Nodes asked for their index.
+    pub nodes_asked: usize,
+    /// Nodes that answered.
+    pub nodes_answered: usize,
+    /// Each node's walk.
+    pub walks: Vec<WalkReport>,
+    /// Addresses this read left undecided: fewer than a quorum of their
+    /// nearest nodes served them, or something couldn't be read. A later
+    /// read decides them.
+    pub deferred: usize,
+    /// Whether the read found too few nodes to trust its view of the network
+    /// (fewer than [`NEAREST_NODES`], or under three quarters as many as
+    /// recent reads found), and so decided nothing.
+    pub too_few_nodes: bool,
+    coverage: Coverage,
+}
+
+impl ListingsIndex {
+    /// What to do with a listing at `address`, with index key `key`,
+    /// published from an earlier read: replace it with what this read
+    /// decided, keep it, or drop it because the network no longer stores its
+    /// file. Only the whole close group, walked past it, says a listing is
+    /// gone; a read that didn't decide an address otherwise keeps it, however
+    /// few nodes answered, so publishing what it decided over what was
+    /// published loses nothing.
+    #[must_use]
+    pub fn carry(&self, address: &XorName, key: &ListingKey) -> Carry {
+        let coverage = &self.coverage;
+        if coverage.decided.contains(address) {
+            return Carry::Decided;
+        }
+        if self.too_few_nodes
+            || coverage.served.contains(address)
+            || coverage.ids.len() < NEAREST_NODES
+        {
+            return Carry::Keep;
+        }
+        // Each node keys a listing that hides its time by its own date, which
+        // can be up to this much earlier than the one published.
+        let lookback = FIRST_SEEN_ROUNDING + CLOCK_MARGIN;
+        let earliest = ListingKey {
+            time: key.time.saturating_sub(lookback),
+            ..ListingKey::MIN
+        };
+        let stored_by = key.time.saturating_add(lookback);
+        let gone = nearest_by_distance(address, &coverage.ids, NEAREST_NODES)
+            .into_iter()
+            .all(|node| {
+                let walk = &coverage.walks[node];
+                walk.covered(&earliest)
+                    && walk.covered(key)
+                    && walk.began.is_some_and(|began| began >= stored_by)
+            });
+        if gone {
+            Carry::NoLongerServed
+        } else {
+            Carry::Keep
+        }
+    }
+}
+
+/// One address's listing, as the nodes nearest it serve it.
+#[derive(Debug, Clone, Default)]
+pub struct ListingLookup {
+    /// The listing, if one passed its checks.
+    pub listing: Option<CheckedListing>,
+    /// Listings for the address that didn't.
+    pub rejected: Vec<RejectedListing>,
+    /// Nodes asked: the nodes nearest the address.
+    pub nearest: usize,
+    /// How many of them answered.
+    pub answered: usize,
+}
+
+/// The hash of a listing's paid quote (the msgpack quote a listing or proof
+/// carries): what the vault's `DataPaymentMade` event names in its fourth
+/// topic. `None` if the bytes aren't a quote.
+#[must_use]
+pub fn paid_quote_hash(quote: &[u8]) -> Option<[u8; 32]> {
+    rmp_serde::from_slice::<ant_protocol::evm::PaymentQuote>(quote)
+        .ok()
+        .map(|quote| quote.hash().0)
+}
+
+/// Unix seconds now.
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or_default()
+}
+
+/// Where to start walking nodes' indexes for listings from time `since`:
+/// a node keys a listing that hides its time by its own `first_seen`, which
+/// can be earlier than the merged one by up to `FIRST_SEEN_ROUNDING +
+/// CLOCK_MARGIN`.
+#[must_use]
+pub fn walk_start(since: u64) -> ListingKey {
+    if since == 0 {
+        return ListingKey::MIN;
+    }
+    ListingKey {
+        time: since.saturating_sub(FIRST_SEEN_ROUNDING + CLOCK_MARGIN),
+        ..ListingKey::MIN
+    }
+}
+
+/// The listing that counts for an address: the listing, its check level, how
+/// many of the nearest nodes serve it, and whether that is a quorum.
+pub type CountingListing = (Listing, CheckLevel, usize, bool);
+
+/// Groups of copies that don't count: each one's index and why.
+pub type RejectedGroups = Vec<(usize, String)>;
+
+/// Why a group of copies didn't check out.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CheckProblem {
+    /// It doesn't check out, or can't whatever the chain says.
+    Invalid(String),
+    /// The payment chain couldn't be read for it: it may check out later.
+    ChainUnread(String),
+}
+
+impl fmt::Display for CheckProblem {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Invalid(problem) => f.write_str(problem),
+            Self::ChainUnread(e) => write!(f, "could not read the payment chain: {e}; try again"),
+        }
+    }
+}
+
+impl From<PaymentError> for CheckProblem {
+    fn from(error: PaymentError) -> Self {
+        Self::Invalid(error.to_string())
+    }
+}
+
+/// How many nodes nearest an address there should be on a network of
+/// `network_size` known nodes: [`NEAREST_NODES`], or all of them on a
+/// smaller network.
+#[must_use]
+pub fn expected_nearest(network_size: usize) -> usize {
+    NEAREST_NODES.min(network_size)
+}
+
+/// Decide which groups of copies for one address count, from each group's
+/// check against the chain (`checked`, in the same order as `groups`; see
+/// [`check_copies`]).
+///
+/// `expected` is how many nodes nearest the address there should be
+/// ([`expected_nearest`]); `nearest` is those a lookup found. The quorum is
+/// [`quorum_needed`] of `expected`, so a lookup that comes back short never
+/// lowers it.
+///
+/// Of the verified groups, the one a quorum of `nearest` serve counts, else
+/// the earliest paid, marked as without a quorum (as [`choose_verified`]
+/// decides). A reported group counts when at least a quorum of `nearest`
+/// serve it; of several, the one most serve. Every other group is rejected,
+/// with why; a reported group short of a quorum because the lookup found too
+/// few nearest nodes is rejected as worth trying again.
+///
+/// If the chain couldn't be read for a group a quorum serves, nothing
+/// counts: as a node does, the others are not decided on without it, so a
+/// failed read can't let a copy that fewer nodes serve stand in.
+pub fn decide_address<P: PartialEq>(
+    groups: &[MergedListing<P>],
+    checked: Vec<std::result::Result<(Listing, ListingCheck), CheckProblem>>,
+    nearest: &[P],
+    expected: usize,
+) -> (Option<CountingListing>, RejectedGroups) {
+    let expected = expected.max(nearest.len());
+    let needed = quorum_needed(expected);
+    let quorum_unread = groups.iter().zip(&checked).any(|(group, result)| {
+        matches!(result, Err(CheckProblem::ChainUnread(_))) && group.count_among(nearest) >= needed
+    });
+    if quorum_unread {
+        let rejected = checked
+            .into_iter()
+            .enumerate()
+            .map(|(index, result)| match result {
+                Err(problem) => (index, problem.to_string()),
+                Ok(_) => (
+                    index,
+                    "not decided: the payment chain could not be read for the listing a \
+                     quorum of the nearest nodes serve; try again"
+                        .into(),
+                ),
+            })
+            .collect();
+        return (None, rejected);
+    }
+    let mut rejected = Vec::new();
+    let mut verified = Vec::new();
+    let mut reported = Vec::new();
+    for (index, (group, result)) in groups.iter().zip(checked).enumerate() {
+        match result {
+            Err(problem) => rejected.push((index, problem.to_string())),
+            Ok((listing, check)) => {
+                let count = group.count_among(nearest);
+                match (check.level, check.paid_at) {
+                    (CheckLevel::Verified, Some(paid_at)) => {
+                        verified.push(((index, listing), count, paid_at));
+                    }
+                    (CheckLevel::Verified, None) => {
+                        rejected.push((index, "verified without where its quote was paid".into()))
+                    }
+                    (CheckLevel::Reported, _) if count >= needed => {
+                        reported.push((index, listing, count));
+                    }
+                    (CheckLevel::Reported, _) if nearest.len() < expected => rejected.push((
+                        index,
+                        format!(
+                            "too few nearest nodes found: {} of the {expected} nodes nearest \
+                             its address, {count} of them serving it, needs {needed}; try again",
+                            nearest.len()
+                        ),
+                    )),
+                    (CheckLevel::Reported, _) => rejected.push((
+                        index,
+                        format!(
+                            "reported by {count} of the {} nodes nearest its address, \
+                             needs {needed}",
+                            nearest.len()
+                        ),
+                    )),
+                }
+            }
+        }
+    }
+    let verified_indexes: Vec<usize> = verified.iter().map(|((index, _), _, _)| *index).collect();
+    if let Some(((chosen_index, listing), count, _, quorum)) =
+        choose_verified_with_quorum(verified, needed)
+    {
+        for index in verified_indexes {
+            if index != chosen_index {
+                rejected.push((
+                    index,
+                    "another payment for this address is the one that counts".into(),
+                ));
+            }
+        }
+        for (index, _, _) in reported {
+            rejected.push((index, "a verified listing for this address counts".into()));
+        }
+        rejected.sort_by_key(|(index, _)| *index);
+        return (
+            Some((listing, CheckLevel::Verified, count, quorum)),
+            rejected,
+        );
+    }
+    // Disjoint groups can't both reach a quorum of the same nodes, but keep
+    // the one most serve if they somehow do.
+    reported.sort_by_key(|(index, _, count)| (std::cmp::Reverse(*count), *index));
+    let mut reported = reported.into_iter();
+    let best = reported
+        .next()
+        .map(|(_, listing, count)| (listing, CheckLevel::Reported, count, true));
+    for (index, _, _) in reported {
+        rejected.push((index, "another listing for this address counts".into()));
+    }
+    rejected.sort_by_key(|(index, _)| *index);
+    (best, rejected)
+}
+
+/// Of verified candidates (the item, how many nearest nodes serve it, where
+/// its quote was paid), the one that counts, with whether it has a quorum:
+/// the earliest paid of those at least `needed` nearest nodes serve, else the
+/// earliest paid of all. The first on a tie.
+///
+/// [`choose_verified`] decides the same, with the quorum taken from how many
+/// nearest nodes a lookup found; this takes it from how many there should be
+/// ([`decide_address`]), so a lookup that comes back short can't lower it.
+fn choose_verified_with_quorum<T>(
+    candidates: Vec<(T, usize, PaidAt)>,
+    needed: usize,
+) -> Option<(T, usize, PaidAt, bool)> {
+    let quorum = candidates.iter().any(|(_, count, _)| *count >= needed);
+    let mut chosen: Option<(T, usize, PaidAt)> = None;
+    for (item, count, paid_at) in candidates {
+        if quorum && count < needed {
+            continue;
+        }
+        if chosen
+            .as_ref()
+            .is_none_or(|(_, _, earliest)| paid_at < *earliest)
+        {
+            chosen = Some((item, count, paid_at));
+        }
+    }
+    chosen.map(|(item, count, paid_at)| (item, count, paid_at, quorum))
+}
+
+/// The nearest nodes to ask for an address's listing before deciding it.
+/// None if a group of copies already has a quorum of `nearest` (`needed`):
+/// that group decides, and no other can reach one. Otherwise, for each
+/// group, those of `nearest` that didn't serve it, aren't in `heard` (they
+/// sent a copy for the address, or were asked for it) and whose walk doesn't
+/// answer for it ([`MergedListing::unheard_among`]). This holds whether or
+/// not the listing shows its quote: which of several payments counts, and a
+/// listing's date, rest on a quorum of the nearest nodes as well.
+fn peers_to_ask<P: Eq + std::hash::Hash + Copy>(
+    groups: &[MergedListing<P>],
+    nearest: &[P],
+    needed: usize,
+    heard: &HashSet<P>,
+    walked: &HashMap<P, u64>,
+) -> Vec<P> {
+    if groups
+        .iter()
+        .any(|group| group.count_among(nearest) >= needed)
+    {
+        return Vec::new();
+    }
+    let mut to_ask = Vec::new();
+    for group in groups {
+        for peer in group.unheard_among(
+            nearest,
+            |peer| heard.contains(peer),
+            |peer| walked.get(peer).copied(),
+        ) {
+            if !to_ask.contains(peer) {
+                to_ask.push(*peer);
+            }
+        }
+    }
+    to_ask
+}
+
+impl Client {
+    /// The index: every node's listings from time `since` on (Unix seconds,
+    /// 0 for all), merged across nodes, each checked, in index order. Starts
+    /// afresh: [`Self::index_listings_with`] carries walks on from earlier
+    /// reads.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error only if no node can be found.
+    pub async fn index_listings(&self, since: u64, chain: &ListingChain) -> Result<ListingsIndex> {
+        self.index_listings_with(since, chain, &mut WalkState::default())
+            .await
+    }
+
+    /// The index, as [`Self::index_listings`], carrying on from `state`:
+    /// walks the last read stopped early carry on where they stopped, and a
+    /// read that finds far fewer nodes than recent ones decides nothing.
+    /// `state` is updated for the next read.
+    ///
+    /// The read walks every node it can find ([`IndexWalk`]), then decides
+    /// each address that at least [`QUORUM_THRESHOLD`] of the
+    /// [`NEAREST_NODES`] nodes nearest it serve: it fetches the envelope from
+    /// those nodes, checks the listing a quorum of them serve first, and asks
+    /// nearest nodes it hasn't heard from only where no listing has a
+    /// quorum. Addresses fewer nodes serve cost nothing, and wait for a later
+    /// read.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error only if no node can be found.
+    pub async fn index_listings_with(
+        &self,
+        since: u64,
+        chain: &ListingChain,
+        state: &mut WalkState,
+    ) -> Result<ListingsIndex> {
+        let nodes = self.walk_nodes().await;
+        if nodes.is_empty() {
+            return Err(Error::InsufficientPeers(
+                "no nodes found to ask for listings".into(),
+            ));
+        }
+        let too_few_nodes = nodes.len() < NEAREST_NODES
+            || nodes.len().saturating_mul(4) < state.recent_max().saturating_mul(3);
+        let base = walk_start(since);
+        let walk = IndexWalk::new(nodes.iter().map(|(peer, _)| {
+            let from = state
+                .resume_for(peer)
+                .filter(|key| *key > base)
+                .unwrap_or(base);
+            (*peer, *peer.as_bytes(), from)
+        }));
+        let requests = ListingsRequests::start(self.network().node());
+        let found = self.run_walk(walk, &requests).await;
+        let walks: Vec<WalkReport> = found.nodes.iter().map(WalkReport::from).collect();
+        state.record(nodes.len(), &walks);
+        debug!(
+            "Walked the index of {} nodes, {} to the end",
+            walks.len(),
+            walks
+                .iter()
+                .filter(|walk| walk.outcome == WalkOutcome::Complete)
+                .count()
+        );
+
+        let mut index = ListingsIndex {
+            nodes_asked: walks.len(),
+            nodes_answered: walks.iter().filter(|walk| walk.pages > 0).count(),
+            walks,
+            too_few_nodes,
+            coverage: Coverage {
+                walks: found.nodes.clone(),
+                ids: found
+                    .nodes
+                    .iter()
+                    .map(|walk| *walk.peer.as_bytes())
+                    .collect(),
+                served: found
+                    .addresses
+                    .iter()
+                    .map(|address| address.address)
+                    .collect(),
+                decided: HashSet::new(),
+            },
+            ..ListingsIndex::default()
+        };
+        if too_few_nodes {
+            debug!(
+                "Found {} nodes, against {} in recent reads: deciding nothing",
+                nodes.len(),
+                state.recent_max()
+            );
+            index.deferred = found.addresses.len();
+            return Ok(index);
+        }
+
+        let context = ReadContext::new(&found, base, nodes.into_iter().collect());
+        let (backed, pending): (Vec<_>, Vec<_>) = found
+            .addresses
+            .into_iter()
+            .partition(|found| found.support >= QUORUM_THRESHOLD);
+        index.deferred = pending.len();
+        index.rejected.extend(
+            pending
+                .iter()
+                .filter(|found| found.support > 1)
+                .filter_map(pending_listing),
+        );
+        let context = &context;
+        let requests = &requests;
+        let decisions: Vec<Decision> = stream::iter(backed)
+            .map(|found| self.decide_backed(found, context, requests, chain))
+            .buffer_unordered(CHECK_CONCURRENCY)
+            .collect()
+            .await;
+        for decision in decisions {
+            if decision.decided {
+                index.coverage.decided.insert(decision.address);
+            } else {
+                index.deferred += 1;
+            }
+            index.listings.extend(decision.listing);
+            index.rejected.extend(decision.rejected);
+        }
+        index
+            .listings
+            .retain(|checked| checked.listing.key().time >= since);
+        index
+            .rejected
+            .retain(|rejected| since == 0 || rejected.listing.key().time >= since);
+        index.listings.sort_by_key(|checked| checked.listing.key());
+        index
+            .rejected
+            .sort_by_key(|rejected| rejected.listing.key());
+        Ok(index)
+    }
+
+    /// Run `walk` until nothing is left to ask, or to the walk phase's
+    /// deadline: at most [`WALK_PHASE_MAX`], and once half the walks have
+    /// settled, [`WALK_PHASE_FACTOR`] times as long as they took (at least
+    /// [`WALK_PHASE_MIN`]).
+    async fn run_walk(
+        &self,
+        mut walk: IndexWalk<PeerId>,
+        requests: &ListingsRequests,
+    ) -> WalkResult<PeerId> {
+        let started = Instant::now();
+        let mut deadline = started + WALK_PHASE_MAX;
+        let mut deadline_set = false;
+        let mut running = FuturesUnordered::new();
+        loop {
+            let slots = PEER_CONCURRENCY.saturating_sub(running.len());
+            for (peer, from) in walk.next_requests(slots, unix_now()) {
+                running.push(async move {
+                    let request = ListingsBody::ListRequest {
+                        from,
+                        limit: MAX_LIST_LIMIT,
+                    };
+                    (peer, requests.ask(&peer, request).await)
+                });
+            }
+            let Ok(next) = tokio::time::timeout_at(deadline, running.next()).await else {
+                debug!("The walk phase reached its deadline");
+                walk.stop();
+                break;
+            };
+            let Some((peer, answer)) = next else {
+                break;
+            };
+            match answer {
+                Some(ListingsBody::ListResponse { listings, more }) => {
+                    walk.answer(&peer, listings, more);
+                }
+                _ => walk.no_answer(&peer),
+            }
+            if !deadline_set && walk.settled() * 2 >= walk.len() {
+                deadline_set = true;
+                let phase = WALK_PHASE_MIN.max(started.elapsed() * WALK_PHASE_FACTOR);
+                deadline = deadline.min(started + phase);
+            }
+        }
+        walk.finish()
+    }
+
+    /// Decide an address at least a quorum of its nearest nodes serve.
+    async fn decide_backed(
+        &self,
+        found: AddressWalk<PeerId>,
+        context: &ReadContext,
+        requests: &ListingsRequests,
+        chain: &ListingChain,
+    ) -> Decision {
+        let AddressWalk {
+            address,
+            nearest,
+            mut copies,
+            ..
+        } = found;
+        let needed = QUORUM_THRESHOLD;
+        let senders: Vec<PeerId> = nearest
+            .iter()
+            .copied()
+            .filter(|peer| copies.iter().any(|(sender, _)| sender == peer))
+            .collect();
+        let envelope = match self.fetch_envelope(&address, &senders, context).await {
+            Ok(Some(envelope)) => envelope,
+            Ok(None) => {
+                return Decision::again(
+                    address,
+                    &merge_copies(copies),
+                    &nearest,
+                    "none of the nodes serving it handed over its envelope; try again",
+                    Vec::new(),
+                )
+            }
+            Err(problem) => {
+                return Decision::rejected(address, &merge_copies(copies), &nearest, &problem)
+            }
+        };
+        let now = unix_now();
+        let mut heard: HashSet<PeerId> = copies.iter().map(|(peer, _)| *peer).collect();
+        let mut failed: Vec<Listing> = Vec::new();
+        let mut rejected: Vec<RejectedListing> = Vec::new();
+        let mut asked = false;
+        let groups = loop {
+            let groups: Vec<MergedListing<PeerId>> = merge_copies(copies.clone())
+                .into_iter()
+                .filter(|group| !failed.iter().any(|listing| same_listing(group, listing)))
+                .collect();
+            // The listing a quorum serves is checked first, and only it: no
+            // other can have a quorum of the same nodes.
+            if let Some(group) = groups
+                .iter()
+                .find(|group| group.count_among(&nearest) >= needed)
+            {
+                match check_quorum_group(group, &envelope, &nearest, chain, now).await {
+                    Ok(checked) => {
+                        let (chosen, problems) = decide_address(
+                            std::slice::from_ref(group),
+                            vec![Ok(checked)],
+                            &nearest,
+                            NEAREST_NODES,
+                        );
+                        for other in groups.iter().filter(|other| !std::ptr::eq(*other, group)) {
+                            rejected.push(rejected_group(
+                                other,
+                                &nearest,
+                                needed,
+                                "not looked up: the listing a quorum of the nearest nodes serve                                  counts"
+                                    .into(),
+                                false,
+                            ));
+                        }
+                        return Decision::from_groups(
+                            address,
+                            std::slice::from_ref(group),
+                            &nearest,
+                            chosen,
+                            problems,
+                            envelope,
+                            rejected,
+                        );
+                    }
+                    Err(GroupProblem::Again(problem)) => {
+                        return Decision::again(address, &groups, &nearest, &problem, rejected);
+                    }
+                    Err(GroupProblem::Invalid(problem)) => {
+                        rejected.push(rejected_group(group, &nearest, needed, problem, false));
+                        failed.push(group_listing(group, &nearest, needed));
+                        continue;
+                    }
+                }
+            }
+            if asked {
+                break groups;
+            }
+            asked = true;
+            let to_ask: Vec<PeerId> =
+                peers_to_ask(&groups, &nearest, needed, &heard, &context.full_walks)
+                    .into_iter()
+                    .filter(|peer| !context.silent.contains(peer) && !context.is_demoted(peer))
+                    .collect();
+            if to_ask.is_empty() {
+                break groups;
+            }
+            for (peer, answer) in self.ask_for_listing(requests, &address, &to_ask).await {
+                match answer {
+                    Some(listing) => {
+                        heard.insert(peer);
+                        copies.extend(listing.map(|listing| (peer, listing)));
+                    }
+                    None => context.demote(peer),
+                }
+            }
+        };
+        if groups.is_empty() {
+            return Decision {
+                address,
+                listing: None,
+                rejected,
+                decided: true,
+            };
+        }
+        // No listing has a quorum: one may still get one if the nodes not
+        // heard from serve it, so nothing is decided until they answer.
+        let unheard: HashSet<&PeerId> = groups
+            .iter()
+            .flat_map(|group| {
+                group.unheard_among(
+                    &nearest,
+                    |peer| heard.contains(peer),
+                    |peer| context.full_walks.get(peer).copied(),
+                )
+            })
+            .collect();
+        let most = groups
+            .iter()
+            .map(|group| group.count_among(&nearest))
+            .max()
+            .unwrap_or(0);
+        if most + unheard.len() >= needed {
+            let problem = format!(
+                "no listing for it has a quorum of its nearest nodes yet: {most} serve the one \
+                 most serve, {} haven't answered; try again",
+                unheard.len()
+            );
+            return Decision::again(address, &groups, &nearest, &problem, rejected);
+        }
+        let mut checked = Vec::with_capacity(groups.len());
+        for group in &groups {
+            checked.push(check_group(group, &envelope, &nearest, needed, chain, now).await);
+        }
+        let (chosen, problems) = decide_address(&groups, checked, &nearest, NEAREST_NODES);
+        Decision::from_groups(
+            address, &groups, &nearest, chosen, problems, envelope, rejected,
+        )
+    }
+
+    /// The envelope at `address`, from the nodes that served its listing
+    /// (`senders`, nearest first), never through a DHT lookup. One node is
+    /// asked at a time, and the next as well whenever none has answered
+    /// within [`ENVELOPE_HEDGE`]. A node that fails, hands over nothing, or
+    /// is beaten by another is demoted: asked last for the rest of the read.
+    ///
+    /// `Ok(None)` if none of them handed it over.
+    ///
+    /// # Errors
+    ///
+    /// Returns why the chunk at the address, which hashes to it, isn't an
+    /// envelope.
+    async fn fetch_envelope(
+        &self,
+        address: &XorName,
+        senders: &[PeerId],
+        context: &ReadContext,
+    ) -> std::result::Result<Option<Envelope>, String> {
+        let mut order = senders.to_vec();
+        order.sort_by_key(|peer| context.is_demoted(peer));
+        let fetch = |peer: PeerId| {
+            let addresses = context.addresses.get(&peer).cloned().unwrap_or_default();
+            async move {
+                let fetched = self.chunk_get_from_peer(address, &peer, &addresses).await;
+                (peer, fetched)
+            }
+        };
+        let mut queue = order.into_iter();
+        let mut running = FuturesUnordered::new();
+        let mut started: Vec<PeerId> = Vec::new();
+        let mut finished: Vec<PeerId> = Vec::new();
+        loop {
+            if running.is_empty() {
+                let Some(peer) = queue.next() else {
+                    return Ok(None);
+                };
+                started.push(peer);
+                running.push(fetch(peer));
+            }
+            let next = if queue.as_slice().is_empty() {
+                running.next().await
+            } else {
+                match tokio::time::timeout(ENVELOPE_HEDGE, running.next()).await {
+                    Ok(next) => next,
+                    Err(_) => {
+                        if let Some(peer) = queue.next() {
+                            started.push(peer);
+                            running.push(fetch(peer));
+                        }
+                        continue;
+                    }
+                }
+            };
+            let Some((peer, fetched)) = next else {
+                continue;
+            };
+            finished.push(peer);
+            match fetched {
+                Ok(Some(chunk)) => {
+                    for beaten in started.iter().filter(|peer| !finished.contains(peer)) {
+                        context.demote(*beaten);
+                    }
+                    return Envelope::from_bytes(&chunk.content)
+                        .map(Some)
+                        .map_err(|e| format!("bad envelope: {e}"));
+                }
+                Ok(None) | Err(_) => context.demote(peer),
+            }
+        }
+    }
+
+    /// The listing for `address`, in the index or not, from the nodes
+    /// nearest it, checked on `chain`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if no node near the address can be found.
+    pub async fn listing(&self, address: &XorName, chain: &ListingChain) -> Result<ListingLookup> {
+        // How many nodes the network has, to know how many nearest nodes
+        // there should be when the lookup comes back short.
+        let (nearest, nodes) = futures::join!(self.nearest_nodes(address), self.walk_nodes());
+        let expected = expected_nearest(nodes.len().max(nearest.len()));
+        if nearest.is_empty() {
+            return Err(Error::InsufficientPeers(format!(
+                "no nodes found near {}",
+                hex::encode(address)
+            )));
+        }
+        let requests = ListingsRequests::start(self.network().node());
+        let answers = self.ask_for_listing(&requests, address, &nearest).await;
+        let answered = answers
+            .iter()
+            .filter(|(_, answer)| answer.is_some())
+            .count();
+        let copies = answers
+            .into_iter()
+            .filter_map(|(peer, answer)| answer.flatten().map(|listing| (peer, listing)))
+            .collect();
+        // Every nearest node was asked: asking again can't change the answer.
+        let heard = nearest.iter().copied().collect();
+        let (listing, rejected) = self
+            .decide_from_copies(
+                &requests,
+                *address,
+                copies,
+                &nearest,
+                expected,
+                heard,
+                &HashMap::new(),
+                chain,
+            )
+            .await;
+        Ok(ListingLookup {
+            listing,
+            rejected,
+            nearest: nearest.len(),
+            answered,
+        })
+    }
+
+    /// Merge the copies for one address, ask the nearest nodes not yet heard
+    /// from when their answers decide it, check each group, and decide: for
+    /// [`Self::listing`], which asks every nearest node of one address.
+    ///
+    /// `expected` is how many nearest nodes there should be
+    /// ([`expected_nearest`]). `heard` holds the nodes already heard from for
+    /// this address: those that sent a copy, or were asked for it.
+    #[allow(clippy::too_many_arguments)]
+    async fn decide_from_copies(
+        &self,
+        requests: &ListingsRequests,
+        address: XorName,
+        mut copies: Vec<(PeerId, Listing)>,
+        nearest: &[PeerId],
+        expected: usize,
+        heard: HashSet<PeerId>,
+        walked: &HashMap<PeerId, u64>,
+        chain: &ListingChain,
+    ) -> (Option<CheckedListing>, Vec<RejectedListing>) {
+        let any_copy = copies.first().map(|(_, listing)| listing.clone());
+        let needed = quorum_needed(expected.max(nearest.len()));
+        let mut groups = merge_copies(copies.clone());
+        let to_ask = peers_to_ask(&groups, nearest, needed, &heard, walked);
+        if !to_ask.is_empty() {
+            for (peer, answer) in self.ask_for_listing(requests, &address, &to_ask).await {
+                copies.extend(answer.flatten().map(|listing| (peer, listing)));
+            }
+            groups = merge_copies(copies);
+        }
+        if groups.is_empty() {
+            let rejected = any_copy.map(|listing| RejectedListing {
+                listing,
+                problem: "no valid copy".into(),
+                nodes: 0,
+                nearest: nearest.len(),
+                again: false,
+            });
+            return (None, rejected.into_iter().collect());
+        }
+        let reject_all = |problem: String, again: bool| {
+            groups
+                .iter()
+                .map(|group| RejectedListing {
+                    listing: group_listing(group, nearest, needed),
+                    problem: problem.clone(),
+                    nodes: group.count_among(nearest),
+                    nearest: nearest.len(),
+                    again,
+                })
+                .collect::<Vec<_>>()
+        };
+        let envelope = match self.chunk_get(&address).await {
+            Ok(Some(chunk)) => match Envelope::from_bytes(&chunk.content) {
+                Ok(envelope) => envelope,
+                Err(e) => return (None, reject_all(format!("bad envelope: {e}"), false)),
+            },
+            Ok(None) => {
+                return (
+                    None,
+                    reject_all("the envelope is not on the network".into(), false),
+                )
+            }
+            Err(e) => {
+                return (
+                    None,
+                    reject_all(
+                        format!("could not fetch the envelope: {e}; try again"),
+                        true,
+                    ),
+                )
+            }
+        };
+        let now = unix_now();
+        let mut checked = Vec::with_capacity(groups.len());
+        for group in &groups {
+            checked.push(check_group(group, &envelope, nearest, needed, chain, now).await);
+        }
+        let (chosen, rejected) = decide_address(&groups, checked, nearest, expected);
+        let rejected = rejected
+            .into_iter()
+            .map(|(index, problem)| {
+                let again = is_again(&problem);
+                rejected_group(&groups[index], nearest, needed, problem, again)
+            })
+            .collect();
+        let chosen = chosen.map(|(listing, level, nodes, quorum)| CheckedListing {
+            listing,
+            envelope,
+            level,
+            nodes,
+            nearest: nearest.len(),
+            quorum,
+        });
+        (chosen, rejected)
+    }
+
+    /// The nodes nearest `address`, or none if the lookup fails.
+    async fn nearest_nodes(&self, address: &XorName) -> Vec<PeerId> {
+        match self
+            .network()
+            .find_closest_peers(address, NEAREST_NODES)
+            .await
+        {
+            Ok(found) => found
+                .into_iter()
+                .map(|(peer, _)| peer)
+                .take(NEAREST_NODES)
+                .collect(),
+            Err(e) => {
+                debug!(
+                    "Could not find the nodes nearest {}: {e}",
+                    hex::encode(address)
+                );
+                Vec::new()
+            }
+        }
+    }
+
+    /// Ask each of `peers` for its listing of `address`. `None`: no answer;
+    /// `Some(None)`: the node has no listing for it (or sent one that
+    /// [`check_get_response`] refuses).
+    async fn ask_for_listing(
+        &self,
+        requests: &ListingsRequests,
+        address: &XorName,
+        peers: &[PeerId],
+    ) -> Vec<(PeerId, Option<Option<Listing>>)> {
+        let address = *address;
+        stream::iter(peers.to_vec())
+            .map(|peer| async move {
+                let answer = match requests
+                    .ask(&peer, ListingsBody::GetRequest { address })
+                    .await
+                {
+                    Some(ListingsBody::GetResponse { listing }) => {
+                        Some(check_get_response(&address, listing).unwrap_or_else(|e| {
+                            debug!(
+                                "{peer} sent a bad listing for {}: {e}",
+                                hex::encode(address)
+                            );
+                            None
+                        }))
+                    }
+                    _ => None,
+                };
+                (peer, answer)
+            })
+            .buffer_unordered(PEER_CONCURRENCY)
+            .collect()
+            .await
+    }
+
+    /// The nodes to walk, each with its addresses: those in the routing
+    /// table, and those a few random lookups find, which may take at most
+    /// [`CRAWL_TIMEOUT`]. Only DHT nodes, never this client.
+    async fn walk_nodes(&self) -> Vec<(PeerId, Vec<MultiAddr>)> {
+        let network = self.network();
+        let mut nodes: HashMap<PeerId, Vec<MultiAddr>> = network
+            .known_peers()
+            .await
+            .into_iter()
+            .map(|node| {
+                let addresses = node.addresses_by_priority();
+                (node.peer_id, addresses)
+            })
+            .collect();
+        let targets: Vec<[u8; 32]> = (0..CRAWL_LOOKUPS).map(|_| rand::random()).collect();
+        let lookups = futures::future::join_all(targets.iter().map(|target| {
+            tokio::time::timeout(
+                CRAWL_TIMEOUT,
+                network.find_closest_peers(target, CRAWL_WIDTH),
+            )
+        }))
+        .await;
+        for lookup in lookups {
+            match lookup {
+                Ok(Ok(found)) => {
+                    for (peer, addresses) in found {
+                        nodes.entry(peer).or_insert(addresses);
+                    }
+                }
+                Ok(Err(e)) => debug!("Listing crawl lookup failed: {e}"),
+                Err(_) => debug!("A listing crawl lookup timed out"),
+            }
+        }
+        nodes.remove(network.peer_id());
+        nodes.into_iter().collect()
+    }
+}
+
+/// Requests waiting for their answers, by node and request id.
+type Waiting = Arc<Mutex<HashMap<(PeerId, u64), oneshot::Sender<ListingsBody>>>>;
+
+/// Listings requests in flight for one read. One subscriber decodes each
+/// answer once and hands it to the request waiting for it, by node and
+/// request id, rather than each request reading every message the client
+/// receives.
+struct ListingsRequests {
+    node: Arc<P2PNode>,
+    waiting: Waiting,
+    router: tokio::task::JoinHandle<()>,
+}
+
+impl ListingsRequests {
+    fn start(node: &Arc<P2PNode>) -> Self {
+        let waiting: Waiting = Arc::default();
+        // Subscribe before anything is sent, so no answer can be missed.
+        let mut events = node.subscribe_events();
+        let routes = Arc::clone(&waiting);
+        let router = tokio::spawn(async move {
+            loop {
+                match events.recv().await {
+                    Ok(P2PEvent::Message {
+                        topic,
+                        source: Some(source),
+                        data,
+                        ..
+                    }) if topic == TOPIC => {
+                        let Ok(message) = ListingsMessage::decode(&data) else {
+                            continue;
+                        };
+                        let waiting = routes
+                            .lock()
+                            .ok()
+                            .and_then(|mut waiting| waiting.remove(&(source, message.request_id)));
+                        if let Some(waiting) = waiting {
+                            let _ = waiting.send(message.body);
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(RecvError::Lagged(missed)) => {
+                        debug!("The listings router missed {missed} messages");
+                    }
+                    Err(RecvError::Closed) => break,
+                }
+            }
+        });
+        Self {
+            node: Arc::clone(node),
+            waiting,
+            router,
+        }
+    }
+
+    /// Send `body` to `peer` and wait for its answer, at most
+    /// [`REQUEST_TIMEOUT`].
+    async fn ask(&self, peer: &PeerId, body: ListingsBody) -> Option<ListingsBody> {
+        let request_id: u64 = rand::random();
+        let request = ListingsMessage { request_id, body }.encode().ok()?;
+        let (sender, receiver) = oneshot::channel();
+        self.waiting
+            .lock()
+            .ok()?
+            .insert((*peer, request_id), sender);
+        let answer = match self.node.send_message(peer, TOPIC, request, &[]).await {
+            Ok(()) => tokio::time::timeout(REQUEST_TIMEOUT, receiver)
+                .await
+                .ok()
+                .and_then(std::result::Result::ok),
+            Err(e) => {
+                debug!("Could not ask {peer} for listings: {e}");
+                None
+            }
+        };
+        if let Ok(mut waiting) = self.waiting.lock() {
+            waiting.remove(&(*peer, request_id));
+        }
+        if answer.is_none() {
+            debug!("{peer} did not answer a listings request");
+        }
+        answer
+    }
+}
+
+impl Drop for ListingsRequests {
+    fn drop(&mut self) {
+        self.router.abort();
+    }
+}
+
+/// What deciding an address needs from its read's walks.
+struct ReadContext {
+    /// When each node's walk began, for walks that ran from the read's start
+    /// to the end: such a walk returned every listing the node held as it
+    /// passed it.
+    full_walks: HashMap<PeerId, u64>,
+    /// Nodes that answered no page: not asked anything more this read.
+    silent: HashSet<PeerId>,
+    /// Each node's addresses, to fetch from it.
+    addresses: HashMap<PeerId, Vec<MultiAddr>>,
+    /// Nodes that failed a request while deciding: asked last, or not
+    /// again, for the rest of the read.
+    demoted: Mutex<HashSet<PeerId>>,
+}
+
+impl ReadContext {
+    fn new(
+        found: &WalkResult<PeerId>,
+        base: ListingKey,
+        addresses: HashMap<PeerId, Vec<MultiAddr>>,
+    ) -> Self {
+        let full_walks = found
+            .nodes
+            .iter()
+            .filter(|walk| walk.outcome == WalkOutcome::Complete && walk.from == base)
+            .filter_map(|walk| walk.began.map(|began| (walk.peer, began)))
+            .collect();
+        let silent = found
+            .nodes
+            .iter()
+            .filter(|walk| walk.pages == 0)
+            .map(|walk| walk.peer)
+            .collect();
+        Self {
+            full_walks,
+            silent,
+            addresses,
+            demoted: Mutex::new(HashSet::new()),
+        }
+    }
+
+    fn demote(&self, peer: PeerId) {
+        if let Ok(mut demoted) = self.demoted.lock() {
+            demoted.insert(peer);
+        }
+    }
+
+    fn is_demoted(&self, peer: &PeerId) -> bool {
+        self.demoted
+            .lock()
+            .is_ok_and(|demoted| demoted.contains(peer))
+    }
+}
+
+/// What a read decided for one address it worked on.
+struct Decision {
+    address: XorName,
+    listing: Option<CheckedListing>,
+    rejected: Vec<RejectedListing>,
+    /// False if nothing final was decided, to try again in a later read.
+    decided: bool,
+}
+
+impl Decision {
+    /// Nothing decided, for `problem`: each group is rejected to try again,
+    /// after `rejected`.
+    fn again(
+        address: XorName,
+        groups: &[MergedListing<PeerId>],
+        nearest: &[PeerId],
+        problem: &str,
+        mut rejected: Vec<RejectedListing>,
+    ) -> Self {
+        rejected.extend(
+            groups.iter().map(|group| {
+                rejected_group(group, nearest, QUORUM_THRESHOLD, problem.into(), true)
+            }),
+        );
+        Self {
+            address,
+            listing: None,
+            rejected,
+            decided: false,
+        }
+    }
+
+    /// Every group rejected for good, for `problem`.
+    fn rejected(
+        address: XorName,
+        groups: &[MergedListing<PeerId>],
+        nearest: &[PeerId],
+        problem: &str,
+    ) -> Self {
+        Self {
+            address,
+            listing: None,
+            rejected: groups
+                .iter()
+                .map(|group| {
+                    rejected_group(group, nearest, QUORUM_THRESHOLD, problem.into(), false)
+                })
+                .collect(),
+            decided: true,
+        }
+    }
+
+    /// What [`decide_address`] decided for `groups`, after `rejected`.
+    fn from_groups(
+        address: XorName,
+        groups: &[MergedListing<PeerId>],
+        nearest: &[PeerId],
+        chosen: Option<CountingListing>,
+        problems: RejectedGroups,
+        envelope: Envelope,
+        mut rejected: Vec<RejectedListing>,
+    ) -> Self {
+        let mut again = false;
+        for (index, problem) in problems {
+            let retry = is_again(&problem);
+            again |= retry;
+            rejected.push(rejected_group(
+                &groups[index],
+                nearest,
+                QUORUM_THRESHOLD,
+                problem,
+                retry,
+            ));
+        }
+        let listing = chosen.map(|(listing, level, nodes, quorum)| CheckedListing {
+            listing,
+            envelope,
+            level,
+            nodes,
+            nearest: nearest.len(),
+            quorum,
+        });
+        let decided = listing.is_some() || !again;
+        Self {
+            address,
+            listing,
+            rejected,
+            decided,
+        }
+    }
+}
+
+/// Why the group a quorum serves didn't check out.
+enum GroupProblem {
+    /// Nothing final: the chain couldn't be read, or doesn't have the
+    /// payment yet.
+    Again(String),
+    /// It doesn't check out.
+    Invalid(String),
+}
+
+/// Check the group a quorum of `nearest` serve, as [`check_group`] does,
+/// saying whether a failure is final. A quorum of nodes checked its payment
+/// on chain when they stored it, so a chain that couldn't be read, or that
+/// doesn't have the payment (yet), is worth trying again.
+async fn check_quorum_group(
+    group: &MergedListing<PeerId>,
+    envelope: &Envelope,
+    nearest: &[PeerId],
+    chain: &ListingChain,
+    now: u64,
+) -> std::result::Result<(Listing, ListingCheck), GroupProblem> {
+    let needed = QUORUM_THRESHOLD;
+    let listing = listing_to_check(group, nearest, needed).ok_or_else(|| {
+        GroupProblem::Invalid("none of the nodes nearest its address gives it a first_seen".into())
+    })?;
+    check_offline(&listing, envelope, chain.vault())
+        .map_err(|e| GroupProblem::Invalid(e.to_string()))?;
+    let lookup = payment_lookup(&listing).map_err(|e| GroupProblem::Invalid(e.to_string()))?;
+    let fetched = chain
+        .fetch(&lookup, &listing.payment)
+        .await
+        .map_err(|e| GroupProblem::Again(CheckProblem::ChainUnread(e).to_string()))?;
+    check_copies(group, nearest, needed, |listing| {
+        verify_listing_receipts(listing, envelope, &fetched, chain.vault(), now)
+    })
+    .map_err(|e| match e {
+        PaymentError::NotFound => {
+            GroupProblem::Again("its payment is not on the chain yet; try again".into())
+        }
+        e => GroupProblem::Invalid(e.to_string()),
+    })
+}
+
+/// The listing to show for an address too few of its nearest nodes serve
+/// to decide yet: the one most of them serve.
+fn pending_listing(found: &AddressWalk<PeerId>) -> Option<RejectedListing> {
+    let groups = merge_copies(found.copies.clone());
+    let group = groups
+        .iter()
+        .max_by_key(|group| group.count_among(&found.nearest))?;
+    let problem = format!(
+        "served by {} of the {} nodes nearest its address so far, needs {QUORUM_THRESHOLD}; \
+         try again",
+        found.support,
+        found.nearest.len()
+    );
+    Some(rejected_group(
+        group,
+        &found.nearest,
+        QUORUM_THRESHOLD,
+        problem,
+        true,
+    ))
+}
+
+/// `group`, rejected for `problem`; `needed` dates it as [`group_listing`]
+/// does.
+fn rejected_group(
+    group: &MergedListing<PeerId>,
+    nearest: &[PeerId],
+    needed: usize,
+    problem: String,
+    again: bool,
+) -> RejectedListing {
+    RejectedListing {
+        listing: group_listing(group, nearest, needed),
+        problem,
+        nodes: group.count_among(nearest),
+        nearest: nearest.len(),
+        again,
+    }
+}
+
+/// Whether `group` is `listing`, apart from `first_seen`.
+fn same_listing(group: &MergedListing<PeerId>, listing: &Listing) -> bool {
+    group.address() == listing.address
+        && group.flags() == listing.flags
+        && group.metadata() == &listing.metadata
+        && group.size() == listing.size
+        && group.payment() == &listing.payment
+}
+
+/// Whether a rejection is worth trying again: the checks say so.
+fn is_again(problem: &str) -> bool {
+    problem.ends_with("try again")
+}
+
+/// A group's listing for showing: as the nearest nodes give it
+/// ([`listing_to_check`]), or as any node sent it.
+fn group_listing(group: &MergedListing<PeerId>, nearest: &[PeerId], needed: usize) -> Listing {
+    listing_to_check(group, nearest, needed).unwrap_or_else(|| Listing {
+        address: group.address(),
+        flags: group.flags(),
+        metadata: group.metadata().clone(),
+        size: group.size(),
+        payment: group.payment().clone(),
+        first_seen: group.peers().iter().find_map(|(_, first_seen)| *first_seen),
+    })
+}
+
+/// Check one group of copies against the chain, as a node checks its close
+/// group's copies: offline first, then fetch once for
+/// [`listing_to_check`], then [`check_copies`].
+async fn check_group<P: PartialEq>(
+    group: &MergedListing<P>,
+    envelope: &Envelope,
+    nearest: &[P],
+    needed: usize,
+    chain: &ListingChain,
+    now: u64,
+) -> std::result::Result<(Listing, ListingCheck), CheckProblem> {
+    let listing = listing_to_check(group, nearest, needed).ok_or_else(|| {
+        CheckProblem::Invalid("none of the nodes nearest its address gives it a first_seen".into())
+    })?;
+    // A copy that can't check out is never looked up.
+    check_offline(&listing, envelope, chain.vault())?;
+    let lookup = payment_lookup(&listing)?;
+    let fetched = chain
+        .fetch(&lookup, &listing.payment)
+        .await
+        .map_err(CheckProblem::ChainUnread)?;
+    Ok(check_copies(group, nearest, needed, |listing| {
+        verify_listing_receipts(listing, envelope, &fetched, chain.vault(), now)
+    })?)
+}
+
+/// Reads payments from the payment chain, for checking listings and upload
+/// proofs.
 pub struct ListingChain {
     http: reqwest::Client,
     rpc_url: String,
     vault: [u8; 20],
+}
+
+/// A vault `DataPaymentMade` log, located.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct VaultLog {
+    tx_hash: [u8; 32],
+    log_index: u64,
 }
 
 impl ListingChain {
@@ -209,23 +1665,145 @@ impl ListingChain {
     pub fn new(network: &EvmNetwork) -> Result<Self> {
         let mut vault = [0u8; 20];
         vault.copy_from_slice(network.payment_vault_address().as_slice());
+        Self::with_rpc(network.rpc_url().to_string(), vault)
+    }
+
+    /// A reader for the chain at `rpc_url` and the vault at `vault`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the HTTP client can't be built.
+    pub fn with_rpc(rpc_url: String, vault: [u8; 20]) -> Result<Self> {
         let http = reqwest::Client::builder()
-            .timeout(Duration::from_secs(15))
+            .timeout(RPC_TIMEOUT)
             .build()
             .map_err(|e| Error::Network(format!("payment chain client: {e}")))?;
         Ok(Self {
             http,
-            rpc_url: network.rpc_url().to_string(),
+            rpc_url,
             vault,
         })
     }
 
+    /// The payment vault's address.
+    #[must_use]
+    pub fn vault(&self) -> &[u8; 20] {
+        &self.vault
+    }
+
+    /// Check an upload proof from the chain alone: the receipt of its
+    /// transaction and that block's timestamp.
+    ///
+    /// # Errors
+    ///
+    /// Returns why the proof fails, or why the chain couldn't be read.
+    pub async fn check_proof(
+        &self,
+        proof: &EnvelopeProof,
+    ) -> std::result::Result<ProvenUpload, String> {
+        let (receipt, timestamp) = self
+            .transaction(&proof.tx_hash)
+            .await?
+            .ok_or("the payment transaction is not on chain")?;
+        ant_listings::check_proof(proof, &receipt, timestamp, &self.vault)
+            .map_err(|e| e.to_string())
+    }
+
     /// The receipt of `tx_hash` and its block's timestamp, or `None` if the
-    /// chain doesn't know the transaction.
-    async fn payment(
+    /// chain doesn't know the transaction (yet).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a call fails or the answer is malformed.
+    pub async fn transaction(
         &self,
         tx_hash: &[u8; 32],
     ) -> std::result::Result<Option<(PaymentReceipt, u64)>, String> {
+        let Some(receipt) = self.receipt(tx_hash).await? else {
+            return Ok(None);
+        };
+        let timestamp = self
+            .block_timestamp(receipt.block_number)
+            .await?
+            .ok_or("the receipt's block is missing")?;
+        Ok(Some((receipt, timestamp)))
+    }
+
+    /// Everything the chain has for `lookup` (see
+    /// [`ant_listings::payment_lookup`]), made for a listing showing `shown`:
+    /// the receipts it locates, each with its block's timestamp, or for
+    /// [`Lookup::Block`] only the block's timestamp. Empty when nothing was
+    /// found.
+    ///
+    /// For [`Lookup::Quote`], only payments of the quote that could be the
+    /// one the listing describes are read: those at its log index and in a
+    /// block of its timestamp, where it shows them. Anyone can pay a quote,
+    /// so others may come first. Without a block number the search starts at
+    /// the block of `search_from` and runs forwards, up to the block of
+    /// `not_after` (or the latest), stopping at the first range with such a
+    /// payment, since the earliest payment is the one that counts; if that
+    /// finds nothing, it runs backwards from `search_from`. A shown timestamp
+    /// narrows the search to the blocks of that second instead. Either way it
+    /// makes at most 64 log queries.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a call fails or an answer is malformed.
+    pub async fn fetch(
+        &self,
+        lookup: &Lookup,
+        shown: &ListingPayment,
+    ) -> std::result::Result<Fetched, String> {
+        match *lookup {
+            Lookup::Transaction { tx_hash } => Ok(self
+                .transaction(&tx_hash)
+                .await?
+                .map(|(receipt, timestamp)| vec![(Some(receipt), Some(timestamp))])
+                .unwrap_or_default()),
+            Lookup::Quote {
+                quote_hash,
+                block_number,
+                search_from,
+                not_after,
+            } => {
+                let topics = [Some(DATA_PAYMENT_MADE_TOPIC), None, None, Some(quote_hash)];
+                let logs = match block_number {
+                    // One block: one timestamp, so only the log index can
+                    // tell its payments apart.
+                    Some(block) => at_log_index(
+                        self.vault_logs(&topics, block, block).await?,
+                        shown.log_index,
+                    ),
+                    None => {
+                        self.search_quote_logs(&topics, search_from, not_after, shown)
+                            .await?
+                    }
+                };
+                self.receipts_for(&logs).await
+            }
+            Lookup::BlockLog {
+                block_number,
+                log_index,
+            } => {
+                let topics = [Some(DATA_PAYMENT_MADE_TOPIC), None, None, None];
+                let logs = at_log_index(
+                    self.vault_logs(&topics, block_number, block_number).await?,
+                    Some(log_index),
+                );
+                self.receipts_for(&logs).await
+            }
+            Lookup::Block { block_number } => {
+                Ok(vec![(None, self.block_timestamp(block_number).await?)])
+            }
+            Lookup::Nothing => Ok(Vec::new()),
+        }
+    }
+
+    /// The receipt of `tx_hash`, or `None` if the chain doesn't know it.
+    async fn receipt(
+        &self,
+        tx_hash: &[u8; 32],
+    ) -> std::result::Result<Option<PaymentReceipt>, String> {
         let receipt = self
             .call(
                 "eth_getTransactionReceipt",
@@ -235,29 +1813,219 @@ impl ListingChain {
         if receipt.is_null() {
             return Ok(None);
         }
-        let block_hex = receipt["blockNumber"]
-            .as_str()
-            .ok_or("the receipt has no block number")?;
-        let block = self
-            .call("eth_getBlockByNumber", json!([block_hex, false]))
-            .await?;
-        let timestamp = block["timestamp"]
+        let block_number = receipt["blockNumber"]
             .as_str()
             .and_then(parse_u64)
-            .ok_or("the block has no timestamp")?;
-        let logs = receipt["logs"]
-            .as_array()
-            .map(|logs| logs.iter().filter_map(parse_log).collect())
-            .unwrap_or_default();
-        Ok(Some((
-            PaymentReceipt {
-                tx_hash: *tx_hash,
-                success: receipt["status"].as_str() == Some("0x1"),
-                block_number: parse_u64(block_hex).ok_or("bad block number")?,
-                logs,
-            },
-            timestamp,
-        )))
+            .ok_or("the receipt has no block number")?;
+        Ok(Some(PaymentReceipt {
+            tx_hash: *tx_hash,
+            success: receipt["status"].as_str() == Some("0x1"),
+            block_number,
+            logs: receipt["logs"]
+                .as_array()
+                .map(|logs| logs.iter().filter_map(parse_log).collect())
+                .unwrap_or_default(),
+        }))
+    }
+
+    /// The timestamp of block `number`, or `None` if there is no such block.
+    async fn block_timestamp(&self, number: u64) -> std::result::Result<Option<u64>, String> {
+        let block = self
+            .call("eth_getBlockByNumber", json!([quantity(number), false]))
+            .await?;
+        if block.is_null() {
+            return Ok(None);
+        }
+        block["timestamp"]
+            .as_str()
+            .and_then(parse_u64)
+            .map(Some)
+            .ok_or_else(|| "the block has no timestamp".into())
+    }
+
+    /// The latest block's number.
+    async fn latest_block(&self) -> std::result::Result<u64, String> {
+        self.call("eth_blockNumber", json!([]))
+            .await?
+            .as_str()
+            .and_then(parse_u64)
+            .ok_or_else(|| "no block number".into())
+    }
+
+    /// The last block up to `latest` whose timestamp is at most `time`, or
+    /// block 0 if there is none: a binary search, one call per step.
+    async fn block_at(&self, time: u64, latest: u64) -> std::result::Result<u64, String> {
+        let timestamp = |number| async move {
+            self.block_timestamp(number)
+                .await?
+                .ok_or_else(|| "a block before the latest is missing".to_string())
+        };
+        if timestamp(latest).await? <= time {
+            return Ok(latest);
+        }
+        // The answer is in `low..high`; `high`'s timestamp is after `time`.
+        let (mut low, mut high) = (0, latest);
+        while low + 1 < high {
+            let middle = low + (high - low) / 2;
+            if timestamp(middle).await? <= time {
+                low = middle;
+            } else {
+                high = middle;
+            }
+        }
+        Ok(low)
+    }
+
+    /// The first and last blocks up to `latest` timed exactly `time`, or
+    /// `None` if no block is.
+    async fn blocks_at(
+        &self,
+        time: u64,
+        latest: u64,
+    ) -> std::result::Result<Option<(u64, u64)>, String> {
+        let timestamp = |number| async move {
+            self.block_timestamp(number)
+                .await?
+                .ok_or_else(|| "a block before the latest is missing".to_string())
+        };
+        let last = self.block_at(time, latest).await?;
+        if timestamp(last).await? != time {
+            return Ok(None);
+        }
+        let Some(before) = time.checked_sub(1) else {
+            return Ok(Some((0, last)));
+        };
+        // Before `last`, whose timestamp is after `before`; block 0 if no
+        // block is timed before `time`.
+        let previous = self.block_at(before, last).await?;
+        if timestamp(previous).await? > before {
+            return Ok(Some((previous, last)));
+        }
+        Ok(Some((previous + 1, last)))
+    }
+
+    /// The payments of a quote that could be the one a listing showing
+    /// `shown` describes, searched for from the block at `search_from`, or in
+    /// the blocks of the shown timestamp (see [`Self::fetch`]).
+    async fn search_quote_logs(
+        &self,
+        topics: &[Option<[u8; 32]>; 4],
+        search_from: u64,
+        not_after: Option<u64>,
+        shown: &ListingPayment,
+    ) -> std::result::Result<Vec<VaultLog>, String> {
+        let latest = self.latest_block().await?;
+        let (first, last) = if let Some(time) = shown.block_timestamp {
+            let Some(blocks) = self.blocks_at(time, latest).await? else {
+                return Ok(Vec::new());
+            };
+            blocks
+        } else {
+            let last = match not_after {
+                Some(time) => self.block_at(time, latest).await?,
+                None => latest,
+            };
+            (self.block_at(search_from, last).await?, last)
+        };
+        let mut budget = MAX_LOG_CALLS;
+        let mut range = last - first + 1;
+        let mut narrowed = false;
+        // Forwards from the quote's time.
+        let mut from = first;
+        while from <= last && budget > 0 {
+            let to = from.saturating_add(range - 1).min(last);
+            budget -= 1;
+            match self.vault_logs(topics, from, to).await {
+                Ok(logs) => {
+                    let logs = at_log_index(logs, shown.log_index);
+                    if !logs.is_empty() {
+                        return Ok(logs);
+                    }
+                    match to.checked_add(1) {
+                        Some(next) => from = next,
+                        None => break,
+                    }
+                }
+                Err(e) if range > MIN_LOG_RANGE => {
+                    debug!("Narrowing a log search after: {e}");
+                    range = (range / 2).max(MIN_LOG_RANGE);
+                    narrowed = true;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        if shown.block_timestamp.is_some() {
+            // The payment is in one of those blocks, or not on chain.
+            return Ok(Vec::new());
+        }
+        // The quote's time is its signer's word: look back from it too, as
+        // widely as the chain allows.
+        if !narrowed {
+            range = range.max(BACK_LOG_RANGE);
+        }
+        let mut to = first;
+        while to > 0 && budget > 0 {
+            let to_block = to - 1;
+            let from_block = to_block.saturating_sub(range - 1);
+            budget -= 1;
+            match self.vault_logs(topics, from_block, to_block).await {
+                Ok(logs) => {
+                    let logs = at_log_index(logs, shown.log_index);
+                    if !logs.is_empty() {
+                        return Ok(logs);
+                    }
+                    to = from_block;
+                }
+                Err(e) if range > MIN_LOG_RANGE => {
+                    debug!("Narrowing a log search after: {e}");
+                    range = (range / 2).max(MIN_LOG_RANGE);
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(Vec::new())
+    }
+
+    /// The vault's logs matching `topics` (`None` = any) in blocks
+    /// `from..=to`.
+    async fn vault_logs(
+        &self,
+        topics: &[Option<[u8; 32]>; 4],
+        from: u64,
+        to: u64,
+    ) -> std::result::Result<Vec<VaultLog>, String> {
+        let topics: Vec<Value> = topics
+            .iter()
+            .map(|topic| match topic {
+                Some(topic) => json!(format!("0x{}", hex::encode(topic))),
+                None => Value::Null,
+            })
+            .collect();
+        let filter = json!({
+            "address": format!("0x{}", hex::encode(self.vault)),
+            "fromBlock": quantity(from),
+            "toBlock": quantity(to),
+            "topics": topics,
+        });
+        let logs = self.call("eth_getLogs", json!([filter])).await?;
+        logs.as_array()
+            .ok_or("logs are not a list")?
+            .iter()
+            .map(|log| parse_vault_log(log).ok_or_else(|| "a log is incomplete".to_string()))
+            .collect()
+    }
+
+    /// The receipt of each transaction among `logs`, once, with its block's
+    /// timestamp. Transactions the chain no longer knows are left out.
+    async fn receipts_for(&self, logs: &[VaultLog]) -> std::result::Result<Fetched, String> {
+        let tx_hashes: BTreeSet<[u8; 32]> = logs.iter().map(|log| log.tx_hash).collect();
+        let mut fetched = Vec::with_capacity(tx_hashes.len());
+        for tx_hash in tx_hashes {
+            if let Some((receipt, timestamp)) = self.transaction(&tx_hash).await? {
+                fetched.push((Some(receipt), Some(timestamp)));
+            }
+        }
+        Ok(fetched)
     }
 
     async fn call(&self, method: &str, params: Value) -> std::result::Result<Value, String> {
@@ -279,6 +2047,18 @@ impl ListingChain {
     }
 }
 
+/// The logs at `log_index`, or all of them if it is hidden. A listing that
+/// shows its log index describes no payment elsewhere.
+fn at_log_index(logs: Vec<VaultLog>, log_index: Option<u64>) -> Vec<VaultLog> {
+    match log_index {
+        Some(index) => logs
+            .into_iter()
+            .filter(|log| log.log_index == index)
+            .collect(),
+        None => logs,
+    }
+}
+
 fn parse_log(log: &Value) -> Option<PaymentLog> {
     Some(PaymentLog {
         address: parse_bytes(log["address"].as_str()?)?,
@@ -291,6 +2071,20 @@ fn parse_log(log: &Value) -> Option<PaymentLog> {
     })
 }
 
+/// Where an `eth_getLogs` log is, or `None` if it is incomplete (a pending
+/// log has no block).
+fn parse_vault_log(log: &Value) -> Option<VaultLog> {
+    parse_u64(log["blockNumber"].as_str()?)?;
+    Some(VaultLog {
+        tx_hash: parse_bytes(log["transactionHash"].as_str()?)?,
+        log_index: parse_u64(log["logIndex"].as_str()?)?,
+    })
+}
+
+fn quantity(number: u64) -> String {
+    format!("0x{number:x}")
+}
+
 fn parse_u64(hex: &str) -> Option<u64> {
     u64::from_str_radix(hex.trim_start_matches("0x"), 16).ok()
 }
@@ -300,4 +2094,1447 @@ fn parse_bytes<const N: usize>(hex: &str) -> Option<[u8; N]> {
         .ok()?
         .try_into()
         .ok()
+}
+
+/// A JSON-RPC payment chain in memory, served over HTTP, for tests.
+#[cfg(test)]
+pub(crate) mod test_chain {
+    use super::*;
+    use std::collections::BTreeMap;
+    use std::sync::{Arc, Mutex};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    /// The vault the tests pay into.
+    pub(crate) const VAULT: [u8; 20] = [0x69; 20];
+
+    /// Receipts (each with the block it is in), and block timestamps.
+    #[derive(Default)]
+    pub(crate) struct MockChain {
+        pub(crate) receipts: HashMap<[u8; 32], PaymentReceipt>,
+        pub(crate) blocks: BTreeMap<u64, u64>,
+        /// The widest block range `eth_getLogs` answers, as providers cap
+        /// it; wider ones get a JSON-RPC error.
+        pub(crate) max_log_range: Option<u64>,
+        /// The methods called, in order.
+        pub(crate) calls: Vec<String>,
+    }
+
+    impl MockChain {
+        /// Blocks `0..blocks`, two seconds apart from `start`.
+        pub(crate) fn with_blocks(blocks: u64, start: u64) -> Self {
+            Self {
+                blocks: (0..blocks)
+                    .map(|number| (number, start + number * 2))
+                    .collect(),
+                ..Self::default()
+            }
+        }
+
+        pub(crate) fn add_receipt(&mut self, receipt: PaymentReceipt) {
+            self.receipts.insert(receipt.tx_hash, receipt);
+        }
+
+        /// How many calls of `method` were made.
+        pub(crate) fn calls_to(&self, method: &str) -> usize {
+            self.calls.iter().filter(|call| *call == method).count()
+        }
+
+        /// The result of a call, or a JSON-RPC error message.
+        fn answer(&self, method: &str, params: &Value) -> std::result::Result<Value, String> {
+            if method == "eth_getLogs" {
+                let filter = &params[0];
+                let bound = |key: &str| filter[key].as_str().and_then(parse_u64).unwrap_or(0);
+                let blocks = bound("toBlock").saturating_sub(bound("fromBlock")) + 1;
+                if self.max_log_range.is_some_and(|max| blocks > max) {
+                    return Err(format!("block range too wide: {blocks}"));
+                }
+            }
+            Ok(self.result(method, params))
+        }
+
+        fn result(&self, method: &str, params: &Value) -> Value {
+            match method {
+                "eth_getTransactionReceipt" => {
+                    let hash = params[0].as_str().and_then(parse_bytes::<32>);
+                    match hash.and_then(|hash| self.receipts.get(&hash)) {
+                        Some(receipt) => receipt_json(receipt),
+                        None => Value::Null,
+                    }
+                }
+                "eth_getBlockByNumber" => {
+                    let number = params[0].as_str().and_then(parse_u64);
+                    match number.and_then(|number| self.blocks.get(&number)) {
+                        Some(timestamp) => json!({ "timestamp": quantity(*timestamp) }),
+                        None => Value::Null,
+                    }
+                }
+                "eth_blockNumber" => json!(quantity(
+                    self.blocks.keys().next_back().copied().unwrap_or(0)
+                )),
+                "eth_getLogs" => {
+                    let filter = &params[0];
+                    let from = filter["fromBlock"]
+                        .as_str()
+                        .and_then(parse_u64)
+                        .unwrap_or(0);
+                    let to = filter["toBlock"].as_str().and_then(parse_u64).unwrap_or(0);
+                    let topics: Vec<Option<[u8; 32]>> = filter["topics"]
+                        .as_array()
+                        .map(|topics| {
+                            topics
+                                .iter()
+                                .map(|topic| topic.as_str().and_then(parse_bytes::<32>))
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    let mut logs = Vec::new();
+                    for receipt in self.receipts.values() {
+                        if receipt.block_number < from || receipt.block_number > to {
+                            continue;
+                        }
+                        for log in &receipt.logs {
+                            let matches = topics.iter().enumerate().all(|(i, topic)| {
+                                topic.is_none_or(|topic| log.topics.get(i) == Some(&topic))
+                            });
+                            if matches {
+                                logs.push(json!({
+                                    "transactionHash": format!("0x{}", hex::encode(receipt.tx_hash)),
+                                    "blockNumber": quantity(receipt.block_number),
+                                    "logIndex": quantity(log.log_index),
+                                }));
+                            }
+                        }
+                    }
+                    Value::Array(logs)
+                }
+                _ => Value::Null,
+            }
+        }
+    }
+
+    fn receipt_json(receipt: &PaymentReceipt) -> Value {
+        json!({
+            "status": if receipt.success { "0x1" } else { "0x0" },
+            "blockNumber": quantity(receipt.block_number),
+            "logs": receipt.logs.iter().map(|log| json!({
+                "address": format!("0x{}", hex::encode(log.address)),
+                "topics": log.topics.iter().map(|t| format!("0x{}", hex::encode(t))).collect::<Vec<_>>(),
+                "logIndex": quantity(log.log_index),
+            })).collect::<Vec<_>>(),
+        })
+    }
+
+    /// Serve `chain` on a local port; the RPC URL.
+    pub(crate) async fn serve(chain: Arc<Mutex<MockChain>>) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let url = format!("http://{}", listener.local_addr().expect("address"));
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let chain = Arc::clone(&chain);
+                tokio::spawn(async move {
+                    let Some(body) = read_request(&mut socket).await else {
+                        return;
+                    };
+                    let request: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+                    let method = request["method"].as_str().unwrap_or_default().to_string();
+                    let answer = {
+                        let mut chain = chain.lock().expect("chain lock");
+                        chain.calls.push(method.clone());
+                        chain.answer(&method, &request["params"])
+                    };
+                    let body = match answer {
+                        Ok(result) => json!({ "jsonrpc": "2.0", "id": 1, "result": result }),
+                        Err(message) => json!({
+                            "jsonrpc": "2.0",
+                            "id": 1,
+                            "error": { "code": -32_000, "message": message },
+                        }),
+                    }
+                    .to_string();
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = socket.write_all(response.as_bytes()).await;
+                    let _ = socket.shutdown().await;
+                });
+            }
+        });
+        url
+    }
+
+    async fn read_request(socket: &mut tokio::net::TcpStream) -> Option<Vec<u8>> {
+        let mut buffer = Vec::new();
+        let mut chunk = [0u8; 4096];
+        loop {
+            let read = socket.read(&mut chunk).await.ok()?;
+            if read == 0 {
+                return None;
+            }
+            buffer.extend_from_slice(&chunk[..read]);
+            let Some(end) = buffer.windows(4).position(|w| w == b"\r\n\r\n") else {
+                continue;
+            };
+            let head = String::from_utf8_lossy(&buffer[..end]).to_ascii_lowercase();
+            let length = head
+                .lines()
+                .find_map(|line| line.strip_prefix("content-length:"))
+                .and_then(|value| value.trim().parse::<usize>().ok())
+                .unwrap_or(0);
+            let body_start = end + 4;
+            while buffer.len() < body_start + length {
+                let read = socket.read(&mut chunk).await.ok()?;
+                if read == 0 {
+                    return None;
+                }
+                buffer.extend_from_slice(&chunk[..read]);
+            }
+            return Some(buffer[body_start..body_start + length].to_vec());
+        }
+    }
+
+    /// A vault log paying `quote` (rewards address and amount as the vault
+    /// emits them).
+    pub(crate) fn paying_log(
+        quote: &ant_protocol::evm::PaymentQuote,
+        log_index: u64,
+    ) -> PaymentLog {
+        let mut rewards = [0u8; 32];
+        rewards[12..].copy_from_slice(quote.rewards_address.as_slice());
+        let mut amount = [0u8; 32];
+        amount[31] = 30;
+        PaymentLog {
+            address: VAULT,
+            topics: vec![DATA_PAYMENT_MADE_TOPIC, rewards, amount, quote.hash().0],
+            log_index,
+        }
+    }
+
+    /// A signed quote for `content`, at a whole second.
+    pub(crate) fn signed_quote(content: [u8; 32], price: u64) -> ant_protocol::evm::PaymentQuote {
+        use ant_protocol::evm::{Amount, PaymentQuote, RewardsAddress};
+        let identity = ant_protocol::transport::NodeIdentity::generate().expect("identity");
+        let mut quote = PaymentQuote {
+            content: xor_name::XorName(content),
+            timestamp: std::time::UNIX_EPOCH + Duration::from_secs(1_800_000_000),
+            price: Amount::from(price),
+            rewards_address: RewardsAddress::new([price as u8; 20]),
+            pub_key: identity.public_key().as_bytes().to_vec(),
+            signature: Vec::new(),
+            committed_key_count: 0,
+            commitment_pin: None,
+        };
+        quote.signature = identity
+            .sign(&quote.bytes_for_sig())
+            .expect("sign")
+            .as_bytes()
+            .to_vec();
+        quote
+    }
+
+    /// A chain reader for `url` with the test vault.
+    pub(crate) fn reader(url: String) -> ListingChain {
+        ListingChain::with_rpc(url, VAULT).expect("reader")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::test_chain::{paying_log, reader, serve, signed_quote, MockChain, VAULT};
+    use super::*;
+    use ant_listings::{
+        first_seen_at, Flags, ListingError, Metadata, Payment, PaymentField, ShownFields,
+    };
+    use std::sync::{Arc, Mutex};
+
+    const NEAREST: [u8; 7] = [1, 2, 3, 4, 5, 6, 7];
+
+    fn reported_listing(block_number: u64, first_seen: u64) -> Listing {
+        Listing {
+            address: [7; 32],
+            flags: Flags {
+                shown: ShownFields::NONE.with(PaymentField::BlockNumber),
+                in_index: true,
+                withheld: false,
+            },
+            metadata: Metadata::default(),
+            size: Some(4_000),
+            payment: ListingPayment {
+                block_number: Some(block_number),
+                ..ListingPayment::default()
+            },
+            first_seen: Some(first_seen),
+        }
+    }
+
+    fn reported(_: &Listing) -> std::result::Result<ListingCheck, ant_listings::PaymentError> {
+        Ok(ListingCheck {
+            level: CheckLevel::Reported,
+            paid_at: None,
+        })
+    }
+
+    /// Merge `copies`, check each group with `check` among `nearest` as
+    /// [`check_copies`] does, and decide with `expected` nearest nodes.
+    fn decide_among(
+        copies: Vec<(u8, Listing)>,
+        nearest: &[u8],
+        expected: usize,
+        check: impl Fn(&Listing) -> std::result::Result<ListingCheck, PaymentError>,
+    ) -> (Option<CountingListing>, RejectedGroups) {
+        let groups = merge_copies(copies);
+        let needed = quorum_needed(expected.max(nearest.len()));
+        let checked = groups
+            .iter()
+            .map(|group| check_copies(group, nearest, needed, &check).map_err(CheckProblem::from))
+            .collect();
+        decide_address(&groups, checked, nearest, expected)
+    }
+
+    /// Merge `copies`, check each group with `check` among [`NEAREST`], and
+    /// decide.
+    fn decide(
+        copies: Vec<(u8, Listing)>,
+        check: impl Fn(&Listing) -> std::result::Result<ListingCheck, PaymentError>,
+    ) -> (Option<CountingListing>, RejectedGroups) {
+        decide_among(copies, &NEAREST, NEAREST.len(), check)
+    }
+
+    #[test]
+    fn copies_differing_only_in_first_seen_merge_and_a_quorum_dates_them() {
+        let hour = FIRST_SEEN_ROUNDING;
+        let base = 1_790_996_400;
+        let copies: Vec<(u8, Listing)> = [(1, 0), (2, 1), (3, 1), (4, 2), (5, 3)]
+            .into_iter()
+            .map(|(peer, hours)| (peer, reported_listing(100, base + hours * hour)))
+            .collect();
+        let groups = merge_copies(copies.clone());
+        assert_eq!(groups.len(), 1);
+        let (chosen, rejected) = decide(copies, reported);
+        assert!(rejected.is_empty());
+        let (listing, level, nodes, quorum) = chosen.expect("a quorum serves it");
+        assert_eq!(level, CheckLevel::Reported);
+        assert_eq!((nodes, quorum), (5, true));
+        // Of 0, 1, 1, 2, 3 hours, four date it at 2 hours or earlier (the
+        // median, 1 hour, has only three).
+        assert_eq!(listing.first_seen, Some(base + 2 * hour));
+    }
+
+    #[test]
+    fn a_listing_without_its_quote_needs_four_of_the_seven_nearest() {
+        let first_seen = 1_790_996_400;
+        let served_by = |peers: &[u8]| -> Vec<(u8, Listing)> {
+            peers
+                .iter()
+                .map(|peer| (*peer, reported_listing(100, first_seen)))
+                .collect()
+        };
+        let (chosen, _) = decide(served_by(&[1, 2, 3, 4]), reported);
+        assert_eq!(chosen.map(|(_, _, nodes, _)| nodes), Some(4));
+        let (chosen, rejected) = decide(served_by(&[1, 2, 3]), reported);
+        assert!(chosen.is_none());
+        assert_eq!(rejected.len(), 1);
+        assert!(rejected[0]
+            .1
+            .contains("reported by 3 of the 7 nodes nearest its address, needs 4"));
+        // Copies from nodes that aren't among the nearest don't count.
+        let (chosen, _) = decide(served_by(&[1, 2, 3, 40, 41, 42]), reported);
+        assert!(chosen.is_none());
+        // A node serving a listing nobody else has.
+        let (chosen, rejected) = decide(served_by(&[1]), reported);
+        assert!(chosen.is_none());
+        assert_eq!(rejected.len(), 1);
+    }
+
+    #[test]
+    fn three_nodes_serving_a_changed_listing_are_outvoted() {
+        let first_seen = 1_790_996_400;
+        let mut copies: Vec<(u8, Listing)> = [1, 2, 3, 4]
+            .into_iter()
+            .map(|peer| (peer, reported_listing(100, first_seen)))
+            .collect();
+        copies.extend(
+            [5, 6, 7]
+                .into_iter()
+                .map(|peer| (peer, reported_listing(99, first_seen))),
+        );
+        let (chosen, rejected) = decide(copies, reported);
+        let (listing, _, nodes, _) = chosen.expect("the four agree");
+        assert_eq!(listing.payment.block_number, Some(100));
+        assert_eq!(nodes, 4);
+        assert_eq!(rejected.len(), 1);
+        assert!(rejected[0].1.contains("reported by 3"));
+        // A peer that sent two different copies counts for neither.
+        let mut copies: Vec<(u8, Listing)> = [1, 2, 3, 4]
+            .into_iter()
+            .map(|peer| (peer, reported_listing(100, first_seen)))
+            .collect();
+        copies.push((4, reported_listing(99, first_seen)));
+        let (chosen, _) = decide(copies, reported);
+        assert!(chosen.is_none());
+    }
+
+    /// Merge `copies`, check each group as reported among `nearest`, and
+    /// decide with `expected` nearest nodes.
+    fn decide_reported_among(
+        copies: Vec<(u8, Listing)>,
+        nearest: &[u8],
+        expected: usize,
+    ) -> (Option<CountingListing>, RejectedGroups) {
+        decide_among(copies, nearest, expected, reported)
+    }
+
+    fn served_by(peers: &[u8]) -> Vec<(u8, Listing)> {
+        peers
+            .iter()
+            .map(|peer| (*peer, reported_listing(100, 1_790_996_400)))
+            .collect()
+    }
+
+    #[test]
+    fn a_short_lookup_never_lowers_the_quorum() {
+        assert_eq!(expected_nearest(10_000), NEAREST_NODES);
+        assert_eq!(expected_nearest(3), 3);
+        // The lookup found 1 or 2 of the 7: one or two nodes serving a
+        // listing that hides its quote are not a quorum, and the reason says
+        // to try again.
+        for found in [&[1u8][..], &[1, 2]] {
+            let (chosen, rejected) = decide_reported_among(served_by(found), found, 7);
+            assert!(chosen.is_none());
+            assert_eq!(rejected.len(), 1);
+            assert!(
+                rejected[0].1.contains("too few nearest nodes found"),
+                "{}",
+                rejected[0].1
+            );
+        }
+        // Four of the five found serve it: a quorum of the seven all the same.
+        let (chosen, _) = decide_reported_among(served_by(&[1, 2, 3, 4]), &[1, 2, 3, 4, 5], 7);
+        assert_eq!(
+            chosen.map(|(_, _, nodes, quorum)| (nodes, quorum)),
+            Some((4, true))
+        );
+        // On a network of three nodes, two of them are a quorum.
+        let (chosen, _) =
+            decide_reported_among(served_by(&[1, 2]), &[1, 2, 3], expected_nearest(3));
+        assert_eq!(chosen.map(|(_, _, nodes, _)| nodes), Some(2));
+        // A lookup that finds more than expected counts as found.
+        let (chosen, rejected) = decide_reported_among(served_by(&[1, 2]), &NEAREST, 2);
+        assert!(chosen.is_none());
+        assert!(rejected[0].1.contains("reported by 2 of the 7"));
+    }
+
+    #[test]
+    fn nodes_already_heard_from_are_not_asked_again() {
+        let groups = merge_copies(served_by(&[1, 2]));
+        let needed = quorum_needed(NEAREST.len());
+        let asked = |heard: &[u8], walked: &[(u8, u64)]| {
+            let heard: HashSet<u8> = heard.iter().copied().collect();
+            let walked: HashMap<u8, u64> = walked.iter().copied().collect();
+            let mut to_ask = peers_to_ask(&groups, &NEAREST, needed, &heard, &walked);
+            to_ask.sort_unstable();
+            to_ask
+        };
+        // Reading the index: the nodes that sent a copy are heard; the other
+        // nearest nodes are asked, unless a walk of their whole index began
+        // late enough to answer for it.
+        assert_eq!(asked(&[1, 2], &[]), vec![3, 4, 5, 6, 7]);
+        let late = 1_790_996_400 + 3 * FIRST_SEEN_ROUNDING;
+        assert_eq!(asked(&[1, 2], &[(3, late)]), vec![4, 5, 6, 7]);
+        // `ant listing`: every nearest node was asked already, so none is
+        // asked again.
+        assert!(asked(&NEAREST, &[]).is_empty());
+        // A listing a quorum serves needs no more answers, nor does any
+        // other copy for its address: none can reach a quorum.
+        let groups = merge_copies(served_by(&[1, 2, 3, 4]));
+        assert!(peers_to_ask(
+            &groups,
+            &NEAREST,
+            needed,
+            &[1, 2, 3, 4].into_iter().collect(),
+            &HashMap::new()
+        )
+        .is_empty());
+        let mut copies = served_by(&[1, 2, 3, 4]);
+        copies.push((5, reported_listing(99, 1_790_996_400)));
+        let groups = merge_copies(copies);
+        assert_eq!(groups.len(), 2);
+        assert!(peers_to_ask(
+            &groups,
+            &NEAREST,
+            needed,
+            &[1, 2, 3, 4, 5].into_iter().collect(),
+            &HashMap::new()
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn a_listing_showing_its_quote_without_a_quorum_asks_the_others_too() {
+        // A quoting node's own payment and the upload's, two nearest nodes
+        // each: which counts, and whether it has a quorum, rests on the
+        // nearest nodes not heard from yet.
+        let mut copies = vec![(1, verified_listing(1)), (2, verified_listing(1))];
+        copies.extend([(3, verified_listing(2)), (4, verified_listing(2))]);
+        let groups = merge_copies(copies);
+        let needed = quorum_needed(NEAREST.len());
+        let heard: HashSet<u8> = [1, 2, 3, 4].into_iter().collect();
+        let mut to_ask = peers_to_ask(&groups, &NEAREST, needed, &heard, &HashMap::new());
+        to_ask.sort_unstable();
+        assert_eq!(to_ask, vec![5, 6, 7]);
+        // Once four serve one of them, nothing more is asked.
+        let mut copies = vec![(1, verified_listing(1))];
+        copies.extend([2, 3, 4, 5].map(|peer| (peer, verified_listing(2))));
+        let groups = merge_copies(copies);
+        let heard: HashSet<u8> = [1, 2, 3, 4, 5].into_iter().collect();
+        assert!(peers_to_ask(&groups, &NEAREST, needed, &heard, &HashMap::new()).is_empty());
+    }
+
+    fn verified_listing(quote: u8) -> Listing {
+        Listing {
+            address: [7; 32],
+            flags: Flags {
+                shown: ShownFields::ALL,
+                in_index: true,
+                withheld: false,
+            },
+            metadata: Metadata::default(),
+            size: Some(4_000),
+            payment: ListingPayment {
+                tx_hash: Some([quote; 32]),
+                block_number: Some(100 + u64::from(quote)),
+                block_timestamp: Some(1_790_996_400 + u64::from(quote)),
+                log_index: Some(1),
+                quote: Some(vec![quote; 8]),
+            },
+            first_seen: None,
+        }
+    }
+
+    #[test]
+    fn of_several_verified_payments_the_one_a_quorum_serves_counts() {
+        // A quoting node paid first (block 101) and serves its own copy; the
+        // close group serves the uploader's (block 102).
+        let mut copies = vec![(1, verified_listing(1))];
+        copies.extend(
+            [2, 3, 4, 5]
+                .into_iter()
+                .map(|peer| (peer, verified_listing(2))),
+        );
+        let verified = |listing: &Listing| {
+            Ok(ListingCheck {
+                level: CheckLevel::Verified,
+                paid_at: Some(PaidAt {
+                    block_number: listing.payment.block_number.unwrap_or_default(),
+                    log_index: 1,
+                }),
+            })
+        };
+        let (chosen, rejected) = decide(copies.clone(), verified);
+        let (listing, level, nodes, quorum) = chosen.expect("verified");
+        assert_eq!(level, CheckLevel::Verified);
+        assert_eq!(listing.payment.block_number, Some(102));
+        assert_eq!((nodes, quorum), (4, true));
+        assert_eq!(rejected.len(), 1);
+        // Without a quorum for any, the earliest stands in, marked.
+        let (chosen, _) = decide(copies[..3].to_vec(), verified);
+        let (listing, _, nodes, quorum) = chosen.expect("verified");
+        assert_eq!(listing.payment.block_number, Some(101));
+        assert_eq!((nodes, quorum), (1, false));
+    }
+
+    #[test]
+    fn a_short_lookup_marks_a_verified_listing_without_a_quorum() {
+        let verified = |listing: &Listing| {
+            Ok(ListingCheck {
+                level: CheckLevel::Verified,
+                paid_at: Some(PaidAt {
+                    block_number: listing.payment.block_number.unwrap_or_default(),
+                    log_index: 1,
+                }),
+            })
+        };
+        // Three nearest nodes found of seven: two serving the later payment
+        // are not a quorum, so the earliest stands in, marked.
+        let copies = vec![
+            (1, verified_listing(1)),
+            (2, verified_listing(2)),
+            (3, verified_listing(2)),
+        ];
+        let (chosen, rejected) = decide_among(copies, &[1u8, 2, 3], 7, verified);
+        let (listing, level, nodes, quorum) = chosen.expect("verified");
+        assert_eq!(level, CheckLevel::Verified);
+        assert_eq!(listing.payment.block_number, Some(101));
+        assert_eq!((nodes, quorum), (1, false));
+        assert_eq!(rejected.len(), 1);
+    }
+
+    #[test]
+    fn the_verified_choice_prefers_a_quorum_then_the_earliest() {
+        let at = |block_number| PaidAt {
+            block_number,
+            log_index: 0,
+        };
+        assert_eq!(
+            choose_verified_with_quorum(Vec::<((), usize, PaidAt)>::new(), 4),
+            None
+        );
+        // The quorum's payment, though a later one.
+        assert_eq!(
+            choose_verified_with_quorum(vec![('a', 1, at(5)), ('b', 4, at(9)), ('c', 5, at(7))], 4),
+            Some(('c', 5, at(7), true))
+        );
+        // None with a quorum: the earliest, unmarked; the first on a tie.
+        assert_eq!(
+            choose_verified_with_quorum(vec![('a', 3, at(9)), ('b', 2, at(5)), ('c', 1, at(5))], 4),
+            Some(('b', 2, at(5), false))
+        );
+    }
+
+    #[test]
+    fn walks_from_a_time_start_early_enough_for_every_first_seen() {
+        assert_eq!(walk_start(0), ListingKey::MIN);
+        let start = walk_start(1_790_996_400);
+        assert_eq!(
+            start.time,
+            1_790_996_400 - FIRST_SEEN_ROUNDING - CLOCK_MARGIN
+        );
+        assert_eq!(start.block_number, 0);
+        assert_eq!(walk_start(5).time, 0);
+    }
+
+    #[tokio::test]
+    async fn the_chain_is_read_for_every_lookup() {
+        let quote = signed_quote([7; 32], 20);
+        let mut chain = MockChain::with_blocks(200, 1_800_000_000);
+        chain.add_receipt(PaymentReceipt {
+            tx_hash: [0xaa; 32],
+            success: true,
+            block_number: 150,
+            logs: vec![paying_log(&quote, 4)],
+        });
+        let url = serve(Arc::new(Mutex::new(chain))).await;
+        let chain = reader(url);
+        let shown = ListingPayment::default();
+        assert_eq!(chain.vault(), &VAULT);
+
+        let fetch = |lookup: Lookup| {
+            let (chain, shown) = (&chain, &shown);
+            async move { chain.fetch(&lookup, shown).await.unwrap() }
+        };
+
+        let by_tx = fetch(Lookup::Transaction {
+            tx_hash: [0xaa; 32],
+        })
+        .await;
+        assert_eq!(by_tx.len(), 1);
+        assert_eq!(by_tx[0].1, Some(1_800_000_300));
+        assert!(fetch(Lookup::Transaction {
+            tx_hash: [0xbb; 32]
+        })
+        .await
+        .is_empty());
+
+        let by_quote = |block_number| Lookup::Quote {
+            quote_hash: quote.hash().0,
+            block_number,
+            search_from: 1_800_000_000,
+            not_after: None,
+        };
+        assert_eq!(fetch(by_quote(Some(150))).await.len(), 1);
+        assert!(fetch(by_quote(Some(149))).await.is_empty());
+        assert_eq!(fetch(by_quote(None)).await.len(), 1);
+
+        let at = |log_index| Lookup::BlockLog {
+            block_number: 150,
+            log_index,
+        };
+        assert_eq!(fetch(at(4)).await.len(), 1);
+        assert!(fetch(at(5)).await.is_empty());
+
+        let block = fetch(Lookup::Block { block_number: 10 }).await;
+        assert_eq!(block, vec![(None, Some(1_800_000_020))]);
+        let missing = fetch(Lookup::Block { block_number: 999 }).await;
+        assert_eq!(missing, vec![(None, None)]);
+        assert!(fetch(Lookup::Nothing).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_listing_hiding_its_quote_is_checked_as_far_as_it_shows() {
+        // An envelope paid in block 150, log 4, of a transaction that paid
+        // other chunks too.
+        let map = {
+            let (map, _) = self_encryption::encrypt(bytes::Bytes::from(vec![1u8; 4000])).unwrap();
+            map
+        };
+        let shown = ShownFields::NONE
+            .with(PaymentField::BlockNumber)
+            .with(PaymentField::LogIndex);
+        let envelope = Envelope::readable(&map, Metadata::default(), shown, true).unwrap();
+        let quote = signed_quote(envelope.address(), 20);
+        let mut chain = MockChain::with_blocks(200, 1_800_000_000);
+        chain.add_receipt(PaymentReceipt {
+            tx_hash: [0xaa; 32],
+            success: true,
+            block_number: 150,
+            logs: vec![
+                paying_log(&signed_quote([3; 32], 20), 3),
+                paying_log(&quote, 4),
+            ],
+        });
+        let url = serve(Arc::new(Mutex::new(chain))).await;
+        let chain = reader(url);
+        let payment = ant_listings::Payment {
+            tx_hash: [0xaa; 32],
+            block_number: 150,
+            block_timestamp: 1_800_000_300,
+            log_index: 4,
+            quote: rmp_serde::to_vec(&quote).unwrap(),
+        };
+        let listing = Listing::new(&envelope, &payment, 1_800_000_400);
+        assert_eq!(listing.payment.tx_hash, None);
+        let now = 1_800_000_500;
+        let copies: Vec<(u8, Listing)> = NEAREST[..4]
+            .iter()
+            .map(|peer| (*peer, listing.clone()))
+            .collect();
+        let groups = merge_copies(copies);
+        let checked = check_group(&groups[0], &envelope, &NEAREST, 4, &chain, now).await;
+        let (checked_listing, check) = checked.expect("checks out");
+        assert_eq!(check.level, CheckLevel::Reported);
+        assert_eq!(checked_listing.first_seen, listing.first_seen);
+        let (chosen, rejected) = decide_address(
+            &groups,
+            vec![Ok((checked_listing, check))],
+            &NEAREST,
+            NEAREST.len(),
+        );
+        assert!(rejected.is_empty());
+        assert_eq!(chosen.map(|(_, _, nodes, _)| nodes), Some(4));
+
+        // A changed log index points at another chunk's payment: still a
+        // vault payment, so only the quorum stands behind it; a log index
+        // with no vault payment fails.
+        let mut tampered = listing.clone();
+        tampered.payment.log_index = Some(9);
+        let groups = merge_copies(vec![(1u8, tampered)]);
+        assert!(check_group(&groups[0], &envelope, &NEAREST, 4, &chain, now)
+            .await
+            .is_err());
+    }
+
+    /// When the upload's payment was made: block 150 of a
+    /// [`MockChain::with_blocks`] chain from 1,800,000,000.
+    const BLOCK_TIME: u64 = 1_800_000_300;
+
+    /// A readable envelope showing `shown`, in the index if `in_index`.
+    fn envelope_showing(shown: ShownFields, in_index: bool) -> Envelope {
+        let (map, _) = self_encryption::encrypt(bytes::Bytes::from(vec![1u8; 4000])).unwrap();
+        Envelope::readable(&map, Metadata::default(), shown, in_index).unwrap()
+    }
+
+    /// The upload's payment of `envelope`: block 150, log index 4.
+    fn upload_payment(envelope: &Envelope) -> Payment {
+        Payment {
+            tx_hash: [0xaa; 32],
+            block_number: 150,
+            block_timestamp: BLOCK_TIME,
+            log_index: 4,
+            quote: rmp_serde::to_vec(&signed_quote(envelope.address(), 20)).unwrap(),
+        }
+    }
+
+    /// `listing` as each of `peers` sent it, with the date it gave.
+    fn dated_copies(listing: &Listing, peers: &[u8], dates: &[u64]) -> Vec<(u8, Listing)> {
+        peers
+            .iter()
+            .zip(dates)
+            .map(|(peer, date)| {
+                let mut copy = listing.clone();
+                copy.first_seen = Some(*date);
+                (*peer, copy)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_quorum_of_the_nearest_dates_a_listing_as_the_nodes_do() {
+        // In the index, nothing shown: dated by first_seen alone, with
+        // nothing on chain to bound it from below.
+        let envelope = envelope_showing(ShownFields::NONE, true);
+        let listing = Listing::new(&envelope, &upload_payment(&envelope), BLOCK_TIME);
+        let hour = first_seen_at(BLOCK_TIME);
+        assert_eq!(listing.first_seen, Some(hour));
+        let h = FIRST_SEEN_ROUNDING;
+        let now = hour + 3 * h;
+        let check =
+            |listing: &Listing| verify_listing_receipts(listing, &envelope, &[], &VAULT, now);
+        let dated_by = |dates: &[u64]| {
+            let (chosen, _) = decide(dated_copies(&listing, &NEAREST, dates), check);
+            chosen.map(|(listing, ..)| listing.first_seen.expect("dated"))
+        };
+
+        // All seven answer: their median.
+        assert_eq!(
+            dated_by(&[0, 0, 1, 1, 2, 2, 3].map(|n| hour + n * h)),
+            Some(hour + h)
+        );
+        // Fewer: the latest of the earliest four, so that four date it then
+        // or earlier (the median would be an hour earlier). One dating it in
+        // the future is not needed for that.
+        assert_eq!(
+            dated_by(&[0, 0, 1, 2, 100].map(|n| hour + n * h)),
+            Some(hour + 2 * h)
+        );
+        // Three dating it in 1970 can't move it before the earliest date
+        // another gives, however few others answer: the median of
+        // [1970, 1970, 1970, hour, hour] would be 1970.
+        assert_eq!(dated_by(&[0, 0, 0, hour]), Some(hour));
+        assert_eq!(dated_by(&[0, 0, 0, hour, hour]), Some(hour));
+        assert_eq!(dated_by(&[0, 0, 0, hour, hour - h]), Some(hour - h));
+        // Four answer and one dates it in the future: that date is dropped,
+        // so one node can't fail a listing three others date honestly.
+        assert_eq!(dated_by(&[hour, hour, hour, hour + 100 * h]), Some(hour));
+        // Three: not a quorum, so a listing hiding its quote doesn't count.
+        assert_eq!(dated_by(&[hour, hour, hour]), None);
+    }
+
+    #[test]
+    fn only_the_nearest_nodes_date_a_listing() {
+        let envelope = envelope_showing(ShownFields::NONE, true);
+        let listing = Listing::new(&envelope, &upload_payment(&envelope), BLOCK_TIME);
+        let hour = first_seen_at(BLOCK_TIME);
+        let check =
+            |listing: &Listing| verify_listing_receipts(listing, &envelope, &[], &VAULT, hour);
+        // Four of the nearest date it at `hour`; ten other nodes dating it
+        // in 1970 neither count nor move it.
+        let mut copies = dated_copies(&listing, &NEAREST[..4], &[hour; 4]);
+        let others: Vec<u8> = (40..50).collect();
+        copies.extend(dated_copies(&listing, &others, &[0; 10]));
+        let (chosen, rejected) = decide(copies, check);
+        assert!(rejected.is_empty());
+        let (dated, _, nodes, quorum) = chosen.expect("four of the nearest serve it");
+        assert_eq!((dated.first_seen, nodes, quorum), (Some(hour), 4, true));
+        // Served by other nodes alone, it doesn't count.
+        let (chosen, rejected) = decide(dated_copies(&listing, &others, &[hour; 10]), check);
+        assert!(chosen.is_none());
+        assert_eq!(rejected.len(), 1);
+    }
+
+    /// A verified listing that hides its block timestamp, so it is dated by
+    /// `first_seen`.
+    fn dated_verified_listing(first_seen: u64) -> Listing {
+        let mut listing = verified_listing(1);
+        listing.flags.shown = ShownFields::ALL.without(PaymentField::BlockTimestamp);
+        listing.payment.block_timestamp = None;
+        listing.first_seen = Some(first_seen);
+        listing
+    }
+
+    #[test]
+    fn dates_out_of_bounds_count_only_as_the_nodes_count_them() {
+        // The payment's block is timed `paid`: a date more than the rounding
+        // and clock margin before it is too early; one after `now` is in the
+        // future.
+        let paid = 1_790_996_400;
+        let h = FIRST_SEEN_ROUNDING;
+        let now = paid + 10 * h;
+        let check = |listing: &Listing| {
+            let first_seen = listing.first_seen.expect("dated");
+            if first_seen + FIRST_SEEN_ROUNDING + CLOCK_MARGIN < paid {
+                Err(PaymentError::FirstSeenTooEarly)
+            } else if first_seen > now + CLOCK_MARGIN {
+                Err(PaymentError::Malformed(ListingError::TimeInFuture))
+            } else {
+                Ok(ListingCheck {
+                    level: CheckLevel::Verified,
+                    paid_at: Some(PaidAt {
+                        block_number: 101,
+                        log_index: 1,
+                    }),
+                })
+            }
+        };
+        let dated_by = |dates: &[u64]| {
+            let copies = dated_copies(&dated_verified_listing(paid), &NEAREST, dates);
+            let (chosen, _) = decide(copies, check);
+            chosen.map(|(listing, _, nodes, quorum)| (listing.first_seen, nodes, quorum))
+        };
+        let early = 0;
+
+        // Without a quorum each date is checked on its own and the median of
+        // those that pass taken: one too early or in the future neither
+        // fails the listing nor moves its date.
+        assert_eq!(
+            dated_by(&[early, paid, paid + h]),
+            Some((Some(paid + h), 3, false))
+        );
+        assert_eq!(
+            dated_by(&[early, paid, now + 100 * h]),
+            Some((Some(paid), 3, false))
+        );
+        // With a quorum, dates that fail their own check are dropped first:
+        // three dating it before its payment neither fail it nor date it.
+        // Fewer than four dates are left, so it takes their median.
+        assert_eq!(
+            dated_by(&[early, early, early, paid, paid + h]),
+            Some((Some(paid + h), 5, true))
+        );
+        // Where every date passes, the latest of the earliest four.
+        assert_eq!(
+            dated_by(&[paid, paid, paid, paid + h, paid + h]),
+            Some((Some(paid + h), 5, true))
+        );
+        assert_eq!(
+            dated_by(&[paid, paid, paid, paid, paid + h]),
+            Some((Some(paid), 5, true))
+        );
+        // Four dating it before its payment, which no node can: those dates
+        // are dropped, and the one that checks out dates it.
+        assert_eq!(
+            dated_by(&[early, early, early, early, paid]),
+            Some((Some(paid), 5, true))
+        );
+    }
+
+    fn peer(n: u8) -> PeerId {
+        PeerId::from_bytes([n; 32])
+    }
+
+    /// A walk of `peer` from `from`, stopped at `reached` (`None`: to the
+    /// end), begun at `began`.
+    fn walk_of(
+        peer: PeerId,
+        from: ListingKey,
+        reached: Option<ListingKey>,
+        began: u64,
+    ) -> NodeReport<PeerId> {
+        NodeReport {
+            peer,
+            outcome: if reached.is_none() {
+                WalkOutcome::Complete
+            } else {
+                WalkOutcome::Deadline
+            },
+            problem: None,
+            from,
+            reached,
+            began: Some(began),
+            pages: 3,
+            listings: 600,
+            backed: 300,
+        }
+    }
+
+    #[test]
+    fn walk_state_carries_on_stopped_walks_and_forgets_finished_ones() {
+        let key = ListingKey {
+            time: 1_800_000_000,
+            block_number: 5,
+            log_index: 1,
+            address: [9; 32],
+        };
+        let stopped = WalkReport {
+            peer: peer(1),
+            outcome: WalkOutcome::Budget,
+            problem: None,
+            pages: 8,
+            listings: 2_048,
+            backed: 0,
+            resume: Some(key),
+        };
+        let finished = WalkReport {
+            peer: peer(2),
+            outcome: WalkOutcome::Complete,
+            problem: None,
+            pages: 3,
+            listings: 600,
+            backed: 600,
+            resume: None,
+        };
+        let mut state = WalkState::default();
+        state.record(24, &[stopped.clone(), finished]);
+        assert_eq!(state.resume_for(&peer(1)), Some(key));
+        assert_eq!(state.resume_for(&peer(2)), None);
+        assert_eq!(state.resuming(), 1);
+
+        // It survives being saved, and an empty file is no state.
+        let saved = serde_json::to_string(&state).unwrap();
+        assert_eq!(serde_json::from_str::<WalkState>(&saved).unwrap(), state);
+        assert_eq!(
+            serde_json::from_str::<WalkState>("{}").unwrap(),
+            WalkState::default()
+        );
+
+        // A walk that finishes forgets where it stopped before.
+        state.record(
+            24,
+            &[WalkReport {
+                resume: None,
+                ..stopped
+            }],
+        );
+        assert_eq!(state.resume_for(&peer(1)), None);
+
+        // Only recent reads say how many nodes there should be.
+        for nodes in [30, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10] {
+            state.record(nodes, &[]);
+        }
+        assert_eq!(state.recent_max(), 10);
+    }
+
+    #[test]
+    fn a_read_carries_what_it_did_not_decide() {
+        let key = ListingKey {
+            time: 1_800_000_000,
+            block_number: 7,
+            log_index: 0,
+            address: [0x42; 32],
+        };
+        let late_enough = key.time + FIRST_SEEN_ROUNDING + CLOCK_MARGIN;
+        let peers: Vec<PeerId> = (1..=8).map(peer).collect();
+        let index_with = |walks: Vec<NodeReport<PeerId>>, served: bool, decided: bool| {
+            let only = |yes: bool| {
+                if yes {
+                    HashSet::from([key.address])
+                } else {
+                    HashSet::new()
+                }
+            };
+            ListingsIndex {
+                coverage: Coverage {
+                    ids: walks.iter().map(|walk| *walk.peer.as_bytes()).collect(),
+                    walks,
+                    served: only(served),
+                    decided: only(decided),
+                },
+                ..ListingsIndex::default()
+            }
+        };
+        let full = |began: u64| -> Vec<NodeReport<PeerId>> {
+            peers
+                .iter()
+                .map(|peer| walk_of(*peer, ListingKey::MIN, None, began))
+                .collect()
+        };
+        let carry = |index: &ListingsIndex| index.carry(&key.address, &key);
+
+        assert_eq!(
+            carry(&index_with(full(late_enough), true, true)),
+            Carry::Decided
+        );
+        assert_eq!(
+            carry(&index_with(full(late_enough), true, false)),
+            Carry::Keep
+        );
+        // Every node nearest it walked past it, late enough, without
+        // serving it.
+        assert_eq!(
+            carry(&index_with(full(late_enough), false, false)),
+            Carry::NoLongerServed
+        );
+        // Walks that began too soon after its time may have passed its place
+        // before the nodes stored it.
+        assert_eq!(
+            carry(&index_with(full(late_enough - 1), false, false)),
+            Carry::Keep
+        );
+        // One of its nearest nodes stopped before reaching it.
+        let ids: Vec<[u8; 32]> = peers.iter().map(|peer| *peer.as_bytes()).collect();
+        let nearest = nearest_by_distance(&key.address, &ids, NEAREST_NODES);
+        let mut walks = full(late_enough);
+        walks[nearest[0]] = walk_of(peers[nearest[0]], ListingKey::MIN, Some(key), late_enough);
+        assert_eq!(carry(&index_with(walks, false, false)), Carry::Keep);
+        // A node further away doesn't count.
+        let far = (0..peers.len())
+            .find(|node| !nearest.contains(node))
+            .expect("eight nodes");
+        let mut walks = full(late_enough);
+        walks[far] = walk_of(peers[far], ListingKey::MIN, Some(key), late_enough);
+        assert_eq!(
+            carry(&index_with(walks, false, false)),
+            Carry::NoLongerServed
+        );
+        // A read that saw too few nodes never says a listing is gone.
+        let mut index = index_with(full(late_enough), false, false);
+        index.too_few_nodes = true;
+        assert_eq!(carry(&index), Carry::Keep);
+        assert_eq!(
+            carry(&index_with(full(late_enough)[..6].to_vec(), false, false)),
+            Carry::Keep
+        );
+    }
+
+    #[test]
+    fn an_address_too_few_serve_is_shown_to_try_again() {
+        let nearest: Vec<PeerId> = (1..=7).map(peer).collect();
+        let listing = verified_listing(1);
+        let found = AddressWalk {
+            address: listing.address,
+            nearest,
+            copies: vec![
+                (peer(1), listing.clone()),
+                (peer(2), listing.clone()),
+                (peer(3), verified_listing(2)),
+            ],
+            support: 3,
+        };
+        let shown = pending_listing(&found).expect("served");
+        assert!(shown.again);
+        assert_eq!((shown.nodes, shown.nearest), (2, 7));
+        assert_eq!(shown.listing, listing);
+        assert!(shown.problem.contains("3 of the 7"), "{}", shown.problem);
+    }
+
+    #[test]
+    fn a_decision_with_nothing_final_is_tried_again() {
+        let nearest: Vec<PeerId> = (1..=7).map(peer).collect();
+        let groups = merge_copies([(peer(1), verified_listing(1))]);
+        let envelope = envelope_showing(ShownFields::ALL, true);
+        let decide = |problem: &str| {
+            Decision::from_groups(
+                [1; 32],
+                &groups,
+                &nearest,
+                None,
+                vec![(0, problem.into())],
+                envelope.clone(),
+                Vec::new(),
+            )
+        };
+        let again = decide("could not read the payment chain: refused; try again");
+        assert!(!again.decided);
+        assert!(again.rejected[0].again);
+        let done = decide("the payment is not on chain");
+        assert!(done.decided);
+        assert!(!done.rejected[0].again);
+    }
+
+    #[tokio::test]
+    async fn the_listing_a_quorum_serves_is_tried_again_unless_it_fails() {
+        // In the index, the tx hash shown: one receipt to read.
+        let envelope = envelope_showing(ShownFields::NONE.with(PaymentField::TxHash), true);
+        let payment = upload_payment(&envelope);
+        let listing = Listing::new(&envelope, &payment, BLOCK_TIME);
+        let nearest: Vec<PeerId> = (1..=7).map(peer).collect();
+        let groups = merge_copies(nearest[..4].iter().map(|peer| (*peer, listing.clone())));
+        let now = BLOCK_TIME + 3_600;
+        let mock = || MockChain::with_blocks(200, 1_800_000_000);
+
+        // The chain has no such transaction (yet): a quorum checked it on
+        // chain when they stored it, so try again.
+        let empty = reader(serve(Arc::new(Mutex::new(mock()))).await);
+        let checked = check_quorum_group(&groups[0], &envelope, &nearest, &empty, now).await;
+        assert!(
+            matches!(&checked, Err(GroupProblem::Again(problem)) if is_again(problem)),
+            "{:?}",
+            checked.as_ref().err().map(|_| ())
+        );
+
+        // Once the chain has it, it checks out.
+        let mut chain = mock();
+        let quote: ant_protocol::evm::PaymentQuote = rmp_serde::from_slice(&payment.quote).unwrap();
+        chain.add_receipt(PaymentReceipt {
+            tx_hash: payment.tx_hash,
+            success: true,
+            block_number: 150,
+            logs: vec![paying_log(&quote, 4)],
+        });
+        let chain = reader(serve(Arc::new(Mutex::new(chain))).await);
+        let (dated, check) =
+            match check_quorum_group(&groups[0], &envelope, &nearest, &chain, now).await {
+                Ok(checked) => checked,
+                Err(GroupProblem::Again(p) | GroupProblem::Invalid(p)) => panic!("{p}"),
+            };
+        assert_eq!(check.level, CheckLevel::Reported);
+        assert_eq!(dated.first_seen, listing.first_seen);
+
+        // A listing that doesn't describe its envelope fails for good.
+        let mut changed = listing.clone();
+        changed.metadata.name = Some("other.txt".into());
+        let groups = merge_copies(nearest[..4].iter().map(|peer| (*peer, changed.clone())));
+        assert!(matches!(
+            check_quorum_group(&groups[0], &envelope, &nearest, &chain, now).await,
+            Err(GroupProblem::Invalid(_))
+        ));
+    }
+
+    #[test]
+    fn a_chain_unread_for_the_copy_a_quorum_serves_decides_nothing() {
+        // A quoting node paid first (block 101) and serves its own copy; four
+        // of the nearest serve the uploader's (block 102).
+        let mut copies = vec![(1, verified_listing(1))];
+        copies.extend([2, 3, 4, 5].map(|peer| (peer, verified_listing(2))));
+        let groups = merge_copies(copies);
+        let paid_in = |quote: u8| {
+            Ok((
+                verified_listing(quote),
+                ListingCheck {
+                    level: CheckLevel::Verified,
+                    paid_at: Some(PaidAt {
+                        block_number: 100 + u64::from(quote),
+                        log_index: 1,
+                    }),
+                },
+            ))
+        };
+        let counted = |chosen: Option<CountingListing>| {
+            chosen.map(|(listing, _, nodes, quorum)| (listing.payment.block_number, nodes, quorum))
+        };
+
+        // The chain can't be read for the close group's copy: the earlier
+        // payment doesn't stand in for it; both are left to try again.
+        let unread = || Err(CheckProblem::ChainUnread("connection refused".into()));
+        let (chosen, rejected) = decide_address(&groups, vec![paid_in(1), unread()], &NEAREST, 7);
+        assert!(chosen.is_none());
+        assert_eq!(rejected.len(), 2);
+        assert!(
+            rejected[0].1.starts_with("not decided"),
+            "{}",
+            rejected[0].1
+        );
+        assert_eq!(
+            rejected[1].1,
+            "could not read the payment chain: connection refused; try again"
+        );
+
+        // The close group's copy doesn't check out: the earliest stands in,
+        // marked.
+        let invalid = Err(CheckProblem::Invalid("not paid".into()));
+        let (chosen, _) = decide_address(&groups, vec![paid_in(1), invalid], &NEAREST, 7);
+        assert_eq!(counted(chosen), Some((Some(101), 1, false)));
+
+        // The chain can't be read for a copy fewer serve: the quorum's
+        // counts all the same.
+        let (chosen, rejected) = decide_address(&groups, vec![unread(), paid_in(2)], &NEAREST, 7);
+        assert_eq!(counted(chosen), Some((Some(102), 4, true)));
+        assert_eq!(rejected.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_chain_that_cant_be_read_is_reported_as_such() {
+        // In the index, only the block shown: checked against its timestamp.
+        let envelope = envelope_showing(ShownFields::NONE.with(PaymentField::BlockNumber), true);
+        let listing = Listing::new(&envelope, &upload_payment(&envelope), BLOCK_TIME);
+        let copies: Vec<(u8, Listing)> = NEAREST[..4]
+            .iter()
+            .map(|peer| (*peer, listing.clone()))
+            .collect();
+        let groups = merge_copies(copies);
+        let unreachable = reader("http://127.0.0.1:9".into());
+        let checked =
+            check_group(&groups[0], &envelope, &NEAREST, 4, &unreachable, BLOCK_TIME).await;
+        assert!(
+            matches!(checked, Err(CheckProblem::ChainUnread(_))),
+            "{checked:?}"
+        );
+        let (chosen, rejected) = decide_address(&groups, vec![checked], &NEAREST, 7);
+        assert!(chosen.is_none());
+        assert!(rejected[0].1.ends_with("; try again"), "{}", rejected[0].1);
+    }
+
+    #[tokio::test]
+    async fn an_index_reader_dates_a_listing_as_the_nodes_do() {
+        // In the index, nothing shown: nothing to read on chain.
+        let envelope = envelope_showing(ShownFields::NONE, true);
+        let listing = Listing::new(&envelope, &upload_payment(&envelope), BLOCK_TIME);
+        let hour = first_seen_at(BLOCK_TIME);
+        // Three of the nearest date it in 1970 and only two others answer.
+        let groups = merge_copies(dated_copies(&listing, &NEAREST, &[0, 0, 0, hour, hour]));
+        let unreachable = reader("http://127.0.0.1:9".into());
+        let (dated, check) = check_group(&groups[0], &envelope, &NEAREST, 4, &unreachable, hour)
+            .await
+            .expect("checks out");
+        assert_eq!(check.level, CheckLevel::Reported);
+        assert_eq!(dated.first_seen, Some(hour));
+        // What is shown for it is dated the same way.
+        assert_eq!(listing_to_check(&groups[0], &NEAREST, 4), Some(dated));
+        // Without a quorum, the median of the nearest nodes' dates.
+        let groups = merge_copies(dated_copies(&listing, &NEAREST, &[0, hour, hour]));
+        assert_eq!(quorum_listing(&groups[0], &NEAREST, 4), None);
+        assert_eq!(
+            listing_to_check(&groups[0], &NEAREST, 4).and_then(|listing| listing.first_seen),
+            Some(hour)
+        );
+    }
+
+    #[tokio::test]
+    async fn copies_that_cant_check_out_are_never_looked_up() {
+        let envelope = envelope_showing(ShownFields::ALL, true);
+        let mock = Arc::new(Mutex::new(MockChain::with_blocks(200, 1_800_000_000)));
+        let chain = reader(serve(Arc::clone(&mock)).await);
+        // A quote for another address, and a listing naming the file
+        // otherwise than its envelope does.
+        let other_quote = Payment {
+            quote: rmp_serde::to_vec(&signed_quote([3; 32], 20)).unwrap(),
+            ..upload_payment(&envelope)
+        };
+        let wrong_quote = Listing::new(&envelope, &other_quote, BLOCK_TIME);
+        let mut renamed = Listing::new(&envelope, &upload_payment(&envelope), BLOCK_TIME);
+        renamed.metadata.name = Some("other.txt".into());
+        for listing in [wrong_quote, renamed] {
+            let copies: Vec<(u8, Listing)> = NEAREST
+                .iter()
+                .map(|peer| (*peer, listing.clone()))
+                .collect();
+            let groups = merge_copies(copies);
+            assert_eq!(groups.len(), 1);
+            let checked = check_group(&groups[0], &envelope, &NEAREST, 4, &chain, BLOCK_TIME).await;
+            assert!(
+                matches!(checked, Err(CheckProblem::Invalid(_))),
+                "{checked:?}"
+            );
+        }
+        assert!(mock.lock().unwrap().calls.is_empty());
+    }
+
+    #[tokio::test]
+    async fn reads_only_the_payments_of_a_quote_a_listing_can_describe() {
+        // Others paid the upload's quote first, at log index 9 in blocks 50
+        // to 53; the upload paid it at log index 4 in block 150. The
+        // provider answers at most 64 blocks of logs at once.
+        let envelope = envelope_showing(
+            ShownFields::NONE
+                .with(PaymentField::Quote)
+                .with(PaymentField::LogIndex),
+            true,
+        );
+        let quote = signed_quote(envelope.address(), 20);
+        let mut mock = MockChain::with_blocks(200, 1_800_000_000);
+        for block in 50..54u8 {
+            mock.add_receipt(PaymentReceipt {
+                tx_hash: [block; 32],
+                success: true,
+                block_number: block.into(),
+                logs: vec![paying_log(&quote, 9)],
+            });
+        }
+        mock.add_receipt(PaymentReceipt {
+            tx_hash: [0xaa; 32],
+            success: true,
+            block_number: 150,
+            logs: vec![paying_log(&quote, 4)],
+        });
+        mock.max_log_range = Some(64);
+        let mock = Arc::new(Mutex::new(mock));
+        let chain = reader(serve(Arc::clone(&mock)).await);
+        let lookup = Lookup::Quote {
+            quote_hash: quote.hash().0,
+            block_number: None,
+            search_from: 1_800_000_000,
+            not_after: None,
+        };
+        let blocks_of = |fetched: Fetched| -> Vec<u64> {
+            fetched
+                .into_iter()
+                .map(|(receipt, _)| receipt.expect("a receipt").block_number)
+                .collect()
+        };
+        let log_calls = || mock.lock().unwrap().calls_to("eth_getLogs");
+        let showing = |log_index, block_timestamp| ListingPayment {
+            log_index,
+            block_timestamp,
+            ..ListingPayment::default()
+        };
+
+        // Nothing shown to tell them apart: the earliest payments.
+        let fetched = chain.fetch(&lookup, &showing(None, None)).await.unwrap();
+        assert_eq!(blocks_of(fetched), vec![50, 51, 52, 53]);
+        // The log index shown: the search goes on past the others' payments.
+        let fetched = chain.fetch(&lookup, &showing(Some(4), None)).await.unwrap();
+        assert_eq!(blocks_of(fetched), vec![150]);
+        // The timestamp shown: only the blocks of that second, in one call.
+        let before = log_calls();
+        let fetched = chain
+            .fetch(&lookup, &showing(None, Some(BLOCK_TIME)))
+            .await
+            .unwrap();
+        assert_eq!(blocks_of(fetched), vec![150]);
+        assert_eq!(log_calls() - before, 1);
+        // A second no block has: nothing, and no logs read.
+        let before = log_calls();
+        let fetched = chain
+            .fetch(&lookup, &showing(None, Some(BLOCK_TIME + 1)))
+            .await
+            .unwrap();
+        assert!(fetched.is_empty());
+        assert_eq!(log_calls(), before);
+        // In one block, the log index still filters.
+        let in_block = Lookup::Quote {
+            quote_hash: quote.hash().0,
+            block_number: Some(150),
+            search_from: 1_800_000_000,
+            not_after: None,
+        };
+        let fetched = chain.fetch(&in_block, &showing(Some(9), None)).await;
+        assert!(fetched.unwrap().is_empty());
+        let fetched = chain.fetch(&in_block, &showing(Some(4), None)).await;
+        assert_eq!(blocks_of(fetched.unwrap()), vec![150]);
+
+        // Four of the nearest serve the upload's listing, one the payment
+        // made first: the upload's is found, checks out and counts.
+        let now = BLOCK_TIME + 100;
+        let upload = Payment {
+            quote: rmp_serde::to_vec(&quote).unwrap(),
+            ..upload_payment(&envelope)
+        };
+        let first = Payment {
+            tx_hash: [50; 32],
+            block_number: 50,
+            block_timestamp: 1_800_000_100,
+            log_index: 9,
+            quote: rmp_serde::to_vec(&quote).unwrap(),
+        };
+        let mut copies: Vec<(u8, Listing)> = NEAREST[..4]
+            .iter()
+            .map(|peer| (*peer, Listing::new(&envelope, &upload, now)))
+            .collect();
+        copies.push((5, Listing::new(&envelope, &first, now)));
+        let groups = merge_copies(copies);
+        let mut checked = Vec::new();
+        for group in &groups {
+            checked.push(check_group(group, &envelope, &NEAREST, 4, &chain, now).await);
+        }
+        let (listing, check) = checked[0].clone().expect("the upload's payment is found");
+        assert_eq!(
+            check.paid_at,
+            Some(PaidAt {
+                block_number: 150,
+                log_index: 4
+            })
+        );
+        let (chosen, rejected) = decide_address(&groups, checked, &NEAREST, 7);
+        assert_eq!(chosen, Some((listing, CheckLevel::Verified, 4, true)));
+        assert_eq!(rejected.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_quote_dated_after_its_payment_is_looked_up_back_widely() {
+        // The quote says 1,800,000,000; the chain's latest block is older,
+        // and the quote was paid in block 50.
+        let quote = signed_quote([7; 32], 20);
+        let mut mock = MockChain::with_blocks(200, 1_799_000_000);
+        mock.add_receipt(PaymentReceipt {
+            tx_hash: [0xaa; 32],
+            success: true,
+            block_number: 50,
+            logs: vec![paying_log(&quote, 4)],
+        });
+        let mock = Arc::new(Mutex::new(mock));
+        let chain = reader(serve(Arc::clone(&mock)).await);
+        let lookup = Lookup::Quote {
+            quote_hash: quote.hash().0,
+            block_number: None,
+            search_from: 1_800_000_000,
+            not_after: None,
+        };
+        let shown = ListingPayment::default();
+        assert_eq!(chain.fetch(&lookup, &shown).await.unwrap().len(), 1);
+        // One call forwards (the latest block alone), one back over the rest.
+        assert_eq!(mock.lock().unwrap().calls_to("eth_getLogs"), 2);
+        // A provider that answers 64 blocks at a time: found all the same.
+        mock.lock().unwrap().max_log_range = Some(64);
+        assert_eq!(chain.fetch(&lookup, &shown).await.unwrap().len(), 1);
+    }
 }

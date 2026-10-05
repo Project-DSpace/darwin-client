@@ -212,29 +212,61 @@ Upload a file to the network. The file is split into encrypted chunks, each paid
 
 ```
 $ SECRET_KEY=0x... ant file upload my_data.bin --public
-Connecting to network... done
-Approving token spend... done
-Uploading my_data.bin (439.5 KB)...
-Storing public data map... done
+warning: the payment fields shown give away the paying wallet to anyone with the envelope's address
+Encrypted into 7 chunks
 
 Upload complete!
-  Address: a1b2c3d4e5f6...
-  Chunks:  7
-  Size:    439.5 KB
-  Time:    12.3s
+  Address:  a1b2c3d4e5f6...
+  Payment:  all fields shown
+  Record:   my_data.bin.record
+  Chunks:   7 (6 + 1 envelope)
+  Size:     439.5 KB
+  Cost:     0.0042 ANT (gas: 0.000150 ETH)
+  Time:     12.3s
 
 Anyone can download this file with:
-  ant file download a1b2c3d4e5f6...
+  ant file download a1b2c3d4e5f6... -o <FILE>
+Prove this upload to anyone with:
+  ant file prove my_data.bin.record
 ```
+
+The `warning:` and `Encrypted` lines go to stderr. The default, a private upload, keeps the data map local and says what its envelope makes public:
+
+```
+$ SECRET_KEY=0x... ant file upload my_data.bin
+warning: the payment fields shown give away the paying wallet to anyone with the envelope's address
+Encrypted into 7 chunks
+
+Upload complete!
+  Datamap:  my_data.bin.datamap
+  Envelope: 9f8e7d6c5b4a... (its payment record is public, the file is not)
+  Payment:  all fields shown
+  Record:   my_data.bin.record
+  Chunks:   7 (6 + 1 envelope)
+  Size:     439.5 KB
+  Cost:     0.0042 ANT (gas: 0.000150 ETH)
+  Time:     12.1s
+
+Download this file with:
+  ant file download --datamap my_data.bin.datamap
+Prove this upload to anyone with:
+  ant file prove my_data.bin.record
+Keep the record as safe as the data map: it holds the data map and the salt, so it reads the file, and its salt is what proves which file this is. `ant file prove --no-reveal` proves only the payment.
+```
+
+Mistakes in `--hide`, `--name` or `--content-type` are reported before `SECRET_KEY` is read or the network is joined.
 
 **Options:**
 
 | Flag | Description |
 |------|-------------|
-| `--visibility <private\|unlisted\|listed>` | Who can read the file. `private` (default): the DataMap is saved to a local `.datamap` file. `unlisted`: the DataMap is stored on-network and anyone with the address can download. `listed`: as `unlisted`, and the file also appears in the network's listings index (see `ant listings`). |
+| `--readable <yes\|no>` | Whether anyone with the address can read the file. `no` (default): the data map is saved to a local `.datamap` file, and the envelope stores only a salted hash of it. `yes`: the data map is stored on the network. |
+| `--index <yes\|no>` | Whether the file appears in the network's listings index (see `ant listings`). Default `no`. |
+| `--visibility <private\|unlisted\|listed>` | Shorthand for the two above: `private` (`no`, `no`; the default), `unlisted` (`yes`, `no`) or `listed` (`yes`, `yes`). The fourth combination, `--readable no --index yes`, is a public, dated record of a file nobody can read until you reveal it. |
 | `--public` | Same as `--visibility unlisted`. |
-| `--name <NAME>` | Listed files only: a name to show in the index (1–255 bytes, no control characters or path separators). Public and permanent. |
-| `--content-type <TYPE>` | Listed files only: a content type to show in the index, as `type/subtype`. Public and permanent. |
+| `--hide <FIELDS>` | Payment fields to hide, comma-separated: `tx-hash`, `block`, `timestamp`, `log-index`, `quote`, or `all`. All five are shown by default. |
+| `--name <NAME>` | A name stored in the envelope, on any visibility (1–255 bytes, no control characters or path separators). Public and permanent. |
+| `--content-type <TYPE>` | A content type stored in the envelope, as `type/subtype`, on any visibility. Public and permanent. |
 | `--merkle` | Force merkle batch payment from 2 chunks, instead of from 64. Reduces gas costs for multi-chunk uploads. |
 | `--no-merkle` | Disable merkle, always use per-chunk payments. |
 
@@ -243,8 +275,13 @@ Anyone can download this file with:
 2. Each encrypted chunk is stored on the network at its XOR content address.
 3. Payment is made per-chunk or via merkle batch transactions (auto-selected by default when >= 64 chunks). The payment vault charges a batch for the next power of two of its chunks, so an upload is paid in exact power-of-two batches (256, 128, 64 and 32 chunks), and a remainder under 32 chunks is paid per chunk.
 4. A `DataMap` is produced that records which chunks compose the file.
-5. In unlisted mode, the DataMap itself is stored as a chunk; the returned address is the DataMap's content address. In private mode, the DataMap is saved to `<filename>.datamap` on disk.
-6. In listed mode, the DataMap is stored inside an envelope chunk that also carries the optional name and content type; the returned address is the envelope's. The content is paid like any file; the envelope is paid per chunk, and stored only after the content is complete. Every node that stores the envelope records a listing with the on-chain payment, so the listing can be checked and can't be forged. **Listed files are public and permanent, and the payment transaction shows the paying wallet.**
+5. Unless the upload hides every payment field, is not in the index and has no name or content type, the client stores an **envelope**: a small chunk holding the data map (readable uploads) or a salted hash of it (private uploads), the name and content type, and flags saying which payment fields its listing shows and whether it is in the index. Its address is the file's address. Nodes that keep listings record the envelope's payment, so anyone with the address can check it against the chain. The envelope is paid in the same payment as the content (one payment for any upload under 64 chunks; from 64, with the chunks left after the merkle batches, or alone) and stored after every content chunk, so it never points at missing content.
+6. Without an envelope, a readable upload stores the DataMap itself as a chunk and returns its address; a private one stores nothing extra.
+7. The client saves the data map of a private upload to `<filename>.datamap`, and the envelope's record to `<filename>.record`: the envelope, its payment's transaction and paid quote, and for a private file the data map and the salt. Keep the record with the data map: it proves the upload from the chain alone (`ant file prove`), even for fields you hid. **A private upload's record reads the file, like the `.datamap`**: whoever has it can download the file (`ant file download --proof`), so keep it as safe as the data map, and hand over `ant file prove --no-reveal` to prove only the payment. Until the record is saved, the client keeps a copy of it under its data directory (`payments/upload/records/<envelope address>.<payer>.record`, the same text as the `.record` file; for a private upload without a record, its salt as `.salt`), so a crash between paying and saving doesn't lose the paid quote and tx hash, which nothing else may hold once the quote is hidden. The upload removes its checkpoint only after that copy is written; a later upload of the same file with the same choices and wallet that finds the envelope already stored gets the kept record back. Saving the `.record` removes the copy.
+
+`ant file cost <PATH>` takes the same `--readable`, `--index`, `--visibility`, `--public`, `--hide`, `--name` and `--content-type` flags, and counts the envelope or data map chunk the upload adds. When the sampled content is already stored, it prices that chunk alone, and says the content is only likely stored unless every content chunk was sampled.
+
+At upload the client warns about what your choices give away: a hidden field that a shown one gives away (a hidden timestamp with the block number shown, for example, or a hidden log index with the tx hash shown when the transaction paid for the envelope alone: a transaction's quotes are paid in quote-hash order, so the envelope's log isn't always its last), a tx hash shown without the quote (the payment can't then be tied to this file), a name or content type on a private file (readable by anyone with the envelope's address, though the file is not), and that shown payment fields, or being listed, show the paying wallet. **Envelopes, their metadata and listings are public and permanent.**
 
 #### `ant file download [ADDRESS]`
 
@@ -274,25 +311,58 @@ Download complete!
 
 | Flag | Description |
 |------|-------------|
-| `ADDRESS` | Hex-encoded public DataMap address (64 hex chars). |
-| `--datamap <PATH>` | Path to a local `.datamap` file (for private downloads). |
+| `ADDRESS` | Hex-encoded public DataMap or envelope address (64 hex chars). |
+| `--datamap <PATH>` | Path to a local `.datamap` file (for private downloads). With an address too (a private file's envelope), the data map is used, and checked against the envelope when the upload's `.record` is next to it. |
+| `--proof <PATH>` | Path to an upload record or proof (`ant file prove`) whose envelope carries the data map, or reveals it. |
 | `-o, --output <PATH>` | Output file path (default: `downloaded_file`). |
+
+A private file's envelope address can't be downloaded from: its envelope stores only a salted hash of the data map, and the download says so. Use `--datamap`, or `--proof` with a proof that reveals it.
+
+#### `ant file prove <RECORD>`
+
+Writes a proof of an upload from its record (`<filename>.record`) to `<filename>.proof` (or `-o <PATH>`). For a private file the proof reveals the data map and salt, so whoever has it can read the file and check that the envelope is for it; `--no-reveal` proves only that the envelope was paid for. Hand it to anyone who should be able to check the upload, including fields you hid. It never writes over the record (which holds the salt), and replaces an existing proof only with `--force`.
+
+#### `ant file verify <PROOF> [--file <PATH>]`
+
+Checks a proof (or record) against the payment chain alone: the envelope hashes to its address, the quote names it and is signed, and the transaction paid it. Prints the payment (block, time, log index, transaction). With `--file`, also checks that a local file encrypts to the proof's data map. Needs no storage node. A proof shows the address was paid for by a block; it doesn't show who uploaded the file, since anyone who has the envelope can pay for the same address. Only a revealed data map and salt tie a private envelope to its file.
 
 ### `ant listings` — The Listings Index
 
 ```
 $ ant listings
-$ ant listings --from-block 78978000 --json
+$ ant listings --since 1767225600 --json
+$ ant listings --json --state walks.json --carry index.json > index.new.json
 ```
 
-Collects listings from every node the client can find, checks each one (the envelope is on the network and matches the listing; the payment is on chain, for this address, with a valid quote signature) and prints them oldest first, in payment order: address, name, content type, size, payment time, block and transaction.
+Collects listings from every node the client can find (`listings.v2`), merges the copies of each (nodes record their own `first_seen` for a listing that hides its time, so copies that differ only there are merged), checks each one as far as its shown fields allow, and prints them in index order: time, address, size, content type, name, the payment fields it hides (`hidden: tx-hash,quote`, or `-` when it shows all five), and the check.
+
+- `verified n/7`: the listing shows its quote, and the payment is checked on chain and tied to this address. Of several payments for one address, the one a quorum of the 7 nodes nearest it serve counts; `(no quorum)` marks the earliest standing in when none has one.
+- `reported n/7`: the listing hides its quote. Its shown fields are checked against the chain, and it counts only when at least 4 of the 7 nodes nearest its address serve it (fewer only on a network of fewer than 7 nodes). A lookup that finds fewer of the nearest nodes than the network has never lowers the bar: the listing is left out as "too few nearest nodes found", to try again.
+
+Listings are decided as the nodes decide them when they repair one. Until 4 of the nearest nodes serve one copy of a listing, the nearest nodes not heard from yet are asked for it (a walk of a node's whole index that began well after the listing's time counts as its answer), whether or not it shows its quote. If the payment chain can't be read for the copy 4 of them serve, the address is left out for now, to try again, rather than shown with a copy fewer nodes serve. A copy that can't check out whatever the chain says (it doesn't match its envelope, or its quote names another address or isn't signed) is never looked up on chain. A listing showing its quote is looked up only among the payments of that quote it can describe (at its shown log index, in a block of its shown timestamp), so earlier payments of the same quote by others don't hide the upload's.
+
+A listing that hides its block timestamp shows `~` and the hour it was first seen. Only the dates of the 7 nodes nearest its address count. A listing at least 4 of them serve is dated by the latest of the earliest 4 dates they give, so that 4 of them date it then or earlier: their median when all 7 answer, and with fewer, 3 nodes dating it early can't move it before the date another gives. Any other listing takes the median of its nearest nodes' dates, each checked on its own against the clock and, where the listing locates its payment, the payment's block, with those out of bounds left out.
+
+A read has no cap on how many listings the index holds, and a node can't make it slow by serving listings nobody else has. The client walks every node's index a page at a time: each node is read for 8 pages, and earns 2 more listings' worth of pages for each listing it sends whose address at least 4 of the 7 nodes nearest that address serve (if the node is itself among the 20 nearest), so the walk of a node holding real listings runs to the end, and that of a node serving made-up ones stops after 8 pages. Only an address at least 4 of its 7 nearest nodes serve is worked on (its envelope fetched, nearest nodes asked, the chain read); any other costs nothing but its pages and waits for a later read, shown with `--all` as `undecided (try again)`. The walks have a deadline: at most 30 minutes, and once half of them are done, four times as long as that took (at least a minute). On stderr, the command counts the walks that stopped early and the addresses left for a later read, and warns when a read found too few nodes to trust (fewer than 7, or under three quarters as many as recent reads): such a read decides nothing.
+
+`--state` keeps the walks' state in a file between reads, so walks stopped early carry on where they stopped, and recent reads' node counts are known. `--carry` takes the previous `--json` output and prints its entries again, as they were, for every address this read didn't decide, marked `"carried": true`: a read never drops a listing it didn't decide, however few nodes answered. A listing whose file the network no longer stores is dropped, but only when each of the nodes nearest its address walked past where it would be without serving it. Where the read decided an address, its own entry replaces the earlier one, or nothing does if it rejected the address. On a timer, run the third example and, when it succeeds, move `index.new.json` over `index.json`: the file then holds the index so far.
 
 | Flag | Description |
 |------|-------------|
-| `--from-block <N>` | Only listings paid in block `N` or later. |
+| `--since <UNIX_SECONDS>` | Only listings from this time on (block timestamp, or first seen). |
 | `--all` | Also show listings that fail their checks, with the reason. |
+| `--state <FILE>` | Keep the walks' state in this file: read if it exists, replaced after the read. |
+| `--carry <FILE>` | A previous `--json` output of this command, whose entries for addresses this read didn't decide are printed again. Needs `--json`. A missing file carries nothing; one that can't be read fails the command before anything is printed. |
 
-With `--json`, each listing also carries its `data_map` (hex), which is enough to read the file without fetching the envelope. Download a listed file with `ant file download <ADDRESS>`.
+With `--json`, hidden payment fields are absent, and each listing carries `check` (`verified` or `reported`), `nodes` and `nearest`, `first_seen` where it has one, and for a readable listing its `data_map` (hex), which is enough to read the file without fetching the envelope. Download a listed file with `ant file download <ADDRESS>`.
+
+### `ant listing <ADDRESS>` — One Listing
+
+```
+$ ant listing be4ec238e14701164b2b97d73013039b28f2c747adaa2062cf0e4ecf3f3b0181
+```
+
+Asks the 7 nodes nearest the address for its listing, in the index or not, and checks it the same way: every field, with hidden ones shown as hidden, the check level and how many of the nearest nodes serve it. `--json` prints the listing and any copies that failed. Without a valid listing the command exits non-zero, with or without `--json`.
 
 ### `ant chunk` — Single-Chunk Operations
 
@@ -870,6 +940,45 @@ let result = client.data_upload(Bytes::from("hello autonomi")).await?;
 let content = client.data_download(&result.data_map).await?;
 assert_eq!(content, Bytes::from("hello autonomi"));
 ```
+
+### Envelopes, Proofs and Listings
+
+```rust
+use ant_core::ant_listings::{Metadata, PaymentField};
+use ant_core::data::{EnvelopeOptions, ListingChain, PaymentMode, WalkState};
+
+// A private upload whose envelope hides its tx hash, with a name.
+let options = EnvelopeOptions::private()
+    .hiding([PaymentField::TxHash])
+    .with_metadata(Metadata { content_type: None, name: Some("photo.jpg".into()) });
+for warning in options.warnings() {
+    eprintln!("warning: {warning}");
+}
+let result = client
+    .file_upload_with_visibility_and_progress(
+        Path::new("photo.jpg"), PaymentMode::Auto, options.into_visibility(), None)
+    .await?;
+// The envelope, the salt of a private one, and the record proving its payment.
+let envelope = result.envelope.expect("an envelope");
+let record = envelope.proof.clone().expect("this upload paid for the envelope");
+// Save the record, then drop the copy the upload kept until it was saved.
+ant_core::datamap_file::write_record(Path::new("photo.jpg.record"), &record)?;
+ant_core::data::forget_upload_record(&envelope.address())?;
+
+// Anyone can check a proof from the chain alone.
+let chain = ListingChain::new(&evm_network)?;
+let proven = chain.check_proof(&record).await?;
+
+// The index, merged across nodes and checked; one listing by address. The
+// walk state carries walks a read stopped early on to the next read.
+let mut state = WalkState::default();
+let index = client.index_listings_with(0, &chain, &mut state).await?;
+let one = client.listing(&envelope.address(), &chain).await?;
+```
+
+`index_listings` and `listing` merge, date, check and decide listings as the nodes do when they repair one. `index_listings_with` carries on from the `WalkState` of earlier reads (save it between them: it serialises), where `index_listings` starts afresh, and `ListingsIndex::carry` says what to do with a listing an earlier read published: replace it with what this read decided, keep it, or drop it because the network no longer stores its file. An indexer of its own can use the same rules from `ant_core::data::client::listings`: `listing_to_check` (what to look up on chain for a group of copies), `check_copies` (the group's date and check, given what was fetched), `quorum_listing` and `decide_address`, with `ant_listings::IndexWalk` to walk the nodes' indexes.
+
+`Visibility::Private` and `Visibility::Public` upload exactly as they always have; `EnvelopeOptions::into_visibility` picks them when no envelope is needed. An envelope upload's checkpoint and kept record belong to whoever pays: the wallet, or an `UploadPayer`'s `checkpoint_scope()`, which a payer serving several accounts must set to each account's id, so one account never resumes another's interrupted upload or gets its record. `file_upload_with_payer` and the external-signer `file_prepare_upload_with_mode`/`finalize_upload*` take `Visibility::Envelope` too; the external path pays an envelope upload per chunk, in one wave batch (its payment intent lists the quotes in quote-hash order: pay them in that order), and fills in the record at finalize once every chunk is stored (unchecked if the client has no EVM network). It refuses, before quoting, an envelope upload the payment mode would pay in merkle batches (`PaymentMode::Auto` from 64 chunks, or `PaymentMode::Merkle`): use `file_upload_with_payer`, or `PaymentMode::Single` to pay every chunk per chunk with all of them held in memory.
 
 ### Low-Level Chunk Operations
 

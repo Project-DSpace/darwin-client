@@ -59,7 +59,7 @@ tower-http = { version = "0.6.8", features = ["cors"], optional = true }
 # deps here or the version can skew between ant-client and ant-node.
 ant-protocol = { version = "3.1.0", default-features = false, features = ["rpc"] }
 # Listed files: envelope format, listings, payment checks, the listings protocol.
-ant-listings = { git = "https://github.com/Project-DSpace/ant-listings", rev = "a135dfe6fa36581e9086e569ec5462edae279868" }
+ant-listings = { git = "https://github.com/Project-DSpace/ant-listings", rev = "e3cf6bbfbd64621acf336342fe928638a386251a" }
 xor_name = { version = "5" }
 futures = { version = "0.3" }
 tracing = { version = "0.1" }

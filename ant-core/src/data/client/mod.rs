@@ -16,6 +16,7 @@ pub mod chunk;
 pub mod data;
 #[cfg(feature = "native")]
 pub mod diagnostics;
+pub mod envelope;
 pub mod file;
 #[cfg(feature = "native")]
 pub mod listings;
@@ -332,6 +333,9 @@ pub(crate) fn classify_error(err: &Error) -> Outcome {
         // the peers answered, there was just nothing stored there. Not a
         // transport symptom, so it must not push the limiter down.
         | Error::NotFound(_)
+        // A private file's envelope: the record was found, it just doesn't
+        // carry its data map.
+        | Error::DataMapWithheld(_)
         | Error::SignatureVerification(_)
         | Error::Config(_)
         | Error::InsufficientDiskSpace(_)
@@ -1243,6 +1247,7 @@ mod tests {
             | Error::Protocol(_)
             | Error::InvalidData(_)
             | Error::NotFound(_)
+            | Error::DataMapWithheld(_)
             | Error::Serialization(_)
             | Error::Crypto(_)
             | Error::Io(_)

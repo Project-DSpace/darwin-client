@@ -8,12 +8,18 @@ use serde::Serialize;
 use tokio::sync::mpsc;
 use tracing::info;
 
+use ant_core::ant_listings::{EnvelopeProof, Metadata, PaymentField, ShownFields};
 use ant_core::data::{
+    file_data_map, forget_upload_record, proof_data_map, shown_after_hiding,
     spawn_download_diagnostics_writer, Client, CollisionPolicy, CostEstimateConfidence,
-    DownloadEvent, Error as DataError, FileChunkPeerReport, FileChunkPeerReportPeer,
-    FileChunkPeerStatus, FileChunkPeerSweepReport, PaymentMode, UploadEvent, Visibility,
+    DownloadEvent, EnvelopeOptions, Error as DataError, EvmNetwork, FileChunkPeerReport,
+    FileChunkPeerReportPeer, FileChunkPeerStatus, FileChunkPeerSweepReport, ListingChain,
+    PaymentMode, UploadEvent,
 };
-use ant_core::datamap_file::{original_name_from_datamap, read_datamap, write_datamap};
+use ant_core::datamap_file::{
+    original_name_from_datamap, read_datamap, read_record, record_path_for, write_record,
+    write_upload_files, UploadFiles,
+};
 
 use super::chunk::{parse_address, xor_distance_decimal};
 use crate::progress;
@@ -21,12 +27,76 @@ use crate::progress;
 /// Values of `ant file upload --visibility`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
 pub enum VisibilityArg {
-    /// Only the holder of the data map can read the file.
+    /// Only the holder of the data map can read the file (`--readable no
+    /// --index no`).
     Private,
-    /// Anyone with the address can read the file.
+    /// Anyone with the address can read the file (`--readable yes --index
+    /// no`).
     Unlisted,
-    /// Anyone can read the file, and it appears in the listings index.
+    /// Anyone can read the file, and it appears in the listings index
+    /// (`--readable yes --index yes`).
     Listed,
+}
+
+/// Parse `yes` or `no` (also `true` or `false`).
+fn parse_yes_no(value: &str) -> Result<bool, String> {
+    match value.to_ascii_lowercase().as_str() {
+        "yes" | "true" => Ok(true),
+        "no" | "false" => Ok(false),
+        _ => Err(format!("expected yes or no, not {value:?}")),
+    }
+}
+
+/// The upload choices `ant file upload` and `ant file cost` take.
+#[derive(clap::Args, Debug, Clone, Default)]
+pub struct UploadChoices {
+    /// Public mode: store the data map on the network (anyone with the
+    /// address can download). Same as `--visibility unlisted`. Default is
+    /// private (data map saved locally).
+    #[arg(long)]
+    public: bool,
+    /// Shorthand for `--readable` and `--index`: `private` (the default:
+    /// no, no), `unlisted` (yes, no) or `listed` (yes, yes).
+    #[arg(long, value_enum, conflicts_with_all = ["public", "readable", "index"])]
+    visibility: Option<VisibilityArg>,
+    /// Whether anyone with the address can read the file (`yes`), or only
+    /// the holder of the data map (`no`, the default: the envelope stores
+    /// a salted hash of it).
+    #[arg(long, value_name = "yes|no", value_parser = parse_yes_no, conflicts_with = "public")]
+    readable: Option<bool>,
+    /// Whether the file appears in the listings index (default `no`).
+    #[arg(long, value_name = "yes|no", value_parser = parse_yes_no, conflicts_with = "public")]
+    index: Option<bool>,
+    /// Payment fields to hide from anyone but you, comma-separated:
+    /// `tx-hash`, `block`, `timestamp`, `log-index`, `quote`, or `all`.
+    /// All are shown by default. Hiding all on an upload that is not in
+    /// the index and has no name or content type stores no envelope.
+    #[arg(long, value_delimiter = ',', value_name = "FIELDS")]
+    hide: Vec<String>,
+    /// A name stored in the envelope, on any visibility. Public and
+    /// permanent: on a private file, anyone with the envelope's address
+    /// can read it, though not the file.
+    #[arg(long)]
+    name: Option<String>,
+    /// A content type stored in the envelope, such as `application/pdf`,
+    /// on any visibility. Public and permanent, like `--name`.
+    #[arg(long)]
+    content_type: Option<String>,
+}
+
+impl UploadChoices {
+    /// The upload options these flags ask for.
+    fn options(&self) -> anyhow::Result<EnvelopeOptions> {
+        upload_options(
+            self.public,
+            self.visibility,
+            self.readable,
+            self.index,
+            &self.hide,
+            self.name.clone(),
+            self.content_type.clone(),
+        )
+    }
 }
 
 /// File subcommands.
@@ -36,23 +106,10 @@ pub enum FileAction {
     Upload {
         /// Path to the file to upload.
         path: PathBuf,
-        /// Public mode: store the data map on the network (anyone with the
-        /// address can download). Default is private (data map saved locally).
-        #[arg(long)]
-        public: bool,
-        /// Who can find the file: `private` (the default; the data map is saved
-        /// locally), `unlisted` (the data map is stored, so anyone with the
-        /// address can read the file) or `listed` (it also appears in the
-        /// listings index, paid per chunk). `--public` means `unlisted`.
-        #[arg(long, value_enum, conflicts_with = "public")]
-        visibility: Option<VisibilityArg>,
-        /// For listed files: a name to show in the index. Public and permanent.
-        #[arg(long)]
-        name: Option<String>,
-        /// For listed files: a content type to show in the index, such as
-        /// `application/pdf`. Public and permanent.
-        #[arg(long)]
-        content_type: Option<String>,
+        /// Who can read it, whether it is listed, which payment fields are
+        /// hidden, and its metadata.
+        #[command(flatten)]
+        choices: UploadChoices,
         /// Force merkle batch payment regardless of chunk count (min 2 chunks).
         /// Reduces gas costs for batches by paying in a single transaction.
         #[arg(long, conflicts_with = "no_merkle")]
@@ -70,9 +127,12 @@ pub enum FileAction {
         /// signals; this override is retained for one release.
         #[arg(long, hide = true)]
         store_concurrency: Option<usize>,
-        /// Replace any existing `<filename>.datamap` instead of writing a
-        /// suffixed `<filename>-2.datamap`. Restores the pre-helper behaviour
-        /// for scripts that re-upload the same path repeatedly.
+        /// Replace any existing `<filename>.datamap` (and `<filename>.record`)
+        /// instead of writing a suffixed `<filename>-2.datamap`. Restores the
+        /// pre-helper behaviour for scripts that re-upload the same path
+        /// repeatedly. An old record holds the salt that proves its upload,
+        /// and a private upload's record also holds its data map, so it reads
+        /// the file like the `.datamap`: keep a copy first.
         #[arg(long)]
         overwrite: bool,
     },
@@ -81,14 +141,21 @@ pub enum FileAction {
     /// Public:  `ant file download ADDRESS -o output.pdf`
     /// Private: `ant file download --datamap photo.jpg.datamap`
     /// Private (custom output): `ant file download --datamap photo.jpg.datamap -o keep.jpg`
+    /// Revealed: `ant file download --proof photo.jpg.proof -o photo.jpg`
     Download {
-        /// Hex-encoded address (public data map address).
-        /// Required unless --datamap is provided.
-        #[arg(required_unless_present = "datamap")]
+        /// Hex-encoded address (public data map or envelope address).
+        /// Required unless --datamap or --proof is provided.
+        #[arg(required_unless_present_any = ["datamap", "proof"])]
         address: Option<String>,
-        /// Path to a local data map file (for private downloads).
-        #[arg(long)]
+        /// Path to a local data map file (for private downloads). Given with
+        /// an address (a private file's envelope), the data map is used, and
+        /// checked against the envelope if the upload's record is next to it.
+        #[arg(long, conflicts_with = "proof")]
         datamap: Option<PathBuf>,
+        /// Path to an upload record or proof (`ant file prove`) whose
+        /// envelope carries the data map or reveals it.
+        #[arg(long, conflicts_with = "address")]
+        proof: Option<PathBuf>,
         /// Output file path. Required for `--address` downloads. Optional for
         /// `--datamap` downloads — defaults to the original filename derived
         /// from the datamap basename (e.g. `photo.jpg.datamap` → `photo.jpg`,
@@ -106,6 +173,37 @@ pub enum FileAction {
         #[arg(long, value_name = "PATH", conflicts_with = "all_peers")]
         download_diagnostics: Option<PathBuf>,
     },
+    /// Write a proof of an upload from its record (`<file>.record`): the
+    /// envelope, its payment's transaction and paid quote, and for a private
+    /// file the data map and salt, which reveal the file to whoever has the
+    /// proof. Anyone can check it from the chain alone with `ant file verify`.
+    Prove {
+        /// The upload's record, saved next to its data map.
+        record: PathBuf,
+        /// Where to write the proof (default: the record's name with
+        /// `.proof`).
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+        /// For a private file: prove the payment without revealing the data
+        /// map and salt. The proof then shows that the envelope was paid
+        /// for, not which file it is for.
+        #[arg(long)]
+        no_reveal: bool,
+        /// Replace the output file if it exists. The record itself is never
+        /// replaced: it holds the salt, which nothing else keeps.
+        #[arg(long)]
+        force: bool,
+    },
+    /// Check an upload proof (or record) from the payment chain alone, and
+    /// optionally that a local file is the one it is for. Needs no storage
+    /// node.
+    Verify {
+        /// The proof, as `ant file prove` writes it.
+        proof: PathBuf,
+        /// A local file to compare with the proof's data map.
+        #[arg(long)]
+        file: Option<PathBuf>,
+    },
     /// Estimate the cost of uploading a file without uploading.
     ///
     /// Encrypts the file locally to determine chunk count, then queries
@@ -113,6 +211,10 @@ pub enum FileAction {
     Cost {
         /// Path to the file to estimate.
         path: PathBuf,
+        /// The upload's choices, as `ant file upload` takes them: an envelope
+        /// (the default) or a public data map adds one chunk.
+        #[command(flatten)]
+        choices: UploadChoices,
         /// Force merkle batch payment mode for the estimate.
         #[arg(long, conflicts_with = "no_merkle")]
         merkle: bool,
@@ -123,6 +225,46 @@ pub enum FileAction {
 }
 
 impl FileAction {
+    /// Check the upload choices (`--hide`, `--name`, `--content-type`) of
+    /// `upload` and `cost`, so a mistake is named before the wallet key is
+    /// asked for or the network is joined.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        match self {
+            FileAction::Upload { choices, .. } | FileAction::Cost { choices, .. } => {
+                choices.options().map(|_| ())
+            }
+            _ => Ok(()),
+        }
+    }
+
+    /// Whether the action needs a connection to the storage network.
+    /// `prove` works offline and `verify` reads only the payment chain.
+    pub fn needs_network(&self) -> bool {
+        !matches!(self, FileAction::Prove { .. } | FileAction::Verify { .. })
+    }
+
+    /// Run an action that needs no storage network. `evm_network` resolves
+    /// the payment chain, for `verify` only.
+    pub async fn execute_offline(
+        self,
+        json: bool,
+        evm_network: impl FnOnce() -> anyhow::Result<EvmNetwork>,
+    ) -> anyhow::Result<()> {
+        match self {
+            FileAction::Prove {
+                record,
+                output,
+                no_reveal,
+                force,
+            } => handle_file_prove(&record, output, no_reveal, force, json),
+            FileAction::Verify { proof, file } => {
+                let chain = ListingChain::new(&evm_network()?)?;
+                handle_file_verify(&chain, &proof, file.as_deref(), json).await
+            }
+            _ => anyhow::bail!("this command needs the network"),
+        }
+    }
+
     /// Return per-upload client config overrides, if any.
     pub fn upload_overrides(&self) -> (Option<u64>, Option<usize>) {
         match self {
@@ -149,8 +291,9 @@ fn resolve_download_output(
     if let Some(p) = output {
         return Ok(p);
     }
-    let dm = datamap
-        .ok_or_else(|| anyhow::anyhow!("-o/--output is required when downloading by --address"))?;
+    let dm = datamap.ok_or_else(|| {
+        anyhow::anyhow!("-o/--output is required when downloading by address or --proof")
+    })?;
     let basename = original_name_from_datamap(dm).ok_or_else(|| {
         anyhow::anyhow!(
             "Cannot derive output filename from {}; pass -o/--output explicitly",
@@ -165,10 +308,7 @@ impl FileAction {
         match self {
             FileAction::Upload {
                 path,
-                public,
-                visibility,
-                name,
-                content_type,
+                choices,
                 merkle,
                 no_merkle,
                 store_timeout: _,
@@ -187,12 +327,13 @@ impl FileAction {
                 } else {
                     CollisionPolicy::NumericSuffix
                 };
-                let visibility = upload_visibility(public, visibility, name, content_type)?;
-                handle_file_upload(client, &path, visibility, mode, policy, json).await
+                let options = choices.options()?;
+                handle_file_upload(client, &path, options, mode, policy, json).await
             }
             FileAction::Download {
                 address,
                 datamap,
+                proof,
                 output,
                 peers,
                 all_peers,
@@ -203,6 +344,7 @@ impl FileAction {
                     client,
                     address.as_deref(),
                     datamap.as_deref(),
+                    proof.as_deref(),
                     resolved_output,
                     json,
                     peers,
@@ -213,6 +355,7 @@ impl FileAction {
             }
             FileAction::Cost {
                 path,
+                choices,
                 merkle,
                 no_merkle,
             } => {
@@ -223,43 +366,64 @@ impl FileAction {
                 } else {
                     PaymentMode::Auto
                 };
-                handle_file_cost(client, &path, mode, json).await
+                let options = choices.options()?;
+                handle_file_cost(client, &path, options, mode, json).await
+            }
+            action @ (FileAction::Prove { .. } | FileAction::Verify { .. }) => {
+                let network = client.wallet().map(|wallet| wallet.network().clone());
+                action
+                    .execute_offline(json, || {
+                        network.ok_or_else(|| anyhow::anyhow!("no payment chain configured"))
+                    })
+                    .await
             }
         }
     }
 }
 
-/// The visibility the upload flags ask for. `--name` and `--content-type` only
-/// apply to listed files.
-fn upload_visibility(
+/// The upload choices the flags ask for. `--visibility` (or `--public`) sets
+/// `--readable` and `--index` together; without them both default to `no`.
+/// Every payment field is shown unless `--hide` names it.
+fn upload_options(
     public: bool,
     visibility: Option<VisibilityArg>,
+    readable: Option<bool>,
+    index: Option<bool>,
+    hide: &[String],
     name: Option<String>,
     content_type: Option<String>,
-) -> anyhow::Result<Visibility> {
-    let visibility = match visibility {
-        Some(VisibilityArg::Listed) => {
-            let metadata = ant_core::ant_listings::Metadata { content_type, name };
-            metadata
-                .validate()
-                .map_err(|e| anyhow::anyhow!("Invalid listing metadata: {e}"))?;
-            return Ok(Visibility::Listed(metadata));
-        }
-        Some(VisibilityArg::Unlisted) => Visibility::Public,
-        Some(VisibilityArg::Private) => Visibility::Private,
-        None if public => Visibility::Public,
-        None => Visibility::Private,
+) -> anyhow::Result<EnvelopeOptions> {
+    let mut options = match visibility {
+        Some(VisibilityArg::Listed) => EnvelopeOptions::listed(),
+        Some(VisibilityArg::Unlisted) => EnvelopeOptions::unlisted(),
+        Some(VisibilityArg::Private) => EnvelopeOptions::private(),
+        None if public => EnvelopeOptions::unlisted(),
+        None => EnvelopeOptions::private(),
     };
-    if name.is_some() || content_type.is_some() {
-        anyhow::bail!("--name and --content-type are only for --visibility listed");
+    if let Some(readable) = readable {
+        options.readable = readable;
     }
-    Ok(visibility)
+    if let Some(index) = index {
+        options.in_index = index;
+    }
+    options.shown =
+        shown_after_hiding(hide.iter().map(String::as_str)).map_err(|e| anyhow::anyhow!(e))?;
+    options.metadata = Metadata { content_type, name };
+    options
+        .validate()
+        .map_err(|e| anyhow::anyhow!("Invalid --name or --content-type: {e}"))?;
+    Ok(options)
+}
+
+/// The names of the payment fields `options` hides.
+fn hidden_names(options: &EnvelopeOptions) -> Vec<&'static str> {
+    options.shown.hidden().map(PaymentField::name).collect()
 }
 
 async fn handle_file_upload(
     client: &Client,
     path: &Path,
-    visibility: Visibility,
+    options: EnvelopeOptions,
     mode: PaymentMode,
     collision_policy: CollisionPolicy,
     json_output: bool,
@@ -275,19 +439,18 @@ async fn handle_file_upload(
         path.display()
     );
 
-    let public = !matches!(visibility, Visibility::Private);
-    let listed = matches!(visibility, Visibility::Listed(_));
+    // Said before anything is paid; the choice stays the uploader's.
+    let warnings: Vec<String> = options.warnings().iter().map(ToString::to_string).collect();
+    for warning in &warnings {
+        eprintln!("warning: {warning}");
+    }
+    let visibility = options.clone().into_visibility();
+
     let upload_outcome = if json_output {
         // No progress bars in JSON mode.
-        match visibility {
-            Visibility::Listed(metadata) => {
-                client
-                    .file_upload_listed_with_progress(path, metadata, None)
-                    .await
-            }
-            Visibility::Public => client.file_upload_public_with_mode(path, mode).await,
-            Visibility::Private => client.file_upload_with_mode(path, mode).await,
-        }
+        client
+            .file_upload_with_visibility_and_progress(path, mode, visibility, None)
+            .await
     } else {
         // Set up progress channel and drive progress bars
         let (tx, rx) = mpsc::channel(64);
@@ -297,19 +460,9 @@ async fn handle_file_upload(
             file_size,
         ));
 
-        let upload_result = match visibility {
-            Visibility::Listed(metadata) => {
-                client
-                    .file_upload_listed_with_progress(path, metadata, Some(tx))
-                    .await
-            }
-            Visibility::Public => {
-                client
-                    .file_upload_public_with_progress(path, mode, Some(tx))
-                    .await
-            }
-            Visibility::Private => client.file_upload_with_progress(path, mode, Some(tx)).await,
-        };
+        let upload_result = client
+            .file_upload_with_visibility_and_progress(path, mode, visibility, Some(tx))
+            .await;
 
         // Wait for progress display to finish (sender dropped → receiver exits)
         let _ = pb_handle.await;
@@ -351,110 +504,278 @@ async fn handle_file_upload(
     };
 
     let elapsed = start.elapsed();
+    let envelope = result.envelope.as_ref();
+    let record = envelope.and_then(|envelope| envelope.proof.as_ref());
 
-    if public {
-        let dm_address = result
-            .data_map_address
-            .ok_or_else(|| anyhow::anyhow!("Public upload completed without a DataMap address"))?;
-        let hex_addr = hex::encode(dm_address);
-        let cost_display = format_cost(&result.storage_cost_atto, result.gas_cost_wei);
-        let total_chunks = result.total_chunks;
-        let data_chunks = total_chunks.saturating_sub(1);
-
-        if json_output {
-            let out = UploadJsonResult {
-                address: Some(hex_addr.clone()),
-                datamap: None,
-                mode: if listed { "listed" } else { "public" }.into(),
-                chunks: total_chunks,
-                total_chunks,
-                chunks_stored: result.chunks_stored,
-                chunks_failed: result.chunks_failed,
-                size: file_size,
-                storage_cost_atto: result.storage_cost_atto.clone(),
-                gas_cost_wei: result.gas_cost_wei.to_string(),
-                elapsed_secs: elapsed.as_secs_f64(),
-                chunk_attempts_total: result.chunk_attempts_total,
-                store_durations_ms: result.store_durations_ms.clone(),
-                retries_histogram: result.retries_histogram,
-            };
-            println!("{}", serde_json::to_string(&out)?);
-        } else {
-            println!();
-            println!("Upload complete!");
-            println!("  Address: {hex_addr}");
-            if listed {
-                println!("  Listed:  yes (see `ant listings`)");
+    // The data map stays local unless anyone can read the file; the record
+    // (envelope, payment, and a private file's salt) is saved next to it.
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let original_name = path
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .ok_or_else(|| {
+            anyhow::anyhow!("Cannot determine source filename from {}", path.display())
+        })?;
+    let local_map = (!options.readable).then_some(&result.data_map);
+    let (files, save_problem) =
+        match write_upload_files(parent, &original_name, local_map, record, collision_policy) {
+            Ok(files) => (files, None),
+            Err(e) => {
+                if let Some(text) = record.and_then(|record| record.to_hex().ok()) {
+                    eprintln!(
+                        "The upload's record, which could not be saved (a copy stays under \
+                         the client's data directory, in payments/upload/records/):\n{text}"
+                    );
+                }
+                if local_map.is_some() {
+                    anyhow::bail!("Failed to save the upload's files: {e}");
+                }
+                // A readable file is on the network at its address: say the
+                // record wasn't saved, and still print the result.
+                let files = UploadFiles {
+                    datamap: None,
+                    record: None,
+                };
+                (files, Some(format!("the record could not be saved: {e}")))
             }
-            println!("  Chunks:  {total_chunks} ({} + 1 data map)", data_chunks);
-            println!("  Size:    {}", format_size(file_size));
-            println!("  Cost:    {cost_display}");
-            println!("  Time:    {:.1}s", elapsed.as_secs_f64());
-            println!();
-            println!("Anyone can download this file with:");
-            println!("  ant file download {hex_addr} -o <FILE>");
+        };
+    if let (Some(_), Some(envelope)) = (&files.record, envelope) {
+        // The record is saved: the copy the upload kept can go.
+        if let Err(e) = forget_upload_record(&envelope.address()) {
+            info!("Could not remove the upload's kept record: {e}");
         }
-
-        info!(
-            "Public upload complete: address={hex_addr}, chunks={}",
-            result.total_chunks
-        );
-    } else {
-        let parent = path
-            .parent()
-            .filter(|p| !p.as_os_str().is_empty())
-            .unwrap_or_else(|| Path::new("."));
-        let original_name = path
-            .file_name()
-            .map(|s| s.to_string_lossy().into_owned())
-            .ok_or_else(|| {
-                anyhow::anyhow!("Cannot determine source filename from {}", path.display())
-            })?;
-        let datamap_path =
-            write_datamap(parent, &original_name, &result.data_map, collision_policy)
-                .map_err(|e| anyhow::anyhow!("Failed to persist datamap: {e}"))?;
-
-        let cost_display = format_cost(&result.storage_cost_atto, result.gas_cost_wei);
-
-        if json_output {
-            let out = UploadJsonResult {
-                address: None,
-                datamap: Some(datamap_path.display().to_string()),
-                mode: "private".into(),
-                chunks: result.chunks_stored,
-                total_chunks: result.total_chunks,
-                chunks_stored: result.chunks_stored,
-                chunks_failed: result.chunks_failed,
-                size: file_size,
-                storage_cost_atto: result.storage_cost_atto.clone(),
-                gas_cost_wei: result.gas_cost_wei.to_string(),
-                elapsed_secs: elapsed.as_secs_f64(),
-                chunk_attempts_total: result.chunk_attempts_total,
-                store_durations_ms: result.store_durations_ms.clone(),
-                retries_histogram: result.retries_histogram,
-            };
-            println!("{}", serde_json::to_string(&out)?);
-        } else {
-            println!();
-            println!("Upload complete!");
-            println!("  Datamap: {}", datamap_path.display());
-            println!("  Chunks:  {}", result.chunks_stored);
-            println!("  Size:    {}", format_size(file_size));
-            println!("  Cost:    {cost_display}");
-            println!("  Time:    {:.1}s", elapsed.as_secs_f64());
-            println!();
-            println!("Download this file with:");
-            println!("  ant file download --datamap {}", datamap_path.display());
+    }
+    let saved = files.record.is_some();
+    let record_problem = join_problems(
+        save_problem,
+        envelope.and_then(|envelope| {
+            record_note(
+                envelope.proof.is_some(),
+                envelope.proof_checked,
+                envelope.proof_problem.as_deref(),
+                saved,
+            )
+        }),
+    );
+    if let Some(note) = &record_problem {
+        eprintln!("warning: {note}");
+    }
+    if let Some(envelope) = envelope.filter(|envelope| envelope.proof.is_none()) {
+        // Without a record, the salt would be lost: say it once.
+        if let Some(salt) = envelope.salt {
+            eprintln!(
+                "The private envelope's salt (keep it with the data map to prove the file): {}",
+                hex::encode(salt)
+            );
         }
-
-        info!(
-            "Upload complete: datamap saved to {}, chunks={}",
-            datamap_path.display(),
-            result.chunks_stored
-        );
     }
 
+    let address = result.data_map_address.map(hex::encode);
+    if options.readable && address.is_none() {
+        anyhow::bail!("Public upload completed without a DataMap address");
+    }
+    let envelope_address = envelope.map(|envelope| hex::encode(envelope.address()));
+    let cost_display = format_cost(&result.storage_cost_atto, result.gas_cost_wei);
+
+    if json_output {
+        let out = UploadJsonResult {
+            address: address.clone(),
+            datamap: files.datamap.as_ref().map(|p| p.display().to_string()),
+            mode: upload_mode(&options).into(),
+            chunks: if options.readable {
+                result.total_chunks
+            } else {
+                result.chunks_stored
+            },
+            total_chunks: result.total_chunks,
+            chunks_stored: result.chunks_stored,
+            chunks_failed: result.chunks_failed,
+            size: file_size,
+            storage_cost_atto: result.storage_cost_atto.clone(),
+            gas_cost_wei: result.gas_cost_wei.to_string(),
+            elapsed_secs: elapsed.as_secs_f64(),
+            chunk_attempts_total: result.chunk_attempts_total,
+            store_durations_ms: result.store_durations_ms.clone(),
+            retries_histogram: result.retries_histogram,
+            choices: upload_choices_json(
+                &options,
+                envelope.map(|envelope| (hex::encode(envelope.address()), envelope.proof_checked)),
+                files.record.as_deref(),
+                record_problem,
+                warnings,
+            ),
+        };
+        println!("{}", serde_json::to_string(&out)?);
+        return Ok(());
+    }
+
+    println!();
+    println!("Upload complete!");
+    if let Some(address) = &address {
+        println!("  Address:  {address}");
+    } else if let Some(datamap) = &files.datamap {
+        println!("  Datamap:  {}", datamap.display());
+        if let Some(envelope_address) = &envelope_address {
+            println!(
+                "  Envelope: {envelope_address} ({})",
+                private_envelope_note(&options)
+            );
+        }
+    }
+    if options.in_index {
+        if options.readable {
+            println!("  Listed:   yes (see `ant listings`)");
+        } else {
+            println!("  Listed:   yes, unreadable until you reveal it (see `ant listings`)");
+        }
+    }
+    if envelope.is_some() {
+        let hidden = hidden_names(&options);
+        if hidden.is_empty() {
+            println!("  Payment:  all fields shown");
+        } else {
+            println!("  Payment:  hidden: {}", hidden.join(", "));
+        }
+    }
+    if let Some(record) = &files.record {
+        println!("  Record:   {}", record.display());
+    }
+    println!(
+        "  Chunks:   {}",
+        chunks_summary(
+            result.total_chunks,
+            result.chunks_stored,
+            envelope.is_some(),
+            options.readable
+        )
+    );
+    println!("  Size:     {}", format_size(file_size));
+    println!("  Cost:     {cost_display}");
+    println!("  Time:     {:.1}s", elapsed.as_secs_f64());
+    println!();
+    if let Some(address) = &address {
+        println!("Anyone can download this file with:");
+        println!("  ant file download {address} -o <FILE>");
+    } else if let Some(datamap) = &files.datamap {
+        println!("Download this file with:");
+        println!("  ant file download --datamap {}", datamap.display());
+    }
+    if let Some(record) = &files.record {
+        println!("Prove this upload to anyone with:");
+        println!("  ant file prove {}", record.display());
+        if !options.readable {
+            println!(
+                "Keep the record as safe as the data map: it holds the data map and the salt, \
+                 so it reads the file, and its salt is what proves which file this is. \
+                 `ant file prove --no-reveal` proves only the payment."
+            );
+        }
+    }
+
+    info!(
+        "Upload complete: address={address:?}, envelope={envelope_address:?}, chunks={}",
+        result.total_chunks
+    );
     Ok(())
+}
+
+/// The `mode` an upload's JSON reports, as before envelopes: `listed`,
+/// `public` (readable, not in the index) or `private`.
+fn upload_mode(options: &EnvelopeOptions) -> &'static str {
+    match (options.readable, options.in_index) {
+        (true, true) => "listed",
+        (true, false) => "public",
+        (false, _) => "private",
+    }
+}
+
+/// What the user should know about an envelope's record: why there is none
+/// (`has_record` false), or why it wasn't checked against the chain
+/// (`checked` false, `problem` says why). `saved`: whether the record file
+/// was written, so `ant file verify` can check it later.
+fn record_note(
+    has_record: bool,
+    checked: bool,
+    problem: Option<&str>,
+    saved: bool,
+) -> Option<String> {
+    match (has_record, problem) {
+        (false, Some(problem)) => Some(format!("no record saved: {problem}")),
+        (false, None) => Some("no record saved".into()),
+        (true, Some(problem)) if !checked && saved => Some(format!(
+            "the record is saved but was {problem}; check it later with `ant file verify`"
+        )),
+        (true, Some(problem)) if !checked => Some(format!("the record was {problem}")),
+        (true, _) => None,
+    }
+}
+
+/// Two problems with a record, as one.
+fn join_problems(first: Option<String>, second: Option<String>) -> Option<String> {
+    match (first, second) {
+        (Some(first), Some(second)) => Some(format!("{first}; {second}")),
+        (first, second) => first.or(second),
+    }
+}
+
+/// What the summary says is public about a private upload's envelope.
+fn private_envelope_note(options: &EnvelopeOptions) -> String {
+    if options.shown != ShownFields::NONE {
+        return "its payment record is public, the file is not".into();
+    }
+    let metadata = &options.metadata;
+    let public = match (&metadata.name, &metadata.content_type) {
+        (Some(_), Some(_)) => "its name and content type are public",
+        (Some(_), None) => "its name is public",
+        (None, Some(_)) => "its content type is public",
+        (None, None) => "its listing is public",
+    };
+    format!("{public}; the payment and the file are not")
+}
+
+/// The summary's chunk count: every chunk stored, with the envelope or the
+/// data map chunk among them called out, as before envelopes.
+fn chunks_summary(
+    total_chunks: usize,
+    chunks_stored: usize,
+    envelope: bool,
+    readable: bool,
+) -> String {
+    let extra = match (envelope, readable) {
+        (true, _) => "envelope",
+        (false, true) => "data map",
+        (false, false) => return chunks_stored.to_string(),
+    };
+    format!(
+        "{total_chunks} ({} + 1 {extra})",
+        total_chunks.saturating_sub(1)
+    )
+}
+
+/// What an upload's JSON says about its choices, envelope and record.
+/// `envelope` is the envelope's address and whether its record was checked
+/// against the chain.
+fn upload_choices_json(
+    options: &EnvelopeOptions,
+    envelope: Option<(String, bool)>,
+    record: Option<&Path>,
+    record_problem: Option<String>,
+    warnings: Vec<String>,
+) -> UploadChoicesJson {
+    let (envelope_address, record_checked) = envelope.unzip();
+    UploadChoicesJson {
+        readable: options.readable,
+        in_index: options.in_index,
+        hidden: hidden_names(options),
+        envelope_address,
+        record: record.map(|path| path.display().to_string()),
+        record_checked,
+        record_problem,
+        warnings,
+    }
 }
 
 /// Drive upload progress from the event channel.
@@ -512,6 +833,7 @@ async fn handle_file_download(
     client: &Client,
     address: Option<&str>,
     datamap_path: Option<&Path>,
+    proof_path: Option<&Path>,
     output: PathBuf,
     json_output: bool,
     peer_count: Option<NonZeroUsize>,
@@ -538,7 +860,20 @@ async fn handle_file_download(
     // failure paths. Failed downloads are the cases where the final records
     // matter most.
     let download_result: anyhow::Result<Option<FilePeerCheckJson>> = async {
-        let data_map = if let Some(addr_hex) = address {
+        let data_map = if let Some(dm_path) = datamap_path {
+            // A private file's envelope address doesn't give the data map;
+            // with --datamap as well, the data map is what reads the file.
+            info!("Downloading file using datamap: {}", dm_path.display());
+            let map = read_datamap(dm_path)
+                .map_err(|e| anyhow::anyhow!("Failed to read datamap: {e}"))?;
+            if let Some(addr_hex) = address {
+                let address = parse_address(addr_hex)?;
+                if let Some(note) = check_datamap_for_address(dm_path, &address, &map)? {
+                    eprintln!("warning: {note}");
+                }
+            }
+            map
+        } else if let Some(addr_hex) = address {
             info!("Downloading public file from address {addr_hex}");
             let address = parse_address(addr_hex)?;
             if !json_output {
@@ -551,7 +886,7 @@ async fn handle_file_download(
                     client.data_map_fetch(&address).await
                 };
                 spinner.finish_and_clear();
-                result.map_err(|e| anyhow::anyhow!("Failed to fetch public DataMap: {e}"))?
+                result.map_err(data_map_fetch_error)?
             } else {
                 if let Some(peer_count) = peer_count {
                     client
@@ -560,13 +895,16 @@ async fn handle_file_download(
                 } else {
                     client.data_map_fetch(&address).await
                 }
-                .map_err(|e| anyhow::anyhow!("Failed to fetch public DataMap: {e}"))?
+                .map_err(data_map_fetch_error)?
             }
+        } else if let Some(proof_path) = proof_path {
+            info!("Downloading file using proof: {}", proof_path.display());
+            let proof = read_record(proof_path)
+                .map_err(|e| anyhow::anyhow!("Failed to read proof: {e}"))?;
+            proof_data_map(&proof)
+                .map_err(|e| anyhow::anyhow!("The proof gives no data map: {e}"))?
         } else {
-            let dm_path = datamap_path
-                .ok_or_else(|| anyhow::anyhow!("--datamap required for private download"))?;
-            info!("Downloading file using datamap: {}", dm_path.display());
-            read_datamap(dm_path).map_err(|e| anyhow::anyhow!("Failed to read datamap: {e}"))?
+            anyhow::bail!("--datamap required for private download");
         };
 
         let chunk_peer_check = if json_output {
@@ -728,16 +1066,342 @@ async fn handle_file_download(
     Ok(())
 }
 
+/// Why a data map couldn't be fetched by address, with what to do about a
+/// private file's envelope.
+fn data_map_fetch_error(error: DataError) -> anyhow::Error {
+    match error {
+        DataError::DataMapWithheld(_) => anyhow::anyhow!(
+            "This address is a private file's envelope: it stores only a salted hash of the \
+             data map, so the file can't be read from the address. Download it with \
+             --datamap <FILE>.datamap, or with --proof <FILE> if the uploader revealed it \
+             (`ant file prove`)."
+        ),
+        error => anyhow::anyhow!("Failed to fetch public DataMap: {error}"),
+    }
+}
+
+/// Downloading with `--datamap` and an address: if the upload's record is
+/// next to the data map, check that the data map is the one the envelope at
+/// that address was made from. Returns a note when it can't tell; errors when
+/// the data map is not the envelope's.
+fn check_datamap_for_address(
+    datamap_path: &Path,
+    address: &[u8; 32],
+    map: &ant_core::data::DataMap,
+) -> anyhow::Result<Option<String>> {
+    let record_path = record_path_for(datamap_path);
+    if !record_path.exists() {
+        return Ok(None);
+    }
+    let record = match read_record(&record_path) {
+        Ok(record) => record,
+        Err(e) => {
+            return Ok(Some(format!(
+                "could not read {} to check the data map: {e}",
+                record_path.display()
+            )))
+        }
+    };
+    let envelope = match ant_core::ant_listings::Envelope::from_bytes(&record.envelope) {
+        Ok(envelope) if envelope.address() == *address => envelope,
+        _ => {
+            return Ok(Some(format!(
+                "{} is not for the address given, so the data map can't be checked \
+                 against it; using the data map",
+                record_path.display()
+            )))
+        }
+    };
+    let bytes = ant_core::ant_listings::encode_data_map(map)
+        .map_err(|e| anyhow::anyhow!("The data map is invalid: {e}"))?;
+    let matches = match (envelope.data_map_bytes(), &record.salt) {
+        (Some(own), _) => own == bytes.as_slice(),
+        (None, Some(salt)) => envelope.check_reveal(&bytes, salt).is_ok(),
+        (None, None) => return Ok(None),
+    };
+    if !matches {
+        anyhow::bail!(
+            "{} is not the data map of the envelope at this address",
+            datamap_path.display()
+        );
+    }
+    Ok(None)
+}
+
+/// Whether `a` and `b` name the same file, following links and relative
+/// paths; `b` need not exist yet.
+fn same_file(a: &Path, b: &Path) -> bool {
+    let resolve = |path: &Path| -> Option<PathBuf> {
+        std::fs::canonicalize(path).ok().or_else(|| {
+            let parent = path
+                .parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+                .unwrap_or_else(|| Path::new("."));
+            Some(std::fs::canonicalize(parent).ok()?.join(path.file_name()?))
+        })
+    };
+    matches!((resolve(a), resolve(b)), (Some(a), Some(b)) if a == b)
+}
+
+/// `ant file prove`: write a proof from an upload's record.
+fn handle_file_prove(
+    record_path: &Path,
+    output: Option<PathBuf>,
+    no_reveal: bool,
+    force: bool,
+    json_output: bool,
+) -> anyhow::Result<()> {
+    let mut proof =
+        read_record(record_path).map_err(|e| anyhow::anyhow!("Failed to read the record: {e}"))?;
+    let envelope = ant_core::ant_listings::Envelope::from_bytes(&proof.envelope)
+        .map_err(|e| anyhow::anyhow!("The record's envelope is invalid: {e}"))?;
+    if envelope.address() != proof.address {
+        anyhow::bail!("The record's envelope does not hash to its address");
+    }
+    let private = envelope.is_withheld();
+    if no_reveal {
+        proof.data_map = None;
+        proof.salt = None;
+    } else if private {
+        // A reveal that doesn't match would make the proof fail later.
+        proof_data_map(&proof)
+            .map_err(|e| anyhow::anyhow!("The record can't reveal the file: {e}"))?;
+    }
+    let reveals = private && proof.data_map.is_some();
+    let output = output.unwrap_or_else(|| default_proof_path(record_path));
+    if same_file(record_path, &output) {
+        anyhow::bail!(
+            "The proof would replace its record {}, which holds the salt nothing else keeps: \
+             choose another --output",
+            record_path.display()
+        );
+    }
+    if output.exists() && !force {
+        anyhow::bail!(
+            "{} already exists: pass --force to replace it",
+            output.display()
+        );
+    }
+    write_record(&output, &proof).map_err(|e| anyhow::anyhow!("Failed to write the proof: {e}"))?;
+
+    if json_output {
+        let out = ProveJson {
+            proof: output.display().to_string(),
+            address: hex::encode(proof.address),
+            private,
+            reveals,
+        };
+        println!("{}", serde_json::to_string(&out)?);
+        return Ok(());
+    }
+    println!("Proof written: {}", output.display());
+    println!("  Address: {}", hex::encode(proof.address));
+    if reveals {
+        println!("  It reveals the data map and salt: anyone with the proof can read the file,");
+        println!("  and can check that the envelope is for it.");
+    } else if private {
+        println!("  It doesn't reveal the data map: it proves the envelope was paid for,");
+        println!("  not which file it is for.");
+    }
+    println!("Anyone can check it from the payment chain with:");
+    println!("  ant file verify {}", output.display());
+    Ok(())
+}
+
+/// Where `ant file prove` writes by default: `notes.txt.record` gives
+/// `notes.txt.proof`.
+fn default_proof_path(record: &Path) -> PathBuf {
+    let name = record
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let stem = name
+        .strip_suffix(&format!(".{}", ant_core::datamap_file::RECORD_EXTENSION))
+        .unwrap_or(&name);
+    record.with_file_name(format!("{stem}.proof"))
+}
+
+/// `ant file verify`: check a proof from the chain, and optionally a file.
+async fn handle_file_verify(
+    chain: &ListingChain,
+    proof_path: &Path,
+    file: Option<&Path>,
+    json_output: bool,
+) -> anyhow::Result<()> {
+    let proof: EnvelopeProof =
+        read_record(proof_path).map_err(|e| anyhow::anyhow!("Failed to read the proof: {e}"))?;
+    let proven = chain
+        .check_proof(&proof)
+        .await
+        .map_err(|e| anyhow::anyhow!("The proof does not check out: {e}"))?;
+    let file_matches = match file {
+        None => None,
+        Some(path) => {
+            let unrevealed = || {
+                anyhow::anyhow!(
+                    "The proof checks out, but it doesn't reveal the data map, \
+                     so it can't be compared with {}",
+                    path.display()
+                )
+            };
+            // Said before the file is encrypted, which can take a while.
+            if proven.data_map.is_none() {
+                return Err(unrevealed());
+            }
+            let local = file_data_map(path)
+                .await
+                .map_err(|e| anyhow::anyhow!("Failed to encrypt {}: {e}", path.display()))?;
+            Some(file_matches(&local, proven.data_map.as_ref()).map_err(|_| unrevealed())?)
+        }
+    };
+    let flags = proven.envelope.flags();
+    let metadata = proven.envelope.metadata();
+    let quote_hash = ant_core::data::paid_quote_hash(&proven.payment.quote).map(hex::encode);
+
+    if json_output {
+        let out = VerifyJson {
+            valid: file_matches != Some(false),
+            address: hex::encode(proven.address),
+            readable: !flags.withheld,
+            in_index: flags.in_index,
+            hidden: flags.shown.hidden().map(PaymentField::name).collect(),
+            name: metadata.name.clone(),
+            content_type: metadata.content_type.clone(),
+            size: proven.envelope.file_size(),
+            revealed: proven.data_map.is_some() && flags.withheld,
+            tx_hash: format!("0x{}", hex::encode(proven.payment.tx_hash)),
+            block_number: proven.payment.block_number,
+            block_timestamp: proven.payment.block_timestamp,
+            log_index: proven.payment.log_index,
+            quote_hash,
+            file_matches,
+        };
+        println!("{}", serde_json::to_string(&out)?);
+    } else {
+        println!("The proof checks out against the payment chain.");
+        println!("  Address:  {}", hex::encode(proven.address));
+        println!(
+            "  Envelope: {}, {}",
+            if flags.withheld {
+                "private (data map withheld)"
+            } else {
+                "readable"
+            },
+            if flags.in_index {
+                "in the index"
+            } else {
+                "not in the index"
+            }
+        );
+        if let Some(name) = &metadata.name {
+            println!("  Name:     {name}");
+        }
+        if let Some(content_type) = &metadata.content_type {
+            println!("  Type:     {content_type}");
+        }
+        println!(
+            "  Paid:     block {}, log {}, at {} UTC",
+            proven.payment.block_number,
+            proven.payment.log_index,
+            super::listings::utc(proven.payment.block_timestamp)
+        );
+        println!("  Tx:       0x{}", hex::encode(proven.payment.tx_hash));
+        if let Some(quote_hash) = &quote_hash {
+            println!("  Quote:    0x{quote_hash}");
+        }
+        match (flags.withheld, proven.data_map.is_some()) {
+            (true, true) => println!("  Reveal:   the data map and salt match the envelope"),
+            (true, false) => println!("  Reveal:   none: the proof doesn't say which file this is"),
+            (false, _) => {}
+        }
+        match file_matches {
+            Some(true) => println!("  File:     matches the proof's data map"),
+            Some(false) => println!("  File:     DOES NOT match the proof's data map"),
+            None => {}
+        }
+        println!();
+        println!(
+            "This shows the address was paid for by block {}. It doesn't show who uploaded",
+            proven.payment.block_number
+        );
+        println!("the file: a node asked to quote, or anyone who has the envelope, can pay for");
+        println!("the same address. Only a revealed data map and salt tie a private envelope to");
+        println!("its file.");
+    }
+    if file_matches == Some(false) {
+        anyhow::bail!(
+            "{} is not the file this proof is for",
+            file.map(|p| p.display().to_string()).unwrap_or_default()
+        );
+    }
+    Ok(())
+}
+
+/// Whether a local file, whose data map is `local` ([`file_data_map`]), is
+/// the file a proof is for: its data map is the one the proof gives
+/// (`proven`: the envelope's own, or the revealed one), byte for byte as the
+/// envelope stores it. Self-encryption is deterministic, so the same file
+/// always gives the same data map.
+///
+/// # Errors
+///
+/// Returns an error when the proof gives no data map: a private file's proof
+/// that doesn't reveal it, which can't be compared with anything.
+fn file_matches(
+    local: &ant_core::data::DataMap,
+    proven: Option<&ant_core::data::DataMap>,
+) -> anyhow::Result<bool> {
+    let proven = proven.ok_or_else(|| anyhow::anyhow!("the proof doesn't reveal the data map"))?;
+    let encode = |map| ant_core::ant_listings::encode_data_map(map).ok();
+    let local = encode(local);
+    Ok(local.is_some() && local == encode(proven))
+}
+
+#[derive(Serialize)]
+struct ProveJson {
+    proof: String,
+    address: String,
+    private: bool,
+    reveals: bool,
+}
+
+#[derive(Serialize)]
+struct VerifyJson {
+    valid: bool,
+    address: String,
+    readable: bool,
+    in_index: bool,
+    hidden: Vec<&'static str>,
+    name: Option<String>,
+    content_type: Option<String>,
+    size: Option<u64>,
+    revealed: bool,
+    tx_hash: String,
+    block_number: u64,
+    block_timestamp: u64,
+    log_index: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    quote_hash: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    file_matches: Option<bool>,
+}
+
 async fn handle_file_cost(
     client: &Client,
     path: &Path,
+    options: EnvelopeOptions,
     mode: PaymentMode,
     json_output: bool,
 ) -> anyhow::Result<()> {
     let file_size = std::fs::metadata(path)?.len();
+    let envelope = options.needs_envelope();
+    let readable = options.readable;
+    let visibility = options.into_visibility();
 
     let raw_result = if json_output {
-        client.estimate_upload_cost(path, mode, None).await
+        client
+            .estimate_upload_cost_with_visibility(path, mode, visibility, None)
+            .await
     } else {
         let (tx, rx) = mpsc::channel(64);
         let pb_handle = tokio::spawn(drive_upload_progress(
@@ -746,7 +1410,9 @@ async fn handle_file_cost(
             file_size,
         ));
 
-        let result = client.estimate_upload_cost(path, mode, Some(tx)).await;
+        let result = client
+            .estimate_upload_cost_with_visibility(path, mode, visibility, Some(tx))
+            .await;
         let _ = pb_handle.await;
         result
     };
@@ -756,30 +1422,56 @@ async fn handle_file_cost(
     if json_output {
         println!("{}", serde_json::to_string(&estimate)?);
     } else {
-        // The estimate is display-only; the real upload reconciles the true
-        // cost at payment time. When every sampled chunk is already stored we
-        // say so rather than print a misleading priced number.
-        let cost_display = match estimate.confidence {
-            CostEstimateConfidence::VerifiedAllAlreadyStored => {
-                "already stored on the network — free".to_string()
-            }
-            CostEstimateConfidence::AllSamplesAlreadyStoredIncomplete => {
-                "likely already stored — free (confirmed at payment)".to_string()
-            }
-            CostEstimateConfidence::PricedSample => {
-                let gas_wei: u128 = estimate.estimated_gas_cost_wei.parse().unwrap_or(0);
-                format_cost(&estimate.storage_cost_atto, gas_wei)
-            }
-        };
+        let cost_display = cost_text(
+            estimate.confidence,
+            &estimate.storage_cost_atto,
+            &estimate.estimated_gas_cost_wei,
+        );
 
         println!();
         println!("Estimated upload cost for {}", path.display());
         println!("  Size:    {}", format_size(estimate.file_size));
-        println!("  Chunks:  {}", estimate.chunk_count);
+        println!(
+            "  Chunks:  {}",
+            chunks_summary(
+                estimate.chunk_count,
+                estimate.chunk_count,
+                envelope,
+                readable
+            )
+        );
         println!("  Cost:    {cost_display}");
     }
 
     Ok(())
+}
+
+/// How `ant file cost` shows an estimate. The estimate is display-only; the
+/// real upload reconciles the true cost at payment time. When every sampled
+/// chunk is already stored we say so rather than print a misleading priced
+/// number: free, or the price of the one chunk the upload adds (its envelope
+/// or data map) when only that was quoted.
+fn cost_text(
+    confidence: CostEstimateConfidence,
+    storage_cost_atto: &str,
+    gas_cost_wei: &str,
+) -> String {
+    let gas_wei: u128 = gas_cost_wei.parse().unwrap_or(0);
+    let priced = storage_cost_atto.parse::<u128>().unwrap_or(0) != 0;
+    match confidence {
+        CostEstimateConfidence::VerifiedAllAlreadyStored => {
+            "already stored on the network — free".to_string()
+        }
+        CostEstimateConfidence::AllSamplesAlreadyStoredIncomplete if priced => format!(
+            "{} for the envelope or data map; the content is likely already stored \
+             (confirmed at payment)",
+            format_cost(storage_cost_atto, gas_wei)
+        ),
+        CostEstimateConfidence::AllSamplesAlreadyStoredIncomplete => {
+            "likely already stored — free (confirmed at payment)".to_string()
+        }
+        CostEstimateConfidence::PricedSample => format_cost(storage_cost_atto, gas_wei),
+    }
 }
 
 #[derive(Serialize)]
@@ -805,6 +1497,38 @@ struct UploadJsonResult {
     store_durations_ms: Vec<u64>,
     /// Stored-chunk count by retry round (index 0 = first attempt).
     retries_histogram: [usize; 4],
+    /// The upload's choices, envelope and record.
+    #[serde(flatten)]
+    choices: UploadChoicesJson,
+}
+
+/// The fields an upload's JSON has for its choices, envelope and record.
+#[derive(Serialize)]
+struct UploadChoicesJson {
+    /// Whether anyone with the address can read the file.
+    readable: bool,
+    /// Whether the file is in the listings index.
+    in_index: bool,
+    /// The payment fields hidden: `tx-hash`, `block`, `timestamp`,
+    /// `log-index`, `quote`.
+    hidden: Vec<&'static str>,
+    /// The envelope's address, for an upload with an envelope (for a readable
+    /// one, the same as `address`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    envelope_address: Option<String>,
+    /// The saved record: envelope, payment, and a private file's data map
+    /// and salt.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    record: Option<String>,
+    /// Whether the record was checked against the chain.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    record_checked: Option<bool>,
+    /// Why there is no record, why it wasn't saved, or why it wasn't checked.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    record_problem: Option<String>,
+    /// What the upload's choices give away (also printed to stderr).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    warnings: Vec<String>,
 }
 
 #[derive(Serialize)]
@@ -1158,6 +1882,7 @@ fn format_cost(storage_cost_atto: &str, gas_cost_wei: u128) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ant_core::data::Visibility;
     use clap::Parser;
 
     #[derive(Debug, Parser)]
@@ -1252,9 +1977,7 @@ mod tests {
                 assert!(address.is_some());
                 assert_eq!(peers.map(NonZeroUsize::get), Some(PUBLIC_DOWNLOAD_PEERS));
             }
-            FileAction::Upload { .. } | FileAction::Cost { .. } => {
-                panic!("expected file download action")
-            }
+            _ => panic!("expected file download action"),
         }
     }
 
@@ -1276,9 +1999,7 @@ mod tests {
                 assert!(datamap.is_some());
                 assert_eq!(peers.map(NonZeroUsize::get), Some(PRIVATE_DOWNLOAD_PEERS));
             }
-            FileAction::Upload { .. } | FileAction::Cost { .. } => {
-                panic!("expected file download action")
-            }
+            _ => panic!("expected file download action"),
         }
     }
 
@@ -1314,9 +2035,7 @@ mod tests {
 
         match cli.action {
             FileAction::Download { all_peers, .. } => assert!(all_peers),
-            FileAction::Upload { .. } | FileAction::Cost { .. } => {
-                panic!("expected file download action")
-            }
+            _ => panic!("expected file download action"),
         }
     }
 
@@ -1346,9 +2065,588 @@ mod tests {
                     Some(DIAGNOSTIC_DOWNLOAD_PEERS)
                 );
             }
-            FileAction::Upload { .. } | FileAction::Cost { .. } => {
-                panic!("expected file download action")
-            }
+            _ => panic!("expected file download action"),
         }
+    }
+
+    fn upload(args: &[&str]) -> Result<EnvelopeOptions, String> {
+        let mut argv = vec!["test", "upload", "notes.txt"];
+        argv.extend_from_slice(args);
+        let cli = TestFileCli::try_parse_from(argv).map_err(|e| e.to_string())?;
+        match cli.action {
+            FileAction::Upload { choices, .. } => choices.options().map_err(|e| e.to_string()),
+            _ => panic!("expected file upload action"),
+        }
+    }
+
+    #[test]
+    fn upload_defaults_to_private_with_every_field_shown() {
+        let options = upload(&[]).unwrap();
+        assert_eq!(options, EnvelopeOptions::private());
+        assert!(matches!(options.into_visibility(), Visibility::Envelope(_)));
+    }
+
+    #[test]
+    fn visibility_is_shorthand_for_readable_and_index() {
+        assert_eq!(
+            upload(&["--visibility", "private"]).unwrap(),
+            EnvelopeOptions::private()
+        );
+        assert_eq!(
+            upload(&["--visibility", "unlisted"]).unwrap(),
+            EnvelopeOptions::unlisted()
+        );
+        assert_eq!(
+            upload(&["--visibility", "listed"]).unwrap(),
+            EnvelopeOptions::listed()
+        );
+        assert_eq!(upload(&["--public"]).unwrap(), EnvelopeOptions::unlisted());
+        assert_eq!(
+            upload(&["--readable", "yes"]).unwrap(),
+            EnvelopeOptions::unlisted()
+        );
+        assert_eq!(
+            upload(&["--readable", "yes", "--index", "yes"]).unwrap(),
+            EnvelopeOptions::listed()
+        );
+        // The fourth combination: dated and listed, unreadable.
+        let dated = upload(&["--index", "yes"]).unwrap();
+        assert!(!dated.readable);
+        assert!(dated.in_index);
+        assert!(upload(&["--readable", "maybe"]).is_err());
+        assert!(upload(&["--visibility", "listed", "--readable", "no"]).is_err());
+        assert!(upload(&["--public", "--index", "yes"]).is_err());
+        assert!(upload(&["--public", "--visibility", "listed"]).is_err());
+    }
+
+    #[test]
+    fn hide_takes_field_names_and_all() {
+        let options = upload(&["--hide", "tx-hash,quote"]).unwrap();
+        assert_eq!(
+            options.shown,
+            ShownFields::ALL
+                .without(PaymentField::TxHash)
+                .without(PaymentField::Quote)
+        );
+        let options = upload(&["--hide", "block", "--hide", "log-index"]).unwrap();
+        assert_eq!(
+            options.shown,
+            ShownFields::ALL
+                .without(PaymentField::BlockNumber)
+                .without(PaymentField::LogIndex)
+        );
+        assert!(upload(&["--hide", "wallet"]).is_err());
+        // Hiding everything on a private, unindexed upload without metadata
+        // needs no envelope: it is stored exactly as before.
+        let bare = upload(&["--hide", "all"]).unwrap();
+        assert_eq!(bare.shown, ShownFields::NONE);
+        assert_eq!(bare.into_visibility(), Visibility::Private);
+        assert_eq!(
+            upload(&["--hide", "all", "--public"])
+                .unwrap()
+                .into_visibility(),
+            Visibility::Public
+        );
+        assert!(matches!(
+            upload(&["--hide", "all", "--name", "notes.txt"])
+                .unwrap()
+                .into_visibility(),
+            Visibility::Envelope(_)
+        ));
+    }
+
+    #[test]
+    fn metadata_works_on_every_visibility_and_is_checked() {
+        for visibility in ["private", "unlisted", "listed"] {
+            let options = upload(&[
+                "--visibility",
+                visibility,
+                "--name",
+                "notes.txt",
+                "--content-type",
+                "text/plain",
+            ])
+            .unwrap();
+            assert_eq!(options.metadata.name.as_deref(), Some("notes.txt"));
+            assert_eq!(options.metadata.content_type.as_deref(), Some("text/plain"));
+        }
+        assert!(upload(&["--name", "a/b"]).is_err());
+        assert!(upload(&["--content-type", "not a type"]).is_err());
+    }
+
+    #[test]
+    fn upload_modes_keep_their_json_names() {
+        assert_eq!(upload_mode(&EnvelopeOptions::private()), "private");
+        assert_eq!(upload_mode(&EnvelopeOptions::unlisted()), "public");
+        assert_eq!(upload_mode(&EnvelopeOptions::listed()), "listed");
+        let dated = EnvelopeOptions {
+            in_index: true,
+            ..EnvelopeOptions::private()
+        };
+        assert_eq!(upload_mode(&dated), "private");
+    }
+
+    #[test]
+    fn prove_and_verify_parse_and_need_no_storage_network() {
+        let cli = TestFileCli::try_parse_from(["test", "prove", "notes.txt.record", "--no-reveal"])
+            .unwrap();
+        assert!(!cli.action.needs_network());
+        match cli.action {
+            FileAction::Prove {
+                record, no_reveal, ..
+            } => {
+                assert_eq!(record, PathBuf::from("notes.txt.record"));
+                assert!(no_reveal);
+            }
+            _ => panic!("expected prove"),
+        }
+        let cli = TestFileCli::try_parse_from([
+            "test",
+            "verify",
+            "notes.txt.proof",
+            "--file",
+            "notes.txt",
+        ])
+        .unwrap();
+        assert!(!cli.action.needs_network());
+        let cli = TestFileCli::try_parse_from([
+            "test",
+            "download",
+            "--proof",
+            "notes.txt.proof",
+            "-o",
+            "notes.txt",
+        ])
+        .unwrap();
+        assert!(cli.action.needs_network());
+        assert!(TestFileCli::try_parse_from([
+            "test",
+            "download",
+            "--proof",
+            "p",
+            "--datamap",
+            "d.datamap"
+        ])
+        .is_err());
+    }
+
+    /// A private file's data map, salt and record, as an upload saves them.
+    fn private_record(salt: [u8; 32]) -> (ant_core::data::DataMap, EnvelopeProof) {
+        use ant_core::ant_listings::{encode_data_map, self_encryption, Envelope};
+        let (map, _) =
+            self_encryption::encrypt(bytes::Bytes::from(vec![7u8; 5_000])).expect("encrypt");
+        let envelope =
+            Envelope::withheld(&map, &salt, Metadata::default(), ShownFields::ALL, false)
+                .expect("envelope");
+        let record = EnvelopeProof {
+            address: envelope.address(),
+            envelope: envelope.to_bytes(),
+            tx_hash: [8; 32],
+            quote: vec![1, 2, 3],
+            data_map: Some(encode_data_map(&map).expect("encode")),
+            salt: Some(salt),
+        };
+        (map, record)
+    }
+
+    #[test]
+    fn prove_reveals_or_strips_the_data_map_and_salt() {
+        let dir = tempfile::tempdir().unwrap();
+        let record_path = dir.path().join("notes.txt.record");
+        let (_, record) = private_record([4; 32]);
+        write_record(&record_path, &record).unwrap();
+
+        // By default the proof reveals the data map and salt.
+        handle_file_prove(&record_path, None, false, false, true).unwrap();
+        let proof = read_record(&dir.path().join("notes.txt.proof")).unwrap();
+        assert_eq!(proof, record);
+
+        // --no-reveal proves only the payment.
+        let bare = dir.path().join("bare.proof");
+        handle_file_prove(&record_path, Some(bare.clone()), true, false, true).unwrap();
+        let proof = read_record(&bare).unwrap();
+        assert_eq!((proof.data_map, proof.salt), (None, None));
+        assert_eq!(proof.envelope, record.envelope);
+
+        // An existing proof is replaced only with --force.
+        let error = handle_file_prove(&record_path, Some(bare.clone()), false, false, true)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("--force"), "{error}");
+        assert_eq!(read_record(&bare).unwrap().salt, None);
+        handle_file_prove(&record_path, Some(bare.clone()), false, true, true).unwrap();
+        assert_eq!(read_record(&bare).unwrap().salt, Some([4; 32]));
+
+        // The record itself is never replaced, even with --force, under any
+        // spelling of its path.
+        for output in [
+            record_path.clone(),
+            dir.path().join(".").join("notes.txt.record"),
+        ] {
+            let error = handle_file_prove(&record_path, Some(output), true, true, true)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("replace its record"), "{error}");
+        }
+        assert_eq!(read_record(&record_path).unwrap(), record);
+    }
+
+    #[test]
+    fn prove_refuses_a_record_that_does_not_check_out() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_, record) = private_record([4; 32]);
+        // A damaged salt: the reveal no longer matches the envelope.
+        let damaged = dir.path().join("salt.record");
+        write_record(
+            &damaged,
+            &EnvelopeProof {
+                salt: Some([5; 32]),
+                ..record.clone()
+            },
+        )
+        .unwrap();
+        let error = handle_file_prove(&damaged, None, false, false, true)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("can't reveal"), "{error}");
+        assert!(!dir.path().join("salt.proof").exists());
+        // An envelope that doesn't hash to the record's address.
+        let moved = dir.path().join("address.record");
+        write_record(
+            &moved,
+            &EnvelopeProof {
+                address: [0; 32],
+                ..record
+            },
+        )
+        .unwrap();
+        let error = handle_file_prove(&moved, None, true, false, true)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("does not hash"), "{error}");
+    }
+
+    #[test]
+    fn a_datamap_given_with_an_address_is_checked_against_its_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let datamap = dir.path().join("notes.txt.datamap");
+        let (map, record) = private_record([4; 32]);
+        let (_, other) = private_record([6; 32]);
+        let (other_map, _) = {
+            use ant_core::ant_listings::self_encryption;
+            self_encryption::encrypt(bytes::Bytes::from(vec![9u8; 5_000])).unwrap()
+        };
+        // No record next to it: nothing to check.
+        assert_eq!(
+            check_datamap_for_address(&datamap, &record.address, &map).unwrap(),
+            None
+        );
+        write_record(&record_path_for(&datamap), &record).unwrap();
+        // The data map the envelope was made from.
+        assert_eq!(
+            check_datamap_for_address(&datamap, &record.address, &map).unwrap(),
+            None
+        );
+        // Another data map is refused.
+        assert!(check_datamap_for_address(&datamap, &record.address, &other_map).is_err());
+        // A record for another address can't check it: a note, not an error.
+        let note = check_datamap_for_address(&datamap, &other.address, &map)
+            .unwrap()
+            .expect("a note");
+        assert!(note.contains("not for the address given"), "{note}");
+    }
+
+    #[test]
+    fn download_takes_a_datamap_with_an_envelope_address() {
+        let cli = TestFileCli::try_parse_from([
+            "test",
+            "download",
+            &test_address(),
+            "--datamap",
+            "notes.txt.datamap",
+        ])
+        .unwrap();
+        match cli.action {
+            FileAction::Download {
+                address, datamap, ..
+            } => {
+                assert!(address.is_some());
+                assert_eq!(datamap, Some(PathBuf::from("notes.txt.datamap")));
+            }
+            _ => panic!("expected download"),
+        }
+    }
+
+    #[test]
+    fn cost_takes_the_upload_choices() {
+        let cost = |args: &[&str]| {
+            let mut argv = vec!["test", "cost", "notes.txt"];
+            argv.extend_from_slice(args);
+            match TestFileCli::try_parse_from(argv).unwrap().action {
+                FileAction::Cost { choices, .. } => choices.options().unwrap(),
+                _ => panic!("expected cost"),
+            }
+        };
+        assert_eq!(cost(&[]), EnvelopeOptions::private());
+        assert!(cost(&[]).needs_envelope());
+        assert_eq!(cost(&["--visibility", "listed"]), EnvelopeOptions::listed());
+        assert!(!cost(&["--hide", "all"]).needs_envelope());
+        assert!(
+            TestFileCli::try_parse_from(["test", "cost", "f", "--public", "--index", "yes"])
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn the_summary_counts_the_envelope_or_data_map_once() {
+        // A 3-chunk private file and its envelope: 4 stored.
+        assert_eq!(chunks_summary(4, 4, true, false), "4 (3 + 1 envelope)");
+        assert_eq!(chunks_summary(4, 4, true, true), "4 (3 + 1 envelope)");
+        // A plain public upload, as before envelopes.
+        assert_eq!(chunks_summary(7, 7, false, true), "7 (6 + 1 data map)");
+        assert_eq!(chunks_summary(3, 3, false, false), "3");
+    }
+
+    #[test]
+    fn the_private_envelope_note_follows_what_is_shown() {
+        assert_eq!(
+            private_envelope_note(&EnvelopeOptions::private()),
+            "its payment record is public, the file is not"
+        );
+        let hidden = EnvelopeOptions {
+            shown: ShownFields::NONE,
+            ..EnvelopeOptions::private()
+        };
+        let named = hidden.clone().with_metadata(Metadata {
+            content_type: Some("text/plain".into()),
+            name: Some("notes.txt".into()),
+        });
+        assert_eq!(
+            private_envelope_note(&named),
+            "its name and content type are public; the payment and the file are not"
+        );
+        let dated = EnvelopeOptions {
+            in_index: true,
+            ..hidden
+        };
+        assert_eq!(
+            private_envelope_note(&dated),
+            "its listing is public; the payment and the file are not"
+        );
+    }
+
+    #[test]
+    fn upload_json_carries_the_choices_and_the_record() {
+        let json = |options: &EnvelopeOptions,
+                    envelope: Option<(String, bool)>,
+                    record: Option<&Path>,
+                    problem: Option<String>| {
+            let warnings = options.warnings().iter().map(ToString::to_string).collect();
+            serde_json::to_value(upload_choices_json(
+                options, envelope, record, problem, warnings,
+            ))
+            .unwrap()
+        };
+        let address = "ab".repeat(32);
+
+        // Private, with an envelope and a saved, checked record.
+        let private = json(
+            &EnvelopeOptions::private(),
+            Some((address.clone(), true)),
+            Some(Path::new("notes.txt.record")),
+            None,
+        );
+        assert_eq!(private["readable"], false);
+        assert_eq!(private["in_index"], false);
+        assert_eq!(private["hidden"], serde_json::json!([]));
+        assert_eq!(private["envelope_address"], address.as_str());
+        assert_eq!(private["record"], "notes.txt.record");
+        assert_eq!(private["record_checked"], true);
+        assert!(private.get("record_problem").is_none());
+        assert!(!private["warnings"].as_array().unwrap().is_empty());
+
+        // Unlisted, whose record couldn't be saved.
+        let unlisted = json(
+            &EnvelopeOptions::unlisted().hiding([PaymentField::Quote]),
+            Some((address.clone(), false)),
+            None,
+            join_problems(
+                Some("the record could not be saved: read-only".into()),
+                Some("not checked".into()),
+            ),
+        );
+        assert_eq!(unlisted["readable"], true);
+        assert_eq!(unlisted["hidden"], serde_json::json!(["quote"]));
+        assert!(unlisted.get("record").is_none());
+        assert_eq!(unlisted["record_checked"], false);
+        assert_eq!(
+            unlisted["record_problem"],
+            "the record could not be saved: read-only; not checked"
+        );
+
+        // Everything hidden on a plain private upload: no envelope at all.
+        let bare = EnvelopeOptions {
+            shown: ShownFields::NONE,
+            ..EnvelopeOptions::private()
+        };
+        let bare = json(&bare, None, None, None);
+        let keys: Vec<&str> = bare
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(keys, ["hidden", "in_index", "readable"]);
+        assert_eq!(bare["hidden"].as_array().unwrap().len(), 5);
+    }
+
+    #[test]
+    fn bad_choices_are_refused_before_the_wallet_or_the_network() {
+        let action = |argv: &[&str]| TestFileCli::try_parse_from(argv).unwrap().action;
+        // `main` calls `validate` before it asks for SECRET_KEY or connects.
+        let error = action(&["test", "upload", "f.txt", "--hide", "tx_hash"])
+            .validate()
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("tx_hash"), "{error}");
+        assert!(action(&["test", "upload", "f.txt", "--name", "a/b"])
+            .validate()
+            .is_err());
+        assert!(
+            action(&["test", "upload", "f.txt", "--content-type", "nonsense"])
+                .validate()
+                .is_err()
+        );
+        assert!(action(&["test", "cost", "f.txt", "--hide", "foo"])
+            .validate()
+            .is_err());
+        assert!(
+            action(&["test", "upload", "f.txt", "--hide", "tx-hash,quote"])
+                .validate()
+                .is_ok()
+        );
+        assert!(action(&["test", "cost", "f.txt", "--visibility", "listed"])
+            .validate()
+            .is_ok());
+        assert!(action(&["test", "prove", "f.txt.record"])
+            .validate()
+            .is_ok());
+    }
+
+    #[test]
+    fn the_record_note_says_whether_the_record_is_saved() {
+        let unchecked = "not checked against the chain: no receipt";
+        assert_eq!(
+            record_note(true, false, Some(unchecked), true).as_deref(),
+            Some(
+                "the record is saved but was not checked against the chain: no receipt; \
+                 check it later with `ant file verify`"
+            )
+        );
+        // Not saved: it doesn't claim it is, nor point at a file that isn't
+        // there.
+        let note = record_note(true, false, Some(unchecked), false);
+        assert_eq!(
+            note.as_deref(),
+            Some("the record was not checked against the chain: no receipt")
+        );
+        let joined = join_problems(
+            Some("the record could not be saved: read-only".into()),
+            note,
+        )
+        .unwrap();
+        assert!(!joined.contains("is saved"), "{joined}");
+        assert!(!joined.contains("ant file verify"), "{joined}");
+        // Checked: nothing to say, saved or not.
+        assert_eq!(record_note(true, true, None, true), None);
+        assert_eq!(record_note(true, true, None, false), None);
+        // No record at all.
+        assert_eq!(
+            record_note(false, false, Some("already stored"), false).as_deref(),
+            Some("no record saved: already stored")
+        );
+        assert_eq!(
+            record_note(false, false, None, false).as_deref(),
+            Some("no record saved")
+        );
+    }
+
+    #[tokio::test]
+    async fn verify_compares_a_local_file_with_the_proven_data_map() {
+        use ant_core::ant_listings::self_encryption;
+        let dir = tempfile::tempdir().unwrap();
+        let write = |name: &str, fill: u8| {
+            let path = dir.path().join(name);
+            std::fs::write(&path, vec![fill; 5_000]).unwrap();
+            path
+        };
+        let same = write("same.bin", 7);
+        let other = write("other.bin", 8);
+        // The map `private_record` reveals is for 5,000 bytes of 7s.
+        let (proven, record) = private_record([4; 32]);
+        // `file_data_map` gives the same map as encrypting the bytes in
+        // memory, as an upload of them does.
+        let local = file_data_map(&same).await.unwrap();
+        let (in_memory, _) =
+            self_encryption::encrypt(bytes::Bytes::from(std::fs::read(&same).unwrap())).unwrap();
+        assert!(local == in_memory);
+        assert!(file_matches(&local, Some(&proven)).unwrap());
+        // The map a proof reveals compares too.
+        let revealed = proof_data_map(&record).unwrap();
+        assert!(file_matches(&local, Some(&revealed)).unwrap());
+        // Another file doesn't match.
+        let other = file_data_map(&other).await.unwrap();
+        assert!(!file_matches(&other, Some(&proven)).unwrap());
+        // A proof that doesn't reveal the map can't be compared.
+        let mut unrevealed = record;
+        unrevealed.data_map = None;
+        unrevealed.salt = None;
+        assert!(proof_data_map(&unrevealed).is_err());
+        assert!(file_matches(&local, None).is_err());
+    }
+
+    #[test]
+    fn a_partly_sampled_estimate_shows_the_extra_chunk_as_a_floor() {
+        use CostEstimateConfidence::{
+            AllSamplesAlreadyStoredIncomplete, PricedSample, VerifiedAllAlreadyStored,
+        };
+        let price = "3000000000000000";
+        let gas = "150000000000000";
+        assert_eq!(
+            cost_text(PricedSample, price, gas),
+            format_cost(price, 150_000_000_000_000)
+        );
+        assert_eq!(
+            cost_text(VerifiedAllAlreadyStored, "0", "0"),
+            "already stored on the network — free"
+        );
+        assert_eq!(
+            cost_text(AllSamplesAlreadyStoredIncomplete, "0", "0"),
+            "likely already stored — free (confirmed at payment)"
+        );
+        // Only the envelope (or data map) was quoted, and some content wasn't
+        // sampled: its price, not a promise for the whole upload.
+        let text = cost_text(AllSamplesAlreadyStoredIncomplete, price, gas);
+        assert!(
+            text.starts_with(&format_cost(price, 150_000_000_000_000)),
+            "{text}"
+        );
+        assert!(text.contains("likely already stored"), "{text}");
+    }
+
+    #[test]
+    fn proofs_are_named_after_their_record() {
+        assert_eq!(
+            default_proof_path(Path::new("dir/notes.txt.record")),
+            PathBuf::from("dir/notes.txt.proof")
+        );
+        assert_eq!(
+            default_proof_path(Path::new("notes.txt-2.record")),
+            PathBuf::from("notes.txt-2.proof")
+        );
+        assert_eq!(
+            default_proof_path(Path::new("saved.hex")),
+            PathBuf::from("saved.hex.proof")
+        );
     }
 }

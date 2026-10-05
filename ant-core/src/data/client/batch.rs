@@ -310,6 +310,14 @@ impl PaymentIntent {
             total_amount: total,
         }
     }
+
+    /// These payments in the order of their quote hashes, so an envelope
+    /// bundled with its content isn't always paid, and logged, last
+    /// ([`order_by_quote_hash`](super::upload::order_by_quote_hash)).
+    #[cfg(feature = "native")]
+    pub(crate) fn sort_by_quote_hash(&mut self) {
+        self.payments.sort_by_key(|(quote_hash, _, _)| *quote_hash);
+    }
 }
 
 /// Build [`PaidChunk`]s from prepared chunks and externally-provided transaction hashes.

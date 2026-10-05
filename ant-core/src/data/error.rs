@@ -79,6 +79,12 @@ pub enum Error {
     #[error("serialization error: {0}")]
     Serialization(String),
 
+    /// The address holds a private file's envelope: the envelope stores only
+    /// a salted hash of the data map, so the file can be read only with the
+    /// uploader's data map (from a `.datamap` file, or revealed in a proof).
+    #[error("data map withheld: {0}")]
+    DataMapWithheld(String),
+
     /// Cryptographic error.
     #[error("crypto error: {0}")]
     Crypto(String),

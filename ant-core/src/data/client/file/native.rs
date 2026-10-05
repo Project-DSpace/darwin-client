@@ -18,6 +18,7 @@ use crate::data::client::batch::{
 use crate::data::client::chunk::{ChunkFetchDiagnostics, ChunkPeerGetResult};
 use crate::data::client::classify_error;
 use crate::data::client::diagnostics::DownloadDiagnosticsSender;
+use crate::data::client::envelope::{EnvelopeOptions, UploadEnvelope};
 use crate::data::client::merkle::{
     finalize_merkle_batch, merge_merkle_batch_results, merkle_deferred_retry,
     merkle_store_with_retry, merkle_upload_billable_units, merkle_upload_split, should_use_merkle,
@@ -801,6 +802,7 @@ fn assemble_merkle_finalize_outcome(
                 chunk_attempts_total: stats.chunk_attempts_total,
                 store_durations_ms: stats.store_durations_ms,
                 retries_histogram: stats.retries_histogram,
+                envelope: None,
             }))
         }
         Err(Error::PartialUpload {
@@ -827,6 +829,7 @@ fn assemble_merkle_finalize_outcome(
                 chunk_attempts_total: 0,
                 store_durations_ms: Vec::new(),
                 retries_histogram: [0; 4],
+                envelope: None,
             };
             let resume = MerkleFinalizeResume {
                 data_map,
@@ -886,6 +889,7 @@ fn assemble_wave_finalize_outcome(
             chunk_attempts_total: stats.chunk_attempts_total,
             store_durations_ms: stats.store_durations_ms,
             retries_histogram: stats.retries_histogram,
+            envelope: None,
         });
     }
 
@@ -910,6 +914,7 @@ fn assemble_wave_finalize_outcome(
         chunk_attempts_total: 0,
         store_durations_ms: Vec::new(),
         retries_histogram: [0; 4],
+        envelope: None,
     };
     let resume = WaveFinalizeResume {
         data_map,
@@ -918,6 +923,7 @@ fn assemble_wave_finalize_outcome(
         stored_count,
         failed_paid_chunks,
         storage_cost_atto,
+        envelope: None,
     };
     FinalizeOutcome::Partial {
         result,
@@ -1141,6 +1147,26 @@ fn adaptive_stream_decrypt_batch_size(
     requested.min(total_chunks.max(1)).max(1)
 }
 
+/// The data map `path` encrypts to, as an upload of it computes it, without
+/// storing anything. Self-encryption is deterministic, so comparing it with
+/// a published or revealed data map checks that a local file is the one
+/// uploaded.
+///
+/// # Errors
+///
+/// Returns an error if the file can't be read or encrypted.
+pub async fn file_data_map(path: &Path) -> Result<DataMap> {
+    let (mut chunks, data_map, handle) = spawn_file_encryption(path.to_path_buf())?;
+    while chunks.recv().await.is_some() {}
+    handle
+        .await
+        .map_err(|e| Error::Encryption(format!("encryption task panicked: {e}")))?
+        .map_err(|e| Error::Encryption(format!("encryption failed: {e}")))?;
+    data_map
+        .await
+        .map_err(|_| Error::Encryption("no DataMap from encryption thread".to_string()))
+}
+
 /// Payment information for external signing — either wave-batch or merkle.
 // ADR-0004 added the signed commitment fields (`committed_key_count`,
 // `commitment_pin`) to the merkle candidate quotes carried inside
@@ -1206,24 +1232,43 @@ impl std::fmt::Debug for ExternalChunkStore {
     }
 }
 
+/// An envelope upload's checkpoint scope: its choices
+/// ([`EnvelopeOptions::scope`]) and its payer (`payer`:
+/// [`UploadPayer::checkpoint_scope`], or the wallet's address), so only the
+/// same payer resumes it, reusing its salt and the envelope's payment. The
+/// choices end where their msgpack ends, so the payer can simply follow.
+fn envelope_checkpoint_scope(options: &EnvelopeOptions, payer: &[u8]) -> Vec<u8> {
+    let mut scope = options.scope();
+    scope.extend_from_slice(payer);
+    scope
+}
+
 /// Open the checkpoint for uploading `records` on `network`: its path, the
 /// lock held while the upload runs, and the state an earlier, interrupted
 /// attempt saved (`None` if there was none).
+///
+/// An envelope upload's checkpoint is scoped by its content records, its
+/// envelope choices and its payer (`envelope`,
+/// [`envelope_checkpoint_scope`]), not by the envelope's address, which a
+/// private envelope's random salt changes: the salt is saved next to the
+/// checkpoint ([`upload_salt`]) so a resumed upload builds the same envelope.
 async fn open_upload_checkpoint(
     network: &ant_protocol::evm::Network,
     records: &[super::super::upload::UploadRecord],
+    envelope: Option<&[u8]>,
 ) -> Result<(
     PathBuf,
     std::fs::File,
     Option<super::super::upload_state::UploadState>,
 )> {
-    let scope = rmp_serde::to_vec(&(
-        network,
-        records
-            .iter()
-            .map(|r| (r.address, r.size))
-            .collect::<Vec<_>>(),
-    ))
+    let records = records
+        .iter()
+        .map(|r| (r.address, r.size))
+        .collect::<Vec<_>>();
+    let scope = match envelope {
+        None => rmp_serde::to_vec(&(network, records)),
+        Some(envelope) => rmp_serde::to_vec(&(network, records, envelope)),
+    }
     .map_err(|e| Error::Serialization(e.to_string()))?;
     let cache_dir = crate::config::data_dir()
         .map_err(|e| Error::Config(e.to_string()))?
@@ -1254,47 +1299,306 @@ async fn open_upload_checkpoint(
     Ok((cache_path, lock, saved))
 }
 
-/// Delete a completed upload's checkpoint.
-fn remove_upload_checkpoint(path: &Path) -> Result<()> {
-    std::fs::remove_file(path).or_else(|error| {
-        if error.kind() == std::io::ErrorKind::NotFound {
-            Ok(())
-        } else {
-            Err(Error::Io(error))
+/// Where a completed upload keeps what proves its envelope until the caller
+/// has saved it ([`forget_upload_record`]): under `records/` next to the
+/// checkpoints, by envelope address and payer, `<address>.<payer>.record`
+/// (the record's text, as [`crate::datamap_file::write_record`] writes it)
+/// or, for a private envelope without a record, `<address>.<payer>.salt`.
+/// `payer` is the payer's checkpoint scope ([`UploadPayer::checkpoint_scope`],
+/// or the wallet's address), shortened to a hash. [`upload_salt`] never
+/// reads there, so a later upload of the same file picks a new salt.
+fn kept_path(upload_dir: &Path, address: &[u8; 32], payer: &[u8], extension: &str) -> PathBuf {
+    let payer = blake3::hash(payer);
+    upload_dir.join("records").join(format!(
+        "{}.{}.{extension}",
+        hex::encode(address),
+        hex::encode(&payer.as_bytes()[..16])
+    ))
+}
+
+/// Write `bytes` to `path`, whole or not at all.
+fn write_whole(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let directory = path
+        .parent()
+        .ok_or_else(|| std::io::Error::other("missing directory"))?;
+    std::fs::create_dir_all(directory)?;
+    let mut file = tempfile::NamedTempFile::new_in(directory)?;
+    file.write_all(bytes)?;
+    file.as_file().sync_all()?;
+    file.persist(path).map_err(|e| e.error)?;
+    Ok(())
+}
+
+/// Keep what proves `envelope` under `upload_dir` ([`kept_path`]): its
+/// record, or the salt of a private one without a record. Nothing for a
+/// readable envelope without a record: nothing of it is lost.
+fn keep_upload_record(
+    upload_dir: &Path,
+    envelope: &UploadEnvelope,
+    payer: &[u8],
+) -> std::result::Result<(), String> {
+    let address = envelope.address();
+    match (&envelope.proof, envelope.salt) {
+        (Some(proof), _) => {
+            let path = kept_path(
+                upload_dir,
+                &address,
+                payer,
+                crate::datamap_file::RECORD_EXTENSION,
+            );
+            let directory = path.parent().ok_or("missing directory")?;
+            std::fs::create_dir_all(directory).map_err(|e| e.to_string())?;
+            crate::datamap_file::write_record(&path, proof).map_err(|e| e.to_string())
         }
-    })
-}
-
-/// A listed upload's result: the content's, plus the envelope record stored
-/// after it, whose address is the file's address.
-fn listed_result(
-    content: FileUploadResult,
-    envelope_address: [u8; 32],
-    envelope: &super::super::upload::UploadOutcome,
-) -> FileUploadResult {
-    let content_cost = content
-        .storage_cost_atto
-        .parse::<Amount>()
-        .unwrap_or(Amount::ZERO);
-    FileUploadResult {
-        chunks_stored: content.chunks_stored + envelope.addresses.len(),
-        total_chunks: content.total_chunks + 1,
-        storage_cost_atto: content_cost.saturating_add(envelope.amount).to_string(),
-        gas_cost_wei: content.gas_cost_wei.saturating_add(envelope.gas),
-        data_map_address: Some(envelope_address),
-        chunk_attempts_total: content.chunk_attempts_total + envelope.stats.chunk_attempts_total,
-        ..content
+        (None, Some(salt)) => write_whole(&kept_path(upload_dir, &address, payer, "salt"), &salt)
+            .map_err(|e| e.to_string()),
+        (None, None) => Ok(()),
     }
 }
 
-/// The payment mode for an upload. A listed upload always pays per chunk: the
-/// nodes that keep listings find a listing's payment from a single-node proof.
-fn listed_payment_mode(visibility: &Visibility, mode: PaymentMode) -> PaymentMode {
-    if matches!(visibility, Visibility::Listed(_)) {
-        PaymentMode::Single
+/// The record `payer`'s completed upload kept for `envelope`
+/// ([`keep_upload_record`]), if it is still there and is for this very
+/// envelope.
+fn kept_upload_record(
+    upload_dir: &Path,
+    envelope: &UploadEnvelope,
+    payer: &[u8],
+) -> Option<ant_listings::EnvelopeProof> {
+    let path = kept_path(
+        upload_dir,
+        &envelope.address(),
+        payer,
+        crate::datamap_file::RECORD_EXTENSION,
+    );
+    let record = match crate::datamap_file::read_record(&path) {
+        Ok(record) => record,
+        Err(Error::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {
+            return None;
+        }
+        Err(e) => {
+            warn!(
+                "Ignoring the unreadable kept record {}: {e}",
+                path.display()
+            );
+            return None;
+        }
+    };
+    let ours = record.address == envelope.address()
+        && record.envelope == envelope.envelope.to_bytes()
+        && record.salt == envelope.salt;
+    ours.then_some(record)
+}
+
+/// Finish a completed upload's checkpoint. What proves the envelope is first
+/// kept by envelope address and payer ([`keep_upload_record`]), so a crash
+/// before the caller has saved the record doesn't lose it; only then are the
+/// salt next to the checkpoint and the checkpoint removed, in that order, so
+/// a crash between the two can't leave a salt a later upload would reuse.
+///
+/// Never fails: the upload is paid and stored, and its result holds what the
+/// caller needs, so a problem here is only logged. If the record can't be
+/// kept, the checkpoint and its salt stay: the next upload of the same file
+/// with the same choices by the same payer resumes, finds the envelope
+/// stored, and builds the record again from the checkpoint.
+fn finish_upload_checkpoint(checkpoint: &Path, envelope: Option<&UploadEnvelope>, payer: &[u8]) {
+    if let Some(envelope) = envelope {
+        let kept = checkpoint
+            .parent()
+            .ok_or_else(|| "missing checkpoint directory".to_string())
+            .and_then(|directory| keep_upload_record(directory, envelope, payer));
+        if let Err(e) = kept {
+            warn!(
+                "Could not keep the record of envelope {}, leaving the checkpoint {} \
+                 to build it again: {e}",
+                hex::encode(envelope.address()),
+                checkpoint.display()
+            );
+            return;
+        }
+    }
+    for path in [checkpoint.with_extension("salt"), checkpoint.to_path_buf()] {
+        if let Err(e) = std::fs::remove_file(&path) {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                warn!("Could not remove {}: {e}", path.display());
+            }
+        }
+    }
+}
+
+/// Delete what a completed upload kept for the envelope at `address` (its
+/// record, or a private envelope's salt), once the caller has saved the
+/// record (as `ant file upload` does with its `.record` file). Until then it
+/// stays under the client's data directory, at
+/// `payments/upload/records/<address>.<payer>.record` (or `.salt`), so a
+/// crash between the upload and saving the record doesn't lose the paid
+/// quote and tx hash, which nothing else may hold. Removes the copies kept
+/// for every payer.
+///
+/// # Errors
+///
+/// Returns an error if the data directory can't be found or a file can't be
+/// removed. Nothing kept is not an error.
+pub fn forget_upload_record(address: &[u8; 32]) -> Result<()> {
+    let directory = crate::config::data_dir()
+        .map_err(|e| Error::Config(e.to_string()))?
+        .join("payments/upload");
+    forget_kept(&directory, address).map_err(Error::Io)
+}
+
+/// [`forget_upload_record`] under `upload_dir`.
+fn forget_kept(upload_dir: &Path, address: &[u8; 32]) -> std::io::Result<()> {
+    let prefix = format!("{}.", hex::encode(address));
+    let entries = match std::fs::read_dir(upload_dir.join("records")) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e),
+    };
+    for entry in entries {
+        let entry = entry?;
+        if !entry.file_name().to_string_lossy().starts_with(&prefix) {
+            continue;
+        }
+        match std::fs::remove_file(entry.path()) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e),
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+/// The salt for a private upload's envelope: the one an interrupted attempt
+/// saved next to `checkpoint`, or 32 new random bytes, saved there before
+/// anything is paid. A resumed upload then builds the same envelope and
+/// reuses its payment.
+fn upload_salt(checkpoint: &Path) -> Result<ant_listings::Salt> {
+    let path = checkpoint.with_extension("salt");
+    match std::fs::read(&path) {
+        Ok(bytes) => {
+            if let Ok(salt) = <ant_listings::Salt>::try_from(bytes.as_slice()) {
+                return Ok(salt);
+            }
+            warn!("Ignoring a damaged envelope salt at {}", path.display());
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(Error::Io(error)),
+    }
+    let salt: ant_listings::Salt = rand::random();
+    write_whole(&path, &salt)?;
+    Ok(salt)
+}
+
+/// How far to trust an estimate priced from a live quote. When every
+/// sampled content chunk was already stored and only the chunk the upload
+/// adds was quoted (`only_extra`), the price covers the content only if
+/// every content chunk was sampled: otherwise the unsampled ones may still
+/// need paying, as with [`CostEstimateConfidence::AllSamplesAlreadyStoredIncomplete`].
+fn priced_confidence(
+    only_extra: bool,
+    sampled: usize,
+    content_chunks: usize,
+) -> CostEstimateConfidence {
+    if only_extra && sampled < content_chunks {
+        CostEstimateConfidence::AllSamplesAlreadyStoredIncomplete
     } else {
-        mode
+        CostEstimateConfidence::PricedSample
     }
+}
+
+/// The payment mode for an external-signer upload of `content_chunks`
+/// chunks. One with an envelope is paid per chunk, in one wave batch, so the
+/// envelope is in the same payment as the content: nodes record a listing
+/// only from a per-chunk payment, and the external merkle path has no
+/// per-chunk payment the envelope could join.
+///
+/// An envelope upload that `mode` would pay in merkle batches is refused
+/// before anything is quoted or paid, rather than silently paid per chunk
+/// with every chunk held in memory: the wallet and payer paths
+/// ([`Client::file_upload_with_payer`]) take it, or the caller can ask for
+/// [`PaymentMode::Single`].
+fn external_payment_mode(
+    visibility: &Visibility,
+    content_chunks: usize,
+    mode: PaymentMode,
+) -> Result<PaymentMode> {
+    if !matches!(visibility, Visibility::Envelope(_)) {
+        return Ok(mode);
+    }
+    if should_use_merkle(content_chunks, mode) {
+        return Err(Error::InvalidData(format!(
+            "an upload with an envelope of {content_chunks} chunks would be paid in merkle \
+             batches ({mode:?}), and the external-signer path can't pay the envelope with \
+             them: upload it with a wallet or a payer (file_upload_with_payer), or ask for \
+             PaymentMode::Single to pay every chunk per chunk, holding them all in memory"
+        )));
+    }
+    Ok(PaymentMode::Single)
+}
+
+/// The chunk an upload with `visibility` stores besides its content, if
+/// any, with its address: a readable upload's data map (plain, or in its
+/// envelope), or a private upload's envelope, with a new random salt as the
+/// upload would pick.
+fn extra_upload_chunk(
+    visibility: &Visibility,
+    data_map: &DataMap,
+) -> Result<Option<([u8; 32], Bytes)>> {
+    match visibility {
+        Visibility::Private => Ok(None),
+        Visibility::Public => crate::client_engine::files::public_map_record(data_map)
+            .map(Some)
+            .map_err(Error::Serialization),
+        Visibility::Envelope(options) => {
+            let salt: Option<ant_listings::Salt> = (!options.readable).then(rand::random);
+            let envelope = options
+                .envelope(data_map, salt.as_ref())
+                .map_err(|e| Error::InvalidData(format!("cannot build the envelope: {e}")))?;
+            Ok(Some(crate::client_engine::files::envelope_record(
+                &envelope,
+            )))
+        }
+    }
+}
+
+/// The payment proof of the envelope's chunk among `paid_chunks`, kept to
+/// build its record once the chunks are stored.
+fn envelope_payment_proof(
+    envelope: Option<&UploadEnvelope>,
+    paid_chunks: &[PaidChunk],
+) -> Option<Vec<u8>> {
+    let address = envelope?.address();
+    paid_chunks
+        .iter()
+        .find(|chunk| chunk.address == address)
+        .map(|chunk| chunk.proof_bytes.clone())
+}
+
+/// Check an upload's envelope metadata before anything is paid.
+fn check_envelope_options(visibility: &Visibility) -> Result<()> {
+    match visibility {
+        Visibility::Envelope(options) => options
+            .validate()
+            .map_err(|e| Error::InvalidData(format!("invalid envelope metadata: {e}"))),
+        _ => Ok(()),
+    }
+}
+
+/// Build an upload's envelope for `data_map`: a private one with `salt`.
+fn build_upload_envelope(
+    options: &EnvelopeOptions,
+    data_map: &DataMap,
+    salt: Option<ant_listings::Salt>,
+) -> Result<(UploadEnvelope, Bytes)> {
+    let envelope = options
+        .envelope(data_map, salt.as_ref())
+        .map_err(|e| Error::InvalidData(format!("cannot build the envelope: {e}")))?;
+    let (address, bytes) = crate::client_engine::files::envelope_record(&envelope);
+    info!(
+        "Envelope upload: envelope chunk ({} bytes, flags {:#04x}) at address {}",
+        bytes.len(),
+        envelope.flags().to_byte(),
+        hex::encode(address)
+    );
+    Ok((UploadEnvelope::new(envelope, salt), bytes))
 }
 
 /// Prepared upload ready for external payment.
@@ -1331,6 +1635,9 @@ pub struct PreparedUpload {
     pub already_stored_addresses: Vec<[u8; 32]>,
     /// Total chunk count for the upload, including already-stored chunks.
     pub total_chunks: usize,
+    /// The envelope of an envelope upload, stored after every other chunk.
+    /// Its proof record is filled in at finalize, once every chunk is stored.
+    pub envelope: Option<UploadEnvelope>,
 }
 
 /// Outcome of a resumable external-signer finalize
@@ -1400,6 +1707,7 @@ pub struct WaveFinalizeResume {
     stored_count: usize,
     failed_paid_chunks: Vec<PaidChunk>,
     storage_cost_atto: String,
+    envelope: Option<UploadEnvelope>,
 }
 
 impl std::fmt::Debug for WaveFinalizeResume {
@@ -1611,28 +1919,34 @@ pub trait UploadPayer: Send + Sync {
         &self,
         batch: &PreparedMerkleBatch,
     ) -> Result<super::super::upload::MerkleUploadPayment>;
+
+    /// Bytes naming who pays, such as an account id or a wallet address.
+    /// An envelope upload's checkpoint, and the record a completed one keeps
+    /// ([`forget_upload_record`]), belong to this payer: only the same payer
+    /// resumes an interrupted envelope upload, reusing its salt and payment,
+    /// or gets a kept record back. A payer used for several accounts must
+    /// return a different value for each. Empty by default.
+    fn checkpoint_scope(&self) -> Vec<u8> {
+        Vec::new()
+    }
 }
 
 /// Where an upload's record bytes come from.
 enum ChunkSource<'a> {
-    /// A file's encrypted chunks, spilled to disk.
+    /// A file's encrypted chunks, spilled to disk, with its envelope if any.
     Spill(&'a ChunkSpill),
-    /// One record held in memory, such as a listing envelope.
-    Record(&'a Bytes),
 }
 
 impl ChunkSource<'_> {
     fn load(&self, address: &[u8; 32]) -> Result<Bytes> {
         match self {
             Self::Spill(spill) => spill.read_chunk(address),
-            Self::Record(bytes) => Ok((*bytes).clone()),
         }
     }
 
     fn len(&self) -> usize {
         match self {
             Self::Spill(spill) => spill.len(),
-            Self::Record(_) => 1,
         }
     }
 }
@@ -1817,6 +2131,37 @@ impl Client {
         mode: PaymentMode,
         progress: Option<mpsc::Sender<UploadEvent>>,
     ) -> Result<UploadCostEstimate> {
+        self.estimate_upload_cost_with_visibility(path, mode, Visibility::Private, progress)
+            .await
+    }
+
+    /// Estimate the cost of uploading a file with `visibility`, as
+    /// [`Client::estimate_upload_cost`] does for a private upload without an
+    /// envelope.
+    ///
+    /// A readable upload stores one more chunk, its data map (plain, or in
+    /// its envelope), and so does a private upload with an envelope. That
+    /// chunk is counted in `chunk_count` and priced like the others: a public
+    /// data map goes with the content, an envelope is always paid per chunk.
+    /// When the sampled content is already stored, the extra chunk is quoted
+    /// on its own (a private envelope never is stored: its salt is new): a
+    /// [`CostEstimateConfidence::PricedSample`] if every content chunk was
+    /// sampled, else [`CostEstimateConfidence::AllSamplesAlreadyStoredIncomplete`]
+    /// with the extra chunk's price, since the unsampled content may still
+    /// need paying.
+    ///
+    /// # Errors
+    ///
+    /// As [`Client::estimate_upload_cost`].
+    pub async fn estimate_upload_cost_with_visibility(
+        &self,
+        path: &Path,
+        mode: PaymentMode,
+        visibility: Visibility,
+        progress: Option<mpsc::Sender<UploadEvent>>,
+    ) -> Result<UploadCostEstimate> {
+        let visibility = visibility.normalized();
+        check_envelope_options(&visibility)?;
         let file_size = std::fs::metadata(path).map_err(Error::Io)?.len();
 
         if file_size < 3 {
@@ -1832,8 +2177,18 @@ impl Client {
             path.display()
         );
 
-        let (spill, _data_map) = self.encrypt_file_to_spill(path, progress.as_ref()).await?;
-        let chunk_count = spill.len();
+        let (spill, data_map) = self.encrypt_file_to_spill(path, progress.as_ref()).await?;
+        let content_chunks = spill.len();
+        // The chunk the upload adds to its content, and how it is paid: an
+        // envelope is kept out of merkle batches, a public data map is not.
+        let extra = extra_upload_chunk(&visibility, &data_map)?;
+        let chunk_count = content_chunks + usize::from(extra.is_some());
+        let envelope_per_chunk = matches!(visibility, Visibility::Envelope(_));
+        let batched = if envelope_per_chunk {
+            content_chunks
+        } else {
+            chunk_count
+        };
 
         if let Some(ref tx) = progress {
             let _ = tx
@@ -1844,7 +2199,7 @@ impl Client {
         }
 
         info!("Encrypted into {chunk_count} chunks, requesting quote");
-        let uses_merkle = should_use_merkle(chunk_count, mode);
+        let uses_merkle = should_use_merkle(batched, mode);
 
         // Sample chunk addresses spread evenly across the file (see
         // `distributed_sample_indices`) rather than the first N. A single
@@ -1888,9 +2243,27 @@ impl Client {
             }
         }
 
+        // The content looks stored: the extra chunk may still need paying.
+        let mut only_extra = false;
+        if let (None, Some((address, bytes))) = (&quotes_opt, &extra) {
+            let data_size = u64::try_from(bytes.len())
+                .map_err(|e| Error::InvalidData(format!("chunk size too large: {e}")))?;
+            match self
+                .get_store_quotes(address, data_size, DATA_TYPE_CHUNK)
+                .await
+            {
+                Ok(q) => {
+                    quotes_opt = Some(q);
+                    only_extra = true;
+                }
+                Err(Error::AlreadyStored) => {}
+                Err(e) => return Err(e),
+            }
+        }
+
         let quotes = match quotes_opt {
             Some(q) => q,
-            None if all_already_stored && sampled == chunk_count => {
+            None if all_already_stored && sampled == content_chunks => {
                 // Every address in the file was sampled and every one is
                 // already on the network — a zero-cost estimate is exact here.
                 info!("All {chunk_count} chunks already stored; returning zero-cost estimate");
@@ -1941,15 +2314,18 @@ impl Client {
             .map_err(|error| Error::Payment(error.to_string()))?;
 
         let chunk_count_u64 = u64::try_from(chunk_count).unwrap_or(u64::MAX);
+        let batched_u64 = u64::try_from(batched).unwrap_or(u64::MAX);
         // Merkle settles per *padded* leaf, not per chunk: the contract charges
         // `median16 × 2^depth` per batch and the tree rounds up to a power of
         // two, so a 65-chunk batch pays for 128 leaves. The total is summed
         // over the batches the upload engine really builds, plus the remainder
         // it pays per chunk (`merkle_upload_split`), so the estimate cannot
-        // drift from execution.
-        let merkle_split = merkle_upload_split(chunk_count, chunk_count);
-        let billable_units = if uses_merkle {
-            merkle_upload_billable_units(chunk_count_u64)
+        // drift from execution. An envelope is paid per chunk on top.
+        let merkle_split = merkle_upload_split(batched, batched);
+        let billable_units = if only_extra {
+            1
+        } else if uses_merkle {
+            merkle_upload_billable_units(batched_u64).saturating_add(u64::from(envelope_per_chunk))
         } else {
             chunk_count_u64
         };
@@ -1975,8 +2351,10 @@ impl Client {
         // One tx per batch the upload engine builds — same split the unit
         // total above is derived from.
         let merkle_batches = u128::try_from(merkle_split.batches.len()).unwrap_or(u128::MAX);
-        let remainder_waves = u128::from(merkle_split.per_chunk > 0);
-        let estimated_gas: u128 = if uses_merkle {
+        let remainder_waves = u128::from(merkle_split.per_chunk > 0 || envelope_per_chunk);
+        let estimated_gas: u128 = if only_extra {
+            GAS_PER_WAVE_TX.saturating_mul(ARBITRUM_GAS_PRICE_WEI)
+        } else if uses_merkle {
             merkle_batches
                 .saturating_mul(GAS_PER_MERKLE_TX)
                 .saturating_add(remainder_waves.saturating_mul(GAS_PER_WAVE_TX))
@@ -1996,12 +2374,12 @@ impl Client {
             chunk_count,
             storage_cost_atto: total_storage.to_string(),
             estimated_gas_cost_wei: estimated_gas.to_string(),
-            payment_mode: if uses_merkle {
+            payment_mode: if uses_merkle && !only_extra {
                 PaymentMode::Merkle
             } else {
                 PaymentMode::Single
             },
-            confidence: CostEstimateConfidence::PricedSample,
+            confidence: priced_confidence(only_extra, sampled, content_chunks),
         })
     }
 
@@ -2062,6 +2440,21 @@ impl Client {
     /// surfaced via [`FileUploadResult::data_map_address`] so the uploader
     /// can share a single address from which anyone can retrieve the file.
     ///
+    /// When `visibility` is [`Visibility::Envelope`], the envelope is bundled
+    /// the same way ([`PreparedUpload::envelope`]), and the upload is paid
+    /// per chunk in one wave batch, so the envelope is in the same payment as
+    /// the content. Its payment intent lists the payments in quote-hash
+    /// order: pay them in that order, so the envelope's vault log isn't
+    /// always the last of the transaction, which would give away its log
+    /// index. An envelope upload `mode` would pay in merkle batches
+    /// ([`PaymentMode::Auto`] from 64 chunks, [`PaymentMode::Merkle`]) is
+    /// refused with [`Error::InvalidData`] before anything is quoted: use
+    /// [`Client::file_upload_with_payer`], or [`PaymentMode::Single`] to pay
+    /// it per chunk with every chunk held in memory. Finalize stores the
+    /// envelope after every other chunk and then fills in its proof record.
+    /// No EVM network is needed: without one the record is built unchecked,
+    /// and the prepared envelope's `proof_problem` says so before payment.
+    ///
     /// When `progress` is `Some`, [`UploadEvent`]s are emitted on the channel
     /// during encryption ([`UploadEvent::Encrypting`] / [`UploadEvent::Encrypted`])
     /// and per-chunk quoting ([`UploadEvent::ChunkQuoted`]). Storage events are
@@ -2088,7 +2481,8 @@ impl Client {
         mode: PaymentMode,
         progress: Option<mpsc::Sender<UploadEvent>>,
     ) -> Result<PreparedUpload> {
-        let mode = listed_payment_mode(&visibility, mode);
+        let visibility = visibility.normalized();
+        check_envelope_options(&visibility)?;
         debug!(
             "Preparing file upload for external signing (visibility={visibility:?}, mode={mode:?}): {}",
             path.display()
@@ -2104,6 +2498,7 @@ impl Client {
             path.display(),
             spill.len()
         );
+        let mode = external_payment_mode(&visibility, spill.len(), mode)?;
 
         // For public uploads, bundle the serialized DataMap as an extra chunk
         // in the same payment batch. This lets the external signer pay for
@@ -2111,6 +2506,7 @@ impl Client {
         // finalize step return the DataMap's chunk address as the shareable
         // retrieval address. It joins the spill like any data chunk so the
         // merkle path stays disk-backed; `push` dedups by address.
+        let mut envelope = None;
         let data_map_address = match visibility {
             Visibility::Private => None,
             Visibility::Public => {
@@ -2125,17 +2521,14 @@ impl Client {
                 spill.push(&serialized)?;
                 Some(address)
             }
-            Visibility::Listed(ref metadata) => {
-                let (address, serialized) =
-                    crate::client_engine::files::listed_map_record(&data_map, metadata)
-                        .map_err(Error::Serialization)?;
-                info!(
-                    "Listed upload: bundling envelope chunk ({} bytes) at address {}",
-                    serialized.len(),
-                    hex::encode(address)
-                );
+            Visibility::Envelope(ref options) => {
+                let salt = (!options.readable).then(rand::random);
+                let (mut prepared, serialized) = build_upload_envelope(options, &data_map, salt)?;
+                self.note_unchecked_envelope(&mut prepared);
                 spill.push(&serialized)?;
-                Some(address)
+                let address = prepared.address();
+                envelope = Some(prepared);
+                options.readable.then_some(address)
             }
         };
 
@@ -2149,7 +2542,7 @@ impl Client {
                 .await;
         }
 
-        let (payment_info, already_stored_addresses) = if should_use_merkle(chunk_count, mode) {
+        let (mut payment_info, already_stored_addresses) = if should_use_merkle(chunk_count, mode) {
             // Merkle path: build tree(s), collect candidate pools, return for
             // external payment. Chunk bodies stay in the spill on disk.
             info!("Using merkle batch preparation for {chunk_count} file chunks");
@@ -2239,6 +2632,13 @@ impl Client {
                 .await?
         };
 
+        if envelope.is_some() {
+            // The envelope's log must not be the last of its payment.
+            if let ExternalPaymentInfo::WaveBatch { payment_intent, .. } = &mut payment_info {
+                payment_intent.sort_by_quote_hash();
+            }
+        }
+
         // Surface the "DataMap chunk was already on the network" case
         // so debugging "why is data_map_address set but no storage cost
         // appears for it?" doesn't require reading the source. See the
@@ -2269,6 +2669,7 @@ impl Client {
             data_map_address,
             already_stored_addresses,
             total_chunks: chunk_count,
+            envelope,
         })
     }
 
@@ -2380,15 +2781,18 @@ impl Client {
         let already_stored_addresses = prepared.already_stored_addresses;
         let already_stored_count = already_stored_addresses.len();
         let total_chunks = prepared.total_chunks;
+        let mut envelope = prepared.envelope;
         match prepared.payment_info {
             ExternalPaymentInfo::WaveBatch {
                 prepared_chunks,
                 payment_intent,
             } => {
                 let paid_chunks = finalize_batch_payment(prepared_chunks, tx_hash_map)?;
+                let envelope_proof = envelope_payment_proof(envelope.as_ref(), &paid_chunks);
                 let wave_result = self
-                    .store_paid_chunks_with_events(
+                    .store_paid_chunks_then(
                         paid_chunks,
+                        envelope.as_ref().map(UploadEnvelope::address),
                         progress.as_ref(),
                         already_stored_count,
                         total_chunks,
@@ -2418,6 +2822,16 @@ impl Client {
                 let chunks_stored = already_stored_count + wave_result.stored.len();
 
                 info!("External-signer upload finalized: {chunks_stored} chunks stored");
+                // Built after the store, so reading the chain never stands
+                // between a paid upload and storing it.
+                if let Some(envelope) = envelope.as_mut() {
+                    self.complete_external_envelope(
+                        envelope,
+                        &prepared.data_map,
+                        envelope_proof.as_deref(),
+                    )
+                    .await;
+                }
 
                 let mut stats = WaveAggregateStats::default();
                 stats.absorb(&wave_result);
@@ -2436,6 +2850,7 @@ impl Client {
                     chunk_attempts_total: stats.chunk_attempts_total,
                     store_durations_ms: stats.store_durations_ms,
                     retries_histogram: stats.retries_histogram,
+                    envelope,
                 })
             }
             ExternalPaymentInfo::Merkle { .. } => Err(Error::Payment(
@@ -2603,6 +3018,8 @@ impl Client {
                     chunk_attempts_total: stats.chunk_attempts_total,
                     store_durations_ms: stats.store_durations_ms,
                     retries_histogram: stats.retries_histogram,
+                    // Envelope uploads are prepared as wave batches.
+                    envelope: None,
                 })
             }
             ExternalPaymentInfo::WaveBatch { .. } => Err(Error::Payment(
@@ -2741,6 +3158,7 @@ impl Client {
         let already_stored_count = prepared.already_stored_addresses.len();
         let total_chunks = prepared.total_chunks;
         let data_map = prepared.data_map;
+        let envelope = prepared.envelope;
         match prepared.payment_info {
             ExternalPaymentInfo::WaveBatch {
                 prepared_chunks,
@@ -2756,6 +3174,7 @@ impl Client {
                         already_stored_count,
                         paid_chunks,
                         storage_cost_atto,
+                        envelope,
                         progress.as_ref(),
                     )
                     .await)
@@ -2818,6 +3237,7 @@ impl Client {
                     stored_count,
                     failed_paid_chunks,
                     storage_cost_atto,
+                    envelope,
                 } = *w;
                 Ok(self
                     .drive_wave_finalize(
@@ -2827,6 +3247,7 @@ impl Client {
                         stored_count,
                         failed_paid_chunks,
                         storage_cost_atto,
+                        envelope,
                         progress.as_ref(),
                     )
                     .await)
@@ -2917,21 +3338,24 @@ impl Client {
         already_stored_count: usize,
         paid_chunks: Vec<PaidChunk>,
         storage_cost_atto: String,
+        envelope: Option<UploadEnvelope>,
         progress: Option<&mpsc::Sender<UploadEvent>>,
     ) -> FinalizeOutcome {
         // Retain address -> paid chunk so the failed subset can be re-stored on
         // resume; cloning is cheap since the chunk body is a ref-counted `Bytes`.
         let retained: HashMap<[u8; 32], PaidChunk> =
             paid_chunks.iter().map(|c| (c.address, c.clone())).collect();
+        let envelope_proof = envelope_payment_proof(envelope.as_ref(), &paid_chunks);
         let wave_result = self
-            .store_paid_chunks_with_events(
+            .store_paid_chunks_then(
                 paid_chunks,
+                envelope.as_ref().map(UploadEnvelope::address),
                 progress,
                 already_stored_count,
                 total_chunks,
             )
             .await;
-        assemble_wave_finalize_outcome(
+        let mut outcome = assemble_wave_finalize_outcome(
             wave_result,
             retained,
             data_map,
@@ -2939,7 +3363,84 @@ impl Client {
             total_chunks,
             already_stored_count,
             storage_cost_atto,
-        )
+        );
+        // The envelope (stored last) goes with the result, its record filled
+        // in once every chunk is stored, so reading the chain never stands
+        // between a paid upload and storing it. A partial one goes with the
+        // resume handle too, so a resume stores it last again.
+        match &mut outcome {
+            FinalizeOutcome::Complete(result) => {
+                if let Some(mut envelope) = envelope {
+                    self.complete_external_envelope(
+                        &mut envelope,
+                        &result.data_map,
+                        envelope_proof.as_deref(),
+                    )
+                    .await;
+                    result.envelope = Some(envelope);
+                }
+            }
+            FinalizeOutcome::Partial { result, resume } => {
+                result.envelope.clone_from(&envelope);
+                if let FinalizeResume::Wave(resume) = resume {
+                    resume.envelope = envelope;
+                }
+            }
+        }
+        outcome
+    }
+
+    /// Store `paid_chunks`, the one at `last` (an envelope) only once every
+    /// other chunk is stored, so it never points at missing content. If any
+    /// other chunk fails, `last` is reported failed without being sent.
+    async fn store_paid_chunks_then(
+        &self,
+        paid_chunks: Vec<PaidChunk>,
+        last: Option<[u8; 32]>,
+        progress: Option<&mpsc::Sender<UploadEvent>>,
+        stored_before: usize,
+        total_chunks: usize,
+    ) -> WaveResult {
+        let (held, others): (Vec<_>, Vec<_>) = paid_chunks
+            .into_iter()
+            .partition(|chunk| Some(chunk.address) == last);
+        let mut result = self
+            .store_paid_chunks_with_events(others, progress, stored_before, total_chunks)
+            .await;
+        // Paid chunks are unique by address, so at most one is held.
+        let Some(held) = super::super::upload::release_last(
+            held.into_iter().next(),
+            |chunk: &PaidChunk| chunk.address,
+            &mut result.failed,
+        ) else {
+            return result;
+        };
+        let stored_before = stored_before + result.stored.len();
+        let last = self
+            .store_paid_chunks_with_events(vec![held], progress, stored_before, total_chunks)
+            .await;
+        result.stored.extend(last.stored);
+        result.failed.extend(last.failed);
+        result.chunk_attempts_total += last.chunk_attempts_total;
+        result.store_durations_ms.extend(last.store_durations_ms);
+        result.retries_per_chunk.extend(last.retries_per_chunk);
+        result
+    }
+
+    /// Fill in an external-signer upload's envelope record, once every chunk
+    /// is stored, from the payment proof of its paid chunk (`proof`; `None`
+    /// if it was already stored when the upload was prepared). Never fails:
+    /// the upload is paid and stored by now, and a client without an EVM
+    /// network builds the record unchecked.
+    async fn complete_external_envelope(
+        &self,
+        envelope: &mut UploadEnvelope,
+        data_map: &DataMap,
+        proof: Option<&[u8]>,
+    ) {
+        let network = self.require_evm_network().ok();
+        self.complete_upload_envelope(envelope, data_map, proof, network)
+            .await;
     }
 
     /// Upload a file with a specific payment mode.
@@ -2994,20 +3495,27 @@ impl Client {
             .await
     }
 
-    /// Listed file upload with progress events.
+    /// Upload a file with the given [`Visibility`], with progress events.
     ///
-    /// Stores the data map in a listing envelope carrying `metadata`, so nodes
-    /// that keep listings list the file. The content is uploaded first, paid
-    /// like any file (a batch payment from 64 chunks); the envelope is then
-    /// uploaded on its own, paid per chunk (nodes record a listing only from a
-    /// single-node payment), so a listing never points at missing content.
-    pub async fn file_upload_listed_with_progress(
+    /// An envelope upload ([`Visibility::Envelope`]) stores the envelope in
+    /// the same payment as the content where the content is paid per chunk
+    /// (every upload under 64 chunks, and the chunks left after the merkle
+    /// batches of a larger one; alone if there are none), after every
+    /// content chunk is stored. [`FileUploadResult::envelope`] carries the
+    /// envelope, the salt of a private one and its proof record. The record
+    /// (or, without one, a private envelope's salt) is also kept under the
+    /// client's data directory until the caller has saved it and calls
+    /// [`forget_upload_record`]. An upload that finds its envelope already
+    /// stored by an earlier upload of the same file, with the same choices
+    /// and wallet, gets that upload's kept record back if it is still there.
+    pub async fn file_upload_with_visibility_and_progress(
         &self,
         path: &Path,
-        metadata: ant_listings::Metadata,
+        mode: PaymentMode,
+        visibility: Visibility,
         progress: Option<mpsc::Sender<UploadEvent>>,
     ) -> Result<FileUploadResult> {
-        self.upload_listed(path, metadata, PaymentMode::Auto, progress, None)
+        self.upload_file(path, mode, visibility, progress, None)
             .await
     }
 
@@ -3020,7 +3528,11 @@ impl Client {
     /// resume (the payer is then asked to recover the same payment) without
     /// paying twice. In [`PaymentMode::Merkle`] a network too small for a batch
     /// payment fails before any payment; [`PaymentMode::Auto`] falls back to
-    /// per-chunk payments.
+    /// per-chunk payments. An envelope upload is paid and stored as
+    /// [`Client::file_upload_with_visibility_and_progress`] describes; its
+    /// checkpoint and kept record belong to the payer
+    /// ([`UploadPayer::checkpoint_scope`]), so a payer serving several
+    /// accounts must name each.
     ///
     /// # Errors
     ///
@@ -3034,75 +3546,8 @@ impl Client {
         payer: &dyn UploadPayer,
         progress: Option<mpsc::Sender<UploadEvent>>,
     ) -> Result<FileUploadResult> {
-        match visibility {
-            Visibility::Listed(metadata) => {
-                self.upload_listed(path, metadata, mode, progress, Some(payer))
-                    .await
-            }
-            visibility => {
-                self.upload_file(path, mode, visibility, progress, Some(payer))
-                    .await
-            }
-        }
-    }
-
-    /// A listed upload in two steps: the content as a private file, then the
-    /// envelope holding its data map as a one-record upload paid per chunk.
-    async fn upload_listed(
-        &self,
-        path: &Path,
-        metadata: ant_listings::Metadata,
-        mode: PaymentMode,
-        progress: Option<mpsc::Sender<UploadEvent>>,
-        payer: Option<&dyn UploadPayer>,
-    ) -> Result<FileUploadResult> {
-        let content = self
-            .upload_file(path, mode, Visibility::Private, progress.clone(), payer)
-            .await?;
-        let (address, envelope) =
-            crate::client_engine::files::listed_map_record(&content.data_map, &metadata)
-                .map_err(Error::Serialization)?;
-        info!(
-            "Listed upload: content stored; storing the envelope at {}",
-            hex::encode(address)
-        );
-        let stored = self
-            .upload_record(envelope, payer, progress.as_ref())
-            .await?;
-        Ok(listed_result(content, address, &stored))
-    }
-
-    /// Upload one record held in memory (stored as it is, not
-    /// self-encrypted), paid per chunk by `payer` or else by the wallet.
-    async fn upload_record(
-        &self,
-        content: Bytes,
-        payer: Option<&dyn UploadPayer>,
-        progress: Option<&mpsc::Sender<UploadEvent>>,
-    ) -> Result<super::super::upload::UploadOutcome> {
-        let network = match payer {
-            Some(_) => self.require_evm_network()?,
-            None => self.require_wallet()?.network(),
-        };
-        let records = vec![super::super::upload::UploadRecord {
-            address: compute_address(&content),
-            size: content.len() as u64,
-            index: 0,
-        }];
-        let (cache_path, _lock, saved) = open_upload_checkpoint(network, &records).await?;
-        let mut state = saved.unwrap_or_default();
-        let adapter = SpillUploadAdapter {
-            client: self,
-            source: ChunkSource::Record(&content),
-            progress,
-            checkpoint: &cache_path,
-            payer,
-        };
-        let outcome = self
-            .upload_records(records, &mut state, &adapter, PaymentMode::Single)
-            .await?;
-        remove_upload_checkpoint(&cache_path)?;
-        Ok(outcome)
+        self.upload_file(path, mode, visibility, progress, Some(payer))
+            .await
     }
 
     /// Public file upload with progress events.
@@ -3120,17 +3565,6 @@ impl Client {
             .await
     }
 
-    async fn file_upload_with_visibility_and_progress(
-        &self,
-        path: &Path,
-        mode: PaymentMode,
-        visibility: Visibility,
-        progress: Option<mpsc::Sender<UploadEvent>>,
-    ) -> Result<FileUploadResult> {
-        self.upload_file(path, mode, visibility, progress, None)
-            .await
-    }
-
     /// Upload a file through the upload engine, paid by `payer` or else by
     /// the client's wallet.
     #[allow(clippy::too_many_lines)]
@@ -3142,7 +3576,8 @@ impl Client {
         progress: Option<mpsc::Sender<UploadEvent>>,
         payer: Option<&dyn UploadPayer>,
     ) -> Result<FileUploadResult> {
-        let mode = listed_payment_mode(&visibility, mode);
+        let visibility = visibility.normalized();
+        check_envelope_options(&visibility)?;
         debug!(
             "Streaming file upload with mode {mode:?}, visibility {visibility:?}: {}",
             path.display()
@@ -3156,8 +3591,7 @@ impl Client {
         // Only 32-byte addresses stay in memory — chunk data lives on disk.
         let (mut spill, data_map) = self.encrypt_file_to_spill(path, progress.as_ref()).await?;
 
-        let data_map_address = match visibility {
-            Visibility::Private => None,
+        let mut data_map_address = match visibility {
             Visibility::Public => {
                 let (address, serialized) =
                     crate::client_engine::files::public_map_record(&data_map)
@@ -3170,18 +3604,57 @@ impl Client {
                 spill.push(&serialized)?;
                 Some(address)
             }
-            Visibility::Listed(ref metadata) => {
-                let (address, serialized) =
-                    crate::client_engine::files::listed_map_record(&data_map, metadata)
-                        .map_err(Error::Serialization)?;
-                info!(
-                    "Listed upload: adding envelope chunk ({} bytes) at address {} to payment batch",
-                    serialized.len(),
-                    hex::encode(address)
-                );
-                spill.push(&serialized)?;
-                Some(address)
+            Visibility::Private | Visibility::Envelope(_) => None,
+        };
+
+        let file_path_key = std::fs::canonicalize(path)
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|_| path.display().to_string());
+        // An envelope is not among these: it is added below, stored last.
+        let records = spill
+            .chunk_entries()?
+            .into_iter()
+            .enumerate()
+            .map(
+                |(index, (address, size))| super::super::upload::UploadRecord {
+                    address,
+                    size,
+                    index,
+                },
+            )
+            .collect::<Vec<_>>();
+        let (network, payer_scope) = match payer {
+            Some(payer) => (self.require_evm_network()?, payer.checkpoint_scope()),
+            None => {
+                let wallet = self.require_wallet()?;
+                (wallet.network(), wallet.address().as_slice().to_vec())
             }
+        };
+        let envelope_scope = visibility
+            .envelope_options()
+            .map(|options| envelope_checkpoint_scope(options, &payer_scope));
+        let (cache_path, _lock, saved) =
+            open_upload_checkpoint(network, &records, envelope_scope.as_deref()).await?;
+        let mut envelope = match &visibility {
+            Visibility::Envelope(options) => {
+                let salt = if options.readable {
+                    None
+                } else {
+                    Some(upload_salt(&cache_path)?)
+                };
+                let (envelope, serialized) = build_upload_envelope(options, &data_map, salt)?;
+                spill.push(&serialized)?;
+                if options.readable {
+                    data_map_address = Some(envelope.address());
+                }
+                let record = super::super::upload::UploadRecord {
+                    address: envelope.address(),
+                    size: serialized.len() as u64,
+                    index: records.len(),
+                };
+                Some((envelope, record))
+            }
+            _ => None,
         };
 
         let chunk_count = spill.len();
@@ -3197,26 +3670,6 @@ impl Client {
                 .await;
         }
 
-        let file_path_key = std::fs::canonicalize(path)
-            .map(|p| p.display().to_string())
-            .unwrap_or_else(|_| path.display().to_string());
-        let records = spill
-            .chunk_entries()?
-            .into_iter()
-            .enumerate()
-            .map(
-                |(index, (address, size))| super::super::upload::UploadRecord {
-                    address,
-                    size,
-                    index,
-                },
-            )
-            .collect::<Vec<_>>();
-        let network = match payer {
-            Some(_) => self.require_evm_network()?,
-            None => self.require_wallet()?.network(),
-        };
-        let (cache_path, _lock, saved) = open_upload_checkpoint(network, &records).await?;
         let mut state = match saved {
             Some(state) => state,
             None => {
@@ -3239,10 +3692,45 @@ impl Client {
             checkpoint: &cache_path,
             payer,
         };
-        let result = self
-            .upload_records(records, &mut state, &adapter, mode)
-            .await?;
-        remove_upload_checkpoint(&cache_path)?;
+        let result = match envelope.as_ref() {
+            Some((_, last)) => {
+                self.upload_records_then(records, *last, &mut state, &adapter, mode)
+                    .await?
+            }
+            None => {
+                self.upload_records(records, &mut state, &adapter, mode)
+                    .await?
+            }
+        };
+        // The record is built before the checkpoint is removed, and kept
+        // until the caller has saved it.
+        if let Some((envelope, _)) = envelope.as_mut() {
+            let proof = state.proof(&envelope.address()).cloned();
+            // Without a payment of its own the envelope was already stored:
+            // by this payer's earlier upload, if it kept a record for it.
+            let kept = proof.is_none().then(|| {
+                cache_path
+                    .parent()
+                    .and_then(|directory| kept_upload_record(directory, envelope, &payer_scope))
+            });
+            match kept.flatten() {
+                Some(record) => self.reuse_upload_record(envelope, record, network).await,
+                None => {
+                    self.complete_upload_envelope(
+                        envelope,
+                        &data_map,
+                        proof.as_deref(),
+                        Some(network),
+                    )
+                    .await;
+                }
+            }
+        }
+        finish_upload_checkpoint(
+            &cache_path,
+            envelope.as_ref().map(|(envelope, _)| envelope),
+            &payer_scope,
+        );
         crate::data::client::cached_single::try_delete_for_file(&file_path_key);
         crate::data::client::cached_merkle::try_delete_for_file(&file_path_key);
         Ok(FileUploadResult {
@@ -3257,6 +3745,7 @@ impl Client {
             chunk_attempts_total: result.stats.chunk_attempts_total,
             store_durations_ms: result.stats.store_durations_ms,
             retries_histogram: result.stats.retries_histogram,
+            envelope: envelope.map(|(envelope, _)| envelope),
         })
     }
 
@@ -4670,6 +5159,316 @@ mod tests {
         assert!(!dir.exists(), "spill dir should be removed on drop");
     }
 
+    /// A record for `envelope`, as an upload builds it: the proof's fields
+    /// don't need to check out to be kept and read back.
+    fn record_for(envelope: &UploadEnvelope, map: &DataMap) -> ant_listings::EnvelopeProof {
+        ant_listings::EnvelopeProof {
+            address: envelope.address(),
+            envelope: envelope.envelope.to_bytes(),
+            tx_hash: [0xab; 32],
+            quote: vec![1, 2, 3],
+            data_map: envelope
+                .salt
+                .map(|_| ant_listings::encode_data_map(map).unwrap()),
+            salt: envelope.salt,
+        }
+    }
+
+    fn private_envelope(fill: u8, salt: ant_listings::Salt) -> (UploadEnvelope, DataMap) {
+        let (map, _) = self_encryption::encrypt(Bytes::from(vec![fill; 4000])).unwrap();
+        let (envelope, _) =
+            build_upload_envelope(&EnvelopeOptions::private(), &map, Some(salt)).unwrap();
+        (envelope, map)
+    }
+
+    #[test]
+    fn a_completed_upload_keeps_its_record_until_the_caller_saves_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let checkpoint = dir.path().join("upload.msgpack");
+        let salt = upload_salt(&checkpoint).unwrap();
+        assert!(checkpoint.with_extension("salt").exists());
+        // An interrupted upload resumes with the same salt, so the same
+        // envelope and the payment already made for it.
+        assert_eq!(upload_salt(&checkpoint).unwrap(), salt);
+        std::fs::write(&checkpoint, b"state").unwrap();
+        let (mut envelope, map) = private_envelope(5, salt);
+        let record = record_for(&envelope, &map);
+        envelope.proof = Some(record.clone());
+        let payer = b"wallet one";
+        finish_upload_checkpoint(&checkpoint, Some(&envelope), payer);
+        assert!(!checkpoint.exists());
+        assert!(!checkpoint.with_extension("salt").exists());
+        // The whole record survives the upload, by envelope address and
+        // payer, as a record file: paid quote and tx hash included.
+        let kept = kept_path(dir.path(), &envelope.address(), payer, "record");
+        assert_eq!(crate::datamap_file::read_record(&kept).unwrap(), record);
+        assert!(!kept_path(dir.path(), &envelope.address(), payer, "salt").exists());
+        // Only the same payer gets it back, and only for this envelope.
+        assert_eq!(
+            kept_upload_record(dir.path(), &envelope, payer),
+            Some(record.clone())
+        );
+        assert_eq!(
+            kept_upload_record(dir.path(), &envelope, b"wallet two"),
+            None
+        );
+        let (other, _) = private_envelope(6, salt);
+        assert_eq!(kept_upload_record(dir.path(), &other, payer), None);
+        // A completed upload's next one gets a new salt: the kept one is
+        // never reused.
+        assert_ne!(upload_salt(&checkpoint).unwrap(), salt);
+        // Once the caller has saved it, it goes.
+        forget_kept(dir.path(), &envelope.address()).unwrap();
+        assert!(!kept.exists());
+        assert_eq!(kept_upload_record(dir.path(), &envelope, payer), None);
+        // Forgetting what isn't there is fine.
+        forget_kept(dir.path(), &envelope.address()).unwrap();
+        forget_kept(&dir.path().join("nowhere"), &envelope.address()).unwrap();
+
+        // A damaged salt is replaced rather than used.
+        std::fs::write(checkpoint.with_extension("salt"), b"short").unwrap();
+        let replaced = upload_salt(&checkpoint).unwrap();
+        assert_eq!(
+            std::fs::read(checkpoint.with_extension("salt")).unwrap(),
+            replaced.to_vec()
+        );
+    }
+
+    #[test]
+    fn without_a_record_a_private_upload_keeps_its_salt_and_a_readable_one_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let payer = b"payer";
+        // A private envelope this upload didn't pay for: its salt is kept.
+        let checkpoint = dir.path().join("private.msgpack");
+        let salt = upload_salt(&checkpoint).unwrap();
+        std::fs::write(&checkpoint, b"state").unwrap();
+        let (envelope, _) = private_envelope(7, salt);
+        finish_upload_checkpoint(&checkpoint, Some(&envelope), payer);
+        assert!(!checkpoint.exists());
+        let kept = kept_path(dir.path(), &envelope.address(), payer, "salt");
+        assert_eq!(std::fs::read(&kept).unwrap(), salt.to_vec());
+        assert_eq!(kept_upload_record(dir.path(), &envelope, payer), None);
+        forget_kept(dir.path(), &envelope.address()).unwrap();
+        assert!(!kept.exists());
+
+        // A readable envelope keeps its record, or nothing without one.
+        let (map, _) = self_encryption::encrypt(Bytes::from(vec![8u8; 4000])).unwrap();
+        let (mut readable, _) =
+            build_upload_envelope(&EnvelopeOptions::unlisted(), &map, None).unwrap();
+        let checkpoint = dir.path().join("readable.msgpack");
+        std::fs::write(&checkpoint, b"state").unwrap();
+        finish_upload_checkpoint(&checkpoint, Some(&readable), payer);
+        assert!(!checkpoint.exists());
+        assert_eq!(
+            std::fs::read_dir(dir.path().join("records"))
+                .unwrap()
+                .count(),
+            0
+        );
+        readable.proof = Some(record_for(&readable, &map));
+        std::fs::write(&checkpoint, b"state").unwrap();
+        finish_upload_checkpoint(&checkpoint, Some(&readable), payer);
+        assert_eq!(
+            kept_upload_record(dir.path(), &readable, payer),
+            readable.proof.clone()
+        );
+        forget_kept(dir.path(), &readable.address()).unwrap();
+        assert_eq!(kept_upload_record(dir.path(), &readable, payer), None);
+    }
+
+    #[test]
+    fn finishing_a_checkpoint_never_fails_a_completed_upload() {
+        let dir = tempfile::tempdir().unwrap();
+        // Nothing to remove: fine.
+        finish_upload_checkpoint(&dir.path().join("gone.msgpack"), None, b"");
+        // A checkpoint that can't be removed (here a directory) is only
+        // logged, and an upload without an envelope keeps nothing.
+        let checkpoint = dir.path().join("stuck.msgpack");
+        std::fs::create_dir(&checkpoint).unwrap();
+        finish_upload_checkpoint(&checkpoint, None, b"");
+        assert!(checkpoint.exists());
+        assert!(!dir.path().join("records").exists());
+        // If the record can't be kept (here `records` is a file), the
+        // checkpoint and its salt both stay, so the next upload of the same
+        // file resumes and builds the record again.
+        let checkpoint = dir.path().join("upload.msgpack");
+        let salt = upload_salt(&checkpoint).unwrap();
+        std::fs::write(&checkpoint, b"state").unwrap();
+        std::fs::write(dir.path().join("records"), b"not a directory").unwrap();
+        let (mut envelope, map) = private_envelope(9, salt);
+        envelope.proof = Some(record_for(&envelope, &map));
+        finish_upload_checkpoint(&checkpoint, Some(&envelope), b"");
+        assert_eq!(std::fs::read(&checkpoint).unwrap(), b"state");
+        assert_eq!(
+            std::fs::read(checkpoint.with_extension("salt")).unwrap(),
+            salt.to_vec()
+        );
+        assert!(forget_kept(dir.path(), &envelope.address()).is_err());
+    }
+
+    #[tokio::test]
+    async fn file_data_map_is_the_map_an_upload_of_the_file_computes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("notes.bin");
+        let bytes: Vec<u8> = (0..20_000u32).map(|i| (i % 251) as u8).collect();
+        std::fs::write(&path, &bytes).unwrap();
+        // The upload path (`encrypt_file_to_spill`): streamed encryption,
+        // its chunks spilled to disk.
+        let (mut chunks, map, handle) = spawn_file_encryption(path.clone()).unwrap();
+        let mut spill = ChunkSpill::new().unwrap();
+        while let Some(content) = chunks.recv().await {
+            spill.push(&content).unwrap();
+        }
+        handle.await.unwrap().unwrap();
+        let uploaded = map.await.unwrap();
+        let local = file_data_map(&path).await.unwrap();
+        assert!(local == uploaded);
+        // The same as encrypting the bytes in memory.
+        let (in_memory, _) = self_encryption::encrypt(Bytes::from(bytes)).unwrap();
+        assert!(local == in_memory);
+        // And its chunks are the ones the upload stores.
+        let stored: HashSet<[u8; 32]> = spill.addresses.iter().copied().collect();
+        assert_eq!(stored.len(), local.infos().len());
+        assert!(local
+            .infos()
+            .iter()
+            .all(|info| stored.contains(&info.dst_hash.0)));
+    }
+
+    #[test]
+    fn an_extra_chunk_priced_alone_is_exact_only_when_all_content_was_sampled() {
+        use CostEstimateConfidence::{AllSamplesAlreadyStoredIncomplete, PricedSample};
+        // A live price for the content: a priced sample, however much was
+        // sampled.
+        assert_eq!(priced_confidence(false, 1, 100), PricedSample);
+        assert_eq!(priced_confidence(false, 5, 5), PricedSample);
+        // Every content chunk sampled and stored: the extra chunk is all
+        // there is to pay.
+        assert_eq!(priced_confidence(true, 3, 3), PricedSample);
+        assert_eq!(priced_confidence(true, 5, 5), PricedSample);
+        // Five of six sampled: the sixth may still need paying.
+        assert_eq!(
+            priced_confidence(true, ESTIMATE_SAMPLE_CAP, ESTIMATE_SAMPLE_CAP + 1),
+            AllSamplesAlreadyStoredIncomplete
+        );
+        assert_eq!(
+            priced_confidence(true, 5, 1_000),
+            AllSamplesAlreadyStoredIncomplete
+        );
+    }
+
+    #[test]
+    fn an_envelope_checkpoint_belongs_to_its_payer() {
+        let options = EnvelopeOptions::private();
+        let one = envelope_checkpoint_scope(&options, b"agent one");
+        assert_eq!(one, envelope_checkpoint_scope(&options, b"agent one"));
+        assert_ne!(one, envelope_checkpoint_scope(&options, b"agent two"));
+        assert_ne!(one, envelope_checkpoint_scope(&options, b""));
+        assert_ne!(
+            one,
+            envelope_checkpoint_scope(&EnvelopeOptions::unlisted(), b"agent one")
+        );
+        // Without a payer scope, as before.
+        assert_eq!(envelope_checkpoint_scope(&options, b""), options.scope());
+        // Kept records too.
+        let dir = Path::new("/data");
+        let address = [3u8; 32];
+        assert_ne!(
+            kept_path(dir, &address, b"agent one", "record"),
+            kept_path(dir, &address, b"agent two", "record")
+        );
+    }
+
+    #[test]
+    fn external_envelope_uploads_are_paid_per_chunk_or_refused() {
+        use crate::data::client::merkle::DEFAULT_MERKLE_THRESHOLD;
+        let envelope = Visibility::Envelope(EnvelopeOptions::private());
+        let below = DEFAULT_MERKLE_THRESHOLD - 1;
+        // Under the merkle threshold the whole upload is one wave batch.
+        for mode in [PaymentMode::Auto, PaymentMode::Single] {
+            assert_eq!(
+                external_payment_mode(&envelope, below, mode).unwrap(),
+                PaymentMode::Single
+            );
+        }
+        // Asked for explicitly, per chunk whatever the size.
+        assert_eq!(
+            external_payment_mode(&envelope, 10_000, PaymentMode::Single).unwrap(),
+            PaymentMode::Single
+        );
+        // Merkle batches can't carry the envelope's payment: refused before
+        // anything is quoted or paid, never silently paid per chunk.
+        for (chunks, mode) in [
+            (DEFAULT_MERKLE_THRESHOLD, PaymentMode::Auto),
+            (10_000, PaymentMode::Auto),
+            (2, PaymentMode::Merkle),
+            (below, PaymentMode::Merkle),
+        ] {
+            let error = external_payment_mode(&envelope, chunks, mode).unwrap_err();
+            assert!(
+                matches!(&error, Error::InvalidData(text) if text.contains("file_upload_with_payer")),
+                "{error}"
+            );
+        }
+        // Without an envelope, the caller's mode stands.
+        for visibility in [Visibility::Public, Visibility::Private] {
+            for mode in [PaymentMode::Auto, PaymentMode::Merkle, PaymentMode::Single] {
+                for chunks in [3, 10_000] {
+                    assert_eq!(
+                        external_payment_mode(&visibility, chunks, mode).unwrap(),
+                        mode
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_cost_estimate_counts_the_chunk_an_upload_adds() {
+        let (map, _) = self_encryption::encrypt(Bytes::from(vec![8u8; 4000])).unwrap();
+        assert!(extra_upload_chunk(&Visibility::Private, &map)
+            .unwrap()
+            .is_none());
+        // A plain public upload adds its data map chunk.
+        let (address, bytes) = extra_upload_chunk(&Visibility::Public, &map)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (address, bytes.clone()),
+            crate::client_engine::files::public_map_record(&map).unwrap()
+        );
+        // A readable envelope is the same chunk the upload stores.
+        let unlisted = Visibility::Envelope(EnvelopeOptions::unlisted());
+        let (address, _) = extra_upload_chunk(&unlisted, &map).unwrap().unwrap();
+        let (envelope, _) =
+            build_upload_envelope(&EnvelopeOptions::unlisted(), &map, None).unwrap();
+        assert_eq!(address, envelope.address());
+        // A private one gets a new salt each time, as an upload does, so it
+        // is never already stored.
+        let private = Visibility::Envelope(EnvelopeOptions::private());
+        let first = extra_upload_chunk(&private, &map).unwrap().unwrap();
+        let second = extra_upload_chunk(&private, &map).unwrap().unwrap();
+        assert_ne!(first.0, second.0);
+        assert_eq!(first.1.len(), second.1.len());
+    }
+
+    #[test]
+    fn the_envelope_record_comes_from_its_own_chunk_proof() {
+        let options = EnvelopeOptions::unlisted();
+        let (map, _) = self_encryption::encrypt(Bytes::from(vec![9u8; 4000])).unwrap();
+        let (envelope, _) = build_upload_envelope(&options, &map, None).unwrap();
+        let mut chunks = vec![paid_chunk([1; 32]), paid_chunk(envelope.address())];
+        chunks[0].proof_bytes = b"content".to_vec();
+        chunks[1].proof_bytes = b"envelope".to_vec();
+        assert_eq!(
+            envelope_payment_proof(Some(&envelope), &chunks),
+            Some(b"envelope".to_vec())
+        );
+        assert_eq!(envelope_payment_proof(None, &chunks), None);
+        // Already stored when the upload was prepared: not paid here.
+        assert_eq!(envelope_payment_proof(Some(&envelope), &chunks[..1]), None);
+    }
+
     #[test]
     fn chunk_spill_deduplicates_identical_content() {
         let mut spill = ChunkSpill::new().unwrap();
@@ -5002,7 +5801,7 @@ impl Client {
 mod payer_tests {
     use super::*;
     use crate::data::client::batch::ChunkPaymentPlan;
-    use crate::data::client::upload::{MerkleUploadPayment, UploadOutcome, UploadPayment};
+    use crate::data::client::upload::{MerkleUploadPayment, UploadPayment};
 
     /// A payer that refuses everything, to show errors reach the caller.
     struct RefusingPayer;
@@ -5023,43 +5822,7 @@ mod payer_tests {
         let payer: &dyn UploadPayer = &RefusingPayer;
         let result = payer.pay_quotes(&[]).await;
         assert!(matches!(result, Err(Error::Payment(reason)) if reason == "refused"));
-    }
-
-    #[test]
-    fn a_record_source_returns_its_bytes() {
-        let bytes = Bytes::from_static(b"envelope bytes");
-        let source = ChunkSource::Record(&bytes);
-        assert_eq!(source.len(), 1);
-        assert_eq!(source.load(&[0; 32]).unwrap(), bytes);
-    }
-
-    #[test]
-    fn a_listed_result_counts_the_envelope_and_takes_its_address() {
-        let content = FileUploadResult {
-            data_map: DataMap::new(Vec::new()),
-            chunks_stored: 129,
-            chunks_failed: 0,
-            total_chunks: 129,
-            payment_mode_used: PaymentMode::Merkle,
-            storage_cost_atto: "1000".into(),
-            gas_cost_wei: 20,
-            data_map_address: None,
-            chunk_attempts_total: 130,
-            store_durations_ms: vec![1, 2],
-            retries_histogram: [1, 0, 0, 0],
-        };
-        let envelope = UploadOutcome {
-            addresses: vec![[7; 32]],
-            amount: Amount::from(5u64),
-            gas: 3,
-            ..Default::default()
-        };
-        let result = listed_result(content, [7; 32], &envelope);
-        assert_eq!(result.chunks_stored, 130);
-        assert_eq!(result.total_chunks, 130);
-        assert_eq!(result.storage_cost_atto, "1005");
-        assert_eq!(result.gas_cost_wei, 23);
-        assert_eq!(result.data_map_address, Some([7; 32]));
-        assert_eq!(result.payment_mode_used, PaymentMode::Merkle);
+        // A payer that doesn't name itself is one payer.
+        assert!(payer.checkpoint_scope().is_empty());
     }
 }

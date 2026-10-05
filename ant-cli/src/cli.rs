@@ -2,7 +2,9 @@ use ant_core::data::MultiAddr;
 use clap::{ArgAction, Parser, Subcommand};
 use std::path::PathBuf;
 
-use crate::commands::data::{ChunkAction, FileAction, ListingsArgs, PointerAction, WalletAction};
+use crate::commands::data::{
+    ChunkAction, FileAction, ListingArgs, ListingsArgs, PointerAction, WalletAction,
+};
 use crate::commands::node::NodeCommand;
 use crate::commands::update::UpdateArgs;
 
@@ -116,9 +118,12 @@ pub enum Commands {
         #[command(subcommand)]
         action: PointerAction,
     },
-    /// Listed files: what nodes list, each checked against the network and the
-    /// payment chain, oldest first
+    /// Listed files: what nodes list, merged across them, each checked against
+    /// the network and the payment chain, oldest first
     Listings(ListingsArgs),
+    /// One file's listing, in the index or not: from the nodes nearest its
+    /// address, checked against the network and the payment chain
+    Listing(ListingArgs),
     /// Update the ant binary to the latest version
     Update(UpdateArgs),
 }

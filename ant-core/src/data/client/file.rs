@@ -5,13 +5,14 @@
 
 #[cfg(feature = "native")]
 mod native;
+use crate::data::client::envelope::{EnvelopeOptions, UploadEnvelope};
 use crate::data::client::merkle::PaymentMode;
 use ant_protocol::transport::{MultiAddr, PeerId};
 use ant_protocol::XorName as ChunkAddress;
 #[cfg(feature = "native")]
 pub use native::{
-    ExternalChunkStore, ExternalPaymentInfo, FinalizeOutcome, FinalizeResume, MerkleFinalizeResume,
-    PreparedUpload, UploadPayer, WaveFinalizeResume,
+    file_data_map, forget_upload_record, ExternalChunkStore, ExternalPaymentInfo, FinalizeOutcome,
+    FinalizeResume, MerkleFinalizeResume, PreparedUpload, UploadPayer, WaveFinalizeResume,
 };
 use self_encryption::DataMap;
 
@@ -117,11 +118,16 @@ pub enum FileChunkPeerStatus {
 /// the network, yielding a single chunk address that anyone can use to
 /// retrieve the `DataMap` (via [`crate::data::Client::data_map_fetch`]) and then the file.
 ///
-/// A listed upload stores the data map inside an envelope with optional
-/// metadata. Nodes that support listings record the envelope's payment and
-/// serve it on the listings topic, so the file can be found without its
-/// address. Its payment is always a single-node payment, which nodes need to
-/// find it.
+/// An envelope upload stores the data map, or for a private file a salted
+/// hash of it, inside an envelope that also carries the uploader's choices
+/// ([`EnvelopeOptions`]): which payment fields its listing shows, whether the
+/// listing is in the index, and optional metadata. Nodes that support
+/// listings record the envelope's payment, so the upload can be checked
+/// against the chain and, in the index, found without its address. The
+/// envelope is paid per chunk, in the same payment as the content where the
+/// content is paid per chunk, and stored after every content chunk. Build the
+/// visibility with [`EnvelopeOptions::into_visibility`], which picks
+/// `Private` or `Public` when no envelope is needed.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum Visibility {
     /// Keep the data map local; only the holder can retrieve the file.
@@ -130,8 +136,29 @@ pub enum Visibility {
     /// Publish the data map as a network chunk so anyone with the returned
     /// address can retrieve and decrypt the file.
     Public,
-    /// Publish the data map in a listing envelope, with the given metadata.
-    Listed(ant_listings::Metadata),
+    /// Store the data map, or a salted hash of it, in an envelope.
+    Envelope(EnvelopeOptions),
+}
+
+impl Visibility {
+    /// The visibility uploads use: an envelope that isn't needed
+    /// ([`EnvelopeOptions::needs_envelope`]) becomes `Private` or `Public`.
+    #[must_use]
+    pub fn normalized(self) -> Self {
+        match self {
+            Self::Envelope(options) => options.into_visibility(),
+            other => other,
+        }
+    }
+
+    /// The envelope choices, for an envelope upload.
+    #[must_use]
+    pub fn envelope_options(&self) -> Option<&EnvelopeOptions> {
+        match self {
+            Self::Envelope(options) => Some(options),
+            _ => None,
+        }
+    }
 }
 
 /// Confidence attached to an [`UploadCostEstimate`]'s `storage_cost_atto`.
@@ -153,9 +180,11 @@ pub enum CostEstimateConfidence {
     /// `storage_cost_atto` is exactly `"0"` — the upload is genuinely free.
     VerifiedAllAlreadyStored,
     /// Every *sampled* chunk was already stored, but not all chunks were
-    /// sampled. `storage_cost_atto` is `"0"` as a best-effort guess; the real
-    /// upload reconciles the true cost at payment time. Render this as "likely
-    /// already stored", not a guaranteed-free price.
+    /// sampled. `storage_cost_atto` is `"0"` as a best-effort guess, or, from
+    /// `Client::estimate_upload_cost_with_visibility`, the price of the one
+    /// chunk the upload adds (its envelope or data map) when that was quoted;
+    /// the real upload reconciles the true cost at payment time. Render this
+    /// as "likely already stored", not a guaranteed price.
     AllSamplesAlreadyStoredIncomplete,
 }
 
@@ -171,6 +200,8 @@ pub struct UploadCostEstimate {
     pub file_size: u64,
     /// Number of chunks the file would be split into (data chunks only,
     /// does not include the DataMap chunk added during public uploads).
+    /// `Client::estimate_upload_cost_with_visibility` counts the data map
+    /// or envelope chunk the upload adds too.
     pub chunk_count: usize,
     /// Estimated total storage cost in atto (token smallest unit).
     pub storage_cost_atto: String,
@@ -210,7 +241,8 @@ pub struct FileUploadResult {
     /// Total gas cost in wei. 0 if no on-chain transactions were made.
     pub gas_cost_wei: u128,
     /// Chunk address of the serialized `DataMap`, set only for
-    /// [`Visibility::Public`] uploads. **`Some` means this address is
+    /// [`Visibility::Public`] uploads and envelope uploads readable by anyone
+    /// (where it is the envelope's address). **`Some` means this address is
     /// retrievable from the network (via [`crate::data::Client::data_map_fetch`])**, not
     /// necessarily that *this* upload paid to store it — if the serialized
     /// `DataMap` hashed to a chunk that was already on the network (same
@@ -228,4 +260,6 @@ pub struct FileUploadResult {
     /// (index 0 = first attempt, 1 = first retry, etc.). All zeros for
     /// paths that don't run the wave store loop.
     pub retries_histogram: [usize; 4],
+    /// The envelope stored with an envelope upload, with its proof record.
+    pub envelope: Option<UploadEnvelope>,
 }

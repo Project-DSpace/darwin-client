@@ -9,9 +9,14 @@ pub mod network;
 #[cfg(feature = "native")]
 pub mod peer_cache;
 
+#[cfg(feature = "native")]
+pub use ant_listings::WalkOutcome;
 pub use client::cache::ChunkCache;
 #[cfg(feature = "native")]
-pub use client::listings::ListingChain;
+pub use client::listings::{
+    expected_nearest, paid_quote_hash, walk_start, Carry, CheckedListing, ListingChain,
+    ListingLookup, ListingsIndex, RejectedListing, WalkReport, WalkState, NEAREST_NODES,
+};
 pub use client::{Client, ClientConfig};
 pub use error::{Error, Result};
 pub use network::{Network, NetworkHealth, REBOOTSTRAP_THRESHOLD};
@@ -40,15 +45,18 @@ pub use client::diagnostics::{
     spawn_download_diagnostics_writer, DownloadDiagnosticsOutcome, DownloadDiagnosticsRecord,
     DownloadDiagnosticsSender,
 };
+pub use client::envelope::{
+    proof_data_map, shown_after_hiding, EnvelopeOptions, EnvelopeWarning, Extent, UploadEnvelope,
+};
+#[cfg(feature = "native")]
+pub use client::file::{
+    file_data_map, forget_upload_record, ExternalChunkStore, ExternalPaymentInfo, FinalizeOutcome,
+    FinalizeResume, MerkleFinalizeResume, PreparedUpload, UploadPayer, WaveFinalizeResume,
+};
 pub use client::file::{
     CostEstimateConfidence, DownloadEvent, FileChunkPeerReport, FileChunkPeerReportPeer,
     FileChunkPeerStatus, FileChunkPeerSweepReport, FileDownloadWithPeerReport, FileUploadResult,
     UploadCostEstimate, UploadEvent, Visibility,
-};
-#[cfg(feature = "native")]
-pub use client::file::{
-    ExternalChunkStore, ExternalPaymentInfo, FinalizeOutcome, FinalizeResume, MerkleFinalizeResume,
-    PreparedUpload, UploadPayer, WaveFinalizeResume,
 };
 pub use client::merkle::{
     finalize_merkle_batch, MerkleBatchPaymentResult, PaymentMode, PreparedMerkleBatch,

@@ -30,24 +30,55 @@ pub(crate) fn public_map_record(map: &DataMap) -> Result<([u8; 32], Bytes), Stri
     Ok((ant_protocol::compute_address(&bytes), bytes))
 }
 
-/// Wrap and address a DataMap for a listed upload.
-pub(crate) fn listed_map_record(
-    map: &DataMap,
-    metadata: &ant_listings::Metadata,
-) -> Result<([u8; 32], Bytes), String> {
-    let envelope = ant_listings::Envelope::new(map, metadata.clone())
-        .map_err(|e| format!("Failed to build listing envelope: {e}"))?;
-    Ok((envelope.address(), Bytes::from(envelope.to_bytes())))
+/// Address and bytes of an envelope, stored as one record.
+#[cfg_attr(not(feature = "native"), allow(dead_code))]
+pub(crate) fn envelope_record(envelope: &ant_listings::Envelope) -> ([u8; 32], Bytes) {
+    (envelope.address(), Bytes::from(envelope.to_bytes()))
 }
 
-pub(crate) fn decode_map(bytes: &[u8]) -> Result<DataMap, String> {
-    // A listed file's address holds its data map inside an envelope.
-    if ant_listings::is_envelope(bytes) {
-        return ant_listings::Envelope::from_bytes(bytes)
-            .map(|envelope| envelope.data_map().clone())
-            .map_err(|e| format!("Failed to read listing envelope: {e}"));
+/// Why a record holding a data map couldn't give one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum MapError {
+    /// The record is an envelope that withholds its data map: only a salted
+    /// hash of it is stored, so only the uploader's data map reads the file.
+    Withheld,
+    /// The record is neither a data map nor a valid envelope.
+    Invalid(String),
+}
+
+impl std::fmt::Display for MapError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Withheld => f.write_str(WITHHELD_MESSAGE),
+            Self::Invalid(message) => f.write_str(message),
+        }
     }
-    rmp_serde::from_slice(bytes).map_err(|e| format!("Failed to deserialize DataMap: {e}"))
+}
+
+/// What a reader is told about an envelope that withholds its data map.
+pub(crate) const WITHHELD_MESSAGE: &str = "this address holds a private file's envelope: \
+     its data map is withheld (the envelope stores only a salted hash of it), \
+     so the file can be read only with the uploader's data map";
+
+/// The data map a record at a file's address holds: a plain data map, or
+/// one inside an envelope (version 1 or 2).
+pub(crate) fn decode_map_record(bytes: &[u8]) -> Result<DataMap, MapError> {
+    if ant_listings::is_envelope(bytes) {
+        let envelope = ant_listings::Envelope::from_bytes(bytes)
+            .map_err(|e| MapError::Invalid(format!("Failed to read envelope: {e}")))?;
+        return envelope.data_map().cloned().ok_or(MapError::Withheld);
+    }
+    rmp_serde::from_slice(bytes)
+        .map_err(|e| MapError::Invalid(format!("Failed to deserialize DataMap: {e}")))
+}
+
+/// [`decode_map_record`] with the error as text, for the browser.
+#[cfg_attr(
+    not(all(target_arch = "wasm32", feature = "browser-wasm")),
+    allow(dead_code)
+)]
+pub(crate) fn decode_map(bytes: &[u8]) -> Result<DataMap, String> {
+    decode_map_record(bytes).map_err(|e| e.to_string())
 }
 
 pub(crate) async fn fetch_records<E, F, Fut, C>(
@@ -353,27 +384,88 @@ mod tests {
         (content, map, records)
     }
 
-    #[test]
-    fn listed_records_decode_to_the_same_data_map() {
-        let (_, map, _) = fixture();
+    fn envelope(map: &DataMap, flags: ant_listings::Flags) -> ant_listings::Envelope {
         let metadata = ant_listings::Metadata {
             content_type: Some("application/octet-stream".into()),
             name: Some("fixture.bin".into()),
         };
-        let (listed_address, listed) = listed_map_record(&map, &metadata).unwrap();
+        if flags.withheld {
+            ant_listings::Envelope::withheld(map, &[9; 32], metadata, flags.shown, flags.in_index)
+        } else {
+            ant_listings::Envelope::readable(map, metadata, flags.shown, flags.in_index)
+        }
+        .unwrap()
+    }
+
+    #[test]
+    fn readable_envelopes_decode_to_the_same_data_map() {
+        let (_, map, _) = fixture();
         let (unlisted_address, unlisted) = public_map_record(&map).unwrap();
-        assert!(ant_listings::is_envelope(&listed));
-        assert_eq!(listed_address, ant_protocol::compute_address(&listed));
-        assert_ne!(listed_address, unlisted_address);
-        assert!(decode_map(&listed).unwrap() == map);
         assert!(decode_map(&unlisted).unwrap() == map);
+        // Every readable combination of shown fields and index flag.
+        for shown in ant_listings::ShownFields::every() {
+            for in_index in [false, true] {
+                let flags = ant_listings::Flags {
+                    shown,
+                    in_index,
+                    withheld: false,
+                };
+                let (address, bytes) = envelope_record(&envelope(&map, flags));
+                assert!(ant_listings::is_envelope(&bytes));
+                assert_eq!(address, ant_protocol::compute_address(&bytes));
+                assert_ne!(address, unlisted_address);
+                assert!(decode_map(&bytes).unwrap() == map);
+            }
+        }
+    }
+
+    #[test]
+    fn version_1_envelopes_still_decode() {
+        let (_, map, _) = fixture();
+        let readable = envelope(&map, ant_listings::Flags::V1).to_bytes();
+        // The same envelope written as version 1: no flags byte.
+        let mut v1 = readable[..8].to_vec();
+        v1.push(1);
+        v1.extend_from_slice(&readable[10..]);
+        let parsed = ant_listings::Envelope::from_bytes(&v1).unwrap();
+        assert_eq!(parsed.version(), 1);
+        assert!(decode_map(&v1).unwrap() == map);
+    }
+
+    #[test]
+    fn withheld_envelopes_say_so() {
+        let (_, map, _) = fixture();
+        for in_index in [false, true] {
+            let flags = ant_listings::Flags {
+                shown: ant_listings::ShownFields::ALL,
+                in_index,
+                withheld: true,
+            };
+            let (_, bytes) = envelope_record(&envelope(&map, flags));
+            assert_eq!(decode_map_record(&bytes), Err(MapError::Withheld));
+            assert!(decode_map(&bytes).unwrap_err().contains("withheld"));
+        }
     }
 
     #[test]
     fn a_broken_envelope_is_an_error() {
         let (_, map, _) = fixture();
-        let (_, listed) = listed_map_record(&map, &ant_listings::Metadata::default()).unwrap();
-        assert!(decode_map(&listed[..12]).is_err());
+        let readable = envelope(&map, ant_listings::Flags::V1).to_bytes();
+        for length in 9..readable.len() {
+            assert!(matches!(
+                decode_map_record(&readable[..length]),
+                Err(MapError::Invalid(_))
+            ));
+        }
+        let mut reserved = readable.clone();
+        reserved[9] |= 0x80;
+        assert!(matches!(
+            decode_map_record(&reserved),
+            Err(MapError::Invalid(_))
+        ));
+        let mut version = readable;
+        version[8] = 3;
+        assert!(decode_map(&version).unwrap_err().contains("version 3"));
     }
 
     #[tokio::test(flavor = "current_thread")]

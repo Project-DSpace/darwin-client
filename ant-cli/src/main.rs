@@ -137,6 +137,16 @@ async fn run() -> anyhow::Result<()> {
             action.execute(wallet).await?;
         }
         Commands::File { action } => {
+            // Bad upload choices fail before SECRET_KEY or the network.
+            action.validate()?;
+            if !action.needs_network() {
+                // `prove` is offline; `verify` reads only the payment chain.
+                return action
+                    .execute_offline(json, || {
+                        resolve_evm_network_and_manifest(&data_ctx).map(|(network, _)| network)
+                    })
+                    .await;
+            }
             let needs_wallet = matches!(action, commands::data::FileAction::Upload { .. });
             // Extract per-upload overrides BEFORE building the client
             // so the adaptive controller picks them up at construction.
@@ -177,6 +187,18 @@ async fn run() -> anyhow::Result<()> {
             result?;
         }
         Commands::Listings(args) => {
+            // A --state or --carry file that can't be used fails before the
+            // network.
+            let earlier = args.load_earlier(json)?;
+            let client = build_data_client(&data_ctx, false, json, None, None).await?;
+            let (network, _) = resolve_evm_network_and_manifest(&data_ctx)?;
+            let chain = ant_core::data::ListingChain::new(&network)?;
+            let result = args.execute(&client, &chain, json, earlier).await;
+            client.save_peer_cache().await;
+            client.save_adaptive_snapshot();
+            result?;
+        }
+        Commands::Listing(args) => {
             let client = build_data_client(&data_ctx, false, json, None, None).await?;
             let (network, _) = resolve_evm_network_and_manifest(&data_ctx)?;
             let chain = ant_core::data::ListingChain::new(&network)?;

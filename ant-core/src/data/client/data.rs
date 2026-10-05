@@ -13,6 +13,8 @@ use crate::data::client::batch::{PaymentIntent, PreparedChunk};
 #[cfg(feature = "native")]
 use crate::data::client::classify_error;
 #[cfg(feature = "native")]
+use crate::data::client::envelope::UploadEnvelope;
+#[cfg(feature = "native")]
 use crate::data::client::file::{ExternalPaymentInfo, PreparedUpload, Visibility};
 use crate::data::client::merkle::PaymentMode;
 use crate::data::client::Client;
@@ -143,7 +145,9 @@ impl Client {
     /// [`Client::finalize_upload`] succeeds, that address is surfaced via
     /// [`crate::data::client::file::FileUploadResult::data_map_address`] so
     /// the uploader can share a single address from which anyone can retrieve
-    /// the data.
+    /// the data. An envelope ([`Visibility::Envelope`]) is bundled the same
+    /// way ([`PreparedUpload::envelope`]); finalize stores it after every
+    /// other chunk and fills in its proof record.
     ///
     /// Wave-batch payment only — the in-memory data path does not currently
     /// support merkle batching. Use [`Client::file_prepare_upload_with_visibility`]
@@ -163,6 +167,12 @@ impl Client {
         visibility: Visibility,
     ) -> Result<PreparedUpload> {
         let content_len = content.len();
+        let visibility = visibility.normalized();
+        if let Visibility::Envelope(options) = &visibility {
+            options
+                .validate()
+                .map_err(|e| Error::InvalidData(format!("invalid envelope metadata: {e}")))?;
+        }
         debug!("Preparing data upload for external signing (visibility={visibility:?}, {content_len} bytes)");
 
         let (data_map, encrypted_chunks) = encrypt(content)
@@ -180,6 +190,7 @@ impl Client {
         // the data chunks and the DataMap chunk in one flow, and lets the
         // finalize step return the DataMap's chunk address as the shareable
         // retrieval address.
+        let mut envelope = None;
         let data_map_address = match visibility {
             Visibility::Private => None,
             Visibility::Public => {
@@ -193,17 +204,22 @@ impl Client {
                 chunk_contents.push(bytes);
                 Some(address)
             }
-            Visibility::Listed(ref metadata) => {
-                let (address, bytes) =
-                    crate::client_engine::files::listed_map_record(&data_map, metadata)
-                        .map_err(Error::Serialization)?;
+            Visibility::Envelope(ref options) => {
+                let salt: Option<ant_listings::Salt> = (!options.readable).then(rand::random);
+                let built = options
+                    .envelope(&data_map, salt.as_ref())
+                    .map_err(|e| Error::InvalidData(format!("cannot build the envelope: {e}")))?;
+                let (address, bytes) = crate::client_engine::files::envelope_record(&built);
                 info!(
-                    "Listed upload: bundling envelope chunk ({} bytes) at address {}",
+                    "Envelope upload: bundling envelope chunk ({} bytes) at address {}",
                     bytes.len(),
                     hex::encode(address)
                 );
                 chunk_contents.push(bytes);
-                Some(address)
+                let mut prepared = UploadEnvelope::new(built, salt);
+                self.note_unchecked_envelope(&mut prepared);
+                envelope = Some(prepared);
+                options.readable.then_some(address)
             }
         };
 
@@ -257,7 +273,11 @@ impl Client {
             }
         }
 
-        let payment_intent = PaymentIntent::from_prepared_chunks(&prepared_chunks);
+        let mut payment_intent = PaymentIntent::from_prepared_chunks(&prepared_chunks);
+        if envelope.is_some() {
+            // The envelope's log must not be the last of its payment.
+            payment_intent.sort_by_quote_hash();
+        }
 
         info!(
             "Data prepared for external signing: {} chunks, {} already stored, total {} atto ({content_len} bytes)",
@@ -275,6 +295,7 @@ impl Client {
             data_map_address,
             already_stored_addresses,
             total_chunks: chunk_count,
+            envelope,
         })
     }
 
@@ -301,12 +322,15 @@ impl Client {
 
     /// Fetch a `DataMap` from the network by its chunk address.
     ///
-    /// Retrieves the chunk at `address` and deserializes it as a `DataMap`.
+    /// Retrieves the chunk at `address` and deserializes it as a `DataMap`,
+    /// unwrapping it from an envelope (version 1 or 2) if it is in one.
     ///
     /// # Errors
     ///
-    /// Returns [`Error::NotFound`] if no chunk exists at `address`; other
-    /// errors if retrieval or deserialization fails.
+    /// Returns [`Error::NotFound`] if no chunk exists at `address`,
+    /// [`Error::DataMapWithheld`] if it is a private file's envelope, which
+    /// holds only a salted hash of the data map; other errors if retrieval or
+    /// deserialization fails.
     pub async fn data_map_fetch(&self, address: &[u8; 32]) -> Result<DataMap> {
         let chunk = self.chunk_get(address).await?.ok_or_else(|| {
             Error::NotFound(format!(
@@ -482,7 +506,11 @@ pub(super) fn map_read_error(error: crate::client_engine::files::ReadError<Error
 }
 
 fn decode_data_map_chunk(content: &[u8]) -> Result<DataMap> {
-    crate::client_engine::files::decode_map(content).map_err(Error::Serialization)
+    use crate::client_engine::files::{decode_map_record, MapError};
+    decode_map_record(content).map_err(|error| match error {
+        MapError::Withheld => Error::DataMapWithheld(error.to_string()),
+        MapError::Invalid(message) => Error::Serialization(message),
+    })
 }
 
 /// Compile-time assertions that Client method futures are Send.

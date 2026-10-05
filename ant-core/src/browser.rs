@@ -216,21 +216,31 @@ pub fn encrypt_public_file(content: &[u8]) -> Result<BrowserEncryptedFile, Brows
     })
 }
 
-/// Decode and normalize a native public DataMap.
+/// The data map the record at a public file's address holds: a plain data
+/// map, or one in an envelope (version 1 or 2), through the native client's
+/// shared decode path. A private file's envelope withholds its data map, and
+/// the error says so.
+fn decode_address_record(content: &[u8]) -> Result<DataMap, BrowserError> {
+    crate::client_engine::files::decode_map_record(content)
+        .map_err(|error| BrowserError::DataMap(error.to_string()))
+}
+
+/// Decode and normalize a native public DataMap: the record at a public
+/// file's address, a plain data map or an envelope holding one.
 pub fn decode_public_data_map(content: &[u8]) -> Result<Vec<BrowserChunkInfo>, BrowserError> {
-    let data_map: DataMap =
-        rmp_serde::from_slice(content).map_err(|error| BrowserError::DataMap(error.to_string()))?;
+    let data_map = decode_address_record(content)?;
     Ok(chunk_infos(&data_map))
 }
 
 /// Reconstruct a public file with native self-encryption after verifying every
-/// encrypted record against its DataMap destination address.
+/// encrypted record against its DataMap destination address. The DataMap
+/// record is the one at the file's address: a plain data map or an envelope
+/// holding one.
 pub fn decrypt_public_file(
     data_map_content: &[u8],
     encrypted_contents: &[Vec<u8>],
 ) -> Result<Vec<u8>, BrowserError> {
-    let data_map: DataMap = rmp_serde::from_slice(data_map_content)
-        .map_err(|error| BrowserError::DataMap(error.to_string()))?;
+    let data_map = decode_address_record(data_map_content)?;
     let available = encrypted_contents
         .iter()
         .map(|content| ant_protocol::compute_address(content))
@@ -921,7 +931,8 @@ mod wasm {
         Ok(content_address(content))
     }
 
-    /// Decode a native public DataMap for browser-side record retrieval.
+    /// Decode a native public DataMap (plain, or in an envelope) for
+    /// browser-side record retrieval.
     #[wasm_bindgen(js_name = decodePublicDataMap)]
     pub fn decode_public_data_map_wasm(content: &[u8]) -> Result<JsValue, JsValue> {
         let chunks = super::decode_public_data_map(content)
@@ -929,7 +940,8 @@ mod wasm {
         serde_wasm_bindgen::to_value(&chunks).map_err(|error| JsValue::from_str(&error.to_string()))
     }
 
-    /// Native public DataMap decoding and whole-file reconstruction.
+    /// Native public DataMap decoding (plain, or in an envelope) and
+    /// whole-file reconstruction.
     #[wasm_bindgen(js_name = decryptPublicFile)]
     pub fn decrypt_public_file_wasm(
         data_map_content: &[u8],
@@ -951,6 +963,63 @@ mod tests {
 
     fn fixture() -> Vec<u8> {
         "browser whole-file fixture\n".repeat(160).into_bytes()
+    }
+
+    #[test]
+    fn public_data_map_decoders_unwrap_envelopes() {
+        let content = fixture();
+        let (map, encrypted) =
+            self_encryption::encrypt(Bytes::from(content.clone())).expect("encrypt fixture");
+        let records: Vec<Vec<u8>> = encrypted
+            .iter()
+            .map(|chunk| chunk.content.to_vec())
+            .collect();
+        let plain = rmp_serde::to_vec(&map).expect("encode the data map");
+        let infos = decode_public_data_map(&plain).expect("a plain data map");
+        // A readable version 2 envelope, as an unlisted or listed upload
+        // stores it at the file's address.
+        let metadata = ant_listings::Metadata {
+            content_type: Some("text/plain".into()),
+            name: Some("notes.txt".into()),
+        };
+        let readable = ant_listings::Envelope::readable(
+            &map,
+            metadata.clone(),
+            ant_listings::ShownFields::ALL,
+            true,
+        )
+        .expect("envelope")
+        .to_bytes();
+        assert_eq!(decode_public_data_map(&readable).expect("readable"), infos);
+        assert_eq!(
+            decrypt_public_file(&readable, &records).expect("decrypt"),
+            content
+        );
+        // A private file's envelope withholds its data map, and says so.
+        let withheld = ant_listings::Envelope::withheld(
+            &map,
+            &[3; 32],
+            metadata,
+            ant_listings::ShownFields::ALL,
+            false,
+        )
+        .expect("envelope")
+        .to_bytes();
+        for error in [
+            decode_public_data_map(&withheld).unwrap_err(),
+            decrypt_public_file(&withheld, &records).unwrap_err(),
+        ] {
+            assert!(
+                matches!(&error, BrowserError::DataMap(message)
+                    if message == crate::client_engine::files::WITHHELD_MESSAGE),
+                "{error}"
+            );
+        }
+        // Neither a data map nor an envelope.
+        assert!(matches!(
+            decode_public_data_map(b"not a data map"),
+            Err(BrowserError::DataMap(_))
+        ));
     }
 
     #[test]
