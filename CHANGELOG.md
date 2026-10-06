@@ -5,6 +5,22 @@ All notable changes to the `ant` binary will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## Darwin fork
+
+Our changes on top of upstream 0.3.9 (ant-core 0.11.0). There are no tagged releases; builds are
+told apart by the commit `darwin --version` prints. Upstream's entries follow.
+
+- The default network is ours: Robinhood Chain (chain ID 4663), with the seeds, token, vault and
+  RPCs bundled in `ant-core/resources/`.
+- Payments in DARWIN (`0x511f76A3…`, vault `0xE0f62798…`), priced like Autonomi with a price
+  multiplier of 32 in the vendored ant-protocol. Builds before `0995cba` pay the retired test token.
+- Listings v2: envelopes on every visibility, optional payment fields, upload records and proofs
+  (`darwin file prove`, `darwin file verify`), and the listings index (`darwin listings`,
+  `darwin listing`) read with quorum checks.
+- Uploads paid by an outside payer; merkle batches paid in exact powers of two.
+- Reads of payments fall back to other RPCs, and uploads recover a payment the RPC errored on.
+- The CLI is `darwin`, shows costs in the payment token, and has self-update turned off.
+
 ## [Unreleased]
 
 ### Added
