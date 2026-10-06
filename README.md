@@ -198,7 +198,7 @@ Upload complete!
   Record:   my_data.bin.record
   Chunks:   7 (6 + 1 envelope)
   Size:     439.5 KB
-  Cost:     0.0042 TEST (gas: 0.000150 ETH)
+  Cost:     0.0042 DARWIN (gas: 0.000150 ETH)
   Time:     12.3s
 
 Anyone can download this file with:
@@ -221,7 +221,7 @@ Upload complete!
   Record:   my_data.bin.record
   Chunks:   7 (6 + 1 envelope)
   Size:     439.5 KB
-  Cost:     0.0042 TEST (gas: 0.000150 ETH)
+  Cost:     0.0042 DARWIN (gas: 0.000150 ETH)
   Time:     12.1s
 
 Download this file with:

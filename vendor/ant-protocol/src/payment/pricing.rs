@@ -34,12 +34,13 @@ const DIVISOR_SQUARED: u128 = PRICING_DIVISOR * PRICING_DIVISOR;
 ///
 /// `0.00390625 ANT × 10¹⁸ wei/ANT = 3_906_250_000_000_000 wei`.
 /// Our network's only change to Autonomi's pricing: every price is scaled by
-/// this factor so that, in dollars, it matches Autonomi's. Our network pays in
-/// its own token instead of ANT, so the factor is ANT's price divided by our
-/// token's price. Set 2026-10-02 for the Pons test token: $0.0333383 per ANT
-/// / $0.000004517 per TEST = 7,381. Retune it when the token or its price
-/// changes; nodes and clients must be rebuilt together.
-const PRICE_MULTIPLIER: u128 = 7_381;
+/// this factor. Our network pays in DARWIN instead of ANT, and costs what
+/// Autonomi does in dollars when DARWIN's market cap is $1M (1B supply, so
+/// $0.001 per DARWIN): the factor is ANT's dollar price × 1,000. Set
+/// 2026-10-06 with ANT at $0.0319 (it was 7,381 for the Pons test token).
+/// Below that market cap storage costs less than Autonomi's, above it more.
+/// Changing it means rebuilding nodes and clients together.
+const PRICE_MULTIPLIER: u128 = 32;
 
 const PRICE_BASELINE_WEI: u128 = 3_906_250_000_000_000 * PRICE_MULTIPLIER;
 
