@@ -180,13 +180,17 @@ async fn replaced_nonce_retains_journal_until_finality_then_allows_retry() {
 
     // Before finality a consumed nonce with no receipt reads as `Pending`
     // (indistinguishable from a stale read on a load-balanced endpoint), so
-    // the journaled bytes are re-sent and the node refuses them; the journal
+    // the journaled bytes are re-sent, the node refuses them, and the payment
+    // is observed until the timeout in case its receipt shows up; the journal
     // is retained for reconciliation, and nothing is paid.
     let error = client
         .test_execute_native_payment(&adapter, &request, &mut state, true)
         .await
         .unwrap_err();
-    assert!(error.to_string().contains("nonce too low"), "{error}");
+    assert!(
+        error.to_string().contains("payment outcome pending"),
+        "{error}"
+    );
     assert!(state.pending_payment.is_some());
     assert_eq!(wallet.balance_of_tokens().await.unwrap(), before);
     wallet

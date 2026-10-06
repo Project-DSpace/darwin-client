@@ -249,10 +249,20 @@ async fn execute_once<A: UploadAdapter, F: Fn(&UploadState) -> bool + Send + Syn
                             return Err(Error::Payment("pending payment has expired quotes; retain its transaction journal for reconciliation".into()));
                         }
                         // An ambiguous send only ever retries these exact signed bytes.
-                        wallet
-                            .broadcast_payment(&signed, request)
-                            .await
-                            .map_err(Error::Payment)?;
+                        // A nonce rejection means the nonce is used: by these bytes,
+                        // whose receipt a lagging replica doesn't show yet (seen live on
+                        // a load-balanced endpoint), or by another transaction, which
+                        // finality turns into `Replaced`. Either way, keep observing
+                        // until the timeout below rather than fail at once.
+                        match wallet.broadcast_payment(&signed, request).await {
+                            Ok(_) => {}
+                            Err(message) if is_stale_nonce(&message) => {
+                                tracing::debug!(
+                                    "re-sent payment's nonce is already used ({message}); observing"
+                                );
+                            }
+                            Err(message) => return Err(Error::Payment(message)),
+                        }
                         broadcast = true;
                     }
                     crate::runtime::sleep(std::time::Duration::from_secs(1)).await;
