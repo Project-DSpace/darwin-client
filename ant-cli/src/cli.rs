@@ -8,13 +8,21 @@ use crate::commands::data::{
 use crate::commands::node::NodeCommand;
 use crate::commands::update::UpdateArgs;
 
+/// `darwin 0.3.9` on line 1, the git commit on line 2 (see build.rs).
+const VERSION: &str = concat!(
+    env!("CARGO_PKG_VERSION"),
+    "\ncommit ",
+    env!("DARWIN_GIT_COMMIT")
+);
+
 #[derive(Parser)]
-// NOTE: when reintroducing a multi-line `--version` (e.g. via `long_version`),
-// the version number MUST stay on line 1. The self-update parser in 0.1.2–0.1.4
-// reads only the last whitespace-separated token of the entire output, so any
-// trailing line (like `License: MIT or Apache-2.0`) breaks upgrades for users
-// on those versions.
-#[command(name = "darwin", version, about = "Darwin storage network client")]
+// NOTE: the version number MUST stay the last token of line 1: the self-update
+// check (ant-core update.rs) reads that token from a new binary's `--version`.
+#[command(
+    name = "darwin",
+    version = VERSION,
+    about = "Darwin storage network client"
+)]
 pub struct Cli {
     /// Output structured JSON instead of human-readable text
     #[arg(long, global = true)]
