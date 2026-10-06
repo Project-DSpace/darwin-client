@@ -503,6 +503,10 @@ async fn handle_file_upload(
                  (spent {cost_display}): {reason}"
             );
         }
+        Err(e @ DataError::Payment(_)) => anyhow::bail!(
+            "File upload failed: {e}\nIf the payment went through, run the same upload again: it \
+             finds the payment on the chain and carries on without paying twice."
+        ),
         Err(e) => anyhow::bail!("File upload failed: {e}"),
     };
 

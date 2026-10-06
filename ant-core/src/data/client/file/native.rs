@@ -1237,6 +1237,39 @@ impl std::fmt::Debug for ExternalChunkStore {
 /// [`UploadPayer::checkpoint_scope`], or the wallet's address), so only the
 /// same payer resumes it, reusing its salt and the envelope's payment. The
 /// choices end where their msgpack ends, so the payer can simply follow.
+/// How long an upload waits before reconciling a payment whose outcome is
+/// unknown, so the RPC has caught up with the transaction.
+const PAYMENT_RECHECK_DELAY: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Whether `state` holds a payment whose outcome is unknown: a transaction
+/// was signed and sent, and neither confirmed nor shown to have failed.
+fn payment_outcome_unknown(state: &crate::data::client::upload_state::UploadState) -> bool {
+    state
+        .pending_payment
+        .as_ref()
+        .is_some_and(|attempt| !attempt.submissions.is_empty())
+}
+
+/// What the payment whose outcome is unknown pays, from its prepared plans:
+/// zero for a Merkle payment or if the plans are missing.
+fn unresolved_payment_amount(state: &crate::data::client::upload_state::UploadState) -> Amount {
+    if state
+        .pending_payment
+        .as_ref()
+        .is_none_or(|attempt| attempt.merkle)
+    {
+        return Amount::ZERO;
+    }
+    state
+        .pending_plans()
+        .map(|plans| {
+            plans.iter().fold(Amount::ZERO, |sum, plan| {
+                sum.saturating_add(plan.payment.total_amount())
+            })
+        })
+        .unwrap_or(Amount::ZERO)
+}
+
 fn envelope_checkpoint_scope(options: &EnvelopeOptions, payer: &[u8]) -> Vec<u8> {
     let mut scope = options.scope();
     scope.extend_from_slice(payer);
@@ -3692,16 +3725,44 @@ impl Client {
             checkpoint: &cache_path,
             payer,
         };
-        let result = match envelope.as_ref() {
-            Some((_, last)) => {
-                self.upload_records_then(records, *last, &mut state, &adapter, mode)
-                    .await?
-            }
-            None => {
-                self.upload_records(records, &mut state, &adapter, mode)
-                    .await?
+        // A payment this wallet sent may have gone through although the RPC
+        // answered with an error. Its signed transaction is in the journal,
+        // and running the upload again reconciles it from the chain before
+        // anything is paid, so do that once here rather than leave it to the
+        // user. Only for this wallet's own payments: an external payer would
+        // be asked to pay again.
+        let mut rechecked = false;
+        let mut recovered = Amount::ZERO;
+        let mut result = loop {
+            let attempt = match envelope.as_ref() {
+                Some((_, last)) => {
+                    self.upload_records_then(records.clone(), *last, &mut state, &adapter, mode)
+                        .await
+                }
+                None => {
+                    self.upload_records(records.clone(), &mut state, &adapter, mode)
+                        .await
+                }
+            };
+            match attempt {
+                Err(error) if !rechecked && payer.is_none() && payment_outcome_unknown(&state) => {
+                    rechecked = true;
+                    recovered = unresolved_payment_amount(&state);
+                    warn!(
+                        "Payment outcome unknown ({error}); checking the chain in {}s before giving up",
+                        PAYMENT_RECHECK_DELAY.as_secs()
+                    );
+                    tokio::time::sleep(PAYMENT_RECHECK_DELAY).await;
+                }
+                attempt => break attempt?,
             }
         };
+        // A payment recovered from the chain was sent by this upload, so it
+        // counts in its cost. If the retry paid instead (the first payment
+        // never landed), that payment is already counted.
+        if result.amount == Amount::ZERO {
+            result.amount = recovered;
+        }
         // The record is built before the checkpoint is removed, and kept
         // until the caller has saved it.
         if let Some((envelope, _)) = envelope.as_mut() {
@@ -4357,6 +4418,27 @@ impl Client {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_a_sent_payment_without_an_outcome_is_rechecked() {
+        let mut state = crate::data::client::upload_state::UploadState::default();
+        // Nothing pending.
+        assert!(!payment_outcome_unknown(&state));
+        // Pending, but no transaction sent yet: nothing on the chain to find.
+        state.start_payment(false, vec![[1; 32]]).unwrap();
+        assert!(!payment_outcome_unknown(&state));
+        // A transaction sent and no outcome: the chain may hold the payment.
+        state
+            .pending_payment
+            .as_mut()
+            .unwrap()
+            .submissions
+            .push(serde_json::json!({ "native_payment_v1": {} }));
+        assert!(payment_outcome_unknown(&state));
+        // Settled either way (confirmed, or shown to have failed): nothing to reconcile.
+        state.pending_payment = None;
+        assert!(!payment_outcome_unknown(&state));
+    }
 
     /// Throwaway payment result — the assembler only moves it into the resume
     /// handle, never inspects it.
