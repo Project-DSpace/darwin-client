@@ -904,7 +904,7 @@ dependencies = [
 [[package]]
 name = "ant-listings"
 version = "0.2.0"
-source = "git+https://github.com/Project-DSpace/ant-listings?rev=e3cf6bbfbd64621acf336342fe928638a386251a#e3cf6bbfbd64621acf336342fe928638a386251a"
+source = "git+https://github.com/Project-DSpace/darwin-listings?rev=e3cf6bbfbd64621acf336342fe928638a386251a#e3cf6bbfbd64621acf336342fe928638a386251a"
 dependencies = [
  "ant-protocol",
  "postcard",

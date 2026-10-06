@@ -48,7 +48,7 @@ impl UpdateArgs {
         if !SELF_UPDATE {
             anyhow::bail!(
                 "self-update is off in this build: it would install Autonomi's `ant`, \
-                 not `darwin`. New builds of `darwin` come from the Project-DSpace/ant-client \
+                 not `darwin`. New builds of `darwin` come from the Project-DSpace/darwin-client \
                  CI (the darwin-linux-x64 artifact)."
             );
         }
