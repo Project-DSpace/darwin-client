@@ -101,7 +101,12 @@ pub struct Cli {
 
 #[derive(Subcommand)]
 pub enum Commands {
-    /// Manage nodes
+    /// Manage local Autonomi nodes (not Darwin nodes)
+    ///
+    /// Upstream's node manager: `darwin node add` downloads Autonomi's ant-node
+    /// from WithAutonomi's releases, and those nodes join Autonomi's network and
+    /// take payment on Arbitrum. Darwin storage nodes run from the storage-node
+    /// Docker image instead (Project-DSpace/darwin-node).
     Node {
         #[command(subcommand)]
         command: NodeCommand,
@@ -132,7 +137,7 @@ pub enum Commands {
     /// One file's listing, in the index or not: from the nodes nearest its
     /// address, checked against the network and the payment chain
     Listing(ListingArgs),
-    /// Update the darwin binary to the latest version
+    /// Update the darwin binary (off in this build: there are no darwin releases yet)
     Update(UpdateArgs),
 }
 

@@ -20,7 +20,7 @@ use crate::commands::node::stop::StopArgs;
 
 #[derive(Subcommand)]
 pub enum NodeCommand {
-    /// Add one or more nodes to the registry
+    /// Add Autonomi ant-node instances to the registry (Autonomi's network, not Darwin's)
     Add(Box<AddArgs>),
     /// Manage the node daemon
     Daemon {
@@ -29,7 +29,7 @@ pub enum NodeCommand {
     },
     /// Dismiss an evicted node, removing it from the registry/list
     Dismiss(DismissArgs),
-    /// Manage node log handling, including forwarding logs to the beta endpoint
+    /// Manage node log handling, including forwarding logs to Autonomi's beta endpoint
     Logs {
         #[command(subcommand)]
         command: LogsCommand,
