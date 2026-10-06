@@ -16,12 +16,14 @@ fn main() {
     let commit = git(&["rev-parse", "--short=7", "HEAD"]).unwrap_or_else(|| "unknown".into());
     println!("cargo:rustc-env=DARWIN_GIT_COMMIT={commit}");
 
-    // Rerun when HEAD moves: a checkout changes HEAD, a commit changes the
-    // branch ref. Only existing files are named, since a missing one would
-    // rerun this script on every build. With none, cargo reruns it when any
-    // file in the package changes.
+    // Rerun when HEAD moves. A checkout changes HEAD and a commit the branch
+    // ref, but once `git gc` or `git pack-refs` has moved that ref into
+    // packed-refs, the next commit writes it to a new file, not watched yet.
+    // HEAD's reflog covers that: by default git appends to it on every
+    // commit, checkout, reset and pull. Only existing files are named, since
+    // a missing one would rerun this script on every build.
     println!("cargo:rerun-if-changed=build.rs");
-    let mut watched = vec!["HEAD".to_string()];
+    let mut watched = vec!["HEAD".to_string(), "logs/HEAD".to_string()];
     if let Some(head_ref) = git(&["symbolic-ref", "-q", "HEAD"]) {
         watched.push(head_ref);
     }
