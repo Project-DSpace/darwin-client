@@ -11,7 +11,7 @@ This project provides two Rust crates:
 - **ant-core** — A headless Rust library containing the client's business logic: data storage/retrieval with self-encryption and EVM payments, node lifecycle management, and local devnet tooling. Its `browser` module shares manifest validation, protocol framing, authenticated WebRTC Direct access, lookup, quote verification, and complete public-file workflows with browser applications through the `browser-wasm` feature.
 - **ant-cli** — A thin CLI binary (`darwin`) built on `ant-core`.
 
-Data on Darwin is **content-addressed**. Files are split into encrypted chunks (via [self-encryption](https://en.wikipedia.org/wiki/Convergent_encryption)), each stored at an XOR address derived from its content. A `DataMap` tracks which chunks belong to a file. Payments for storage are made on an EVM-compatible blockchain (Arbitrum).
+Data on Darwin is **content-addressed**. Files are split into encrypted chunks (via [self-encryption](https://en.wikipedia.org/wiki/Convergent_encryption)), each stored at an XOR address derived from its content. A `DataMap` tracks which chunks belong to a file. Storage is paid in DARWIN on Robinhood Chain (chain ID 4663), through the payment vault `0xE0f627986c0438De0E314B644f3C8aA21D3f4f6B`. The token, the vault and the RPCs are bundled in `ant-core/resources/payment_network.toml`; `--evm-network robinhood`, the default, selects them.
 
 ### Browser WebAssembly client
 
@@ -100,28 +100,52 @@ cargo build --release --locked -p ant-cli --bin darwin
 Every push to `main` also builds a Linux x86-64 binary in CI, uploaded as the
 `darwin-linux-x64` workflow artifact (`darwin-linux-x64.tar.gz` and its `SHA256SUMS.txt`).
 
+`darwin --version` prints the package version and, on a second line, the git commit the binary
+was built from. Every build says 0.3.9, so go by the commit: builds before `0995cba`
+(2026-10-06) pay the retired test token and can't upload to the current network.
+
 `darwin` keeps the data and configuration directories of the `ant` name (for example
 `~/.local/share/ant` and `~/.config/ant` on Linux), so files written by earlier builds are found
 where they were.
+
+> **Warning:** a `bootstrap_peers.toml` in that config directory overrides the seeds bundled in
+> `darwin`. On a machine where Autonomi's `ant` was installed, that file names Autonomi's
+> network, and `darwin` would join it instead of ours. Delete or rename the file, or pass
+> `--bootstrap`. See [Bootstrap multiaddresses and browser defaults](#bootstrap-multiaddresses-and-browser-defaults).
 
 > **Note:** `install.sh`, `install.ps1` and the npm packages in this repository are upstream's
 > and install Autonomi's `ant`, not `darwin`.
 
 ## Quick Start
 
-### Store and retrieve a file (production)
+### Store and retrieve a file
+
+The network's seeds are bundled, so no `--bootstrap` is needed. The wallet behind `SECRET_KEY`
+needs DARWIN for storage and a little ETH on Robinhood Chain for gas.
 
 ```bash
-# Upload (private — DataMap saved locally)
-SECRET_KEY=0x... darwin file upload photo.jpg -b 1.2.3.4:12000
-# Output:
-#   Upload complete!
-#     Datamap: photo.datamap
-#     Chunks:  3
+# What it will cost
+darwin file cost notes.txt
+# Output (an 8 KB file):
+#   Chunks: 4 (3 + 1 envelope)
+#   Cost:   1.50 DARWIN (gas: 0.000150 ETH)
 
-# Download using the local DataMap
-darwin file download --datamap photo.datamap -o photo_copy.jpg -b 1.2.3.4:12000
+# Upload (private: the data map is saved locally)
+SECRET_KEY=0x... darwin file upload notes.txt
+# Output (in part):
+#   Upload complete!
+#     Datamap:  notes.txt.datamap
+#     Record:   notes.txt.record
+#     Chunks:   4 (3 + 1 envelope)
+#     Cost:     1.50 DARWIN (gas: 0.000005 ETH)
+
+# Download using the local data map
+darwin file download --datamap notes.txt.datamap -o notes_copy.txt
 ```
+
+Each chunk costs three times the median quote of the nodes that store it: about 0.375 DARWIN
+on today's network, rising as nodes fill. The gas in `darwin file cost` is upstream's fixed
+estimate; an upload's actual gas on Robinhood Chain is far lower.
 
 ### Store and retrieve a file (local devnet)
 
@@ -138,28 +162,15 @@ darwin file download abc123... -o photo_copy.jpg \
     --devnet-manifest ~/.local/share/ant/devnet-manifest.json --allow-loopback --evm-network local
 ```
 
-### Store and retrieve a file (Arbitrum mainnet)
-
-```bash
-# Upload (private — DataMap saved locally)
-SECRET_KEY=0x... darwin file upload photo.jpg \
-    --bootstrap 1.2.3.4:12000 --evm-network arbitrum-one
-# Output: DATAMAP_FILE=photo.jpg.datamap
-
-# Download using the local DataMap
-darwin file download --datamap photo.jpg.datamap -o photo_copy.jpg \
-    --bootstrap 1.2.3.4:12000 --evm-network arbitrum-one
-```
-
 ### Low-level chunk operations
 
 ```bash
 # Store a single chunk (< 1 MB)
-echo "hello darwin" | SECRET_KEY=0x... darwin chunk put --bootstrap ...
+echo "hello darwin" | SECRET_KEY=0x... darwin chunk put
 # Output: abc123def456...
 
 # Retrieve it
-darwin chunk get abc123def456... --bootstrap ...
+darwin chunk get abc123def456...
 # Output: hello darwin
 ```
 
@@ -172,12 +183,12 @@ darwin chunk get abc123def456... --bootstrap ...
 | Flag | Description |
 |------|-------------|
 | `--json` | Output structured JSON instead of human-readable text |
-| `-b, --bootstrap <IP:PORT>` | Bootstrap peer addresses, comma-separated or repeated (`-b 1.2.3.4:10000,5.6.7.8:10000`) |
+| `-b, --bootstrap <ADDR>` | Bootstrap peers as QUIC multiaddresses (`/ip4/1.2.3.4/udp/10000/quic`) or `ip:port`, comma-separated or repeated. Default: the bundled seeds, unless a config file names others |
 | `--devnet-manifest <PATH>` | Path to devnet manifest JSON file |
 | `--allow-loopback` | Allow loopback connections (required for local devnet) |
 | `--timeout-secs <N>` | Network operation timeout in seconds (default: 60) |
 | `-v, --verbose` | Increase verbosity: `-v` info, `-vv` debug, `-vvv` trace. Default: no logs (privacy by design) |
-| `--evm-network <NET>` | EVM network: `arbitrum-one` (default), `arbitrum-sepolia`, or `local` |
+| `--evm-network <NET>` | Payment network: `robinhood` (default: Robinhood Chain, DARWIN), `local` (the devnet manifest's chain), or upstream's `arbitrum-one` and `arbitrum-sepolia` (Autonomi's network, which our nodes don't accept) |
 
 ### `darwin file` — File Operations
 
@@ -190,16 +201,16 @@ Upload a file to the network. The file is split into encrypted chunks, each paid
 ```
 $ SECRET_KEY=0x... darwin file upload my_data.bin --public
 warning: the payment fields shown give away the paying wallet to anyone with the envelope's address
-Encrypted into 7 chunks
+Encrypted into 3 chunks
 
 Upload complete!
   Address:  a1b2c3d4e5f6...
   Payment:  all fields shown
   Record:   my_data.bin.record
-  Chunks:   7 (6 + 1 envelope)
-  Size:     439.5 KB
-  Cost:     0.0042 DARWIN (gas: 0.000150 ETH)
-  Time:     12.3s
+  Chunks:   4 (3 + 1 envelope)
+  Size:     8.0 KB
+  Cost:     1.50 DARWIN (gas: 0.000005 ETH)
+  Time:     6.3s
 
 Anyone can download this file with:
   darwin file download a1b2c3d4e5f6... -o <FILE>
@@ -212,17 +223,17 @@ The `warning:` and `Encrypted` lines go to stderr. The default, a private upload
 ```
 $ SECRET_KEY=0x... darwin file upload my_data.bin
 warning: the payment fields shown give away the paying wallet to anyone with the envelope's address
-Encrypted into 7 chunks
+Encrypted into 3 chunks
 
 Upload complete!
   Datamap:  my_data.bin.datamap
   Envelope: 9f8e7d6c5b4a... (its payment record is public, the file is not)
   Payment:  all fields shown
   Record:   my_data.bin.record
-  Chunks:   7 (6 + 1 envelope)
-  Size:     439.5 KB
-  Cost:     0.0042 DARWIN (gas: 0.000150 ETH)
-  Time:     12.1s
+  Chunks:   4 (3 + 1 envelope)
+  Size:     8.0 KB
+  Cost:     1.50 DARWIN (gas: 0.000005 ETH)
+  Time:     6.1s
 
 Download this file with:
   darwin file download --datamap my_data.bin.datamap
@@ -271,8 +282,8 @@ Connecting to network... done
 Downloading from network...
 Download complete!
   File: restored.bin
-  Size: 439.5 KB
-  Time: 3.2s
+  Size: 8.0 KB
+  Time: 0.4s
 
 # Private download (from local DataMap)
 $ darwin file download --datamap my_data.bin.datamap -o restored.bin
@@ -280,8 +291,8 @@ Connecting to network... done
 Downloading from network...
 Download complete!
   File: restored.bin
-  Size: 439.5 KB
-  Time: 2.8s
+  Size: 8.0 KB
+  Time: 0.4s
 ```
 
 **Options:**
@@ -433,16 +444,22 @@ $ SECRET_KEY=0x... darwin wallet address
 
 #### `darwin wallet balance`
 
-Query the token balance on the configured EVM network.
+Print the wallet's payment-token balance (DARWIN by default) in its smallest unit, 10⁻¹⁸ of a token.
 
 ```
-$ SECRET_KEY=0x... darwin wallet balance --evm-network arbitrum-one
+$ SECRET_KEY=0x... darwin wallet balance
 1000000000000000000
 ```
 
-### `darwin node` — Node Management
+### `darwin node` — Node Management (Autonomi only)
 
-Manage Darwin network nodes via a local daemon process. The daemon runs in the background, exposes a REST API on `127.0.0.1`, and supervises all node processes.
+> **This does not run Darwin nodes.** `darwin node` is upstream's node manager, unchanged:
+> `darwin node add` downloads Autonomi's `ant-node` from WithAutonomi's GitHub releases, and
+> those nodes join Autonomi's network and take payment on Arbitrum (`--evm-network` offers only
+> `arbitrum-one` and `arbitrum-sepolia`). Darwin storage nodes run from the storage-node Docker
+> image built from Project-DSpace/darwin-node. The rest of this section describes upstream's tool.
+
+Manage Autonomi `ant-node` processes via a local daemon process. The daemon runs in the background, exposes a REST API on `127.0.0.1`, and supervises all node processes.
 
 #### `darwin node daemon start`
 
@@ -579,7 +596,7 @@ $ darwin node reset --force
 
 #### `darwin node logs forward`
 
-Optionally ship this machine's node logs to the Autonomi beta log endpoint, to help judge a beta
+Autonomi only: the endpoint and the beta programme are Autonomi's. Optionally ship this machine's node logs to the Autonomi beta log endpoint, to help judge a beta
 build. Off by default and never enabled for you — running `enable` yourself is the whole of the
 consent, and `disable` stops it. See
 [Forwarding your node logs](#forwarding-your-node-logs-optional) for the walkthrough.
@@ -626,41 +643,17 @@ tell which token is in use.
 
 ### `darwin update` — Self-Update
 
-Replace the running `darwin` binary with the newest release from GitHub. The downloaded archive's
-ML-DSA-65 signature is verified against the embedded release signing key before anything is
-installed, and the extracted binary must report the expected version.
-
-```
-$ darwin update
-Current version: 0.3.3
-Checking for updates on the stable channel...
-Update available: v0.3.3 -> v0.3.4
-Updated successfully: v0.3.3 -> v0.3.4
-```
-
-**Options:**
-
-| Flag | Description |
-|------|-------------|
-| `--channel <CHAN>` | Release channel to update along: `stable` or `beta`. Defaults to the channel the running binary belongs to. |
-| `--force` | Re-download and reinstall even when already on the newest release. |
-
-The default channel is inferred from the running binary's own version, so there is nothing to
-configure: a `-beta.N` build tracks `beta` and every other build tracks `stable`. On `beta`,
-both `-beta.N` and stable releases are accepted and the highest wins; `-rc.N` releases are
-rejected on both channels.
-
-Because a beta version outranks the stable release it was cut from, `--channel stable` cannot
-walk a beta build backwards — it will report that you are already up to date. Leaving the beta
-channel means installing a stable build manually.
-
-> **Note:** self-update still follows upstream's release feed (the `ant-cli-v*` releases of
-> `WithAutonomi/ant-client`), so it can replace `darwin` with Autonomi's `ant`. Until Darwin
-> publishes its own releases, update by building a new `darwin` instead.
+Off in this build: `darwin update` exits with an error. Upstream's release feed (the `ant-cli-v*`
+releases of `WithAutonomi/ant-client`) would replace `darwin` with Autonomi's `ant`, and Darwin
+publishes no releases yet. Update by building a new `darwin` or taking the latest
+`darwin-linux-x64` CI artifact.
 
 ---
 
 ## Beta Programme
+
+> **Autonomi only.** This is Autonomi's beta programme for `ant` and `ant-node`. Darwin has no
+> beta channel, `darwin update` is off, and the log endpoint below is Autonomi's.
 
 The beta channel carries the week's build ahead of the stable train, for people who want to soak it
 and report back.
@@ -871,14 +864,15 @@ ant-core = { path = "ant-core" }
 ### Connecting to the Network
 
 ```rust
-use ant_core::data::{Client, ClientConfig};
+use ant_core::config::{bundled_payment_network, resolve_bootstrap_multiaddrs};
+use ant_core::data::{Client, ClientConfig, Wallet};
 
-// Connect to bootstrap peers
-let client = Client::connect(&["1.2.3.4:12000".parse()?], ClientConfig::default()).await?;
+// Connect through the bundled seeds (or a config file's; see the bootstrap section below)
+let peers = resolve_bootstrap_multiaddrs(&[], None)?;
+let client = Client::connect_multiaddrs(&peers, ClientConfig::default()).await?;
 
-// Attach a wallet for paid operations (uploads)
-use ant_core::data::{Wallet, EvmNetwork};
-let wallet = Wallet::new_from_private_key(EvmNetwork::ArbitrumOne, "0xprivate_key...")?;
+// Attach a wallet for paid operations (uploads), on the bundled network: Robinhood Chain, DARWIN
+let wallet = Wallet::new_from_private_key(bundled_payment_network()?, "0xprivate_key...")?;
 let client = client.with_wallet(wallet);
 client.approve_token_spend().await?;
 ```
@@ -1134,9 +1128,10 @@ Data operations (upload/download) go directly to the P2P network — they do not
 
 | Value | Network | Use case |
 |-------|---------|----------|
-| `arbitrum-one` | Arbitrum mainnet | Production |
-| `arbitrum-sepolia` | Arbitrum Sepolia testnet | Staging / testing |
+| `robinhood` | Robinhood Chain (4663), DARWIN, from `ant-core/resources/payment_network.toml` | Default: the Darwin network |
 | `local` | Custom (Anvil) | Local development (requires `--devnet-manifest`) |
+| `arbitrum-one` | Arbitrum One, Autonomi's ANT | Upstream's network only; our nodes don't accept it |
+| `arbitrum-sepolia` | Arbitrum Sepolia testnet | Upstream's test network only |
 
 ## Environment Variables
 
@@ -1181,24 +1176,32 @@ Unless you explicitly state otherwise, any contribution intentionally submitted 
 ## Bootstrap multiaddresses and browser defaults
 
 `ant-core/resources/bootstrap_peers.toml` is the shared release resource. Its
-`quic` list contains native multiaddresses; its `webrtc` list contains complete
-WebRTC Direct multiaddresses with certificate and peer identity pins. The
-WebRTC list includes seven mainnet bootstrap nodes and is exposed through WASM
-for the browser SDK's default mainnet connection.
+`quic` list holds one native seed per storage server, on port 10000. Its
+`webrtc` list holds every node's WebRTC Direct address (ports 11000 and 11001)
+with its certificate hash and peer ID, the same list as storage-viewer's
+`network.json`; a node's entry changes when its identity or certificate does.
 
 The CLI accepts `--bootstrap /ip4/127.0.0.1/udp/10000/quic` (including optional
 `/p2p/<peer-id>`). Legacy `ip:port` arguments and installed `peers = [...]`
 configuration remain readable. Explicit peers take precedence over a selected
-devnet manifest, which takes precedence over the installed bootstrap file.
-Only QUIC seeds are selected for native dialing. Existing installed configuration
-is preserved by the installer; replace it explicitly to adopt new bundled seeds.
+devnet manifest, which takes precedence over a `bootstrap_peers.toml` in the
+config directory, which takes precedence over the bundled seeds. Only QUIC seeds
+are selected for native dialing. `darwin -v` logs "using N bundled bootstrap
+seed(s)" when it falls back to the bundled ones.
+
+The config directory is `ant`'s: `~/.config/ant` on Linux,
+`~/Library/Application Support/ant` on macOS, `%APPDATA%\ant` on Windows. A
+`bootstrap_peers.toml` left there by Autonomi's `ant` installer names Autonomi's
+network, and `darwin` would join it (the price check then refuses to pay).
+Delete or rename that file to use the bundled seeds.
 
 Native library callers can use `config::resolve_bootstrap_multiaddrs()` and
 `Client::connect_multiaddrs()` to retain peer pins. Existing socket-address APIs
 remain available. `network_defaults::browser_mainnet_defaults()` and the WASM
-`mainnetNetworkDefaults()` export return only WebRTC seeds, the expected payment
-identity, and evmlib's mainnet RPC URL without connecting to any network.
+`mainnetNetworkDefaults()` export return the bundled WebRTC seeds, the payment
+identity (chain 4663, the DARWIN token and vault) and the bundled RPC URL,
+without connecting to any network.
 
-Add verified WebRTC seeds to the shared TOML resource, commit the source, and
-regenerate the browser SDK's WASM artifact to activate its mainnet defaults.
+To change the seeds, edit the TOML resource, commit it, and rebuild the WASM
+artifact for browser apps that use these defaults.
 See [ADR-0005](docs/adr/ADR-0005-bootstrap-multiaddresses.md).
