@@ -762,10 +762,24 @@ impl Connection {
         data_channel.set_onerror(Some(on_error.as_ref().unchecked_ref()));
         let close_inbox = Rc::clone(&inbox);
         let close_open = Rc::clone(&open_tx);
+        let close_association = Rc::downgrade(&peer_connection);
         let on_close = Closure::<dyn FnMut(Event)>::new(move |_event: Event| {
             close_inbox.fail("WebRTC DataChannel closed".to_string());
             if let Some(sender) = close_open.borrow_mut().take() {
                 let _ = sender.send(Err("WebRTC DataChannel closed before opening".into()));
+            }
+            // Once every lane has closed (a node ends idle associations), close
+            // the peer connection too. The browser otherwise keeps sending ICE
+            // consent checks on it, and the node admits each one as a new
+            // session that never completes.
+            if let Some(association) = close_association.upgrade() {
+                let all_closed = association
+                    .channels
+                    .try_borrow()
+                    .is_ok_and(|channels| channels.iter().all(AssociationChannel::is_closed));
+                if all_closed {
+                    association.connection.close();
+                }
             }
         });
         data_channel.set_onclose(Some(on_close.as_ref().unchecked_ref()));

@@ -9,8 +9,8 @@ export const paymentNetwork = {
 // DataChannel closes still in flight (see Channel.close below).
 const pendingCloses = new Set();
 
-// Await this before asserting that a channel, or the peer connection its last
-// close releases, has closed. It also waits for closes requested while it
+// Await this before asserting that a channel, or the peer connection the client
+// closes after its last channel, has closed. It also waits for closes requested while it
 // waits, such as sibling channels closed in reaction to a close event.
 export async function closesSettled() {
   do {
@@ -90,11 +90,12 @@ export function mockWebRtc(nodes = [{}]) {
       pendingCloses.add(closed);
       closed.then(() => pendingCloses.delete(closed));
     }
+    // Like browsers, closing every channel leaves the peer connection open:
+    // the client has to close it.
     finishClose() {
       this.readyState = "closed";
       this.dispatchEvent(new Event("close"));
       this.onclose?.({});
-      if (this.connection.channels.every(channel => channel.readyState === "closed")) this.connection.close();
     }
   }
 

@@ -26,6 +26,23 @@ test("idle pooled connections reject unsolicited messages immediately", async ()
   }
 });
 
+test("a node closing an idle association closes the browser's peer connection", async () => {
+  const rtc = mockWebRtc();
+  const client = await test_connect_node(rtc.endpoints[0]);
+  try {
+    await client.hello();
+    const connection = rtc.connections[0];
+    // The node ends the association: its channel closes without the page
+    // asking. Left open, the peer connection keeps sending ICE consent
+    // checks, which the node admits as new sessions.
+    connection.channel.finishClose();
+    await closesSettled();
+    assert.equal(connection.closed, true);
+  } finally {
+    client.close();
+  }
+});
+
 for (const scenario of ["oversized", "byte budget", "tiny messages", "empty"]) {
   test(`active response rejects ${scenario} before retaining unbounded data`, async () => {
     const rtc = mockWebRtc([{
