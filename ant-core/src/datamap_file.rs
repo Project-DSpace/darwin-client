@@ -196,6 +196,14 @@ fn reserve_target_path(
 
 fn write_atomic(dir: &Path, target: &Path, bytes: &[u8]) -> Result<()> {
     let mut tmp = NamedTempFile::new_in(dir)?;
+    // Owner-only: a data map or a private file's record can read the file.
+    // tempfile already creates 0600; this keeps it so whatever its default.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        tmp.as_file()
+            .set_permissions(fs::Permissions::from_mode(0o600))?;
+    }
     tmp.write_all(bytes)?;
     tmp.as_file().sync_all()?;
     tmp.persist(target).map_err(|e| Error::Io(e.error))?;
@@ -412,6 +420,33 @@ mod record_tests {
         let text = fs::read_to_string(&saved).expect("text");
         assert!(text.ends_with('\n'));
         assert_eq!(text.trim(), record.to_hex().expect("hex"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn datamaps_and_records_are_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let map = data_map();
+        let record = record(&map);
+        let files = write_upload_files(
+            dir.path(),
+            "notes.txt",
+            Some(&map),
+            Some(&record),
+            CollisionPolicy::NumericSuffix,
+        )
+        .expect("write");
+        let copy = dir.path().join("copy.record");
+        write_record(&copy, &record).expect("record copy");
+        for path in [
+            files.datamap.expect("datamap"),
+            files.record.expect("record"),
+            copy,
+        ] {
+            let mode = fs::metadata(&path).expect("metadata").permissions().mode();
+            assert_eq!(mode & 0o777, 0o600, "{}", path.display());
+        }
     }
 
     #[test]

@@ -1356,6 +1356,13 @@ fn write_whole(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
         .ok_or_else(|| std::io::Error::other("missing directory"))?;
     std::fs::create_dir_all(directory)?;
     let mut file = tempfile::NamedTempFile::new_in(directory)?;
+    // Owner-only, like the records kept next to it: a salt helps read a private file.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.as_file()
+            .set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    }
     file.write_all(bytes)?;
     file.as_file().sync_all()?;
     file.persist(path).map_err(|e| e.error)?;
