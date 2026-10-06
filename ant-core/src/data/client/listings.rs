@@ -55,6 +55,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::broadcast::error::RecvError;
@@ -1645,7 +1646,12 @@ async fn check_group<P: PartialEq>(
 /// proofs.
 pub struct ListingChain {
     http: reqwest::Client,
-    rpc_url: String,
+    /// The RPCs to read through. A call starts at the last one that
+    /// answered and moves on to the next when one fails: a provider can
+    /// refuse a method the reader needs (PublicNode refuses `eth_getLogs`).
+    rpc_urls: Vec<String>,
+    /// Index in `rpc_urls` of the last RPC that answered.
+    answered: AtomicUsize,
     vault: [u8; 20],
 }
 
@@ -1657,7 +1663,9 @@ struct VaultLog {
 }
 
 impl ListingChain {
-    /// A reader for `network`'s chain and payment vault.
+    /// A reader for `network`'s chain and payment vault, through its RPC
+    /// and then the RPCs it falls back to
+    /// ([`crate::config::fallback_rpc_urls`]).
     ///
     /// # Errors
     ///
@@ -1665,7 +1673,9 @@ impl ListingChain {
     pub fn new(network: &EvmNetwork) -> Result<Self> {
         let mut vault = [0u8; 20];
         vault.copy_from_slice(network.payment_vault_address().as_slice());
-        Self::with_rpc(network.rpc_url().to_string(), vault)
+        let mut rpc_urls = vec![network.rpc_url().to_string()];
+        rpc_urls.extend(crate::config::fallback_rpc_urls(network));
+        Self::with_rpcs(rpc_urls, vault)
     }
 
     /// A reader for the chain at `rpc_url` and the vault at `vault`.
@@ -1674,13 +1684,28 @@ impl ListingChain {
     ///
     /// Returns an error if the HTTP client can't be built.
     pub fn with_rpc(rpc_url: String, vault: [u8; 20]) -> Result<Self> {
+        Self::with_rpcs(vec![rpc_url], vault)
+    }
+
+    /// A reader for the chain through `rpc_urls`, first to last, and the
+    /// vault at `vault`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `rpc_urls` is empty or the HTTP client can't be
+    /// built.
+    pub fn with_rpcs(rpc_urls: Vec<String>, vault: [u8; 20]) -> Result<Self> {
+        if rpc_urls.is_empty() {
+            return Err(Error::Network("payment chain client: no RPC".into()));
+        }
         let http = reqwest::Client::builder()
             .timeout(RPC_TIMEOUT)
             .build()
             .map_err(|e| Error::Network(format!("payment chain client: {e}")))?;
         Ok(Self {
             http,
-            rpc_url,
+            rpc_urls,
+            answered: AtomicUsize::new(0),
             vault,
         })
     }
@@ -2028,10 +2053,38 @@ impl ListingChain {
         Ok(fetched)
     }
 
+    /// Call `method` on the RPC that last answered, then on the others in
+    /// turn until one answers; every RPC's error if none does.
     async fn call(&self, method: &str, params: Value) -> std::result::Result<Value, String> {
+        let count = self.rpc_urls.len();
+        let first = self.answered.load(Ordering::Relaxed) % count;
+        let mut errors = Vec::new();
+        for index in (0..count).map(|offset| (first + offset) % count) {
+            match self.call_rpc(&self.rpc_urls[index], method, &params).await {
+                Ok(result) => {
+                    self.answered.store(index, Ordering::Relaxed);
+                    return Ok(result);
+                }
+                Err(e) => {
+                    if count > 1 {
+                        debug!("{e} (RPC {index} of {count})");
+                    }
+                    errors.push(e);
+                }
+            }
+        }
+        Err(errors.join("; "))
+    }
+
+    async fn call_rpc(
+        &self,
+        rpc_url: &str,
+        method: &str,
+        params: &Value,
+    ) -> std::result::Result<Value, String> {
         let response: Value = self
             .http
-            .post(&self.rpc_url)
+            .post(rpc_url)
             .json(&json!({ "jsonrpc": "2.0", "id": 1, "method": method, "params": params }))
             .send()
             .await
@@ -2116,6 +2169,9 @@ pub(crate) mod test_chain {
         /// The widest block range `eth_getLogs` answers, as providers cap
         /// it; wider ones get a JSON-RPC error.
         pub(crate) max_log_range: Option<u64>,
+        /// Methods answered with HTTP 403, as PublicNode answers
+        /// `eth_getLogs`.
+        pub(crate) refused: Vec<&'static str>,
         /// The methods called, in order.
         pub(crate) calls: Vec<String>,
     }
@@ -2238,11 +2294,19 @@ pub(crate) mod test_chain {
                     };
                     let request: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
                     let method = request["method"].as_str().unwrap_or_default().to_string();
-                    let answer = {
+                    let (answer, refused) = {
                         let mut chain = chain.lock().expect("chain lock");
                         chain.calls.push(method.clone());
-                        chain.answer(&method, &request["params"])
+                        let refused = chain.refused.iter().any(|refused| *refused == method);
+                        (chain.answer(&method, &request["params"]), refused)
                     };
+                    if refused {
+                        let _ = socket
+                            .write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                            .await;
+                        let _ = socket.shutdown().await;
+                        return;
+                    }
                     let body = match answer {
                         Ok(result) => json!({ "jsonrpc": "2.0", "id": 1, "result": result }),
                         Err(message) => json!({
@@ -3387,6 +3451,80 @@ mod tests {
             );
         }
         assert!(mock.lock().unwrap().calls.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_call_an_rpc_refuses_goes_to_the_next_one() {
+        // The first RPC refuses eth_getLogs, as PublicNode does; the second
+        // answers everything. A listing hiding its transaction hash is found
+        // by its logs, through the second.
+        let envelope = envelope_showing(
+            ShownFields::NONE
+                .with(PaymentField::Quote)
+                .with(PaymentField::LogIndex),
+            true,
+        );
+        let quote = signed_quote(envelope.address(), 20);
+        let receipt = PaymentReceipt {
+            tx_hash: [0xaa; 32],
+            success: true,
+            block_number: 150,
+            logs: vec![paying_log(&quote, 4)],
+        };
+        let mut refusing = MockChain::with_blocks(200, 1_800_000_000);
+        refusing.add_receipt(receipt.clone());
+        refusing.refused = vec!["eth_getLogs"];
+        let refusing = Arc::new(Mutex::new(refusing));
+        let mut answering = MockChain::with_blocks(200, 1_800_000_000);
+        answering.add_receipt(receipt);
+        let answering = Arc::new(Mutex::new(answering));
+        let urls = vec![
+            serve(Arc::clone(&refusing)).await,
+            serve(Arc::clone(&answering)).await,
+        ];
+        let lookup = Lookup::Quote {
+            quote_hash: quote.hash().0,
+            block_number: None,
+            search_from: 1_800_000_000,
+            not_after: None,
+        };
+        let showing = ListingPayment {
+            log_index: Some(4),
+            ..ListingPayment::default()
+        };
+
+        // Through the refusing RPC alone, the search fails.
+        let alone = reader(urls[0].clone());
+        let error = alone.fetch(&lookup, &showing).await.unwrap_err();
+        assert!(error.contains("403"), "{error}");
+
+        // With the second behind it, the payment is found.
+        let chain = ListingChain::with_rpcs(urls, VAULT).unwrap();
+        let fetched = chain.fetch(&lookup, &showing).await.unwrap();
+        let blocks: Vec<u64> = fetched
+            .into_iter()
+            .map(|(receipt, _)| receipt.expect("a receipt").block_number)
+            .collect();
+        assert_eq!(blocks, vec![150]);
+        assert!(answering.lock().unwrap().calls_to("eth_getLogs") > 0);
+        // Later calls start at the RPC that answered.
+        let refused_before = refusing.lock().unwrap().calls.len();
+        chain.fetch(&lookup, &showing).await.unwrap();
+        assert_eq!(refusing.lock().unwrap().calls.len(), refused_before);
+    }
+
+    #[test]
+    fn only_the_bundled_network_falls_back_to_other_rpcs() {
+        let bundled = crate::config::bundled_payment_network().unwrap();
+        let fallbacks = crate::config::fallback_rpc_urls(&bundled);
+        assert!(!fallbacks.is_empty());
+        assert!(!fallbacks.contains(&bundled.rpc_url().to_string()));
+        let local = EvmNetwork::Custom(crate::data::CustomNetwork {
+            rpc_url_http: "http://127.0.0.1:8545".parse().unwrap(),
+            payment_token_address: *bundled.payment_token_address(),
+            payment_vault_address: *bundled.payment_vault_address(),
+        });
+        assert!(crate::config::fallback_rpc_urls(&local).is_empty());
     }
 
     #[tokio::test]

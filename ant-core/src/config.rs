@@ -153,6 +153,8 @@ const BUNDLED_PAYMENT_NETWORK: &str = include_str!("../resources/payment_network
 #[derive(serde::Deserialize)]
 struct PaymentNetworkConfig {
     rpc_url: String,
+    #[serde(default)]
+    fallback_rpc_urls: Vec<String>,
     payment_token_address: String,
     payment_vault_address: String,
 }
@@ -166,6 +168,20 @@ pub fn bundled_payment_network() -> Result<EvmNetwork> {
         &config.payment_token_address,
         &config.payment_vault_address,
     )
+}
+
+/// The RPCs reads of payments on `network` fall back to when its own RPC
+/// refuses or fails a call: the bundled network's `fallback_rpc_urls`, and
+/// none for any other network.
+#[must_use]
+pub fn fallback_rpc_urls(network: &EvmNetwork) -> Vec<String> {
+    let Ok(config) = toml::from_str::<PaymentNetworkConfig>(BUNDLED_PAYMENT_NETWORK) else {
+        return Vec::new();
+    };
+    match bundled_payment_network() {
+        Ok(bundled) if &bundled == network => config.fallback_rpc_urls,
+        _ => Vec::new(),
+    }
 }
 
 fn custom_network(rpc_url: &str, token: &str, vault: &str) -> Result<EvmNetwork> {
