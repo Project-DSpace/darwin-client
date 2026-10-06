@@ -7,6 +7,9 @@
 # mid-payment in testing;
 # heavy users can point at their own provider with a devnet manifest.
 rpc_url = "https://robinhood-rpc.publicnode.com"
+# Robinhood Chain mainnet. Browsers check the wallet and nodes against it; the
+# native client signs for whatever chain the RPC reports.
+chain_id = 4663
 # Where reads of payments (listings, upload proofs) go when `rpc_url` refuses
 # or fails a call: PublicNode refuses `eth_getLogs`, which finding a payment
 # whose transaction hash is hidden needs. Robinhood's own RPC comes last, for

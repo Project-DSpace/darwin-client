@@ -1,12 +1,16 @@
 //! Release-bundled bootstrap multiaddresses and portable payment defaults.
 
-use ant_protocol::{evm::Network, transport::MultiAddr};
+use ant_protocol::transport::MultiAddr;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 
-use crate::browser::{parse_webrtc_direct_multiaddr, BrowserPaymentNetwork};
+use crate::browser::{
+    parse_webrtc_direct_multiaddr, validate_browser_payment_network, BrowserPaymentNetwork,
+};
 
 const BOOTSTRAP: &str = include_str!("../resources/bootstrap_peers.toml");
+/// The payment chain native builds use by default (`--evm-network robinhood`).
+const PAYMENT_NETWORK: &str = include_str!("../resources/payment_network.toml");
 
 /// Validated bootstrap addresses, separated by transport.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -86,18 +90,30 @@ pub struct BrowserNetworkDefaults {
     pub rpc_url: String,
 }
 
-/// Return defaults without connecting, even before WebRTC seeds are published.
+/// Return defaults without connecting: the bundled WebRTC seeds and the
+/// bundled payment network (Robinhood Chain, DARWIN), the same identity the
+/// native client pays on by default.
 pub fn browser_mainnet_defaults() -> Result<BrowserNetworkDefaults, NetworkDefaultsError> {
-    let network = Network::ArbitrumOne;
+    #[derive(Deserialize)]
+    struct Payment {
+        chain_id: u64,
+        rpc_url: String,
+        payment_token_address: String,
+        payment_vault_address: String,
+    }
+    let config: Payment =
+        toml::from_str(PAYMENT_NETWORK).map_err(|e| NetworkDefaultsError(e.to_string()))?;
+    let payment = validate_browser_payment_network(BrowserPaymentNetwork {
+        chain_id: config.chain_id,
+        payment_token_address: config.payment_token_address,
+        payment_vault_address: config.payment_vault_address,
+    })
+    .map_err(|e| NetworkDefaultsError(e.to_string()))?;
     Ok(BrowserNetworkDefaults {
         id: "mainnet".into(),
         seeds: bundled_bootstrap_seeds()?.webrtc,
-        payment: BrowserPaymentNetwork {
-            chain_id: 42161,
-            payment_token_address: network.payment_token_address().to_string().to_lowercase(),
-            payment_vault_address: network.payment_vault_address().to_string().to_lowercase(),
-        },
-        rpc_url: network.rpc_url().to_string(),
+        payment,
+        rpc_url: config.rpc_url,
     })
 }
 
@@ -109,17 +125,21 @@ mod tests {
     fn bundled_defaults_share_evm_identity_and_exclude_quic() {
         let seeds = bundled_bootstrap_seeds().unwrap();
         assert!(!seeds.quic.is_empty());
+        assert!(!seeds.webrtc.is_empty());
         let browser = browser_mainnet_defaults().unwrap();
         assert_eq!(browser.seeds, seeds.webrtc);
-        assert_eq!(browser.payment.chain_id, 42161);
-        assert_eq!(browser.rpc_url, Network::ArbitrumOne.rpc_url().as_str());
+        assert!(browser.seeds.iter().all(|s| s.contains("/webrtc-direct/")));
+        // Robinhood Chain and the DARWIN vault, as the native client's default.
+        assert_eq!(browser.payment.chain_id, 4663);
+        assert_eq!(
+            browser.payment.payment_token_address,
+            "0x511f76a3de41f000ec11ea4fd212fb3587c6cef3"
+        );
         assert_eq!(
             browser.payment.payment_vault_address,
-            Network::ArbitrumOne
-                .payment_vault_address()
-                .to_string()
-                .to_lowercase()
+            "0xe0f627986c0438de0e314b644f3c8aa21d3f4f6b"
         );
+        assert!(browser.rpc_url.starts_with("https://"));
     }
 
     #[test]
