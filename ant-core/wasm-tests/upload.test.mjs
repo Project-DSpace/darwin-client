@@ -5,6 +5,7 @@ import {
   contentAddress,
   encryptPublicFile,
   parseWebRtcDirectMultiaddr,
+  test_storage_price,
 } from "./pkg/ant_core.js";
 import { mockWebRtc, paymentNetwork } from "./mock-webrtc.mjs";
 
@@ -110,6 +111,12 @@ test("an unsupported peer is excluded when enough witness PUT targets remain", a
   } finally { client.close(); }
 });
 
+// Our vendored ant-protocol scales Autonomi's price curve by a multiplier;
+// read it from the baseline price (zero records) this build carries.
+const PRICE_BASELINE = 3_906_250_000_000_000n;
+const PRICE_MULTIPLIER = BigInt(test_storage_price(0)) / PRICE_BASELINE;
+assert.equal(BigInt(test_storage_price(0)), PRICE_MULTIPLIER * PRICE_BASELINE);
+
 const priceCases = [
   { name: "expensive closest peer", nodes: Array.from({ length: 7 }, () => ({})), closestCount: 1_000_000, expectedCount: 0 },
   { name: "cheap closest peer", nodes: Array.from({ length: 7 }, () => ({ keyCount: 6000 })), closestCount: 0, expectedCount: 6000 },
@@ -155,10 +162,11 @@ for (const scenario of priceCases) {
         assert.equal(result.file.replicas, 4);
         const quotes = signer.calls[0].quotes;
         assert.equal(quotes.length, result.records);
-        // Fixed native price curve, independent of the implementation's
-        // selected amount and reported total.
+        // Fixed native price curve, scaled by the vendored multiplier,
+        // independent of the implementation's selected amount and reported total.
         const count = BigInt(scenario.expectedCount);
-        const expectedAmount = 3n * (3_906_250_000_000_000n + count * count * 35_156_250_000_000_000n / 36_000_000n);
+        const expectedAmount = 3n * (PRICE_BASELINE * PRICE_MULTIPLIER
+          + count * count * 35_156_250_000_000_000n * PRICE_MULTIPLIER / 36_000_000n);
         assert.equal(result.storageCostAtto, (expectedAmount * BigInt(result.records)).toString());
         for (const paid of quotes) {
           assert.equal(paid.quote.committed_key_count, scenario.expectedCount);

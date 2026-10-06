@@ -1450,3 +1450,10 @@ pub async fn test_multiplex_puts(endpoint: &str) -> JsValue {
     client.close();
     serde_wasm_bindgen::to_value(&results).unwrap()
 }
+
+/// The vendored node price for `count` close records, in atto as a decimal
+/// string, so tests can read the price multiplier this build carries.
+#[wasm_bindgen]
+pub fn test_storage_price(count: u32) -> String {
+    ant_protocol::payment::calculate_price(count as usize).to_string()
+}
