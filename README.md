@@ -101,7 +101,8 @@ Every push to `main` also builds a Linux x86-64 binary in CI, uploaded as the
 `darwin-linux-x64` workflow artifact (`darwin-linux-x64.tar.gz` and its `SHA256SUMS.txt`).
 
 `darwin --version` prints the package version and, on a second line, the git commit the binary
-was built from. Every build says 0.3.9, so go by the commit: builds before `0995cba`
+was built from (`unknown` outside a git checkout of this repository; uncommitted changes don't
+show). Every build says 0.3.9, so go by the commit: builds before `0995cba`
 (2026-10-06) pay the retired test token and can't upload to the current network.
 
 `darwin` keeps the data and configuration directories of the `ant` name (for example

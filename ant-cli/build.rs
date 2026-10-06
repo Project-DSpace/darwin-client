@@ -1,5 +1,6 @@
 //! Records the git commit the binary was built from, so `darwin --version`
 //! tells builds apart: the package version alone stays 0.3.9 across them.
+//! It names the commit only: uncommitted changes in the tree don't show.
 
 use std::process::Command;
 
@@ -13,8 +14,19 @@ fn git(args: &[&str]) -> Option<String> {
 }
 
 fn main() {
-    let commit = git(&["rev-parse", "--short=7", "HEAD"]).unwrap_or_else(|| "unknown".into());
+    println!("cargo:rerun-if-changed=build.rs");
+    // Only a checkout of this repository counts: a copy of these files
+    // without its own .git can sit inside another repository, whose commit
+    // says nothing about this code.
+    let own_checkout = git(&["rev-parse", "--show-prefix"]).as_deref() == Some("ant-cli/");
+    let commit = own_checkout
+        .then(|| git(&["rev-parse", "--short=7", "HEAD"]))
+        .flatten()
+        .unwrap_or_else(|| "unknown".into());
     println!("cargo:rustc-env=DARWIN_GIT_COMMIT={commit}");
+    if !own_checkout {
+        return;
+    }
 
     // Rerun when HEAD moves. A checkout changes HEAD and a commit the branch
     // ref, but once `git gc` or `git pack-refs` has moved that ref into
@@ -22,7 +34,6 @@ fn main() {
     // HEAD's reflog covers that: by default git appends to it on every
     // commit, checkout, reset and pull. Only existing files are named, since
     // a missing one would rerun this script on every build.
-    println!("cargo:rerun-if-changed=build.rs");
     let mut watched = vec!["HEAD".to_string(), "logs/HEAD".to_string()];
     if let Some(head_ref) = git(&["symbolic-ref", "-q", "HEAD"]) {
         watched.push(head_ref);
