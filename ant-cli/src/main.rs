@@ -159,7 +159,8 @@ async fn run() -> anyhow::Result<()> {
                 store_concurrency_override,
             )
             .await?;
-            let result = action.execute(&client, json).await;
+            let token = token_symbol(&data_ctx);
+            let result = action.execute(&client, json, &token).await;
             // Persist whatever the controller learned this run, even
             // on error — partial signal is still better than cold next
             // time. Drop will also fire as a backstop.
@@ -264,7 +265,7 @@ async fn build_data_client(
     // Connection phase with animated spinner showing peer discovery in real-time.
     // The spinner is the user-facing UI; tracing::info! provides log-level visibility
     // when `-v` is set.
-    info!("Connecting to autonomi network");
+    info!("Connecting to the Darwin network");
     let node = if quiet {
         create_client_node(
             &bootstrap,
@@ -274,7 +275,7 @@ async fn build_data_client(
         )
         .await?
     } else {
-        let spinner = progress::new_spinner("Connecting to autonomi network...");
+        let spinner = progress::new_spinner("Connecting to the Darwin network...");
 
         let node = match create_client_node_raw(
             &bootstrap,
@@ -303,7 +304,7 @@ async fn build_data_client(
                 let count = node_clone.connected_peers().await.len();
                 if count > 0 {
                     spinner_clone.set_message(format!(
-                        "Connecting to autonomi network... (found {count} peers)"
+                        "Connecting to the Darwin network... (found {count} peers)"
                     ));
                 }
                 if count > last_logged {
@@ -323,8 +324,8 @@ async fn build_data_client(
         if use_peer_cache {
             promote_client_peer_cache(&node).await;
         }
-        info!("Connected to autonomi network ({peers} peers)");
-        eprintln!("Connected to autonomi network (found {peers} peers)");
+        info!("Connected to the Darwin network ({peers} peers)");
+        eprintln!("Connected to the Darwin network (found {peers} peers)");
         node
     };
 
@@ -378,7 +379,7 @@ async fn build_data_client(
         }
         config.store_concurrency = concurrency;
     }
-    // Per-action overrides (e.g. `ant file upload --store-concurrency`)
+    // Per-action overrides (e.g. `darwin file upload --store-concurrency`)
     // applied here, BEFORE Client::from_node so the adaptive
     // controller actually picks them up. Mutating `config_mut()` after
     // construction is a no-op for the controller's per-channel max.
@@ -458,6 +459,17 @@ fn resolve_evm_network_and_manifest(
     let manifest = load_manifest(ctx)?;
     let network = resolve_evm_network(ctx.evm_network.as_deref(), manifest.as_ref())?;
     Ok((network, manifest))
+}
+
+/// The symbol of the selected payment network's token, which costs are
+/// shown in. A network that can't be resolved here (the command reports why
+/// if it needs one) gets the neutral word ant-core uses for unknown networks.
+fn token_symbol(ctx: &DataCliContext) -> String {
+    let manifest = load_manifest(ctx).ok().flatten();
+    match ant_core::config::resolve_evm_network(ctx.evm_network.as_deref(), manifest.as_ref()) {
+        Ok(network) => ant_core::config::token_symbol(&network),
+        Err(_) => "tokens".to_string(),
+    }
 }
 
 /// Resolve the EVM network through ant-core, with a CLI-side warning for

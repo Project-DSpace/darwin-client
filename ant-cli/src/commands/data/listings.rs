@@ -1,4 +1,4 @@
-//! `ant listings` and `ant listing`: listings collected from the nodes, merged
+//! `darwin listings` and `darwin listing`: listings collected from the nodes, merged
 //! across them and checked.
 
 use std::collections::BTreeMap;
@@ -16,7 +16,7 @@ use serde_json::{Map, Value};
 
 use super::chunk::parse_address;
 
-/// Arguments of `ant listings`.
+/// Arguments of `darwin listings`.
 #[derive(Args)]
 pub struct ListingsArgs {
     /// Only listings from this time on, in Unix seconds: the block timestamp,
@@ -39,14 +39,14 @@ pub struct ListingsArgs {
     pub carry: Option<PathBuf>,
 }
 
-/// Arguments of `ant listing`.
+/// Arguments of `darwin listing`.
 #[derive(Args)]
 pub struct ListingArgs {
     /// The envelope's address (hex): the file's address.
     pub address: String,
 }
 
-/// What `ant listings` takes from earlier reads: the walks' state
+/// What `darwin listings` takes from earlier reads: the walks' state
 /// (`--state`) and the entries to carry (`--carry`). Read before the network,
 /// so a file that can't be used fails the command before anything else.
 #[derive(Debug)]
@@ -175,7 +175,7 @@ impl ListingJson {
     }
 }
 
-/// An entry `ant listings --json` prints: this read's, or an earlier read's
+/// An entry `darwin listings --json` prints: this read's, or an earlier read's
 /// that `--carry` printed again.
 #[derive(Serialize)]
 #[serde(untagged)]
@@ -351,7 +351,7 @@ impl ListingArgs {
     }
 }
 
-/// `ant listing` fails, in text and JSON alike, when no listing for the
+/// `darwin listing` fails, in text and JSON alike, when no listing for the
 /// address passed its checks.
 fn require_listing(lookup: &ListingLookup, address: &str) -> anyhow::Result<()> {
     if lookup.listing.is_none() {
@@ -475,7 +475,7 @@ fn merge_carried(
     merged.into_iter().map(|(_, entry)| entry).collect()
 }
 
-/// What `ant listings` says on stderr about a read, if anything: that it
+/// What `darwin listings` says on stderr about a read, if anything: that it
 /// found too few of the `nodes` to decide anything, how the walks that
 /// stopped before the end of a node's index (`stopped`, their outcomes)
 /// stopped, and how many addresses it left for a later read.

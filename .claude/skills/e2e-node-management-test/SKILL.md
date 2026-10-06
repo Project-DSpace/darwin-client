@@ -30,17 +30,17 @@ mandatory — do not proceed without it. Store this for use in the `--bootstrap`
 ### Phase 2: Build
 
 ```bash
-cargo build --bin ant
+cargo build --bin darwin
 ```
 
-### Phase 3: Determine binary path and ant command
+### Phase 3: Determine binary path and darwin command
 
 Determine the platform and set variables accordingly:
-- **Linux/macOS**: binary is at `target/debug/ant`
-- **Windows**: binary is at `target\debug\ant.exe`
+- **Linux/macOS**: binary is at `target/debug/darwin`
+- **Windows**: binary is at `target\debug\darwin.exe`
 
-For all subsequent `ant` commands, use the full path to the built binary (e.g.,
-`./target/debug/ant`). Use the `--json` flag on every command to get structured output for
+For all subsequent `darwin` commands, use the full path to the built binary (e.g.,
+`./target/debug/darwin`). Use the `--json` flag on every command to get structured output for
 validation.
 
 ### Phase 4: Clean slate
@@ -48,7 +48,7 @@ validation.
 Ensure we start from a clean state. Run:
 
 ```
-ant node reset --force --json
+darwin node reset --force --json
 ```
 
 This may fail if no nodes exist yet — that's OK. A "no nodes to reset" error (or similar) is
@@ -59,7 +59,7 @@ acceptable here. Any other error is a failure.
 **Step 5.1 — Start the daemon:**
 
 ```
-ant node daemon start --json
+darwin node daemon start --json
 ```
 
 Verify the JSON response contains `pid` (a number) and `already_running` is `false`.
@@ -67,7 +67,7 @@ Verify the JSON response contains `pid` (a number) and `already_running` is `fal
 **Step 5.2 — Check daemon status:**
 
 ```
-ant node daemon status --json
+darwin node daemon status --json
 ```
 
 Verify: `running` is `true`, `pid` is present, `port` is present and **non-zero** (the daemon binds
@@ -76,7 +76,7 @@ to an OS-assigned port, so port must be a real port number, not 0).
 **Step 5.3 — Check daemon info:**
 
 ```
-ant node daemon info --json
+darwin node daemon info --json
 ```
 
 Verify: `running` is `true`, `api_base` contains a URL like `http://127.0.0.1:<port>/api/v1`.
@@ -88,9 +88,9 @@ Save the `api_base` URL for REST API checks later.
 Verify `--port` is honored end-to-end. Stop the daemon, restart it with an explicit port, confirm the bound port matches, then restore the OS-assigned default for the rest of the test.
 
 ```
-ant node daemon stop --json
-ant node daemon start --port 18765 --json
-ant node daemon status --json
+darwin node daemon stop --json
+darwin node daemon start --port 18765 --json
+darwin node daemon status --json
 ```
 
 Verify on the status response: `running` is `true` and `port` is exactly `18765`. If port 18765 is already in use on the test host, the daemon will fail to start — choose a different free high port and re-run.
@@ -98,18 +98,18 @@ Verify on the status response: `running` is `true` and `port` is exactly `18765`
 Then restore the baseline so the rest of the phases use the default OS-assigned port:
 
 ```
-ant node daemon stop --json
-ant node daemon start --json
+darwin node daemon stop --json
+darwin node daemon start --json
 ```
 
-Re-run `ant node daemon info --json` and update the saved `api_base` URL (the port will have changed).
+Re-run `darwin node daemon info --json` and update the saved `api_base` URL (the port will have changed).
 
 ### Phase 6: Node management
 
 **Step 6.1 — Add nodes:**
 
 ```
-ant node add --rewards-address 0x03B770D9cD32077cC0bF330c13C114a87643B124 --count 3 --bootstrap <bootstrap-address> --evm-network arbitrum-sepolia --json
+darwin node add --rewards-address 0x03B770D9cD32077cC0bF330c13C114a87643B124 --count 3 --bootstrap <bootstrap-address> --evm-network arbitrum-sepolia --json
 ```
 
 Verify the JSON response shows 3 nodes were added (the `nodes_added` array has 3 entries) and
@@ -121,7 +121,7 @@ Nodes are added in `stopped` state (add and start are distinct operations, as wi
 managers). Start all nodes before proceeding:
 
 ```
-ant node start --json
+darwin node start --json
 ```
 
 Verify the JSON response has a `started` array with 3 entries and an empty `failed` array.
@@ -129,7 +129,7 @@ Verify the JSON response has a `started` array with 3 entries and an empty `fail
 **Step 6.3 — Check node status (all running):**
 
 ```
-ant node status --json
+darwin node status --json
 ```
 
 Verify: `nodes` array has 3 entries and all are `running`. For each running node, verify that `pid`
@@ -138,7 +138,7 @@ is present and is a number, and `uptime_secs` is present and is a number.
 **Step 6.4 — Stop a single node:**
 
 ```
-ant node stop --service-name node1 --json
+darwin node stop --service-name node1 --json
 ```
 
 Verify the JSON response shows `node_id` and `service_name` of `node1`.
@@ -146,7 +146,7 @@ Verify the JSON response shows `node_id` and `service_name` of `node1`.
 **Step 6.5 — Check status (partial):**
 
 ```
-ant node status --json
+darwin node status --json
 ```
 
 Verify: one node is `stopped`, two nodes are `running`. For the stopped node (`node1`), verify that
@@ -157,7 +157,7 @@ and are numbers.
 **Step 6.6 — Start the stopped node:**
 
 ```
-ant node start --service-name node1 --json
+darwin node start --service-name node1 --json
 ```
 
 Verify the JSON response shows `node_id`, `service_name` of `node1`, and `pid`.
@@ -165,7 +165,7 @@ Verify the JSON response shows `node_id`, `service_name` of `node1`, and `pid`.
 **Step 6.7 — Stop all nodes:**
 
 ```
-ant node stop --json
+darwin node stop --json
 ```
 
 Verify the JSON response has a `stopped` array with 3 entries and an empty `failed` array.
@@ -173,7 +173,7 @@ Verify the JSON response has a `stopped` array with 3 entries and an empty `fail
 **Step 6.8 — Start all nodes:**
 
 ```
-ant node start --json
+darwin node start --json
 ```
 
 Verify the JSON response has a `started` array with 3 entries and an empty `failed` array.
@@ -243,7 +243,7 @@ node on its next poll.
 **Step 8.1 — Capture baseline PIDs, uptimes, and data_dirs:**
 
 ```
-ant node status --json
+darwin node status --json
 ```
 
 For each of the 3 `running` nodes, record `node_id`, `service_name`, `pid`, and `uptime_secs`.
@@ -260,7 +260,7 @@ curl -s <api_base>/nodes/3 | jq -r '.data_dir'
 **Step 8.2 — Stop the daemon (leave nodes running):**
 
 ```
-ant node daemon stop --json
+darwin node daemon stop --json
 ```
 
 Verify: response contains `pid` (the stopped daemon's pid).
@@ -277,13 +277,13 @@ nodes, which is a regression.
 **Step 8.3 — Restart the daemon (happy-path adoption via pid file):**
 
 ```
-ant node daemon start --json
+darwin node daemon start --json
 ```
 
 Verify: JSON response contains `pid` (the new daemon pid) and `already_running` is `false`.
 
 ```
-ant node status --json
+darwin node status --json
 ```
 
 Verify:
@@ -298,7 +298,7 @@ This confirms happy-path adoption via the `node.pid` file in each node's data di
 **Step 8.4 — Stop the daemon again (prepare for fallback scan):**
 
 ```
-ant node daemon stop --json
+darwin node daemon stop --json
 ```
 
 Verify the 3 node processes are still alive (same check as Step 8.2).
@@ -322,11 +322,11 @@ Verify each file is gone before proceeding.
 **Step 8.6 — Restart the daemon (fallback process-table scan):**
 
 ```
-ant node daemon start --json
+darwin node daemon start --json
 ```
 
 ```
-ant node status --json
+darwin node status --json
 ```
 
 Verify the same assertions as Step 8.3:
@@ -353,7 +353,7 @@ margin):
 Then query status:
 
 ```
-ant node status --json
+darwin node status --json
 ```
 
 Verify:
@@ -367,20 +367,20 @@ Verify:
 Return to the "3 running nodes" state expected by the Cleanup phase:
 
 ```
-ant node start --service-name node1 --json
+darwin node start --service-name node1 --json
 ```
 
 Verify the response shows a new `pid` for `node1` (a fresh process).
 
 ```
-ant node status --json
+darwin node status --json
 ```
 
 Verify all 3 nodes are `running` before proceeding to cleanup.
 
 ### Phase 9: Log forwarding
 
-Validates `ant node logs forward` (V2-1021). Forwarding ships node logs to the beta Elasticsearch
+Validates `darwin node logs forward` (V2-1021). Forwarding ships node logs to the beta Elasticsearch
 endpoint, so this phase must **never** point at the real endpoint. Everything below uses
 `--endpoint` against a throwaway local listener, and the phase ends with forwarding disabled.
 
@@ -391,7 +391,7 @@ than silently forward nothing.
 **Step 9.1 — Status before enabling:**
 
 ```
-ant node logs forward status --json
+darwin node logs forward status --json
 ```
 
 Verify: `enabled` is `false` and `token_fingerprint` is `null`.
@@ -399,7 +399,7 @@ Verify: `enabled` is `false` and `token_fingerprint` is `null`.
 **Step 9.2 — Enable against a local endpoint:**
 
 ```
-ant node logs forward enable --token e2e-test-token --endpoint http://127.0.0.1:19999 --json
+darwin node logs forward enable --token e2e-test-token --endpoint http://127.0.0.1:19999 --json
 ```
 
 Verify: `enabled` is `true`, `endpoint` is the local URL, and `min_level` is `"info"`.
@@ -413,8 +413,8 @@ directory writes no log files, so there is nothing to forward and the command mu
 **Step 9.4 — Add a node with logging and confirm it is picked up:**
 
 ```
-ant node add --rewards-address 0x03B770D9cD32077cC0bF330c13C114a87643B124 --count 1 --bootstrap <bootstrap-address> --evm-network arbitrum-sepolia --log-dir-path <tmp>/e2e-logs --json
-ant node logs forward status --json
+darwin node add --rewards-address 0x03B770D9cD32077cC0bF330c13C114a87643B124 --count 1 --bootstrap <bootstrap-address> --evm-network arbitrum-sepolia --log-dir-path <tmp>/e2e-logs --json
+darwin node logs forward status --json
 ```
 
 Verify: `nodes_forwarding` now has one entry, whose `log_dir` is under the path just given.
@@ -447,25 +447,25 @@ Verify: the count is at least 3 (status, enable and disable paths are all docume
 **Step 9.8 — Disable:**
 
 ```
-ant node logs forward disable --json
-ant node logs forward status --json
+darwin node logs forward disable --json
+darwin node logs forward status --json
 ```
 
 Verify: `enabled` is `false` in both responses, and `active` is `false`. Disabling must not change
-anything else about the nodes — confirm with `ant node status --json` that every node's status and
+anything else about the nodes — confirm with `darwin node status --json` that every node's status and
 PID are unchanged from before Step 9.2.
 
 **Step 9.9 — Re-enable needs no token:**
 
 ```
-ant node logs forward enable --json
+darwin node logs forward enable --json
 ```
 
 Verify: succeeds without `--token`, reusing the stored one, and reports the same
 `token_fingerprint` as Step 9.5. Then disable again so the phase leaves forwarding off:
 
 ```
-ant node logs forward disable --json
+darwin node logs forward disable --json
 ```
 
 ### Phase 10: Cleanup
@@ -473,7 +473,7 @@ ant node logs forward disable --json
 **Step 10.1 — Stop all nodes:**
 
 ```
-ant node stop --json
+darwin node stop --json
 ```
 
 Verify all nodes stopped.
@@ -481,7 +481,7 @@ Verify all nodes stopped.
 **Step 10.2 — Reset:**
 
 ```
-ant node reset --force --json
+darwin node reset --force --json
 ```
 
 Verify: `nodes_cleared` is 3.
@@ -489,7 +489,7 @@ Verify: `nodes_cleared` is 3.
 **Step 10.3 — Stop the daemon:**
 
 ```
-ant node daemon stop --json
+darwin node daemon stop --json
 ```
 
 Verify: response contains `pid`.
@@ -497,7 +497,7 @@ Verify: response contains `pid`.
 **Step 10.4 — Verify daemon stopped:**
 
 ```
-ant node daemon status --json
+darwin node daemon status --json
 ```
 
 Verify: `running` is `false`.

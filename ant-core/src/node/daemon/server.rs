@@ -427,7 +427,7 @@ async fn post_start_node(
             Json(serde_json::json!({
                 "error": format!(
                     "Node {id} has been evicted and cannot be started. Dismiss it with \
-                     `ant node dismiss {id}` and add a new node instead."
+                     `darwin node dismiss {id}` and add a new node instead."
                 ),
                 "current_state": { "node_id": id, "status": "evicted" }
             })),
@@ -560,7 +560,7 @@ async fn post_stop_node(
             Json(serde_json::json!({
                 "error": format!(
                     "Node {id} has been evicted; there is nothing to stop. Dismiss it with \
-                     `ant node dismiss {id}`."
+                     `darwin node dismiss {id}`."
                 ),
                 "current_state": { "node_id": id, "status": "evicted" }
             })),
@@ -835,9 +835,9 @@ async fn get_openapi() -> impl IntoResponse {
     let spec = serde_json::json!({
         "openapi": "3.1.0",
         "info": {
-            "title": "Ant Daemon API",
+            "title": "Darwin Daemon API",
             "version": "0.1.0",
-            "description": "REST API for the ant node management daemon"
+            "description": "REST API for the darwin node management daemon"
         },
         "paths": {
             "/api/v1/status": {

@@ -66,7 +66,7 @@ async fn openapi_spec_is_valid_json() {
 
     let spec: serde_json::Value = resp.json().await.unwrap();
     assert_eq!(spec["openapi"], "3.1.0");
-    assert_eq!(spec["info"]["title"], "Ant Daemon API");
+    assert_eq!(spec["info"]["title"], "Darwin Daemon API");
     assert!(spec["paths"]["/api/v1/status"].is_object());
 
     shutdown.cancel();

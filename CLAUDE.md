@@ -6,7 +6,7 @@ This is the development guide for the `autonomi-client` project (the Unified CLI
 
 A Rust workspace with two crates:
 - **ant-core** (`ant-core/`) — Headless library containing all business logic. No UI code, no terminal output.
-- **ant-cli** (`ant-cli/`) — Thin CLI adapter. Parses arguments via clap, calls `ant-core`, formats output. The binary is named `ant`.
+- **ant-cli** (`ant-cli/`) — Thin CLI adapter. Parses arguments via clap, calls `ant-core`, formats output. The binary is named `darwin`.
 
 ## Design Principles
 
@@ -37,7 +37,7 @@ The REST API is the primary integration point for AI agents. All operations avai
 
 ```
 ┌──────────┐     HTTP      ┌──────────────────────────────────┐
-│  ant CLI │──────────────▶│         ant daemon                │
+│darwin CLI│──────────────▶│         darwin daemon             │
 └──────────┘  127.0.0.1    │                                  │
                            │  ┌────────────┐ ┌────────────┐  │
 ┌──────────┐     HTTP      │  │  antnode 1  │ │  antnode 2  │  │
@@ -107,19 +107,19 @@ ant-cli/src/
 ├── cli.rs                    # Top-level clap definition
 └── commands/
     ├── data/
-    │   ├── file.rs           # ant file upload/download
-    │   ├── chunk.rs          # ant chunk put/get
-    │   ├── pointer.rs        # ant pointer keygen/address/create/update/get/resolve
-    │   └── wallet.rs         # ant wallet address/balance
+    │   ├── file.rs           # darwin file upload/download
+    │   ├── chunk.rs          # darwin chunk put/get
+    │   ├── pointer.rs        # darwin pointer keygen/address/create/update/get/resolve
+    │   └── wallet.rs         # darwin wallet address/balance
     └── node/
         ├── mod.rs
-        ├── add.rs            # ant node add command
+        ├── add.rs            # darwin node add command
         ├── daemon.rs         # daemon start/stop/status/info/run commands
-        ├── logs.rs           # ant node logs forward enable/disable/status
-        ├── start.rs          # ant node start
-        ├── stop.rs           # ant node stop
-        ├── status.rs         # ant node status
-        └── reset.rs          # ant node reset
+        ├── logs.rs           # darwin node logs forward enable/disable/status
+        ├── start.rs          # darwin node start
+        ├── stop.rs           # darwin node stop
+        ├── status.rs         # darwin node status
+        └── reset.rs          # darwin node reset
 ```
 
 ## Common Commands
@@ -129,23 +129,23 @@ cargo check              # Fast compilation check
 cargo test --all         # Run all unit and integration tests
 cargo clippy --all-targets --all-features -- -D warnings  # Lint
 cargo fmt --all -- --check  # Format check
-cargo run --bin ant -- --help  # Run the CLI
+cargo run --bin darwin -- --help  # Run the CLI
 ```
 
 ## Key Conventions
 
 - **Error handling**: Use `thiserror` in ant-core, `anyhow` in ant-cli. ant-core defines `error::Error` and `error::Result<T>`.
 - **CLI output**: All commands support `--json` global flag. Human-readable output by default, structured JSON when `--json` is passed.
-- **Hidden commands**: `ant node daemon run` is hidden (runs daemon in foreground, used internally by `daemon start`).
+- **Hidden commands**: `darwin node daemon run` is hidden (runs daemon in foreground, used internally by `daemon start`).
 - **REST API conflict responses**: All 409 responses include a `current_state` field so retrying clients can confirm desired state already exists.
 - **Platform paths**: Use `ant_core::config::data_dir()` and `ant_core::config::log_dir()` for platform-appropriate paths. Never hardcode paths.
 - **OpenAPI schema**: Types exposed in the REST API derive `utoipa::ToSchema`. Use `#[schema(value_type = String)]` for `PathBuf` fields.
 - **Tests**: Unit tests go in `#[cfg(test)] mod tests` inside the source file. Integration tests go in `ant-core/tests/`.
 - **Progress reporting**: Long-running operations (e.g., binary downloads) accept a `&dyn ProgressReporter` from `ant_core::node::binary`. CLI provides a terminal-printing implementation; use `NoopProgress` in tests and daemon API handlers.
 - **Registry file locking**: Use `NodeRegistry::load_locked()` for read-modify-write operations to prevent concurrent CLI invocations from corrupting the registry. The returned `File` handle holds the lock until dropped.
-- **Dual-path CLI commands**: Commands that modify the registry (like `ant node add`) check if the daemon is running. If so, they route through the REST API; otherwise, they operate directly on the registry file.
+- **Dual-path CLI commands**: Commands that modify the registry (like `darwin node add`) check if the daemon is running. If so, they route through the REST API; otherwise, they operate directly on the registry file.
 - **Binary source resolution**: Node binary sources are represented by the `BinarySource` enum (Latest, Version, Url, LocalPath). Download variants are stubbed until release infrastructure is available.
-- **Log forwarding is opt-in and node-logging-dependent**: `ant node logs forward enable` is the
+- **Log forwarding is opt-in and node-logging-dependent**: `darwin node logs forward enable` is the
   consent act. It only forwards nodes whose `NodeConfig.log_dir` is `Some` — node file logging is
   off unless the node was added with `--log-dir-path` — and reports the nodes it is skipping.
   Enabling never restarts a node or changes its arguments. See
@@ -154,7 +154,7 @@ cargo run --bin ant -- --help  # Run the CLI
 
 ## E2E Test Skill
 
-The project includes an E2E test skill at `.claude/skills/e2e-node-management-test/SKILL.md` that tests all node management features against a real testnet (invoked via `/e2e-node-management-test`). When adding new `ant node` subcommands or changing existing node management behavior, update this command to cover the new or changed functionality.
+The project includes an E2E test skill at `.claude/skills/e2e-node-management-test/SKILL.md` that tests all node management features against a real testnet (invoked via `/e2e-node-management-test`). When adding new `darwin node` subcommands or changing existing node management behavior, update this command to cover the new or changed functionality.
 
 ## Linear Project
 

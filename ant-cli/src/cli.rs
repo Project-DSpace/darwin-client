@@ -14,7 +14,7 @@ use crate::commands::update::UpdateArgs;
 // reads only the last whitespace-separated token of the entire output, so any
 // trailing line (like `License: MIT or Apache-2.0`) breaks upgrades for users
 // on those versions.
-#[command(name = "ant", version, about = "Autonomi network client")]
+#[command(name = "darwin", version, about = "Darwin storage network client")]
 pub struct Cli {
     /// Output structured JSON instead of human-readable text
     #[arg(long, global = true)]
@@ -124,7 +124,7 @@ pub enum Commands {
     /// One file's listing, in the index or not: from the nodes nearest its
     /// address, checked against the network and the payment chain
     Listing(ListingArgs),
-    /// Update the ant binary to the latest version
+    /// Update the darwin binary to the latest version
     Update(UpdateArgs),
 }
 
@@ -149,7 +149,7 @@ mod bootstrap_tests {
     fn accepts_multiaddresses_and_legacy_sockets_without_losing_pins() {
         let pin = format!("/ip6/::1/udp/10000/quic/p2p/{}", "ab".repeat(32));
         let cli = Cli::try_parse_from([
-            "ant",
+            "darwin",
             "--bootstrap",
             &pin,
             "-b",
@@ -164,7 +164,7 @@ mod bootstrap_tests {
             "/ip4/127.0.0.1/udp/10001/quic"
         );
         assert!(Cli::try_parse_from([
-            "ant",
+            "darwin",
             "--bootstrap",
             "/ip4/127.0.0.1/tcp/10000",
             "wallet",

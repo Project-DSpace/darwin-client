@@ -18,7 +18,9 @@ impl StartArgs {
         // Verify daemon is running
         let status = client::status(&config).await?;
         if !status.running {
-            anyhow::bail!("The daemon is not running. Start it first with: ant node daemon start");
+            anyhow::bail!(
+                "The daemon is not running. Start it first with: darwin node daemon start"
+            );
         }
 
         match self.service_name {
@@ -109,7 +111,7 @@ impl StartArgs {
                 println!(
                     "{} No nodes registered. Add nodes first with: {}",
                     "●".yellow(),
-                    "ant node add".cyan()
+                    "darwin node add".cyan()
                 );
             }
         }

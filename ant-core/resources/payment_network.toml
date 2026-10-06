@@ -1,6 +1,6 @@
 # The payment chain the client uses by default (and as --evm-network
-# robinhood). Switching tokens means changing the two addresses here and
-# rebuilding; the nodes take the same values from their node.env.
+# robinhood). Switching tokens means changing the two addresses and the
+# symbol here and rebuilding; the nodes take the addresses from their node.env.
 #
 # Robinhood Chain mainnet (chain ID 4663), through PublicNode's free RPC. Robinhood's
 # own public RPC load-balances over servers at different heights and failed
@@ -14,3 +14,6 @@ rpc_url = "https://robinhood-rpc.publicnode.com"
 fallback_rpc_urls = ["https://rpc.ordofi.network", "https://rpc.mainnet.chain.robinhood.com"]
 payment_token_address = "0x96ca806d020bf2a2c6b7ea62e0a1b318112ae180"
 payment_vault_address = "0x69C5BB60dB609F0B9a5AE48F08d3dc98092b566C"
+# The symbol costs are shown in. It changes with the token: TEST stands in
+# for now, DARWIN later.
+token_symbol = "TEST"

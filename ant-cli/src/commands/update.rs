@@ -22,7 +22,7 @@ pub struct UpdateArgs {
     pub channel: Option<UpdateChannelArg>,
 }
 
-/// CLI value for the update channel. Mirrors `ant node add --upgrade-channel`.
+/// CLI value for the update channel. Mirrors `darwin node add --upgrade-channel`.
 #[derive(Clone, Copy, clap::ValueEnum)]
 pub enum UpdateChannelArg {
     Stable,
@@ -38,8 +38,20 @@ impl From<UpdateChannelArg> for UpgradeChannel {
     }
 }
 
+/// Self-update reads Autonomi's releases (`WithAutonomi/ant-client`) and
+/// would replace this client with their `ant`, which uses their network and
+/// token. Off until this client publishes releases of its own.
+const SELF_UPDATE: bool = false;
+
 impl UpdateArgs {
     pub async fn execute(self, json_output: bool) -> anyhow::Result<()> {
+        if !SELF_UPDATE {
+            anyhow::bail!(
+                "self-update is off in this build: it would install Autonomi's `ant`, \
+                 not `darwin`. New builds of `darwin` come from the Project-DSpace/ant-client \
+                 CI (the darwin-linux-x64 artifact)."
+            );
+        }
         let current_version = env!("CARGO_PKG_VERSION");
         let channel = self
             .channel
@@ -89,7 +101,7 @@ impl UpdateArgs {
                     .package_manager()
                     .unwrap_or("a package manager");
                 println!();
-                println!("This ant was installed with {manager}, so it cannot replace itself.");
+                println!("This copy of darwin was installed with {manager}, so it cannot replace itself.");
                 println!("Update it with:");
                 println!();
                 println!("    {}", deferred.update_command.bold());

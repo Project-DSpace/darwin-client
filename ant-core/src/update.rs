@@ -284,7 +284,7 @@ pub async fn perform_update(
             .update_command()
             .unwrap_or_else(|| "your package manager".to_string());
         return Err(Error::UpdateFailed(format!(
-            "this ant was installed by a package manager, so it cannot replace itself. \
+            "this copy of darwin was installed by a package manager, so it cannot replace itself. \
              Update it with: {command}"
         )));
     }

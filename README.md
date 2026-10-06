@@ -1,15 +1,17 @@
-# ant — Autonomi Network Client
+# darwin — Darwin Storage Network Client
 
-A unified CLI and Rust library for storing data on the Autonomi decentralized network and managing Autonomi nodes.
+A unified CLI and Rust library for storing data on the Darwin storage network and managing its nodes.
+
+Based on Autonomi's [ant-client](https://github.com/WithAutonomi/ant-client), licensed MIT or Apache-2.0.
 
 ## Overview
 
 This project provides two Rust crates:
 
-- **ant-core** — A headless Rust library containing the Autonomi business logic: data storage/retrieval with self-encryption and EVM payments, node lifecycle management, and local devnet tooling. Its `browser` module shares manifest validation, protocol framing, authenticated WebRTC Direct access, lookup, quote verification, and complete public-file workflows with browser applications through the `browser-wasm` feature.
-- **ant-cli** — A thin CLI binary (`ant`) built on `ant-core`.
+- **ant-core** — A headless Rust library containing the client's business logic: data storage/retrieval with self-encryption and EVM payments, node lifecycle management, and local devnet tooling. Its `browser` module shares manifest validation, protocol framing, authenticated WebRTC Direct access, lookup, quote verification, and complete public-file workflows with browser applications through the `browser-wasm` feature.
+- **ant-cli** — A thin CLI binary (`darwin`) built on `ant-core`.
 
-Data on Autonomi is **content-addressed**. Files are split into encrypted chunks (via [self-encryption](https://en.wikipedia.org/wiki/Convergent_encryption)), each stored at an XOR address derived from its content. A `DataMap` tracks which chunks belong to a file. Payments for storage are made on an EVM-compatible blockchain (Arbitrum).
+Data on Darwin is **content-addressed**. Files are split into encrypted chunks (via [self-encryption](https://en.wikipedia.org/wiki/Convergent_encryption)), each stored at an XOR address derived from its content. A `DataMap` tracks which chunks belong to a file. Payments for storage are made on an EVM-compatible blockchain (Arbitrum).
 
 ### Browser WebAssembly client
 
@@ -88,47 +90,22 @@ matching node, Rust/WASM client, and SDK versions together.
 
 ## Installation
 
-### Linux / macOS
+Build the `darwin` binary from source with a stable Rust toolchain:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/WithAutonomi/ant-client/main/install.sh | bash
+cargo build --release --locked -p ant-cli --bin darwin
+# The binary is target/release/darwin (darwin.exe on Windows).
 ```
 
-### Windows
+Every push to `main` also builds a Linux x86-64 binary in CI, uploaded as the
+`darwin-linux-x64` workflow artifact (`darwin-linux-x64.tar.gz` and its `SHA256SUMS.txt`).
 
-```powershell
-irm https://raw.githubusercontent.com/WithAutonomi/ant-client/main/install.ps1 | iex
-```
+`darwin` keeps the data and configuration directories of the `ant` name (for example
+`~/.local/share/ant` and `~/.config/ant` on Linux), so files written by earlier builds are found
+where they were.
 
-> **Note:** the `curl ... | bash` installer is for Linux/macOS only. Running it inside WSL installs a Linux binary that is only usable from within WSL — to use `ant` from PowerShell or cmd, install with the PowerShell command above.
-
-Both installers take the same environment variables:
-
-| Variable | Description |
-|----------|-------------|
-| `ANT_CHANNEL` | Release channel: `stable` (default) or `beta`. See [Beta Programme](#beta-programme). |
-| `ANT_VERSION` | Install one specific version, e.g. `0.3.3`. Overrides `ANT_CHANNEL`. |
-| `INSTALL_DIR` | Where to put the binary. Defaults to `~/.local/bin` on Linux, `/usr/local/bin` on macOS, `%LOCALAPPDATA%\ant\bin` on Windows. |
-
-### npm
-
-`ant` is also on npm, which is useful in agent sandboxes and CI runners that allow
-package-manager traffic but block direct binary downloads:
-
-```bash
-npm install -g @withautonomi/ant
-```
-
-This installs the same signed binary as the release page — a per-platform companion package
-carries it, so only the one your machine needs is downloaded. Use `@withautonomi/ant@beta` for
-the beta channel, and `npm update -g @withautonomi/ant` to upgrade; `ant update` recognises an
-npm-managed install and points you at npm rather than replacing itself.
-
-> **Note:** npm 12 blocks package install scripts by default, so an npm install may not write
-> `bootstrap_peers.toml` into your config directory. `ant` works either way — it falls back to
-> the bootstrap seeds compiled into the binary — but if you want the editable file, install with
-> `npm install -g --allow-scripts=@withautonomi/ant @withautonomi/ant`. See
-> [`npm/README.md`](npm/README.md).
+> **Note:** `install.sh`, `install.ps1` and the npm packages in this repository are upstream's
+> and install Autonomi's `ant`, not `darwin`.
 
 ## Quick Start
 
@@ -136,14 +113,14 @@ npm-managed install and points you at npm rather than replacing itself.
 
 ```bash
 # Upload (private — DataMap saved locally)
-SECRET_KEY=0x... ant file upload photo.jpg -b 1.2.3.4:12000
+SECRET_KEY=0x... darwin file upload photo.jpg -b 1.2.3.4:12000
 # Output:
 #   Upload complete!
 #     Datamap: photo.datamap
 #     Chunks:  3
 
 # Download using the local DataMap
-ant file download --datamap photo.datamap -o photo_copy.jpg -b 1.2.3.4:12000
+darwin file download --datamap photo.datamap -o photo_copy.jpg -b 1.2.3.4:12000
 ```
 
 ### Store and retrieve a file (local devnet)
@@ -153,11 +130,11 @@ ant file download --datamap photo.datamap -o photo_copy.jpg -b 1.2.3.4:12000
 cargo run --release --example start-local-devnet
 
 # 2. Upload a file (the manifest is auto-written to the shared data dir)
-SECRET_KEY=0x... ant file upload photo.jpg --public \
+SECRET_KEY=0x... darwin file upload photo.jpg --public \
     --devnet-manifest ~/.local/share/ant/devnet-manifest.json --allow-loopback --evm-network local
 
 # 3. Download it back
-ant file download abc123... -o photo_copy.jpg \
+darwin file download abc123... -o photo_copy.jpg \
     --devnet-manifest ~/.local/share/ant/devnet-manifest.json --allow-loopback --evm-network local
 ```
 
@@ -165,12 +142,12 @@ ant file download abc123... -o photo_copy.jpg \
 
 ```bash
 # Upload (private — DataMap saved locally)
-SECRET_KEY=0x... ant file upload photo.jpg \
+SECRET_KEY=0x... darwin file upload photo.jpg \
     --bootstrap 1.2.3.4:12000 --evm-network arbitrum-one
 # Output: DATAMAP_FILE=photo.jpg.datamap
 
 # Download using the local DataMap
-ant file download --datamap photo.jpg.datamap -o photo_copy.jpg \
+darwin file download --datamap photo.jpg.datamap -o photo_copy.jpg \
     --bootstrap 1.2.3.4:12000 --evm-network arbitrum-one
 ```
 
@@ -178,12 +155,12 @@ ant file download --datamap photo.jpg.datamap -o photo_copy.jpg \
 
 ```bash
 # Store a single chunk (< 1 MB)
-echo "hello autonomi" | SECRET_KEY=0x... ant chunk put --bootstrap ...
+echo "hello darwin" | SECRET_KEY=0x... darwin chunk put --bootstrap ...
 # Output: abc123def456...
 
 # Retrieve it
-ant chunk get abc123def456... --bootstrap ...
-# Output: hello autonomi
+darwin chunk get abc123def456... --bootstrap ...
+# Output: hello darwin
 ```
 
 ---
@@ -202,16 +179,16 @@ ant chunk get abc123def456... --bootstrap ...
 | `-v, --verbose` | Increase verbosity: `-v` info, `-vv` debug, `-vvv` trace. Default: no logs (privacy by design) |
 | `--evm-network <NET>` | EVM network: `arbitrum-one` (default), `arbitrum-sepolia`, or `local` |
 
-### `ant file` — File Operations
+### `darwin file` — File Operations
 
 Upload and download files with automatic chunking, self-encryption, and EVM payment.
 
-#### `ant file upload <PATH>`
+#### `darwin file upload <PATH>`
 
 Upload a file to the network. The file is split into encrypted chunks, each paid for via the configured EVM network. Requires `SECRET_KEY` environment variable.
 
 ```
-$ SECRET_KEY=0x... ant file upload my_data.bin --public
+$ SECRET_KEY=0x... darwin file upload my_data.bin --public
 warning: the payment fields shown give away the paying wallet to anyone with the envelope's address
 Encrypted into 7 chunks
 
@@ -221,19 +198,19 @@ Upload complete!
   Record:   my_data.bin.record
   Chunks:   7 (6 + 1 envelope)
   Size:     439.5 KB
-  Cost:     0.0042 ANT (gas: 0.000150 ETH)
+  Cost:     0.0042 TEST (gas: 0.000150 ETH)
   Time:     12.3s
 
 Anyone can download this file with:
-  ant file download a1b2c3d4e5f6... -o <FILE>
+  darwin file download a1b2c3d4e5f6... -o <FILE>
 Prove this upload to anyone with:
-  ant file prove my_data.bin.record
+  darwin file prove my_data.bin.record
 ```
 
 The `warning:` and `Encrypted` lines go to stderr. The default, a private upload, keeps the data map local and says what its envelope makes public:
 
 ```
-$ SECRET_KEY=0x... ant file upload my_data.bin
+$ SECRET_KEY=0x... darwin file upload my_data.bin
 warning: the payment fields shown give away the paying wallet to anyone with the envelope's address
 Encrypted into 7 chunks
 
@@ -244,14 +221,14 @@ Upload complete!
   Record:   my_data.bin.record
   Chunks:   7 (6 + 1 envelope)
   Size:     439.5 KB
-  Cost:     0.0042 ANT (gas: 0.000150 ETH)
+  Cost:     0.0042 TEST (gas: 0.000150 ETH)
   Time:     12.1s
 
 Download this file with:
-  ant file download --datamap my_data.bin.datamap
+  darwin file download --datamap my_data.bin.datamap
 Prove this upload to anyone with:
-  ant file prove my_data.bin.record
-Keep the record as safe as the data map: it holds the data map and the salt, so it reads the file, and its salt is what proves which file this is. `ant file prove --no-reveal` proves only the payment.
+  darwin file prove my_data.bin.record
+Keep the record as safe as the data map: it holds the data map and the salt, so it reads the file, and its salt is what proves which file this is. `darwin file prove --no-reveal` proves only the payment.
 ```
 
 Mistakes in `--hide`, `--name` or `--content-type` are reported before `SECRET_KEY` is read or the network is joined.
@@ -261,7 +238,7 @@ Mistakes in `--hide`, `--name` or `--content-type` are reported before `SECRET_K
 | Flag | Description |
 |------|-------------|
 | `--readable <yes\|no>` | Whether anyone with the address can read the file. `no` (default): the data map is saved to a local `.datamap` file, and the envelope stores only a salted hash of it. `yes`: the data map is stored on the network. |
-| `--index <yes\|no>` | Whether the file appears in the network's listings index (see `ant listings`). Default `no`. |
+| `--index <yes\|no>` | Whether the file appears in the network's listings index (see `darwin listings`). Default `no`. |
 | `--visibility <private\|unlisted\|listed>` | Shorthand for the two above: `private` (`no`, `no`; the default), `unlisted` (`yes`, `no`) or `listed` (`yes`, `yes`). The fourth combination, `--readable no --index yes`, is a public, dated record of a file nobody can read until you reveal it. |
 | `--public` | Same as `--visibility unlisted`. |
 | `--hide <FIELDS>` | Payment fields to hide, comma-separated: `tx-hash`, `block`, `timestamp`, `log-index`, `quote`, or `all`. All five are shown by default. |
@@ -277,19 +254,19 @@ Mistakes in `--hide`, `--name` or `--content-type` are reported before `SECRET_K
 4. A `DataMap` is produced that records which chunks compose the file.
 5. Unless the upload hides every payment field, is not in the index and has no name or content type, the client stores an **envelope**: a small chunk holding the data map (readable uploads) or a salted hash of it (private uploads), the name and content type, and flags saying which payment fields its listing shows and whether it is in the index. Its address is the file's address. Nodes that keep listings record the envelope's payment, so anyone with the address can check it against the chain. The envelope is paid in the same payment as the content (one payment for any upload under 64 chunks; from 64, with the chunks left after the merkle batches, or alone) and stored after every content chunk, so it never points at missing content.
 6. Without an envelope, a readable upload stores the DataMap itself as a chunk and returns its address; a private one stores nothing extra.
-7. The client saves the data map of a private upload to `<filename>.datamap`, and the envelope's record to `<filename>.record`: the envelope, its payment's transaction and paid quote, and for a private file the data map and the salt. Keep the record with the data map: it proves the upload from the chain alone (`ant file prove`), even for fields you hid. **A private upload's record reads the file, like the `.datamap`**: whoever has it can download the file (`ant file download --proof`), so keep it as safe as the data map, and hand over `ant file prove --no-reveal` to prove only the payment. Until the record is saved, the client keeps a copy of it under its data directory (`payments/upload/records/<envelope address>.<payer>.record`, the same text as the `.record` file; for a private upload without a record, its salt as `.salt`), so a crash between paying and saving doesn't lose the paid quote and tx hash, which nothing else may hold once the quote is hidden. The upload removes its checkpoint only after that copy is written; a later upload of the same file with the same choices and wallet that finds the envelope already stored gets the kept record back. Saving the `.record` removes the copy.
+7. The client saves the data map of a private upload to `<filename>.datamap`, and the envelope's record to `<filename>.record`: the envelope, its payment's transaction and paid quote, and for a private file the data map and the salt. Keep the record with the data map: it proves the upload from the chain alone (`darwin file prove`), even for fields you hid. **A private upload's record reads the file, like the `.datamap`**: whoever has it can download the file (`darwin file download --proof`), so keep it as safe as the data map, and hand over `darwin file prove --no-reveal` to prove only the payment. Until the record is saved, the client keeps a copy of it under its data directory (`payments/upload/records/<envelope address>.<payer>.record`, the same text as the `.record` file; for a private upload without a record, its salt as `.salt`), so a crash between paying and saving doesn't lose the paid quote and tx hash, which nothing else may hold once the quote is hidden. The upload removes its checkpoint only after that copy is written; a later upload of the same file with the same choices and wallet that finds the envelope already stored gets the kept record back. Saving the `.record` removes the copy.
 
-`ant file cost <PATH>` takes the same `--readable`, `--index`, `--visibility`, `--public`, `--hide`, `--name` and `--content-type` flags, and counts the envelope or data map chunk the upload adds. When the sampled content is already stored, it prices that chunk alone, and says the content is only likely stored unless every content chunk was sampled.
+`darwin file cost <PATH>` takes the same `--readable`, `--index`, `--visibility`, `--public`, `--hide`, `--name` and `--content-type` flags, and counts the envelope or data map chunk the upload adds. When the sampled content is already stored, it prices that chunk alone, and says the content is only likely stored unless every content chunk was sampled.
 
 At upload the client warns about what your choices give away: a hidden field that a shown one gives away (a hidden timestamp with the block number shown, for example, or a hidden log index with the tx hash shown when the transaction paid for the envelope alone: a transaction's quotes are paid in quote-hash order, so the envelope's log isn't always its last), a tx hash shown without the quote (the payment can't then be tied to this file), a name or content type on a private file (readable by anyone with the envelope's address, though the file is not), and that shown payment fields, or being listed, show the paying wallet. **Envelopes, their metadata and listings are public and permanent.**
 
-#### `ant file download [ADDRESS]`
+#### `darwin file download [ADDRESS]`
 
 Download a file from the network.
 
 ```
 # Public download (by address)
-$ ant file download a1b2c3d4e5f6... -o restored.bin
+$ darwin file download a1b2c3d4e5f6... -o restored.bin
 Connecting to network... done
 Downloading from network...
 Download complete!
@@ -298,7 +275,7 @@ Download complete!
   Time: 3.2s
 
 # Private download (from local DataMap)
-$ ant file download --datamap my_data.bin.datamap -o restored.bin
+$ darwin file download --datamap my_data.bin.datamap -o restored.bin
 Connecting to network... done
 Downloading from network...
 Download complete!
@@ -313,25 +290,25 @@ Download complete!
 |------|-------------|
 | `ADDRESS` | Hex-encoded public DataMap or envelope address (64 hex chars). |
 | `--datamap <PATH>` | Path to a local `.datamap` file (for private downloads). With an address too (a private file's envelope), the data map is used, and checked against the envelope when the upload's `.record` is next to it. |
-| `--proof <PATH>` | Path to an upload record or proof (`ant file prove`) whose envelope carries the data map, or reveals it. |
+| `--proof <PATH>` | Path to an upload record or proof (`darwin file prove`) whose envelope carries the data map, or reveals it. |
 | `-o, --output <PATH>` | Output file path (default: `downloaded_file`). |
 
 A private file's envelope address can't be downloaded from: its envelope stores only a salted hash of the data map, and the download says so. Use `--datamap`, or `--proof` with a proof that reveals it.
 
-#### `ant file prove <RECORD>`
+#### `darwin file prove <RECORD>`
 
 Writes a proof of an upload from its record (`<filename>.record`) to `<filename>.proof` (or `-o <PATH>`). For a private file the proof reveals the data map and salt, so whoever has it can read the file and check that the envelope is for it; `--no-reveal` proves only that the envelope was paid for. Hand it to anyone who should be able to check the upload, including fields you hid. It never writes over the record (which holds the salt), and replaces an existing proof only with `--force`.
 
-#### `ant file verify <PROOF> [--file <PATH>]`
+#### `darwin file verify <PROOF> [--file <PATH>]`
 
 Checks a proof (or record) against the payment chain alone: the envelope hashes to its address, the quote names it and is signed, and the transaction paid it. Prints the payment (block, time, log index, transaction). With `--file`, also checks that a local file encrypts to the proof's data map. Needs no storage node. A proof shows the address was paid for by a block; it doesn't show who uploaded the file, since anyone who has the envelope can pay for the same address. Only a revealed data map and salt tie a private envelope to its file.
 
-### `ant listings` — The Listings Index
+### `darwin listings` — The Listings Index
 
 ```
-$ ant listings
-$ ant listings --since 1767225600 --json
-$ ant listings --json --state walks.json --carry index.json > index.new.json
+$ darwin listings
+$ darwin listings --since 1767225600 --json
+$ darwin listings --json --state walks.json --carry index.json > index.new.json
 ```
 
 Collects listings from every node the client can find (`listings.v2`), merges the copies of each (nodes record their own `first_seen` for a listing that hides its time, so copies that differ only there are merged), checks each one as far as its shown fields allow, and prints them in index order: time, address, size, content type, name, the payment fields it hides (`hidden: tx-hash,quote`, or `-` when it shows all five), and the check.
@@ -354,35 +331,35 @@ A read has no cap on how many listings the index holds, and a node can't make it
 | `--state <FILE>` | Keep the walks' state in this file: read if it exists, replaced after the read. |
 | `--carry <FILE>` | A previous `--json` output of this command, whose entries for addresses this read didn't decide are printed again. Needs `--json`. A missing file carries nothing; one that can't be read fails the command before anything is printed. |
 
-With `--json`, hidden payment fields are absent, and each listing carries `check` (`verified` or `reported`), `nodes` and `nearest`, `first_seen` where it has one, and for a readable listing its `data_map` (hex), which is enough to read the file without fetching the envelope. Download a listed file with `ant file download <ADDRESS>`.
+With `--json`, hidden payment fields are absent, and each listing carries `check` (`verified` or `reported`), `nodes` and `nearest`, `first_seen` where it has one, and for a readable listing its `data_map` (hex), which is enough to read the file without fetching the envelope. Download a listed file with `darwin file download <ADDRESS>`.
 
-### `ant listing <ADDRESS>` — One Listing
+### `darwin listing <ADDRESS>` — One Listing
 
 ```
-$ ant listing be4ec238e14701164b2b97d73013039b28f2c747adaa2062cf0e4ecf3f3b0181
+$ darwin listing be4ec238e14701164b2b97d73013039b28f2c747adaa2062cf0e4ecf3f3b0181
 ```
 
 Asks the 7 nodes nearest the address for its listing, in the index or not, and checks it the same way: every field, with hidden ones shown as hidden, the check level and how many of the nearest nodes serve it. `--json` prints the listing and any copies that failed. Without a valid listing the command exits non-zero, with or without `--json`.
 
-### `ant chunk` — Single-Chunk Operations
+### `darwin chunk` — Single-Chunk Operations
 
 Low-level put/get for individual chunks (max ~1 MB each). Useful for small data or building custom data structures.
 
-#### `ant chunk put [FILE]`
+#### `darwin chunk put [FILE]`
 
 Store a single chunk. Reads from `FILE` or stdin. Requires `SECRET_KEY`.
 
 ```
-$ echo "small payload" | SECRET_KEY=0x... ant chunk put
+$ echo "small payload" | SECRET_KEY=0x... darwin chunk put
 a1b2c3d4...
 ```
 
-#### `ant chunk get <ADDRESS>`
+#### `darwin chunk get <ADDRESS>`
 
 Retrieve a single chunk by its hex-encoded XOR address.
 
 ```
-$ ant chunk get a1b2c3d4... -o output.bin
+$ darwin chunk get a1b2c3d4... -o output.bin
 ```
 
 **Options:**
@@ -391,7 +368,7 @@ $ ant chunk get a1b2c3d4... -o output.bin
 |------|-------------|
 | `-o, --output <PATH>` | Write to file instead of stdout. |
 
-### `ant pointer` — Pointer Operations
+### `darwin pointer` — Pointer Operations
 
 A pointer is a mutable reference to a chunk or to another pointer, signed by an
 owner key that can never change. Every state is paid for; reads are free. The
@@ -399,37 +376,37 @@ owner key is kept as a 32-byte seed in a file only its owner can read (`0600`
 on Unix; on Windows it takes its directory's permissions, so keep it in your
 user profile). Losing it means the pointer can never be updated again.
 
-#### `ant pointer keygen --output <FILE>`
+#### `darwin pointer keygen --output <FILE>`
 
 Create a new owner key and print the address of the pointer it controls. Never
 overwrites an existing file.
 
 ```
-$ ant pointer keygen --output owner.key
+$ darwin pointer keygen --output owner.key
 Owner key written to owner.key
 9f3c...
 ```
 
-#### `ant pointer address --key <FILE>`
+#### `darwin pointer address --key <FILE>`
 
 Print the address of the pointer a key controls. Needs no network.
 
-#### `ant pointer create --key <FILE> <TARGET> [--kind chunk|pointer]`
+#### `darwin pointer create --key <FILE> <TARGET> [--kind chunk|pointer]`
 
 Create the pointer, pointing at `TARGET` (hex). Requires `SECRET_KEY` to pay.
 Refused before paying if the pointer already exists.
 
-#### `ant pointer update --key <FILE> <TARGET> [--kind chunk|pointer]`
+#### `darwin pointer update --key <FILE> <TARGET> [--kind chunk|pointer]`
 
 Point it at `TARGET`, one past the counter the network serves (or create it).
 Requires `SECRET_KEY` to pay for the new state.
 
-#### `ant pointer get <ADDRESS>`
+#### `darwin pointer get <ADDRESS>`
 
 Print a pointer's counter, target and state.
 
 ```
-$ ant pointer get 9f3c...
+$ darwin pointer get 9f3c...
 address:  9f3c...
 counter:  1
 kind:     chunk
@@ -437,42 +414,42 @@ target:   a1b2...
 state_id: 5e7d...
 ```
 
-#### `ant pointer resolve <ADDRESS>`
+#### `darwin pointer resolve <ADDRESS>`
 
 Follow a chain of pointers to the target at its end.
 
-### `ant wallet` — Wallet Operations
+### `darwin wallet` — Wallet Operations
 
 Inspect the EVM wallet derived from `SECRET_KEY`.
 
-#### `ant wallet address`
+#### `darwin wallet address`
 
 Print the wallet's EVM address.
 
 ```
-$ SECRET_KEY=0x... ant wallet address
+$ SECRET_KEY=0x... darwin wallet address
 0x1234567890abcdef...
 ```
 
-#### `ant wallet balance`
+#### `darwin wallet balance`
 
 Query the token balance on the configured EVM network.
 
 ```
-$ SECRET_KEY=0x... ant wallet balance --evm-network arbitrum-one
+$ SECRET_KEY=0x... darwin wallet balance --evm-network arbitrum-one
 1000000000000000000
 ```
 
-### `ant node` — Node Management
+### `darwin node` — Node Management
 
-Manage Autonomi network nodes via a local daemon process. The daemon runs in the background, exposes a REST API on `127.0.0.1`, and supervises all node processes.
+Manage Darwin network nodes via a local daemon process. The daemon runs in the background, exposes a REST API on `127.0.0.1`, and supervises all node processes.
 
-#### `ant node daemon start`
+#### `darwin node daemon start`
 
 Launch the daemon as a detached background process. By default it binds to a random free port on `127.0.0.1` and writes the chosen port to `daemon.port` for discovery.
 
 ```
-$ ant node daemon start
+$ darwin node daemon start
 Daemon started (pid: 12345, port: 48532)
 ```
 
@@ -486,31 +463,31 @@ Daemon started (pid: 12345, port: 48532)
 Pin the port and bind on all interfaces — useful when the daemon runs inside a container and the API needs to be reachable through a port mapping:
 
 ```
-$ ant node daemon start --listen-addr 0.0.0.0 --port 8765
+$ darwin node daemon start --listen-addr 0.0.0.0 --port 8765
 ```
 
 ```
-$ docker run -d -p 8765:8765 my/ant-image \
-    ant node daemon start --listen-addr 0.0.0.0 --port 8765
+$ docker run -d -p 8765:8765 my/darwin-image \
+    darwin node daemon start --listen-addr 0.0.0.0 --port 8765
 ```
 
 > **Warning:** the daemon has no authentication. Binding to a non-loopback address exposes node management — start, stop, reset, registry mutation — to anyone who can reach the port. Only do this when the network path is controlled (e.g. a container with an explicit port mapping or a trusted private network).
 
-#### `ant node daemon stop`
+#### `darwin node daemon stop`
 
 Shut down the running daemon. Sends SIGTERM and waits for exit.
 
 ```
-$ ant node daemon stop
+$ darwin node daemon stop
 Daemon stopped (pid: 12345)
 ```
 
-#### `ant node daemon status`
+#### `darwin node daemon status`
 
 Show daemon status and node count summary.
 
 ```
-$ ant node daemon status
+$ darwin node daemon status
 Daemon is running
   PID:           12345
   Port:          48532
@@ -521,7 +498,7 @@ Daemon is running
   Nodes errored: 0
 ```
 
-#### `ant node daemon info`
+#### `darwin node daemon info`
 
 Output connection details as JSON (always JSON, regardless of `--json` flag). AI agents use this to discover the daemon's REST API.
 
@@ -534,12 +511,12 @@ Output connection details as JSON (always JSON, regardless of `--json` flag). AI
 }
 ```
 
-#### `ant node add`
+#### `darwin node add`
 
 Register one or more nodes in the registry. Does **not** start them. Does **not** require the daemon.
 
 ```
-$ ant node add --rewards-address 0xYourWallet --count 3 --node-port 12000-12002 --path /path/to/antnode
+$ darwin node add --rewards-address 0xYourWallet --count 3 --node-port 12000-12002 --path /path/to/antnode
 Added 3 node(s):
   Node 1: port 12000
   Node 2: port 12001
@@ -570,37 +547,37 @@ eligible for the chosen channel: the latest stable release on `stable`, and the 
 `-beta.N` and stable releases on `beta`. Release candidates (`-rc.N`) are never installed on
 either channel — they are cut before the release gates have given a verdict.
 
-#### `ant node start`
+#### `darwin node start`
 
 Start registered node(s). Requires the daemon to be running.
 
 ```
-$ ant node start                          # Start all
-$ ant node start --service-name node1     # Start specific node
+$ darwin node start                          # Start all
+$ darwin node start --service-name node1     # Start specific node
 ```
 
-#### `ant node stop`
+#### `darwin node stop`
 
 Stop running node(s). Requires the daemon.
 
 ```
-$ ant node stop                           # Stop all
-$ ant node stop --service-name node1      # Stop specific node
+$ darwin node stop                           # Stop all
+$ darwin node stop --service-name node1      # Stop specific node
 ```
 
-#### `ant node status`
+#### `darwin node status`
 
 Display all nodes and their current status.
 
-#### `ant node reset`
+#### `darwin node reset`
 
 Remove all node data, log directories, and clear the registry. All nodes must be stopped first.
 
 ```
-$ ant node reset --force
+$ darwin node reset --force
 ```
 
-#### `ant node logs forward`
+#### `darwin node logs forward`
 
 Optionally ship this machine's node logs to the Autonomi beta log endpoint, to help judge a beta
 build. Off by default and never enabled for you — running `enable` yourself is the whole of the
@@ -608,9 +585,9 @@ consent, and `disable` stops it. See
 [Forwarding your node logs](#forwarding-your-node-logs-optional) for the walkthrough.
 
 ```
-$ ant node logs forward enable --token <token>
-$ ant node logs forward status
-$ ant node logs forward disable
+$ darwin node logs forward enable --token <token>
+$ darwin node logs forward status
+$ darwin node logs forward disable
 ```
 
 **`enable` options:**
@@ -625,7 +602,7 @@ $ ant node logs forward disable
 why, and how many events have been delivered:
 
 ```
-$ ant node logs forward status
+$ darwin node logs forward status
 Log forwarding: on
   Endpoint: https://logs.autonomi.com   Level: INFO and above
   Token:    75f57160d2c2
@@ -647,14 +624,14 @@ The token is stored at `~/.config/ant/log_forward.json` with owner-only permissi
 printed back or returned by the API — `status` shows a short fingerprint of it instead, enough to
 tell which token is in use.
 
-### `ant update` — Self-Update
+### `darwin update` — Self-Update
 
-Replace the running `ant` binary with the newest release from GitHub. The downloaded archive's
+Replace the running `darwin` binary with the newest release from GitHub. The downloaded archive's
 ML-DSA-65 signature is verified against the embedded release signing key before anything is
 installed, and the extracted binary must report the expected version.
 
 ```
-$ ant update
+$ darwin update
 Current version: 0.3.3
 Checking for updates on the stable channel...
 Update available: v0.3.3 -> v0.3.4
@@ -677,6 +654,10 @@ Because a beta version outranks the stable release it was cut from, `--channel s
 walk a beta build backwards — it will report that you are already up to date. Leaving the beta
 channel means installing a stable build manually.
 
+> **Note:** self-update still follows upstream's release feed (the `ant-cli-v*` releases of
+> `WithAutonomi/ant-client`), so it can replace `darwin` with Autonomi's `ant`. Until Darwin
+> publishes its own releases, update by building a new `darwin` instead.
+
 ---
 
 ## Beta Programme
@@ -687,7 +668,7 @@ and report back.
 Taking part means [running beta builds](#running-beta-builds). That is the whole requirement.
 
 Separately, and entirely optionally, you can [forward your node logs](#forwarding-your-node-logs-optional)
-to us. It is off by default, it is not a condition of being on the beta channel, and choosing not to
+to Autonomi's beta log endpoint. It is off by default, it is not a condition of being on the beta channel, and choosing not to
 turn it on costs you nothing.
 
 ### Running beta builds
@@ -695,19 +676,14 @@ turn it on costs you nothing.
 The client and the nodes have separate beta channels, opted into separately.
 
 ```bash
-# 1. Install the beta client. Pass ANT_CHANNEL=beta to the quick-start installer:
-$ curl -fsSL https://raw.githubusercontent.com/WithAutonomi/ant-client/main/install.sh \
-      | ANT_CHANNEL=beta bash
-
-#    On Windows:
-#      $env:ANT_CHANNEL="beta"; irm https://raw.githubusercontent.com/WithAutonomi/ant-client/main/install.ps1 | iex
+# 1. Run a beta build of the client (a version with a -beta.N suffix).
 
 # 2. From then on, self-update stays on beta with no flag needed.
-$ ant update
+$ darwin update
 
 # 3. Add nodes that track the beta channel. The binary is downloaded from the newest
 #    beta-eligible ant-node release.
-$ ant node add --rewards-address 0xYourWallet --count 3 --upgrade-channel beta
+$ darwin node add --rewards-address 0xYourWallet --count 3 --upgrade-channel beta
 ```
 
 Existing nodes are not switched to the beta channel by any of this — `--upgrade-channel` applies
@@ -716,12 +692,12 @@ to nodes at the point they are added, so opting in means adding new nodes.
 ### Forwarding your node logs (optional)
 
 **This is opt-in and stays off until you ask for it.** Nothing leaves your machine unless you run
-`ant node logs forward enable` yourself, and running it is the whole of the consent. You can skip
+`darwin node logs forward enable` yourself, and running it is the whole of the consent. You can skip
 this section entirely and still run beta builds.
 
 If you do want to help: beta enrolment comes with a write-only token, and handing it to that command
 makes the daemon tail your nodes' log files and ship them to the Autonomi beta log endpoint. It is
-the difference between us judging a build on a handful of self-reported problems and judging it on
+the difference between Autonomi judging a build on a handful of self-reported problems and judging it on
 what the nodes actually did, so it is genuinely useful — but it is your call, and `disable` stops it
 at any point.
 
@@ -730,14 +706,14 @@ at any point.
 ```bash
 # 1. Add nodes WITH LOGGING ENABLED. Node file logging is off by default; without
 #    --log-dir-path a node writes no log files at all and there is nothing to forward.
-$ ant node add --rewards-address 0xYourWallet --count 3 \
+$ darwin node add --rewards-address 0xYourWallet --count 3 \
       --upgrade-channel beta --log-dir-path ~/.local/share/ant
 
 # 2. Enable forwarding BEFORE starting the nodes.
-$ ant node logs forward enable --token <your-token>
+$ darwin node logs forward enable --token <your-token>
 
 # 3. Now start them.
-$ ant node start
+$ darwin node start
 ```
 
 #### Why the order matters
@@ -745,7 +721,7 @@ $ ant node start
 **`--log-dir-path` has to be set when the node is added.** The value is a prefix — each node gets
 `<prefix>/node-<id>/logs` — and there is no way to turn logging on for an existing node short of
 removing it and adding it again. If you forget, `enable` will tell you —
-those nodes appear under "Not forwarding" in `ant node logs forward status` — but the node has to be
+those nodes appear under "Not forwarding" in `darwin node logs forward status` — but the node has to be
 re-added to fix it.
 
 **Enable before you start, not after.** Enabling forwarding is forward-looking consent: for any log
@@ -781,7 +757,7 @@ or above — the same lines you can read yourself in the node's log directory.
 
 #### If something looks wrong
 
-`ant node logs forward status` is the place to look. `Batches: N sent, M failed` with an error line
+`darwin node logs forward status` is the place to look. `Batches: N sent, M failed` with an error line
 underneath means the endpoint is unreachable or rejecting the token. Delivery is best-effort by
 design: it is bounded in memory, it retries a few times and then gives up on a batch, and it never
 blocks or slows a node. Losing some log lines is an acceptable outcome; a stalled node is not.
@@ -799,7 +775,7 @@ already delivered. If you want a genuinely clean slate, `disable` first, then de
 You can stop forwarding at any time, without leaving the beta channel and without giving a reason:
 
 ```bash
-$ ant node logs forward disable
+$ darwin node logs forward disable
 ```
 
 Nothing else about your nodes changes — no restart, no change to how they run, no data touched. They
@@ -808,14 +784,14 @@ keep writing their own logs to disk exactly as before; the daemon just stops rea
 ### Leaving the beta channel
 
 Separate from the above, and manual. Because a beta version outranks the stable release it was cut
-from, `ant update --channel stable` cannot walk a beta build backwards — installing a stable build
+from, `darwin update --channel stable` cannot walk a beta build backwards — installing a stable build
 means downloading it yourself. Nodes already on `--upgrade-channel beta` stay on it.
 
 ---
 
 ## REST API
 
-When the daemon is running, it exposes a REST API on `127.0.0.1:<port>`. Discover the port via `ant node daemon info` or by reading `~/.local/share/ant/daemon.port`.
+When the daemon is running, it exposes a REST API on `127.0.0.1:<port>`. Discover the port via `darwin node daemon info` or by reading `~/.local/share/ant/daemon.port`.
 
 | Method | Path | Description |
 |--------|------|-------------|
@@ -934,11 +910,11 @@ client.file_download(&data_map, Path::new("photo_copy.jpg")).await?;
 use bytes::Bytes;
 
 // Upload bytes (encrypted + chunked automatically)
-let result = client.data_upload(Bytes::from("hello autonomi")).await?;
+let result = client.data_upload(Bytes::from("hello darwin")).await?;
 
 // Download and decrypt
 let content = client.data_download(&result.data_map).await?;
-assert_eq!(content, Bytes::from("hello autonomi"));
+assert_eq!(content, Bytes::from("hello darwin"));
 ```
 
 ### Envelopes, Proofs and Listings
@@ -999,7 +975,7 @@ let exists: bool = client.chunk_exists(&address).await?;
 
 ### Payment Modes
 
-Autonomi supports two payment strategies:
+Darwin supports two payment strategies:
 
 | Mode | Description |
 |------|-------------|
@@ -1077,7 +1053,7 @@ let result = add_nodes(opts, &data_dir()?.join("node_registry.json"), &NoopProgr
 
 ```
 ┌──────────┐     HTTP      ┌──────────────────────────────────┐
-│  ant CLI │──────────────▶│         ant daemon                │
+│darwin CLI│──────────────▶│         darwin daemon             │
 └──────────┘  127.0.0.1    │                                  │
                            │  ┌────────────┐ ┌────────────┐  │
 ┌──────────┐     HTTP      │  │  antnode 1  │ │  antnode 2  │  │
@@ -1140,17 +1116,17 @@ Data operations (upload/download) go directly to the P2P network — they do not
 │       ├── cli.rs               # clap argument definitions
 │       └── commands/
 │           ├── data/
-│           │   ├── file.rs      # ant file upload/download
-│           │   ├── chunk.rs     # ant chunk put/get
-│           │   └── wallet.rs    # ant wallet address/balance
+│           │   ├── file.rs      # darwin file upload/download
+│           │   ├── chunk.rs     # darwin chunk put/get
+│           │   └── wallet.rs    # darwin wallet address/balance
 │           └── node/
-│               ├── add.rs       # ant node add
-│               ├── daemon.rs    # ant node daemon start/stop/status/info/run
-│               ├── logs.rs      # ant node logs forward enable/disable/status
-│               ├── start.rs     # ant node start
-│               ├── stop.rs      # ant node stop
-│               ├── status.rs    # ant node status
-│               └── reset.rs     # ant node reset
+│               ├── add.rs       # darwin node add
+│               ├── daemon.rs    # darwin node daemon start/stop/status/info/run
+│               ├── logs.rs      # darwin node logs forward enable/disable/status
+│               ├── start.rs     # darwin node start
+│               ├── stop.rs      # darwin node stop
+│               ├── status.rs    # darwin node status
+│               └── reset.rs     # darwin node reset
 └── docs/                        # Architecture documentation
 ```
 
@@ -1184,9 +1160,9 @@ cargo clippy --all-targets --all-features -- -D warnings
 cargo fmt --all -- --check
 
 # Run the CLI
-cargo run --bin ant -- --help
-cargo run --bin ant -- file upload photo.jpg --public --devnet-manifest ~/.local/share/ant/devnet-manifest.json --allow-loopback --evm-network local
-cargo run --bin ant -- node daemon status
+cargo run --bin darwin -- --help
+cargo run --bin darwin -- file upload photo.jpg --public --devnet-manifest ~/.local/share/ant/devnet-manifest.json --allow-loopback --evm-network local
+cargo run --bin darwin -- node daemon status
 ```
 
 ## License

@@ -157,6 +157,7 @@ struct PaymentNetworkConfig {
     fallback_rpc_urls: Vec<String>,
     payment_token_address: String,
     payment_vault_address: String,
+    token_symbol: String,
 }
 
 /// The payment chain this client uses unless told otherwise.
@@ -181,6 +182,26 @@ pub fn fallback_rpc_urls(network: &EvmNetwork) -> Vec<String> {
     match bundled_payment_network() {
         Ok(bundled) if &bundled == network => config.fallback_rpc_urls,
         _ => Vec::new(),
+    }
+}
+
+/// The symbol amounts of `network`'s payment token are shown in: the
+/// bundled network's `token_symbol`, `ANT` on the upstream Arbitrum presets
+/// (their real token), and a neutral word on any other network.
+#[must_use]
+pub fn token_symbol(network: &EvmNetwork) -> String {
+    if matches!(
+        network,
+        EvmNetwork::ArbitrumOne | EvmNetwork::ArbitrumSepoliaTest
+    ) {
+        return "ANT".to_string();
+    }
+    match (
+        toml::from_str::<PaymentNetworkConfig>(BUNDLED_PAYMENT_NETWORK),
+        bundled_payment_network(),
+    ) {
+        (Ok(config), Ok(bundled)) if &bundled == network => config.token_symbol,
+        _ => "tokens".to_string(),
     }
 }
 
@@ -370,6 +391,17 @@ mod tests {
             }
             other => panic!("expected Custom network, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn token_symbol_follows_the_network() {
+        let bundled = bundled_payment_network().unwrap();
+        let symbol = token_symbol(&bundled);
+        assert!(!symbol.is_empty() && symbol != "tokens", "{symbol}");
+        assert_eq!(token_symbol(&EvmNetwork::ArbitrumOne), "ANT");
+        assert_eq!(token_symbol(&EvmNetwork::ArbitrumSepoliaTest), "ANT");
+        let local = resolve_evm_network(Some("local"), Some(&manifest_with_evm())).unwrap();
+        assert_eq!(token_symbol(&local), "tokens");
     }
 
     #[test]

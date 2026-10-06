@@ -3,7 +3,7 @@
 //! The CLI uses `indicatif` spinners and progress bars for long-running operations
 //! (network connection, file uploads/downloads). Tracing logs and progress bars
 //! both write to stderr, so without coordination they garble each other when both
-//! are active (e.g. `ant -v file upload ...`).
+//! are active (e.g. `darwin -v file upload ...`).
 //!
 //! This module exposes a single `MultiProgress` that all bars/spinners attach to,
 //! and a tracing writer that wraps each write in `MultiProgress::suspend()` so log

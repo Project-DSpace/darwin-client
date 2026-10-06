@@ -72,7 +72,7 @@ pub async fn stop(config: &DaemonConfig) -> Result<DaemonStopResult> {
         let _ = std::fs::remove_file(&config.pid_file_path);
         let _ = std::fs::remove_file(&config.port_file_path);
         return Err(Error::DaemonStopFailed(format!(
-            "PID {pid} is alive but does not appear to be the ant daemon (possible PID reuse). \
+            "PID {pid} is alive but does not appear to be the darwin daemon (possible PID reuse). \
              Stale PID file removed."
         )));
     }
@@ -464,7 +464,12 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
     Ok(())
 }
 
-/// Validate that a PID belongs to an ant daemon process by checking its
+/// Executable names (without `.exe`) a daemon process may run under: the CLI's
+/// own, and `ant`, its name before the rename, so a daemon an older build
+/// started can still be stopped.
+const DAEMON_EXE_NAMES: &[&str] = &["darwin", "ant"];
+
+/// Validate that a PID belongs to a daemon process of this CLI by checking its
 /// command line. This guards against PID reuse after a daemon crash.
 #[cfg(unix)]
 fn validate_daemon_process(pid: u32) -> bool {
@@ -472,9 +477,10 @@ fn validate_daemon_process(pid: u32) -> bool {
     match std::fs::read(&cmdline_path) {
         Ok(raw) => {
             // /proc/PID/cmdline uses null bytes as separators.
-            // Check that the executable basename ends with "ant" and one
-            // of the arguments is "daemon". This avoids false positives
-            // from processes like "rant" or "phantom-daemon".
+            // Check that the executable basename is one of
+            // DAEMON_EXE_NAMES and one of the arguments is "daemon". This
+            // avoids false positives from processes like "rant" or
+            // "phantom-daemon".
             let args: Vec<String> = raw
                 .split(|&b| b == 0)
                 .filter(|s| !s.is_empty())
@@ -484,7 +490,9 @@ fn validate_daemon_process(pid: u32) -> bool {
                 .first()
                 .and_then(|exe| std::path::Path::new(exe).file_name())
                 .and_then(|name| name.to_str())
-                .is_some_and(|name| name == "ant" || name == "ant.exe");
+                .is_some_and(|name| {
+                    DAEMON_EXE_NAMES.contains(&name.strip_suffix(".exe").unwrap_or(name))
+                });
             let has_daemon_arg = args.iter().any(|a| a == "daemon");
             exe_matches && has_daemon_arg
         }
@@ -522,11 +530,11 @@ fn validate_daemon_process(pid: u32) -> bool {
         std::path::Path::new(&path)
             .file_stem()
             .and_then(|s| s.to_str())
-            .is_some_and(|name| name == "ant")
+            .is_some_and(|name| DAEMON_EXE_NAMES.contains(&name))
     }
 }
 
-/// Build the arg list passed to the detached `ant node daemon run` child.
+/// Build the arg list passed to the detached `darwin node daemon run` child.
 ///
 /// Overrides are forwarded explicitly so the child binds to the same address
 /// and port the caller asked for. Unset fields fall through to the child's

@@ -44,7 +44,7 @@ impl StatusArgs {
                 println!(
                     "{} No nodes registered. Add nodes first with: {}",
                     "●".yellow(),
-                    "ant node add".cyan()
+                    "darwin node add".cyan()
                 );
                 return Ok(());
             }
@@ -81,7 +81,7 @@ impl StatusArgs {
                     println!(
                         "       {} {}",
                         "dismiss with:".dimmed(),
-                        format!("ant node dismiss {}", node.node_id).cyan()
+                        format!("darwin node dismiss {}", node.node_id).cyan()
                     );
                 }
             }
@@ -92,7 +92,7 @@ impl StatusArgs {
                     "  {} Daemon is not running — all nodes shown as stopped.",
                     "!".yellow().bold()
                 );
-                println!("  Start it with: {}", "ant node daemon start".cyan());
+                println!("  Start it with: {}", "darwin node daemon start".cyan());
             }
         }
 

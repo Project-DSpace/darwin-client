@@ -808,7 +808,7 @@ impl Client {
         config: ClientConfig,
     ) -> Result<Self> {
         debug!(
-            "Connecting to Autonomi network with {} bootstrap peers (allow_loopback={}, ipv6={})",
+            "Connecting to the Darwin network with {} bootstrap peers (allow_loopback={}, ipv6={})",
             bootstrap_peers.len(),
             config.allow_loopback,
             config.ipv6,

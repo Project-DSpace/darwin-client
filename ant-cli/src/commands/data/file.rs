@@ -24,7 +24,7 @@ use ant_core::datamap_file::{
 use super::chunk::{parse_address, xor_distance_decimal};
 use crate::progress;
 
-/// Values of `ant file upload --visibility`.
+/// Values of `darwin file upload --visibility`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
 pub enum VisibilityArg {
     /// Only the holder of the data map can read the file (`--readable no
@@ -47,7 +47,7 @@ fn parse_yes_no(value: &str) -> Result<bool, String> {
     }
 }
 
-/// The upload choices `ant file upload` and `ant file cost` take.
+/// The upload choices `darwin file upload` and `darwin file cost` take.
 #[derive(clap::Args, Debug, Clone, Default)]
 pub struct UploadChoices {
     /// Public mode: store the data map on the network (anyone with the
@@ -138,10 +138,10 @@ pub enum FileAction {
     },
     /// Download a file from the network.
     ///
-    /// Public:  `ant file download ADDRESS -o output.pdf`
-    /// Private: `ant file download --datamap photo.jpg.datamap`
-    /// Private (custom output): `ant file download --datamap photo.jpg.datamap -o keep.jpg`
-    /// Revealed: `ant file download --proof photo.jpg.proof -o photo.jpg`
+    /// Public:  `darwin file download ADDRESS -o output.pdf`
+    /// Private: `darwin file download --datamap photo.jpg.datamap`
+    /// Private (custom output): `darwin file download --datamap photo.jpg.datamap -o keep.jpg`
+    /// Revealed: `darwin file download --proof photo.jpg.proof -o photo.jpg`
     Download {
         /// Hex-encoded address (public data map or envelope address).
         /// Required unless --datamap or --proof is provided.
@@ -152,7 +152,7 @@ pub enum FileAction {
         /// checked against the envelope if the upload's record is next to it.
         #[arg(long, conflicts_with = "proof")]
         datamap: Option<PathBuf>,
-        /// Path to an upload record or proof (`ant file prove`) whose
+        /// Path to an upload record or proof (`darwin file prove`) whose
         /// envelope carries the data map or reveals it.
         #[arg(long, conflicts_with = "address")]
         proof: Option<PathBuf>,
@@ -176,7 +176,7 @@ pub enum FileAction {
     /// Write a proof of an upload from its record (`<file>.record`): the
     /// envelope, its payment's transaction and paid quote, and for a private
     /// file the data map and salt, which reveal the file to whoever has the
-    /// proof. Anyone can check it from the chain alone with `ant file verify`.
+    /// proof. Anyone can check it from the chain alone with `darwin file verify`.
     Prove {
         /// The upload's record, saved next to its data map.
         record: PathBuf,
@@ -198,7 +198,7 @@ pub enum FileAction {
     /// optionally that a local file is the one it is for. Needs no storage
     /// node.
     Verify {
-        /// The proof, as `ant file prove` writes it.
+        /// The proof, as `darwin file prove` writes it.
         proof: PathBuf,
         /// A local file to compare with the proof's data map.
         #[arg(long)]
@@ -211,7 +211,7 @@ pub enum FileAction {
     Cost {
         /// Path to the file to estimate.
         path: PathBuf,
-        /// The upload's choices, as `ant file upload` takes them: an envelope
+        /// The upload's choices, as `darwin file upload` takes them: an envelope
         /// (the default) or a public data map adds one chunk.
         #[command(flatten)]
         choices: UploadChoices,
@@ -304,7 +304,9 @@ fn resolve_download_output(
 }
 
 impl FileAction {
-    pub async fn execute(self, client: &Client, json: bool) -> anyhow::Result<()> {
+    /// Run an action on the network. `token` is the payment token's symbol,
+    /// which costs are shown in.
+    pub async fn execute(self, client: &Client, json: bool, token: &str) -> anyhow::Result<()> {
         match self {
             FileAction::Upload {
                 path,
@@ -328,7 +330,7 @@ impl FileAction {
                     CollisionPolicy::NumericSuffix
                 };
                 let options = choices.options()?;
-                handle_file_upload(client, &path, options, mode, policy, json).await
+                handle_file_upload(client, &path, options, mode, policy, json, token).await
             }
             FileAction::Download {
                 address,
@@ -367,7 +369,7 @@ impl FileAction {
                     PaymentMode::Auto
                 };
                 let options = choices.options()?;
-                handle_file_cost(client, &path, options, mode, json).await
+                handle_file_cost(client, &path, options, mode, json, token).await
             }
             action @ (FileAction::Prove { .. } | FileAction::Verify { .. }) => {
                 let network = client.wallet().map(|wallet| wallet.network().clone());
@@ -427,6 +429,7 @@ async fn handle_file_upload(
     mode: PaymentMode,
     collision_policy: CollisionPolicy,
     json_output: bool,
+    token: &str,
 ) -> anyhow::Result<()> {
     let file_size = std::fs::metadata(path)?.len();
     if file_size < 3 {
@@ -494,7 +497,7 @@ async fn handle_file_upload(
             }
             // The partial upload still spent money on-chain for the chunks it
             // paid for; report it so the user knows what the failed attempt cost.
-            let cost_display = format_cost(&spend.storage_cost_atto, spend.gas_cost_wei);
+            let cost_display = format_cost(&spend.storage_cost_atto, spend.gas_cost_wei, token);
             anyhow::bail!(
                 "Upload failed: {stored_count}/{total_chunks} stored, {failed_count} failed \
                  (spent {cost_display}): {reason}"
@@ -578,7 +581,7 @@ async fn handle_file_upload(
         anyhow::bail!("Public upload completed without a DataMap address");
     }
     let envelope_address = envelope.map(|envelope| hex::encode(envelope.address()));
-    let cost_display = format_cost(&result.storage_cost_atto, result.gas_cost_wei);
+    let cost_display = format_cost(&result.storage_cost_atto, result.gas_cost_wei, token);
 
     if json_output {
         let out = UploadJsonResult {
@@ -627,9 +630,9 @@ async fn handle_file_upload(
     }
     if options.in_index {
         if options.readable {
-            println!("  Listed:   yes (see `ant listings`)");
+            println!("  Listed:   yes (see `darwin listings`)");
         } else {
-            println!("  Listed:   yes, unreadable until you reveal it (see `ant listings`)");
+            println!("  Listed:   yes, unreadable until you reveal it (see `darwin listings`)");
         }
     }
     if envelope.is_some() {
@@ -658,19 +661,19 @@ async fn handle_file_upload(
     println!();
     if let Some(address) = &address {
         println!("Anyone can download this file with:");
-        println!("  ant file download {address} -o <FILE>");
+        println!("  darwin file download {address} -o <FILE>");
     } else if let Some(datamap) = &files.datamap {
         println!("Download this file with:");
-        println!("  ant file download --datamap {}", datamap.display());
+        println!("  darwin file download --datamap {}", datamap.display());
     }
     if let Some(record) = &files.record {
         println!("Prove this upload to anyone with:");
-        println!("  ant file prove {}", record.display());
+        println!("  darwin file prove {}", record.display());
         if !options.readable {
             println!(
                 "Keep the record as safe as the data map: it holds the data map and the salt, \
                  so it reads the file, and its salt is what proves which file this is. \
-                 `ant file prove --no-reveal` proves only the payment."
+                 `darwin file prove --no-reveal` proves only the payment."
             );
         }
     }
@@ -695,7 +698,7 @@ fn upload_mode(options: &EnvelopeOptions) -> &'static str {
 /// What the user should know about an envelope's record: why there is none
 /// (`has_record` false), or why it wasn't checked against the chain
 /// (`checked` false, `problem` says why). `saved`: whether the record file
-/// was written, so `ant file verify` can check it later.
+/// was written, so `darwin file verify` can check it later.
 fn record_note(
     has_record: bool,
     checked: bool,
@@ -706,7 +709,7 @@ fn record_note(
         (false, Some(problem)) => Some(format!("no record saved: {problem}")),
         (false, None) => Some("no record saved".into()),
         (true, Some(problem)) if !checked && saved => Some(format!(
-            "the record is saved but was {problem}; check it later with `ant file verify`"
+            "the record is saved but was {problem}; check it later with `darwin file verify`"
         )),
         (true, Some(problem)) if !checked => Some(format!("the record was {problem}")),
         (true, _) => None,
@@ -1074,7 +1077,7 @@ fn data_map_fetch_error(error: DataError) -> anyhow::Error {
             "This address is a private file's envelope: it stores only a salted hash of the \
              data map, so the file can't be read from the address. Download it with \
              --datamap <FILE>.datamap, or with --proof <FILE> if the uploader revealed it \
-             (`ant file prove`)."
+             (`darwin file prove`)."
         ),
         error => anyhow::anyhow!("Failed to fetch public DataMap: {error}"),
     }
@@ -1143,7 +1146,7 @@ fn same_file(a: &Path, b: &Path) -> bool {
     matches!((resolve(a), resolve(b)), (Some(a), Some(b)) if a == b)
 }
 
-/// `ant file prove`: write a proof from an upload's record.
+/// `darwin file prove`: write a proof from an upload's record.
 fn handle_file_prove(
     record_path: &Path,
     output: Option<PathBuf>,
@@ -1204,11 +1207,11 @@ fn handle_file_prove(
         println!("  not which file it is for.");
     }
     println!("Anyone can check it from the payment chain with:");
-    println!("  ant file verify {}", output.display());
+    println!("  darwin file verify {}", output.display());
     Ok(())
 }
 
-/// Where `ant file prove` writes by default: `notes.txt.record` gives
+/// Where `darwin file prove` writes by default: `notes.txt.record` gives
 /// `notes.txt.proof`.
 fn default_proof_path(record: &Path) -> PathBuf {
     let name = record
@@ -1221,7 +1224,7 @@ fn default_proof_path(record: &Path) -> PathBuf {
     record.with_file_name(format!("{stem}.proof"))
 }
 
-/// `ant file verify`: check a proof from the chain, and optionally a file.
+/// `darwin file verify`: check a proof from the chain, and optionally a file.
 async fn handle_file_verify(
     chain: &ListingChain,
     proof_path: &Path,
@@ -1392,6 +1395,7 @@ async fn handle_file_cost(
     options: EnvelopeOptions,
     mode: PaymentMode,
     json_output: bool,
+    token: &str,
 ) -> anyhow::Result<()> {
     let file_size = std::fs::metadata(path)?.len();
     let envelope = options.needs_envelope();
@@ -1426,6 +1430,7 @@ async fn handle_file_cost(
             estimate.confidence,
             &estimate.storage_cost_atto,
             &estimate.estimated_gas_cost_wei,
+            token,
         );
 
         println!();
@@ -1446,7 +1451,7 @@ async fn handle_file_cost(
     Ok(())
 }
 
-/// How `ant file cost` shows an estimate. The estimate is display-only; the
+/// How `darwin file cost` shows an estimate. The estimate is display-only; the
 /// real upload reconciles the true cost at payment time. When every sampled
 /// chunk is already stored we say so rather than print a misleading priced
 /// number: free, or the price of the one chunk the upload adds (its envelope
@@ -1455,6 +1460,7 @@ fn cost_text(
     confidence: CostEstimateConfidence,
     storage_cost_atto: &str,
     gas_cost_wei: &str,
+    token: &str,
 ) -> String {
     let gas_wei: u128 = gas_cost_wei.parse().unwrap_or(0);
     let priced = storage_cost_atto.parse::<u128>().unwrap_or(0) != 0;
@@ -1465,12 +1471,12 @@ fn cost_text(
         CostEstimateConfidence::AllSamplesAlreadyStoredIncomplete if priced => format!(
             "{} for the envelope or data map; the content is likely already stored \
              (confirmed at payment)",
-            format_cost(storage_cost_atto, gas_wei)
+            format_cost(storage_cost_atto, gas_wei, token)
         ),
         CostEstimateConfidence::AllSamplesAlreadyStoredIncomplete => {
             "likely already stored — free (confirmed at payment)".to_string()
         }
-        CostEstimateConfidence::PricedSample => format_cost(storage_cost_atto, gas_wei),
+        CostEstimateConfidence::PricedSample => format_cost(storage_cost_atto, gas_wei, token),
     }
 }
 
@@ -1832,26 +1838,27 @@ fn format_size(bytes: u64) -> String {
     }
 }
 
-/// Format storage cost for human display.
+/// Format storage cost for human display, in the payment token `token`
+/// (its symbol, from `ant_core::config::token_symbol`).
 ///
 /// Always shows the most readable denomination:
-/// - >= 1 ANT (1e18 atto): "1.25 ANT"
-/// - >= 0.001 ANT: "0.250 ANT"
-/// - < 0.001 ANT: "X nanoANT"
+/// - >= 1 token (1e18 atto): "1.25 TEST"
+/// - >= 0.001 token: "0.2500 TEST"
+/// - < 0.001 token: "X nanoTEST"
 /// - 0: "free"
-fn format_storage_cost(atto_str: &str) -> String {
+fn format_storage_cost(atto_str: &str, token: &str) -> String {
     let atto: u128 = atto_str.parse().unwrap_or(0);
     if atto == 0 {
         return "free".to_string();
     }
-    let ant = atto as f64 / 1e18;
-    if ant >= 1.0 {
-        format!("{ant:.2} ANT")
-    } else if ant >= 0.001 {
-        format!("{ant:.4} ANT")
+    let whole = atto as f64 / 1e18;
+    if whole >= 1.0 {
+        format!("{whole:.2} {token}")
+    } else if whole >= 0.001 {
+        format!("{whole:.4} {token}")
     } else {
         let nano = atto as f64 / 1e9;
-        format!("{nano:.2} nanoANT")
+        format!("{nano:.2} nano{token}")
     }
 }
 
@@ -1868,13 +1875,13 @@ fn format_gas_cost(wei: u128) -> String {
     }
 }
 
-/// Combined cost display.
-fn format_cost(storage_cost_atto: &str, gas_cost_wei: u128) -> String {
+/// Combined cost display, the storage cost in the payment token `token`.
+fn format_cost(storage_cost_atto: &str, gas_cost_wei: u128, token: &str) -> String {
     let atto: u128 = storage_cost_atto.parse().unwrap_or(0);
     if atto == 0 && gas_cost_wei == 0 {
         return "free (already stored)".to_string();
     }
-    let storage = format_storage_cost(storage_cost_atto);
+    let storage = format_storage_cost(storage_cost_atto, token);
     let gas = format_gas_cost(gas_cost_wei);
     format!("{storage} (gas: {gas})")
 }
@@ -2540,7 +2547,7 @@ mod tests {
             record_note(true, false, Some(unchecked), true).as_deref(),
             Some(
                 "the record is saved but was not checked against the chain: no receipt; \
-                 check it later with `ant file verify`"
+                 check it later with `darwin file verify`"
             )
         );
         // Not saved: it doesn't claim it is, nor point at a file that isn't
@@ -2556,7 +2563,7 @@ mod tests {
         )
         .unwrap();
         assert!(!joined.contains("is saved"), "{joined}");
-        assert!(!joined.contains("ant file verify"), "{joined}");
+        assert!(!joined.contains("darwin file verify"), "{joined}");
         // Checked: nothing to say, saved or not.
         assert_eq!(record_note(true, true, None, true), None);
         assert_eq!(record_note(true, true, None, false), None);
@@ -2613,25 +2620,39 @@ mod tests {
         let price = "3000000000000000";
         let gas = "150000000000000";
         assert_eq!(
-            cost_text(PricedSample, price, gas),
-            format_cost(price, 150_000_000_000_000)
+            cost_text(PricedSample, price, gas, "TEST"),
+            format_cost(price, 150_000_000_000_000, "TEST")
         );
         assert_eq!(
-            cost_text(VerifiedAllAlreadyStored, "0", "0"),
+            cost_text(VerifiedAllAlreadyStored, "0", "0", "TEST"),
             "already stored on the network — free"
         );
         assert_eq!(
-            cost_text(AllSamplesAlreadyStoredIncomplete, "0", "0"),
+            cost_text(AllSamplesAlreadyStoredIncomplete, "0", "0", "TEST"),
             "likely already stored — free (confirmed at payment)"
         );
         // Only the envelope (or data map) was quoted, and some content wasn't
         // sampled: its price, not a promise for the whole upload.
-        let text = cost_text(AllSamplesAlreadyStoredIncomplete, price, gas);
+        let text = cost_text(AllSamplesAlreadyStoredIncomplete, price, gas, "TEST");
         assert!(
-            text.starts_with(&format_cost(price, 150_000_000_000_000)),
+            text.starts_with(&format_cost(price, 150_000_000_000_000, "TEST")),
             "{text}"
         );
         assert!(text.contains("likely already stored"), "{text}");
+    }
+
+    #[test]
+    fn costs_are_shown_in_the_given_token() {
+        assert_eq!(
+            format_cost("1250000000000000000", 0, "TEST"),
+            "1.25 TEST (gas: free)"
+        );
+        assert_eq!(format_storage_cost("3000000000000000", "ANT"), "0.0030 ANT");
+        assert_eq!(
+            format_storage_cost("2500000000", "tokens"),
+            "2.50 nanotokens"
+        );
+        assert_eq!(format_storage_cost("0", "TEST"), "free");
     }
 
     #[test]

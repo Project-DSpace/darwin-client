@@ -1,5 +1,6 @@
-# Checks formatting and lints, runs the unit tests, then builds the Linux `ant`
-# client binary on every push to main and uploads it as a workflow artifact.
+# Checks formatting and lints, runs the unit tests, then builds the Linux `darwin`
+# client binary (from the ant-cli crate) on every push to main and uploads it as
+# the `darwin-linux-x64` workflow artifact.
 #
 # Replaces upstream's workflows, which run Autonomi's test matrix, PR checks
 # and signed multi-platform releases.
@@ -52,21 +53,21 @@ jobs:
         run: cargo test --locked -p ant-core --lib && cargo test --locked -p ant-cli
 
       - name: Build
-        run: cargo build --release --locked -p ant-cli --bin ant
+        run: cargo build --release --locked -p ant-cli --bin darwin
 
       - name: Package
         run: |
           mkdir dist
-          cp target/release/ant dist/
-          tar -C dist -czf ant-linux-x64.tar.gz .
-          sha256sum ant-linux-x64.tar.gz > SHA256SUMS.txt
+          cp target/release/darwin dist/
+          tar -C dist -czf darwin-linux-x64.tar.gz .
+          sha256sum darwin-linux-x64.tar.gz > SHA256SUMS.txt
 
       - name: Upload build
         uses: actions/upload-artifact@v4
         with:
-          name: ant-linux-x64
+          name: darwin-linux-x64
           path: |
-            ant-linux-x64.tar.gz
+            darwin-linux-x64.tar.gz
             SHA256SUMS.txt
           if-no-files-found: error
           retention-days: 30

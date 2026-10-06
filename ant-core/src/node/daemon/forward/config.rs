@@ -227,7 +227,7 @@ impl LogForwardConfig {
         }
         if self.token.trim().is_empty() {
             return Err(Error::LogForward(
-                "a write token is required: ant node logs forward enable --token <token>".into(),
+                "a write token is required: darwin node logs forward enable --token <token>".into(),
             ));
         }
         if !self.endpoint.starts_with("http://") && !self.endpoint.starts_with("https://") {

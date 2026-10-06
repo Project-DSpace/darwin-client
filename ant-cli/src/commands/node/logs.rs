@@ -193,7 +193,7 @@ fn print_result(result: &LogForwardResult, json_output: bool) -> anyhow::Result<
         );
         println!(
             "  Forwarding starts when you run: {}",
-            "ant node daemon start".cyan()
+            "darwin node daemon start".cyan()
         );
     }
 
@@ -217,7 +217,7 @@ fn print_status(status: &LogForwardStatus, json_output: bool) -> anyhow::Result<
         println!("Log forwarding: {}", "off".dimmed().bold());
         println!(
             "  Enable it with: {}",
-            "ant node logs forward enable --token <token>".cyan()
+            "darwin node logs forward enable --token <token>".cyan()
         );
         return Ok(());
     }

@@ -19,7 +19,7 @@ pub struct BindArgs {
     /// restarted.
     ///
     /// The path names the log family rather than a single file: it rotates daily and keeps a
-    /// month, so `--log-path ~/ant-daemon.log` writes `~/ant-daemon.2026-08-27.log`. A relative
+    /// month, so `--log-path ~/darwin-daemon.log` writes `~/darwin-daemon.2026-08-27.log`. A relative
     /// path is resolved against the current directory before being handed to the detached daemon,
     /// which does not share it.
     #[arg(long, value_name = "PATH")]
@@ -239,7 +239,7 @@ impl DaemonCommand {
                         "●".red(),
                         "not running".red().bold()
                     );
-                    println!("  Start it with: {}", "ant node daemon start".cyan());
+                    println!("  Start it with: {}", "darwin node daemon start".cyan());
                 } else {
                     let port = resolve_port(&config, status.port);
 
@@ -288,7 +288,7 @@ impl DaemonCommand {
                         "●".red(),
                         "not running".red().bold()
                     );
-                    println!("  Start it with: {}", "ant node daemon start".cyan());
+                    println!("  Start it with: {}", "darwin node daemon start".cyan());
                 } else {
                     println!(
                         "{} Node management daemon is {}",
@@ -315,7 +315,7 @@ impl DaemonCommand {
                     // A first line on every start, so the file is never silently empty and so the
                     // supervisor's later entries can be tied to a particular daemon instance.
                     tracing::info!(
-                        "ant node daemon starting — version {}, pid {}",
+                        "darwin node daemon starting — version {}, pid {}",
                         env!("CARGO_PKG_VERSION"),
                         std::process::id()
                     );
