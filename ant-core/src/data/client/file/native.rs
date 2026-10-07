@@ -1355,14 +1355,9 @@ fn write_whole(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
         .parent()
         .ok_or_else(|| std::io::Error::other("missing directory"))?;
     std::fs::create_dir_all(directory)?;
+    // Owner-only, like the records kept next to it: tempfile creates files
+    // 0600 on Unix (`salts_are_owner_only` checks it).
     let mut file = tempfile::NamedTempFile::new_in(directory)?;
-    // Owner-only, like the records kept next to it: a salt helps read a private file.
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        file.as_file()
-            .set_permissions(std::fs::Permissions::from_mode(0o600))?;
-    }
     file.write_all(bytes)?;
     file.as_file().sync_all()?;
     file.persist(path).map_err(|e| e.error)?;
@@ -5363,6 +5358,27 @@ mod tests {
         );
         forget_kept(dir.path(), &readable.address()).unwrap();
         assert_eq!(kept_upload_record(dir.path(), &readable, payer), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn salts_are_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let owner_only = |path: &Path| {
+            let mode = std::fs::metadata(path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o077, 0, "{} is {mode:o}", path.display());
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let payer = b"payer";
+        // The salt saved next to the checkpoint, then the one kept for a
+        // private envelope without a record once the upload completes.
+        let checkpoint = dir.path().join("private.msgpack");
+        let salt = upload_salt(&checkpoint).unwrap();
+        owner_only(&checkpoint.with_extension("salt"));
+        std::fs::write(&checkpoint, b"state").unwrap();
+        let (envelope, _) = private_envelope(7, salt);
+        finish_upload_checkpoint(&checkpoint, Some(&envelope), payer);
+        owner_only(&kept_path(dir.path(), &envelope.address(), payer, "salt"));
     }
 
     #[test]

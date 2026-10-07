@@ -196,14 +196,6 @@ fn reserve_target_path(
 
 fn write_atomic(dir: &Path, target: &Path, bytes: &[u8]) -> Result<()> {
     let mut tmp = NamedTempFile::new_in(dir)?;
-    // Owner-only: a data map or a private file's record can read the file.
-    // tempfile already creates 0600; this keeps it so whatever its default.
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        tmp.as_file()
-            .set_permissions(fs::Permissions::from_mode(0o600))?;
-    }
     tmp.write_all(bytes)?;
     tmp.as_file().sync_all()?;
     tmp.persist(target).map_err(|e| Error::Io(e.error))?;
@@ -422,6 +414,10 @@ mod record_tests {
         assert_eq!(text.trim(), record.to_hex().expect("hex"));
     }
 
+    /// A data map or a private file's record can read the file. They are
+    /// written through tempfile, which creates files owner-only (0600) on
+    /// Unix; this pins that, with no chmod that could fail a write made after
+    /// the upload was paid.
     #[cfg(unix)]
     #[test]
     fn datamaps_and_records_are_owner_only() {
@@ -445,7 +441,7 @@ mod record_tests {
             copy,
         ] {
             let mode = fs::metadata(&path).expect("metadata").permissions().mode();
-            assert_eq!(mode & 0o777, 0o600, "{}", path.display());
+            assert_eq!(mode & 0o077, 0, "{} is {mode:o}", path.display());
         }
     }
 
