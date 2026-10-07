@@ -1,9 +1,9 @@
-# Settings for generate.py, which the release workflow runs to produce the
-# THIRD-PARTY-NOTICES.txt shipped in every `ant` archive and npm platform
-# package.
+# Settings for generate.py, which the Build workflow runs to produce the
+# THIRD-PARTY-NOTICES.txt shipped in darwin-linux-x64.tar.gz (upstream ships
+# it in every `ant` archive and npm platform package).
 
 header = """
-The ant CLI is licensed under MIT OR Apache-2.0; see LICENSE-MIT and
+The darwin CLI is licensed under MIT OR Apache-2.0; see LICENSE-MIT and
 LICENSE-APACHE. This file covers the third-party software in this build and
 the tools used to produce it. Each crate's Source link is its exact source,
 which is how source is made available where a licence requires it.
@@ -101,7 +101,7 @@ note = "a build tool; its prebuilt .a files are test data, and nothing from it i
 [exception.self_encryption]
 version = "0.36.0"
 licence = "GPL-3.0"
-reason = "GPL-3.0 with a linking exception, set out at the top of its LICENSE file, which is reproduced in full. The exception permits linking the unmodified library with independent modules into an executable distributed under other terms, provided each module's own licence terms are met; the library itself remains under GPL-3.0, and its exact source is the Source link above. Remove this entry when ant-core moves to a self_encryption release published under MIT OR Apache-2.0."
+reason = "GPL-3.0 with a linking exception, set out at the top of its LICENSE file, which is reproduced in full. The exception permits linking the unmodified library with independent modules into an executable distributed under other terms, provided each module's own licence terms are met; the library itself remains under GPL-3.0, and its exact source is the Source link above. This build links it because it is how files are stored on the network: ant-core uses it to encrypt files into chunks and a data map and to decrypt them, and ant-listings uses its data maps."
 
 # Explanations printed with a crate's entry, for licence or notice files that
 # could mislead without context.
