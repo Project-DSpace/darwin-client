@@ -21,7 +21,7 @@ const reverted = transactionHashes => ({
 function stagedRecords() {
   const encrypted = encryptPublicFile(content);
   const records = encrypted.records.slice(0, -1);
-  while (records.length < 256) {
+  while (records.length < 287) {
     const bytes = new TextEncoder().encode(`valid record ${records.length}`);
     records.push({ address: contentAddress(bytes), content: bytes });
   }
@@ -46,22 +46,23 @@ test("later Merkle payment and recovery failures still store the first paid batc
   const upload = () => client.uploadStagedPublicFile(staged, paymentNetwork, i => records[i].content,
     noSingle, undefined, checkpoint, value => { checkpoint = value; }, "merkle", pay);
   try {
-    // The batch partitioner avoids singleton payments by splitting 257 as 255 + 2.
-    await assert.rejects(upload(), /partial upload: 255\/257 stored, 2 failed:.*second payment observation failed/);
+    // Merkle batches are exact powers of two, the remainder under 32 paid per
+    // chunk, so 288 records pay as two Merkle batches, 256 + 32.
+    await assert.rejects(upload(), /partial upload: 256\/288 stored, 32 failed:.*second payment observation failed/);
     const puts = rtc.requests.filter(r => r.method === "put_chunk");
-    assert.equal(new Set(puts.map(r => r.address)).size, 255);
+    assert.equal(new Set(puts.map(r => r.address)).size, 256);
     assert.equal(payments, 2);
     pay.recover = async (_, _request, _submitted, attempt) => {
       assert.equal(attempt.submissions[0].transactionHash, `0x${"cd".repeat(32)}`);
       throw new Error("still pending");
     };
-    await assert.rejects(upload(), /partial upload: 255\/257 stored, 2 failed:.*still pending/);
+    await assert.rejects(upload(), /partial upload: 256\/288 stored, 32 failed:.*still pending/);
     assert.ok(rtc.requests.filter(r => r.method === "put_chunk").length > puts.length);
     assert.equal(payments, 2, "an unresolved payment must never be resubmitted");
     checkpoint = await client.reconcileFailedUploadPayment(checkpoint,
       () => reverted([`0x${"cd".repeat(32)}`]), value => { checkpoint = value; });
     const completed = await upload();
-    assert.equal(completed.records, 257);
+    assert.equal(completed.records, 288);
     assert.equal(payments, 3, "retry pays only the failed batch and retains earlier proofs");
   } finally { client.close(); }
 });
