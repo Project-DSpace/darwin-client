@@ -21,9 +21,13 @@ export async function closesSettled() {
 
 // Reset for each test. Only browser-owned RTC objects are mocked; all node
 // responses use the shared Rust wire contract and real session encryption.
-export function mockWebRtc(nodes = [{}]) {
+// ICE gathering completes `gatheringMs` after setLocalDescription; Infinity
+// never completes.
+export function mockWebRtc(nodes = [{}], { gatheringMs = 0 } = {}) {
   const connections = [];
   const requests = [];
+  // When each connection started and completed ICE gathering.
+  const gathering = [];
   const stores = nodes.map(() => new Map());
   const endpoints = nodes.map((options, index) => {
     const node = new BrowserTestNode(index + 1, options.alreadyStored ?? false);
@@ -39,6 +43,8 @@ export function mockWebRtc(nodes = [{}]) {
       this.onmessage?.({ data });
     }
     send(message) {
+      // A failed association delivers nothing, while WebKit still accepts sends.
+      if (this.connection.connectionState === "failed") return;
       // A real DataChannel copies the outgoing bytes. The mock re-enters WASM
       // instead, where allocating the server argument can grow memory and
       // detach an outgoing view into that same memory. Copy before re-entry.
@@ -58,10 +64,11 @@ export function mockWebRtc(nodes = [{}]) {
         if (record.length) stores[this.index].set(key, record);
       }
       const put = method === "put_chunk" || method === "put_pointer";
+      const address = method === "get_chunk" ? this.server.last_get_address() : undefined;
       requests.push({ node: this.index, method, ...(put ? {
         address: this.server.last_put_address(),
         quoteHash: this.server.last_put_quote_hash(),
-      } : {}) });
+      } : {}), ...(address ? { address } : {}) });
       if (this.options.respond?.(this, method, response) === false) return;
       setTimeout(() => {
         if (this.options.multiplex && method !== "handshake") response = this.server.seal_response(response);
@@ -69,7 +76,7 @@ export function mockWebRtc(nodes = [{}]) {
         for (let offset = 0; offset < response.length; offset += 16_384) {
           this.emit(response.slice(offset, offset + 16_384).buffer);
         }
-      }, this.options.delay?.(method) ?? 0);
+      }, this.options.delay?.(method, address) ?? 0);
     }
     // Matches node-datachannel's polyfill, which the Node.js WASM client
     // runs on: close() only records the request and defers the native close
@@ -100,9 +107,17 @@ export function mockWebRtc(nodes = [{}]) {
   }
 
   globalThis.RTCPeerConnection = class {
+    connectionState = "new";
+    iceGatheringState = "new";
     constructor() {
       connections.push(this);
       this.channels = [];
+    }
+    // WebKit reports a lost association as failed but leaves its channels
+    // "open" without a close event, and opens channels created on it later.
+    failLikeWebKit() {
+      this.connectionState = "failed";
+      this.onconnectionstatechange?.(new Event("connectionstatechange"));
     }
     createDataChannel() {
       if (this.closed) throw new Error("peer connection closed");
@@ -121,6 +136,15 @@ export function mockWebRtc(nodes = [{}]) {
       };
     }
     async setLocalDescription(local) {
+      const span = { start: performance.now() };
+      gathering.push(span);
+      this.iceGatheringState = "gathering";
+      if (Number.isFinite(gatheringMs)) {
+        setTimeout(() => {
+          this.iceGatheringState = "complete";
+          span.complete = performance.now();
+        }, gatheringMs);
+      }
       this.localDescription = local;
     }
     async setRemoteDescription(remote) {
@@ -156,13 +180,16 @@ export function mockWebRtc(nodes = [{}]) {
         channel.server.set_put_error(channel.options.putError.code, channel.options.putError.message);
       }
       if (channel.options.connectDelay) await new Promise(resolve => setTimeout(resolve, channel.options.connectDelay));
+      if (this.connectionState === "new") this.connectionState = "connected";
       setTimeout(() => channel.onopen?.({}), 0);
     }
     close() {
       if (this.closed) return;
       this.closed = true;
+      // Browsers report closed at once, without a connectionstatechange event.
+      this.connectionState = "closed";
       for (const channel of this.channels) channel.close();
     }
   };
-  return { endpoints, connections, requests, stores };
+  return { endpoints, connections, requests, stores, gathering };
 }

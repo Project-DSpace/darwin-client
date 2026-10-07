@@ -58,8 +58,8 @@ pub trait AdapterBounds {}
 impl<T> AdapterBounds for T {}
 
 /// Only byte loading, wallet submission, endpoint admission, and persistence vary by platform.
-// async_trait marks each method `#[must_use]` on a boxed future that already
-// is, which clippy's `double_must_use` flags.
+// async-trait marks each method `#[must_use]`, and Clippy now treats the boxed
+// future it returns as must-use already.
 #[allow(clippy::double_must_use)]
 #[cfg_attr(not(feature = "native"), async_trait::async_trait(?Send))]
 #[cfg_attr(feature = "native", async_trait::async_trait)]

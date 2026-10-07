@@ -45,17 +45,21 @@ use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::ops::Deref;
 use std::rc::{Rc, Weak};
+use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::watch;
+use tokio::sync::{watch, OwnedSemaphorePermit, Semaphore};
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::JsFuture;
 use web_sys::{
     Event, MessageEvent, RtcConfiguration, RtcDataChannel, RtcDataChannelInit, RtcDataChannelState,
-    RtcDataChannelType, RtcPeerConnection, RtcSdpType, RtcSessionDescriptionInit,
+    RtcDataChannelType, RtcIceGatheringState, RtcPeerConnection, RtcPeerConnectionState,
+    RtcSdpType, RtcSessionDescriptionInit,
 };
 
 const REQUEST_TIMEOUT_MS: u32 = 10_000;
+/// Lane failure reported when the browser declares the peer connection dead.
+const PEER_CONNECTION_FAILED: &str = "WebRTC peer connection failed";
 /// Advertised by a node whose `chunk_protocol` admits pointer reads and paid
 /// pointer writes (ADR-0016).
 const POINTER_PROTOCOL_CAPABILITY: &str = "pointer_protocol";
@@ -64,16 +68,22 @@ const POINTER_PROTOCOL_CAPABILITY: &str = "pointer_protocol";
 // own ceiling and never spends the caller's response allowance.
 const RPC_ADMISSION_TIMEOUT: Duration = Duration::from_secs(400);
 const CONNECTION_SETUP_TIMEOUT_MS: u32 = 30_000;
+/// Longest one connection holds the page's ICE gathering turn. Gathering host
+/// candidates, the only kind without ICE servers, takes about a tenth of a second.
+const ICE_GATHERING_TURN_TIMEOUT: Duration = Duration::from_secs(1);
+/// How often the holder of the gathering turn checks whether its gathering completed.
+const ICE_GATHERING_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const MAX_BUFFERED_AMOUNT: u32 = 2 * 1024 * 1024;
 // Retain useful associations across concurrent close-group walks. Active leases
 // remain non-evictable, and the pool still imposes a hard resource bound.
 const DEFAULT_MAX_POOLED_CLIENTS: usize = 64;
 const MAX_LOOKUP_PRECONNECTS: usize = 8;
 /// Queries in flight per browser lookup round. A third to a half of the WebRTC
-/// Direct endpoints discovered on mainnet time out when dialled, so a round of
-/// the Kademlia default of three often waits on one. Six halved the mean
-/// cold-record read time on mainnet; ten was faster for isolated reads but
-/// slowed playback, whose read-ahead runs several lookups at once.
+/// Direct endpoints discovered on mainnet time out when dialled, so most rounds
+/// wait out the lookup grace period at any width. A wider round gets more
+/// answers for that wait, so lookups need fewer rounds. Ten stalled playback
+/// after seeks while read-ahead ran several lookups against the client pool.
+/// ADR-0004 records the measurements.
 const BROWSER_LOOKUP_ALPHA: usize = 6;
 const MAX_BOOTSTRAP_CONNECTIONS: usize = 4;
 const ENDPOINT_FAILURE_COOLDOWN: Duration = Duration::from_secs(30 * 60);
@@ -93,11 +103,21 @@ const MAX_UPLOAD_CHECKPOINT_BYTES: usize = 128 * 1024 * 1024;
 // JavaScript metadata from creating unbounded quote work.
 const MAX_UPLOAD_RECORDS: usize = 4096;
 
+thread_local! {
+    /// One connection in the page gathers ICE candidates at a time. WebKit opens
+    /// up to thirty UDP sockets for each connection whose gathering overlaps
+    /// another's, instead of two, and past 256 sockets per page it closes the
+    /// oldest, silently cutting established connections. The cap is per page,
+    /// so the turn is shared by every client in it.
+    static ICE_GATHERING_TURN: Arc<Semaphore> = Arc::new(Semaphore::new(1));
+}
+
 mod bootstrap;
 mod failed_payment;
 mod inbox;
 mod multiplex;
 mod pointer;
+mod read_ahead;
 mod shared;
 mod upload_adapter;
 use ant_protocol::transport::{client_routing, PeerId};
@@ -602,6 +622,7 @@ impl BrowserClientPool {
 struct PeerAssociation {
     connection: RtcPeerConnection,
     channels: RefCell<Vec<AssociationChannel>>,
+    _on_state_change: Closure<dyn FnMut(Event)>,
 }
 
 /// One lane's channel, with the inbox that records when this client stopped
@@ -632,20 +653,64 @@ impl Deref for PeerAssociation {
 }
 
 impl PeerAssociation {
+    /// Wrap a new peer connection. Its lanes fail as soon as the browser
+    /// reports the connection dead.
+    fn new(connection: RtcPeerConnection) -> Rc<Self> {
+        Rc::new_cyclic(|association: &Weak<Self>| {
+            let association = association.clone();
+            let on_state_change = Closure::<dyn FnMut(Event)>::new(move |_event: Event| {
+                if let Some(association) = association.upgrade() {
+                    association.fail_lanes_if_dead();
+                }
+            });
+            connection.set_onconnectionstatechange(Some(on_state_change.as_ref().unchecked_ref()));
+            Self {
+                connection,
+                channels: RefCell::new(Vec::new()),
+                _on_state_change: on_state_change,
+            }
+        })
+    }
+
+    /// The browser reports that the association can carry nothing more.
+    /// WebKit keeps a failed association's channels reading "open" and opens
+    /// new channels on it at once, so channel state alone cannot tell. A
+    /// browser without `connectionState` never reports it dead here.
+    fn is_dead(&self) -> bool {
+        matches!(
+            self.connection.connection_state(),
+            RtcPeerConnectionState::Failed | RtcPeerConnectionState::Closed
+        )
+    }
+
+    /// Fail every lane of a dead association, as its channels' `close` events
+    /// would, so requests waiting on it fail now rather than at their deadlines.
+    fn fail_lanes_if_dead(&self) {
+        if !self.is_dead() {
+            return;
+        }
+        for lane in self.channels.borrow().iter() {
+            lane.inbox.fail(PEER_CONNECTION_FAILED.to_string());
+        }
+    }
+
     /// Reuse the association only while another lane still uses it. A
     /// channel this client has retired may still read "open", and reusing its
     /// association could put a new channel on a dead SCTP association without
     /// counting the failure as a dial.
     fn has_live_channel(&self) -> bool {
-        self.channels
-            .borrow()
-            .iter()
-            .any(AssociationChannel::is_live)
+        !self.is_dead()
+            && self
+                .channels
+                .borrow()
+                .iter()
+                .any(AssociationChannel::is_live)
     }
 }
 
 impl Drop for PeerAssociation {
     fn drop(&mut self) {
+        self.connection.set_onconnectionstatechange(None);
         self.connection.close();
     }
 }
@@ -704,11 +769,10 @@ impl Connection {
         } else {
             let configuration = RtcConfiguration::new();
             configuration.set_ice_servers(&Array::new());
-            Rc::new(PeerAssociation {
-                connection: RtcPeerConnection::new_with_configuration(&configuration)
+            PeerAssociation::new(
+                RtcPeerConnection::new_with_configuration(&configuration)
                     .map_err(js_error_message)?,
-                channels: RefCell::new(Vec::new()),
-            })
+            )
         };
         // Wait for a retired lane to finish closing before replacing it. The
         // server admits two channels, including channels still unwinding.
@@ -738,6 +802,9 @@ impl Connection {
                 inbox: Rc::clone(&inbox),
             });
         }
+        // The association may have died while this lane waited to replace a
+        // retired one; its state-change event will not fire again.
+        peer_connection.fail_lanes_if_dead();
 
         let (open_tx, open_rx) = oneshot::channel::<Result<(), String>>();
         let open_tx = Rc::new(RefCell::new(Some(open_tx)));
@@ -822,9 +889,12 @@ impl Connection {
                 .ok_or_else(|| "browser created an empty WebRTC offer".to_string())?;
             let local = RtcSessionDescriptionInit::new(RtcSdpType::Offer);
             local.set_sdp(&offer_sdp);
+            // Setting the local description starts gathering.
+            let turn = ice_gathering_turn().await;
             JsFuture::from(connection.peer_connection.set_local_description(&local))
                 .await
                 .map_err(js_error_message)?;
+            pass_ice_gathering_turn(RtcPeerConnection::clone(&connection.peer_connection), turn);
             let local_sdp = connection
                 .peer_connection
                 .local_description()
@@ -884,6 +954,7 @@ impl Connection {
     fn is_live(&self) -> bool {
         self.data_channel.ready_state() == RtcDataChannelState::Open
             && !self.inbox.is_failed()
+            && !self.peer_connection.is_dead()
             && self.rpc().is_some_and(|rpc| !rpc.is_closed())
     }
 
@@ -2032,6 +2103,26 @@ struct BrowserPrivateFileInput {
     content_type: String,
 }
 
+/// Options for `openPublicFile` and `openPrivateFile`, as a JavaScript object.
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct BrowserFileReaderOptions {
+    /// Treat every read as the start of a sequential stream and fetch ahead of
+    /// it, as media playback needs. Other readers read ahead only once a read
+    /// continues another.
+    streaming: bool,
+}
+
+impl BrowserFileReaderOptions {
+    fn from_js(options: Option<JsValue>) -> Result<Self, JsValue> {
+        options
+            .map(serde_wasm_bindgen::from_value)
+            .transpose()
+            .map(Option::unwrap_or_default)
+            .map_err(|error| JsValue::from_str(&error.to_string()))
+    }
+}
+
 /// Where a readable file's published DataMap comes from.
 enum BrowserFileSource {
     /// Fetch the public DataMap record by address.
@@ -2166,6 +2257,7 @@ pub struct BrowserFileReader {
     shared: Rc<crate::data::Client>,
     file: PublicFileDescriptor,
     root_data_map: self_encryption::DataMap,
+    read_ahead: Rc<read_ahead::ReadAhead>,
     closed: Cell<bool>,
 }
 
@@ -2202,7 +2294,14 @@ impl BrowserFileReader {
     /// Release cached encrypted records held for playback read-ahead and seeks.
     pub fn close(&self) {
         self.closed.set(true);
+        self.read_ahead.close();
         self.shared.chunk_cache().clear();
+    }
+}
+
+impl Drop for BrowserFileReader {
+    fn drop(&mut self) {
+        self.read_ahead.close();
     }
 }
 
@@ -2216,9 +2315,19 @@ impl BrowserFileReader {
                 "browser range reads are limited to {MAX_BROWSER_RANGE_BYTES} bytes"
             ));
         }
-        self.shared
-            .data_download_range(&self.root_data_map, start, length)
-            .await
+        let lease = self.read_ahead.begin_read(start, length);
+        let bytes = self
+            .shared
+            .data_download_range_with(&self.root_data_map, start, length, |address| {
+                lease.record(address)
+            })
+            .await;
+        if matches!(bytes, Err(crate::data::Error::Encryption(_))) {
+            // The records do not decrypt as the DataMap declares, so reading
+            // further ahead would only spend bandwidth and memory.
+            self.read_ahead.close();
+        }
+        bytes
             .map(|bytes| bytes.to_vec())
             .map_err(|error| error.to_string())
     }
@@ -2317,6 +2426,7 @@ pub struct BrowserNetworkClient {
     inner: Rc<BrowserNetworkCore>,
     shared: Rc<crate::data::Client>,
     adapter: Rc<SharedNetworkAdapter>,
+    read_ahead: Rc<read_ahead::ReadAheadPool>,
 }
 
 #[wasm_bindgen(js_class = BrowserNetworkClient)]
@@ -2344,10 +2454,12 @@ impl BrowserNetworkClient {
                 )),
         );
         *inner.pool.fetch_limiter.borrow_mut() = Some(shared.controller().fetch.clone());
+        let read_ahead = read_ahead::ReadAheadPool::new(&inner, &shared);
         Ok(Self {
             inner,
             shared,
             adapter,
+            read_ahead,
         })
     }
 
@@ -2410,31 +2522,38 @@ impl BrowserNetworkClient {
     }
 
     /// Resolve and validate a public file for random-access range reads.
+    /// `options` is an object of `BrowserFileReaderOptions`, such as
+    /// `{ streaming: true }`; omitted fields take their defaults.
     #[wasm_bindgen(js_name = openPublicFile)]
     pub async fn open_public_file(
         &self,
         file: JsValue,
         on_progress: Option<js_sys::Function>,
+        options: Option<JsValue>,
     ) -> Result<BrowserFileReader, JsValue> {
         let file: BrowserPublicFileInput = serde_wasm_bindgen::from_value(file)
             .map_err(|error| JsValue::from_str(&error.to_string()))?;
+        let options = BrowserFileReaderOptions::from_js(options)?;
         let progress = ProgressReporter::from_js(on_progress);
-        self.open_file_inner(BrowserFileSource::Public(file), progress)
+        self.open_file_inner(BrowserFileSource::Public(file), progress, options)
             .await
             .map_err(|error| JsValue::from_str(&error))
     }
 
     /// Resolve a private file from its DataMap for random-access range reads.
+    /// `options` is as for `openPublicFile`.
     #[wasm_bindgen(js_name = openPrivateFile)]
     pub async fn open_private_file(
         &self,
         file: JsValue,
         on_progress: Option<js_sys::Function>,
+        options: Option<JsValue>,
     ) -> Result<BrowserFileReader, JsValue> {
         let file: BrowserPrivateFileInput = serde_wasm_bindgen::from_value(file)
             .map_err(|error| JsValue::from_str(&error.to_string()))?;
+        let options = BrowserFileReaderOptions::from_js(options)?;
         let progress = ProgressReporter::from_js(on_progress);
-        self.open_file_inner(BrowserFileSource::Private(file), progress)
+        self.open_file_inner(BrowserFileSource::Private(file), progress, options)
             .await
             .map_err(|error| JsValue::from_str(&error))
     }
@@ -2633,6 +2752,7 @@ impl BrowserNetworkClient {
         &self,
         source: BrowserFileSource,
         progress: ProgressReporter,
+        options: BrowserFileReaderOptions,
     ) -> Result<BrowserFileReader, String> {
         let resolved = self.resolve_file(source, &progress).await?;
         let file = resolved.file;
@@ -2642,10 +2762,16 @@ impl BrowserNetworkClient {
             file.size,
             file.chunks.len()
         ));
+        let read_ahead = read_ahead::ReadAhead::new(
+            &self.read_ahead,
+            &resolved.root_data_map,
+            options.streaming,
+        );
         Ok(BrowserFileReader {
             shared: Rc::clone(&self.shared),
             file,
             root_data_map: resolved.root_data_map,
+            read_ahead,
             closed: Cell::new(false),
         })
     }
@@ -3408,6 +3534,30 @@ where
 
 fn transfer_timeout_ms(content_bytes: usize) -> u32 {
     u32::try_from(transfer_timeout(content_bytes).as_millis()).unwrap_or(u32::MAX)
+}
+
+/// Wait for the page's ICE gathering turn. The semaphore is never closed, so
+/// this always returns a turn; `None` would only skip the wait.
+async fn ice_gathering_turn() -> Option<OwnedSemaphorePermit> {
+    ICE_GATHERING_TURN
+        .with(Arc::clone)
+        .acquire_owned()
+        .await
+        .ok()
+}
+
+/// Pass the turn on once `connection` finishes gathering, or after
+/// [`ICE_GATHERING_TURN_TIMEOUT`]. The connection itself carries on at once.
+fn pass_ice_gathering_turn(connection: RtcPeerConnection, turn: Option<OwnedSemaphorePermit>) {
+    wasm_bindgen_futures::spawn_local(async move {
+        let deadline = web_time::Instant::now() + ICE_GATHERING_TURN_TIMEOUT;
+        while connection.ice_gathering_state() != RtcIceGatheringState::Complete
+            && web_time::Instant::now() < deadline
+        {
+            crate::runtime::sleep(ICE_GATHERING_POLL_INTERVAL).await;
+        }
+        drop(turn);
+    });
 }
 
 fn js_error_message(value: JsValue) -> String {
