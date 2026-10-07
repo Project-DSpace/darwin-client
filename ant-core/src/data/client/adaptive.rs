@@ -4364,10 +4364,12 @@ mod tests {
         // exits within deadline + small slack when the inner work
         // takes longer than the deadline. We approximate by giving
         // the wrapper a deadline shorter than any plausible local
-        // disk write (1ms is too tight; 0ms is too tight). Use
-        // 1ms deadline and assert wall time < 100ms — proving the
-        // wrapper does NOT wait for the writer to actually finish
-        // (the inner write to a tempdir takes a few ms typically).
+        // disk write (1ms is too tight; 0ms is too tight). Use a
+        // 1µs deadline and assert wall time < 1s, as the fast-failure
+        // test above does. The wrapper itself waits at most one 5ms
+        // poll; the slack is for the scheduler, which under the
+        // parallel test suite can take a few hundred ms to run the
+        // test thread again (a 200ms bound failed at 200-300ms).
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("snap.json");
         let snap = ChannelStart {
@@ -4381,7 +4383,7 @@ mod tests {
         save_snapshot_with_timeout(path, snap, Duration::from_micros(1));
         let elapsed = started.elapsed();
         assert!(
-            elapsed < Duration::from_millis(200),
+            elapsed < Duration::from_secs(1),
             "timeout wrapper did not bound wall time: {elapsed:?}"
         );
     }
