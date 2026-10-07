@@ -109,6 +109,19 @@ reason = "GPL-3.0 with a linking exception, set out at the top of its LICENSE fi
 [remark.security-framework]
 note = "its THIRD_PARTY file covers documentation adapted from Apple's Security Framework under the Apple Public Source License 2.0; that documentation is not compiled into this build."
 
+# Ours: crates kept as copies in vendor/ (see Cargo.toml and ant-core's
+# Cargo.toml), whose Source is therefore a path in this repository. The
+# entries name the vendored versions, so the script reports them as unused
+# once a copy moves to another version; update them when a copy changes.
+
+[remark.ant-protocol]
+version = "3.1.0"
+note = "a modified copy of the crates.io release, kept in vendor/ant-protocol of the repository this build is made from; its Source above is that copy. The one change is PRICE_MULTIPLIER in src/payment/pricing.rs (see vendor/ant-protocol/VENDORED.md)."
+
+[remark.ant-listings]
+version = "0.2.0"
+note = "a copy of Project-DSpace/darwin-listings v0.2.0 (commit e3cf6bbfbd64621acf336342fe928638a386251a), which is not published on crates.io, kept in vendor/ant-listings of the repository this build is made from; its Source above is that copy. Its files are those of that commit, without the .github folder, plus a VENDORED.md saying where they come from."
+
 # Crates whose published files and repository contain no text of any licence
 # they are offered under. Each entry is for one reviewed version; it supplies
 # the canonical text of one of those licences, pinned by checksum, and says
