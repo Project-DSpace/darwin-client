@@ -1,6 +1,7 @@
 # The payment chain the client uses by default (and as --evm-network
 # robinhood). Switching tokens means changing the two addresses and the
-# symbol here and rebuilding; the nodes take the addresses from their node.env.
+# symbol here and rebuilding; switching chains, the RPC URLs and chain_id
+# too. The nodes take the addresses from their node.env.
 #
 # Robinhood Chain mainnet (chain ID 4663), through PublicNode's free RPC. Robinhood's
 # own public RPC load-balances over servers at different heights and failed
