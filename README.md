@@ -99,6 +99,8 @@ cargo build --release --locked -p ant-cli --bin darwin
 
 Every push to `main` also builds a Linux x86-64 binary in CI, uploaded as the
 `darwin-linux-x64` workflow artifact (`darwin-linux-x64.tar.gz` and its `SHA256SUMS.txt`).
+Next to `darwin`, the archive holds its license files (`LICENSE-MIT`, `LICENSE-APACHE`) and the
+notices for the third-party code in it (`THIRD-PARTY-NOTICES.txt`, `RUST-STD-COPYRIGHT.html`).
 
 `darwin --version` prints the package version and, on a second line, the git commit the binary
 was built from (`unknown` outside a git checkout of this repository; uncommitted changes don't
