@@ -133,7 +133,7 @@ async fn run() -> anyhow::Result<()> {
             // Wallet commands don't need network connection
             let private_key = require_secret_key()?;
             let (network, _) = resolve_evm_network_and_manifest(&data_ctx)?;
-            let wallet = create_wallet(&private_key, network)?;
+            let wallet = create_wallet(&private_key, network, &data_ctx)?;
             action.execute(wallet).await?;
         }
         Commands::File { action } => {
@@ -404,7 +404,7 @@ async fn build_data_client(
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("SECRET_KEY environment variable required"))?;
         let network = resolve_evm_network(ctx.evm_network.as_deref(), manifest.as_ref())?;
-        let wallet = create_wallet(key, network)?;
+        let wallet = create_wallet(key, network, ctx)?;
         info!("Wallet configured for EVM payments");
         client = client.with_wallet(wallet);
     }
@@ -438,8 +438,22 @@ fn require_secret_key() -> anyhow::Result<String> {
         .map_err(|_| anyhow::anyhow!("SECRET_KEY environment variable required"))
 }
 
-fn create_wallet(private_key: &str, network: EvmNetwork) -> anyhow::Result<Wallet> {
-    Wallet::new_from_private_key(network, private_key)
+/// The wallet signs only for the payment network's chain: the bundled
+/// network's, or with `--evm-network local` the devnet manifest's
+/// `evm.chain_id`. A network without one signs for whatever chain its RPC
+/// reports.
+fn create_wallet(
+    private_key: &str,
+    network: EvmNetwork,
+    ctx: &DataCliContext,
+) -> anyhow::Result<Wallet> {
+    let chain_id = match (ctx.evm_network.as_deref(), &ctx.devnet_manifest) {
+        (Some("local"), Some(path)) => {
+            ant_core::config::manifest_chain_id(&std::fs::read_to_string(path)?)?
+        }
+        _ => ant_core::config::chain_id(&network),
+    };
+    ant_core::config::wallet(network, private_key, chain_id)
         .map_err(|e| anyhow::anyhow!("Failed to create wallet: {e}"))
 }
 

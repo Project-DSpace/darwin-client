@@ -1,7 +1,10 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
-use crate::data::{CustomNetwork, DevnetManifest, EvmAddress, EvmNetwork, MultiAddr};
+use alloy::network::EthereumWallet;
+use alloy::signers::{local::PrivateKeySigner, Signer};
+
+use crate::data::{CustomNetwork, DevnetManifest, EvmAddress, EvmNetwork, MultiAddr, Wallet};
 use crate::error::{Error, Result};
 
 /// Returns the platform-appropriate data directory for ant.
@@ -153,6 +156,7 @@ const BUNDLED_PAYMENT_NETWORK: &str = include_str!("../resources/payment_network
 #[derive(serde::Deserialize)]
 struct PaymentNetworkConfig {
     rpc_url: String,
+    chain_id: u64,
     #[serde(default)]
     fallback_rpc_urls: Vec<String>,
     payment_token_address: String,
@@ -203,6 +207,50 @@ pub fn token_symbol(network: &EvmNetwork) -> String {
         (Ok(config), Ok(bundled)) if &bundled == network => config.token_symbol,
         _ => "tokens".to_string(),
     }
+}
+
+/// The chain payments on `network` are signed for: the bundled network's
+/// `chain_id`, and none for any other network (a devnet manifest may give
+/// one; see [`manifest_chain_id`]).
+#[must_use]
+pub fn chain_id(network: &EvmNetwork) -> Option<u64> {
+    match (
+        toml::from_str::<PaymentNetworkConfig>(BUNDLED_PAYMENT_NETWORK),
+        bundled_payment_network(),
+    ) {
+        (Ok(config), Ok(bundled)) if &bundled == network => Some(config.chain_id),
+        _ => None,
+    }
+}
+
+/// The `chain_id` a devnet manifest's `evm` block may give for payments on
+/// its network. Upstream's [`DevnetManifest`] has no such field, so it is
+/// read from the manifest's JSON.
+pub fn manifest_chain_id(manifest: &str) -> Result<Option<u64>> {
+    #[derive(serde::Deserialize)]
+    struct Manifest {
+        evm: Option<Evm>,
+    }
+    #[derive(serde::Deserialize)]
+    struct Evm {
+        chain_id: Option<u64>,
+    }
+    let manifest: Manifest = serde_json::from_str(manifest)
+        .map_err(|e| Error::InvalidEvmManifest(format!("invalid chain ID: {e}")))?;
+    Ok(manifest.evm.and_then(|evm| evm.chain_id))
+}
+
+/// A wallet paying on `network` with `private_key` (hex, `0x` optional).
+/// With a `chain_id` it signs for that chain only: each transaction's chain
+/// ID is the RPC's `eth_chainId`, and the signer refuses one that differs,
+/// naming both, so a wrong or lying RPC gets nothing signed or sent. Without
+/// one it signs for whatever chain the RPC reports.
+pub fn wallet(network: EvmNetwork, private_key: &str, chain_id: Option<u64>) -> Result<Wallet> {
+    let signer: PrivateKeySigner = private_key.parse().map_err(|_| Error::InvalidPrivateKey)?;
+    Ok(Wallet::new(
+        network,
+        EthereumWallet::from(signer.with_chain_id(chain_id)),
+    ))
 }
 
 fn custom_network(rpc_url: &str, token: &str, vault: &str) -> Result<EvmNetwork> {
@@ -402,6 +450,63 @@ mod tests {
         assert_eq!(token_symbol(&EvmNetwork::ArbitrumSepoliaTest), "ANT");
         let local = resolve_evm_network(Some("local"), Some(&manifest_with_evm())).unwrap();
         assert_eq!(token_symbol(&local), "tokens");
+    }
+
+    #[test]
+    fn chain_id_is_the_bundled_networks_or_the_manifests() {
+        assert_eq!(chain_id(&bundled_payment_network().unwrap()), Some(4663));
+        assert_eq!(chain_id(&EvmNetwork::ArbitrumOne), None);
+        let local = resolve_evm_network(Some("local"), Some(&manifest_with_evm())).unwrap();
+        assert_eq!(chain_id(&local), None);
+
+        let manifest = serde_json::to_value(manifest_with_evm()).unwrap();
+        assert_eq!(manifest_chain_id(&manifest.to_string()).unwrap(), None);
+        let mut with_chain = manifest.clone();
+        with_chain["evm"]["chain_id"] = 31337.into();
+        assert_eq!(
+            manifest_chain_id(&with_chain.to_string()).unwrap(),
+            Some(31337)
+        );
+        assert_eq!(manifest_chain_id("{}").unwrap(), None);
+        with_chain["evm"]["chain_id"] = "4663".into();
+        assert!(matches!(
+            manifest_chain_id(&with_chain.to_string()),
+            Err(Error::InvalidEvmManifest(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn wallet_signs_only_for_its_chain() {
+        use alloy::network::TransactionBuilder;
+        use alloy::providers::WalletProvider;
+        use alloy::rpc::types::TransactionRequest;
+
+        // Ready to sign but for the chain ID, which the RPC's `eth_chainId` fills in.
+        let tx = |chain| {
+            TransactionRequest::default()
+                .with_to(EvmAddress::ZERO)
+                .with_nonce(0)
+                .with_gas_limit(21_000)
+                .with_max_fee_per_gas(1)
+                .with_max_priority_fee_per_gas(1)
+                .with_chain_id(chain)
+        };
+        let network = bundled_payment_network().unwrap();
+        let key = Wallet::random_private_key();
+
+        let bound = wallet(network.clone(), &key, chain_id(&network))
+            .unwrap()
+            .to_provider();
+        let refused = tx(1).build(bound.wallet()).await.unwrap_err().to_string();
+        assert!(
+            refused.contains("chain ID (1)") && refused.contains("chain ID (4663)"),
+            "{refused}"
+        );
+        assert!(tx(4663).build(bound.wallet()).await.is_ok());
+
+        // No chain ID: the RPC's chain is signed for, as before.
+        let unbound = wallet(network, &key, None).unwrap().to_provider();
+        assert!(tx(1).build(unbound.wallet()).await.is_ok());
     }
 
     #[test]

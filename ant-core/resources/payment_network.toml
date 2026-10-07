@@ -6,10 +6,12 @@
 # Robinhood Chain mainnet (chain ID 4663), through PublicNode's free RPC. Robinhood's
 # own public RPC load-balances over servers at different heights and failed
 # mid-payment in testing;
-# heavy users can point at their own provider with a devnet manifest.
+# heavy users can point at their own provider with a devnet manifest, giving
+# its evm block "chain_id": 4663 so their payments are checked as below.
 rpc_url = "https://robinhood-rpc.publicnode.com"
-# Robinhood Chain mainnet. Browsers check the wallet and nodes against it; the
-# native client signs for whatever chain the RPC reports.
+# Robinhood Chain mainnet. Browsers check the wallet and nodes against it, and
+# the native client signs payments for this chain only, refusing an RPC that
+# reports another.
 chain_id = 4663
 # Where reads of payments (listings, upload proofs) go when `rpc_url` refuses
 # or fails a call: PublicNode refuses `eth_getLogs`, which finding a payment

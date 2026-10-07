@@ -93,6 +93,9 @@ pub enum Error {
     #[error("Invalid EVM info in devnet manifest: {0}")]
     InvalidEvmManifest(String),
 
+    #[error("Private key is invalid")]
+    InvalidPrivateKey,
+
     #[error("Node count {count} exceeds maximum of {max} per call")]
     InvalidNodeCount { count: u16, max: u16 },
 

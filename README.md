@@ -867,15 +867,17 @@ ant-core = { path = "ant-core" }
 ### Connecting to the Network
 
 ```rust
-use ant_core::config::{bundled_payment_network, resolve_bootstrap_multiaddrs};
-use ant_core::data::{Client, ClientConfig, Wallet};
+use ant_core::config::{self, bundled_payment_network, resolve_bootstrap_multiaddrs};
+use ant_core::data::{Client, ClientConfig};
 
 // Connect through the bundled seeds (or a config file's; see the bootstrap section below)
 let peers = resolve_bootstrap_multiaddrs(&[], None)?;
 let client = Client::connect_multiaddrs(&peers, ClientConfig::default()).await?;
 
-// Attach a wallet for paid operations (uploads), on the bundled network: Robinhood Chain, DARWIN
-let wallet = Wallet::new_from_private_key(bundled_payment_network()?, "0xprivate_key...")?;
+// Attach a wallet for paid operations (uploads), on the bundled network: Robinhood Chain, DARWIN.
+// It signs for chain 4663 only, refusing an RPC that reports another chain.
+let network = bundled_payment_network()?;
+let wallet = config::wallet(network.clone(), "0xprivate_key...", config::chain_id(&network))?;
 let client = client.with_wallet(wallet);
 client.approve_token_spend().await?;
 ```
@@ -1135,6 +1137,8 @@ Data operations (upload/download) go directly to the P2P network — they do not
 | `local` | Custom (Anvil) | Local development (requires `--devnet-manifest`) |
 | `arbitrum-one` | Arbitrum One, Autonomi's ANT | Upstream's network only; our nodes don't accept it |
 | `arbitrum-sepolia` | Arbitrum Sepolia testnet | Upstream's test network only |
+
+Payments on `robinhood` are signed for chain 4663 only: an RPC that reports another chain is refused before anything is signed. On `local` the same check uses the devnet manifest's `evm.chain_id` when it has one (`"chain_id": 4663` for your own Robinhood Chain RPC); without one, and on the Arbitrum presets, payments are signed for whatever chain the RPC reports.
 
 ## Environment Variables
 

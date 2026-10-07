@@ -19,6 +19,8 @@ told apart by the commit `darwin --version` prints. Upstream's entries follow.
   `darwin listing`) read with quorum checks.
 - Uploads paid by an outside payer; merkle batches paid in exact powers of two.
 - Reads of payments fall back to other RPCs, and uploads recover a payment the RPC errored on.
+- Payments are signed for the payment network's chain only (4663, or a devnet manifest's
+  `evm.chain_id`), so an RPC that reports another chain gets nothing signed.
 - The CLI is `darwin`, shows costs in the payment token, and has self-update turned off.
 - `darwin-linux-x64.tar.gz` from CI carries license notices: `LICENSE-MIT`, `LICENSE-APACHE`,
   `THIRD-PARTY-NOTICES.txt` and `RUST-STD-COPYRIGHT.html` next to `darwin`, like upstream's archives.
