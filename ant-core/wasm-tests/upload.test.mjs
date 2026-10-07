@@ -111,10 +111,11 @@ test("an unsupported peer is excluded when enough witness PUT targets remain", a
   } finally { client.close(); }
 });
 
-// Our vendored ant-protocol scales Autonomi's price curve by a multiplier;
-// read it from the baseline price (zero records) this build carries.
+// Our vendored ant-protocol scales Autonomi's price curve by the production
+// multiplier, 32. It is pinned here, so a pricing change fails on purpose:
+// the baseline price (zero records) this build carries must match it.
 const PRICE_BASELINE = 3_906_250_000_000_000n;
-const PRICE_MULTIPLIER = BigInt(test_storage_price(0)) / PRICE_BASELINE;
+const PRICE_MULTIPLIER = 32n;
 assert.equal(BigInt(test_storage_price(0)), PRICE_MULTIPLIER * PRICE_BASELINE);
 
 const priceCases = [
