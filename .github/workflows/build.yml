@@ -1,6 +1,7 @@
 # Checks formatting and lints, runs the unit tests, then builds the Linux `darwin`
-# client binary (from the ant-cli crate) on every push to main and uploads it as
-# the `darwin-linux-x64` workflow artifact.
+# client binary (from the ant-cli crate) on every push to main and uploads it,
+# with its licence files and third-party notices, as the `darwin-linux-x64`
+# workflow artifact.
 #
 # Replaces upstream's workflows, which run Autonomi's test matrix, PR checks
 # and signed multi-platform releases.
@@ -55,10 +56,32 @@ jobs:
       - name: Build
         run: cargo build --release --locked -p ant-cli --bin darwin
 
+      # Collects, unaltered, the licence, copyright and notice files of every
+      # crate the build resolves for this target, including build-time tools
+      # and OpenSSL, and fails if any crate's licence is outside the policy or
+      # its texts cannot be found (see the script and its config). The token
+      # raises the GitHub rate limit for licence files fetched from crates'
+      # repositories. Ubuntu 24.04's python3 is 3.12; the script needs 3.11+.
+      - name: Generate THIRD-PARTY-NOTICES.txt
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: >-
+          python3 scripts/third_party_notices/generate.py
+          --package ant-cli
+          --target x86_64-unknown-linux-gnu
+          --config scripts/third_party_notices/config.toml
+          --output THIRD-PARTY-NOTICES.txt
+
+      # As in upstream's release archives: the binary, the project's licence
+      # files, the third-party notices and the Rust standard library's notices
+      # from the toolchain that built the binary. Files sit at the archive's
+      # root, so `darwin` is where it always was.
       - name: Package
         run: |
           mkdir dist
           cp target/release/darwin dist/
+          cp LICENSE-MIT LICENSE-APACHE THIRD-PARTY-NOTICES.txt dist/
+          cp "$(rustc --print sysroot)/share/doc/rust/COPYRIGHT-library.html" dist/RUST-STD-COPYRIGHT.html
           tar -C dist -czf darwin-linux-x64.tar.gz .
           sha256sum darwin-linux-x64.tar.gz > SHA256SUMS.txt
 
