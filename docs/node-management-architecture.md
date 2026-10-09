@@ -131,7 +131,7 @@ needing the CLI.
 ```
 ant [global flags]
 ├── file
-│   ├── upload <PATH> [--public] [--merkle|--no-merkle]
+│   ├── upload <PATH> [--public]
 │   └── download [ADDRESS] [--datamap PATH] [-o PATH]
 ├── chunk
 │   ├── put [FILE]

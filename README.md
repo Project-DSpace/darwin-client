@@ -258,13 +258,12 @@ Mistakes in `--hide`, `--name` or `--content-type` are reported before `SECRET_K
 | `--hide <FIELDS>` | Payment fields to hide, comma-separated: `tx-hash`, `block`, `timestamp`, `log-index`, `quote`, or `all`. All five are shown by default. |
 | `--name <NAME>` | A name stored in the envelope, on any visibility (1–255 bytes, no control characters or path separators). Public and permanent. |
 | `--content-type <TYPE>` | A content type stored in the envelope, as `type/subtype`, on any visibility. Public and permanent. |
-| `--merkle` | Force merkle batch payment from 2 chunks, instead of from 64. Reduces gas costs for multi-chunk uploads. |
-| `--no-merkle` | Disable merkle, always use per-chunk payments. |
+| `--merkle` | Refused: batch (merkle) payments are off on the Darwin network (see step 3). |
 
 **How it works:**
 1. The file is streamed through self-encryption in 8KB reads (never fully loaded into memory).
 2. Each encrypted chunk is stored on the network at its XOR content address.
-3. Payment is made per-chunk or via merkle batch transactions (auto-selected by default when >= 64 chunks). The payment vault charges a batch for the next power of two of its chunks, so an upload is paid in exact power-of-two batches (256, 128, 64 and 32 chunks), and a remainder under 32 chunks is paid per chunk.
+3. Payment is made per chunk, in transactions of up to 64 chunks each. Batch (merkle) payments are off on the Darwin network since 2026-10-09: the DARWIN vault picks a batch's paid pool from inputs the payer chooses, so a payer can steer the payout, and a re-sent batch can be charged twice. Upstream pays uploads of 64 chunks or more in batches.
 4. A `DataMap` is produced that records which chunks compose the file.
 5. Unless the upload hides every payment field, is not in the index and has no name or content type, the client stores an **envelope**: a small chunk holding the data map (readable uploads) or a salted hash of it (private uploads), the name and content type, and flags saying which payment fields its listing shows and whether it is in the index. Its address is the file's address. Nodes that keep listings record the envelope's payment, so anyone with the address can check it against the chain. The envelope is paid in the same payment as the content (one payment for any upload under 64 chunks; from 64, with the chunks left after the merkle batches, or alone) and stored after every content chunk, so it never points at missing content.
 6. Without an envelope, a readable upload stores the DataMap itself as a chunk and returns its address; a private one stores nothing extra.

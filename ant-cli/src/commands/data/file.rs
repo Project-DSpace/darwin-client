@@ -110,12 +110,14 @@ pub enum FileAction {
         /// hidden, and its metadata.
         #[command(flatten)]
         choices: UploadChoices,
-        /// Force merkle batch payment regardless of chunk count (min 2 chunks).
-        /// Reduces gas costs for batches by paying in a single transaction.
+        /// Refused: batch (merkle) payments are off on the Darwin network.
+        /// The vault lets a payer steer a batch's payout, and a re-sent batch
+        /// can be charged twice, so every upload pays per chunk.
         #[arg(long, conflicts_with = "no_merkle")]
         merkle: bool,
-        /// Disable merkle batch payment, always use per-chunk payments.
-        #[arg(long, conflicts_with = "merkle")]
+        /// Per-chunk payments, now always used; kept so scripts that pass it
+        /// still run.
+        #[arg(long, conflicts_with = "merkle", hide = true)]
         no_merkle: bool,
         /// **Deprecated.** Per-upload override for the store timeout
         /// (seconds). The adaptive controller now sizes timeouts from
@@ -215,11 +217,12 @@ pub enum FileAction {
         /// (the default) or a public data map adds one chunk.
         #[command(flatten)]
         choices: UploadChoices,
-        /// Force merkle batch payment mode for the estimate.
+        /// Refused: batch (merkle) payments are off on the Darwin network.
         #[arg(long, conflicts_with = "no_merkle")]
         merkle: bool,
-        /// Force single payment mode for the estimate.
-        #[arg(long, conflicts_with = "merkle")]
+        /// Per-chunk payments, now always used; kept so scripts that pass it
+        /// still run.
+        #[arg(long, conflicts_with = "merkle", hide = true)]
         no_merkle: bool,
     },
 }
@@ -312,18 +315,12 @@ impl FileAction {
                 path,
                 choices,
                 merkle,
-                no_merkle,
+                no_merkle: _,
                 store_timeout: _,
                 store_concurrency: _,
                 overwrite,
             } => {
-                let mode = if merkle {
-                    PaymentMode::Merkle
-                } else if no_merkle {
-                    PaymentMode::Single
-                } else {
-                    PaymentMode::Auto
-                };
+                let mode = payment_mode(merkle)?;
                 let policy = if overwrite {
                     CollisionPolicy::Overwrite
                 } else {
@@ -359,15 +356,9 @@ impl FileAction {
                 path,
                 choices,
                 merkle,
-                no_merkle,
+                no_merkle: _,
             } => {
-                let mode = if merkle {
-                    PaymentMode::Merkle
-                } else if no_merkle {
-                    PaymentMode::Single
-                } else {
-                    PaymentMode::Auto
-                };
+                let mode = payment_mode(merkle)?;
                 let options = choices.options()?;
                 handle_file_cost(client, &path, options, mode, json, token).await
             }
@@ -420,6 +411,20 @@ fn upload_options(
 /// The names of the payment fields `options` hides.
 fn hidden_names(options: &EnvelopeOptions) -> Vec<&'static str> {
     options.shown.hidden().map(PaymentField::name).collect()
+}
+
+/// How uploads pay on the Darwin network: per chunk, in transactions of up to
+/// 64 chunks. Batch (merkle) payments are off since 2026-10-09: the DARWIN
+/// vault picks a batch's paid pool from inputs the payer chooses, so a payer
+/// can steer the payout, and a re-sent batch can be charged twice (see
+/// payment-vault's README). `--merkle` is refused rather than ignored.
+fn payment_mode(merkle: bool) -> anyhow::Result<PaymentMode> {
+    if merkle {
+        anyhow::bail!(
+            "batch (merkle) payments are off on the Darwin network: the vault lets a payer steer a batch's payout and a re-sent batch can be charged twice, so uploads pay per chunk. Leave out --merkle."
+        );
+    }
+    Ok(PaymentMode::Single)
 }
 
 async fn handle_file_upload(

@@ -18,6 +18,9 @@ told apart by the commit `darwin --version` prints. Upstream's entries follow.
   (`darwin file prove`, `darwin file verify`), and the listings index (`darwin listings`,
   `darwin listing`) read with quorum checks.
 - Uploads paid by an outside payer; merkle batches paid in exact powers of two.
+- Uploads pay per chunk: `darwin file upload` and `darwin file cost` no longer use batch (merkle)
+  payments, which the vault lets a payer steer and can charge twice when re-sent, and refuse
+  `--merkle`; `--no-merkle` is accepted and does nothing (2026-10-09).
 - Reads of payments fall back to other RPCs, and uploads recover a payment the RPC errored on.
 - Payments are signed for the payment network's chain only (4663, or a devnet manifest's
   `evm.chain_id`), so an RPC that reports another chain gets nothing signed.
