@@ -465,6 +465,56 @@ const fn is_version_unaware(error: &Error) -> bool {
     matches!(error, Error::Network(_) | Error::Timeout(_))
 }
 
+/// How a storer's refusal for rate reads in a quote failure: darwin-node
+/// answers `ProtocolError::QuoteFailed("rate limited")` (`RATE_LIMITED` in its
+/// `src/storage/handler.rs`) while the requesting peer or its IP is over the
+/// node's quote rate.
+const RATE_LIMITED_QUOTE: &str = "quote failed: rate limited";
+
+/// Waits before quoting a record again when its quotes were refused for rate.
+/// A storer's bucket holds one second of its rate and refills in a second, so
+/// the first wait lets it refill and the longer ones ride out a client's other
+/// records quoting at the same time. Up to half a second of jitter is added so
+/// records refused together don't come back together.
+const RATE_LIMITED_RETRY_DELAYS: [Duration; 3] = [
+    Duration::from_secs(1),
+    Duration::from_secs(2),
+    Duration::from_secs(4),
+];
+
+/// Whether quote collection failed because storers refused for rate: too few
+/// usable quotes came back, and at least one refusal was for rate. Other failures
+/// (timeouts, missing peers) are not retried here.
+fn refused_for_rate(error: &Error) -> bool {
+    matches!(error, Error::InsufficientPeers(message) if message.contains(RATE_LIMITED_QUOTE))
+}
+
+/// Run a quote collection, and run it again after each of
+/// [`RATE_LIMITED_RETRY_DELAYS`] while it fails because storers refused for
+/// rate. Without this, a client that meets a node's per-peer or per-IP quote
+/// limit (several uploads at once from one address) fails the whole upload on
+/// the first record left with no quote, though a second's wait would do.
+async fn retry_while_rate_limited<T, F, Fut>(address: &[u8; 32], mut collect: F) -> Result<T>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T>>,
+{
+    for delay in RATE_LIMITED_RETRY_DELAYS {
+        match collect().await {
+            Err(error) if refused_for_rate(&error) => {
+                let delay = delay + Duration::from_millis(rand::random::<u64>() % 500);
+                warn!(
+                    "Quotes for {} refused for rate; quoting again in {delay:?}",
+                    hex::encode(address)
+                );
+                crate::runtime::sleep(delay).await;
+            }
+            result => return result,
+        }
+    }
+    collect().await
+}
+
 /// Fold one peer's quote result into the collection state.
 ///
 /// Returns `Err` only when collection must stop outright: a storer has said
@@ -973,7 +1023,25 @@ impl Client {
     /// paid for instead, or every update after the first would be free. The
     /// close group is still the one around the pointer's address, because that
     /// is what the network routes on and a state identifier names no group.
+    ///
+    /// Quoted again, after a wait, while every quote is refused because this
+    /// client or its address is over the storers' quote rate (see
+    /// [`retry_while_rate_limited`]).
     pub(crate) async fn get_store_quote_plan_split(
+        &self,
+        routing: &[u8; 32],
+        content: &[u8; 32],
+        data_size: u64,
+        data_type: u32,
+    ) -> Result<StoreQuotePlan> {
+        retry_while_rate_limited(content, || {
+            self.get_store_quote_plan_split_once(routing, content, data_size, data_type)
+        })
+        .await
+    }
+
+    /// One attempt of [`Self::get_store_quote_plan_split`].
+    async fn get_store_quote_plan_split_once(
         &self,
         routing: &[u8; 32],
         content: &[u8; 32],
@@ -2799,6 +2867,91 @@ mod tests {
             }
             other => panic!("expected ClientUpdateRequired, got: {other:?}"),
         }
+    }
+
+    /// Quote collection's error when every storer refused for rate, built
+    /// the way `collect_store_quotes_from_remote_peers` builds it from the
+    /// storers' answers.
+    fn refused_for_rate_error() -> Error {
+        let peer = "a57988031ea5483b";
+        let refusal = Error::Protocol(format!(
+            "Quote error from {peer}: {}",
+            ProtocolError::QuoteFailed("rate limited".to_string())
+        ));
+        Error::InsufficientPeers(format!(
+            "Got 0 quotes, need 1 (16 responses: 0 already_stored, 16 failed including 0 \
+             with mismatched peer bindings). Failures: [{peer}: {refusal}]"
+        ))
+    }
+
+    #[test]
+    fn refusals_for_rate_are_told_from_other_failures() {
+        assert!(refused_for_rate(&refused_for_rate_error()));
+        assert!(!refused_for_rate(&Error::InsufficientPeers(
+            "Got 0 quotes, need 1 (7 responses). Failures: [p: Timeout: quote timed out]".into()
+        )));
+        // One storer's refusal on its own is not a failed collection.
+        assert!(!refused_for_rate(&Error::Protocol(format!(
+            "Quote error from p: {}",
+            ProtocolError::QuoteFailed("rate limited".to_string())
+        ))));
+    }
+
+    /// A collection refused for rate is run again after a wait, and succeeds
+    /// once the storers' buckets have refilled.
+    #[tokio::test(start_paused = true)]
+    async fn quotes_refused_for_rate_are_collected_again_after_a_wait() {
+        let attempts = std::sync::atomic::AtomicUsize::new(0);
+        let started = tokio::time::Instant::now();
+        let result = retry_while_rate_limited(&[7; 32], || {
+            let attempt = attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            async move {
+                if attempt < 2 {
+                    Err(refused_for_rate_error())
+                } else {
+                    Ok(attempt)
+                }
+            }
+        })
+        .await;
+        assert_eq!(result.expect("third collection succeeds"), 2);
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 3);
+        assert!(
+            started.elapsed() >= Duration::from_secs(3),
+            "waited 1 s, then 2 s"
+        );
+    }
+
+    /// The retries end: a collection still refused for rate after every wait
+    /// fails with the refusal.
+    #[tokio::test(start_paused = true)]
+    async fn quotes_refused_for_rate_every_time_fail_after_the_last_wait() {
+        let attempts = std::sync::atomic::AtomicUsize::new(0);
+        let result: Result<()> = retry_while_rate_limited(&[7; 32], || {
+            attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            async { Err(refused_for_rate_error()) }
+        })
+        .await;
+        assert!(result.is_err_and(|error| refused_for_rate(&error)));
+        assert_eq!(
+            attempts.load(std::sync::atomic::Ordering::SeqCst),
+            RATE_LIMITED_RETRY_DELAYS.len() + 1
+        );
+    }
+
+    /// Other failures are returned at once, without waiting.
+    #[tokio::test(start_paused = true)]
+    async fn other_quote_failures_are_not_retried() {
+        let attempts = std::sync::atomic::AtomicUsize::new(0);
+        let started = tokio::time::Instant::now();
+        let result: Result<()> = retry_while_rate_limited(&[7; 32], || {
+            attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            async { Err(Error::InsufficientPeers("Got 0 quotes, need 1".into())) }
+        })
+        .await;
+        assert!(result.is_err());
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(started.elapsed(), Duration::ZERO);
     }
 
     /// The legacy retry exists for storers that cannot parse a versioned

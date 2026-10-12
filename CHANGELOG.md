@@ -26,6 +26,9 @@ told apart by the commit `darwin --version` prints. Upstream's entries follow.
   again, up to 3 times per chunk; after that the chunk fails with a `quotes occupied` error naming
   the node that issued the quotes. Applies to uploads paid by the wallet or an outside payer, and
   to single records (`chunk_put`, pointers). Browser builds don't read records back.
+- A record whose quotes storers refuse for rate (darwin-node's per-peer and per-IP quote limits,
+  met by several uploads at once from one address) is quoted again after 1, 2 and 4 seconds
+  instead of failing the upload.
 - Reads of payments fall back to other RPCs, and uploads recover a payment the RPC errored on.
 - Payments are signed for the payment network's chain only (4663, or a devnet manifest's
   `evm.chain_id`), so an RPC that reports another chain gets nothing signed.
