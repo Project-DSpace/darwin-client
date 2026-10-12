@@ -158,7 +158,15 @@ impl MiniTestnet {
     /// Use `DEFAULT_NODE_COUNT` for standard tests, 35+ for merkle tests (need 16 peers per pool).
     /// Nodes emit baseline `(0, None)` quotes (no commitment source wired).
     pub async fn start(node_count: usize) -> Self {
-        Self::start_inner(node_count, None).await
+        Self::start_inner(node_count, None, false).await
+    }
+
+    /// Start a testnet whose payment vault runs the DARWIN vault's code, with
+    /// write-once payment records: a quote hash's first non-zero payment is
+    /// kept and later ones are skipped. The evmlib test vault lets a later
+    /// payment overwrite the record instead.
+    pub async fn start_with_darwin_vault(node_count: usize) -> Self {
+        Self::start_inner(node_count, None, true).await
     }
 
     /// ADR-0004: start a testnet where every node carries a live storage
@@ -167,18 +175,26 @@ impl MiniTestnet {
     /// in the quote response). Exercises the full node→client→storer binding
     /// handshake against real QUIC + Anvil.
     pub async fn start_with_commitments(node_count: usize, key_count: u32) -> Self {
-        Self::start_inner(node_count, Some(key_count)).await
+        Self::start_inner(node_count, Some(key_count), false).await
     }
 
-    async fn start_inner(node_count: usize, commitment_key_count: Option<u32>) -> Self {
+    async fn start_inner(
+        node_count: usize,
+        commitment_key_count: Option<u32>,
+        darwin_vault: bool,
+    ) -> Self {
         // Start Anvil EVM testnet FIRST
         let testnet = Testnet::new().await.expect("start Anvil testnet");
-        let evm_network = testnet.to_network();
 
         // Create funded wallet from the same Anvil instance
         let private_key = testnet
             .default_wallet_private_key()
             .expect("get wallet key");
+        let evm_network = if darwin_vault {
+            deploy_darwin_vault(&testnet.to_network(), &private_key).await
+        } else {
+            testnet.to_network()
+        };
         let wallet = Wallet::new_from_private_key(evm_network.clone(), &private_key)
             .expect("create funded wallet");
 
@@ -595,4 +611,42 @@ fn build_commitment_source(key_count: u32, identity: &NodeIdentity) -> Arc<dyn C
     let state = ResponderCommitmentState::new();
     state.rotate(built);
     Arc::new(state)
+}
+
+/// The DARWIN vault's creation code, without its constructor arguments: the
+/// creation code of payment-vault's `deployments/darwin-vault-2026-10-06/initcode.hex`.
+pub const DARWIN_VAULT_CREATION_CODE: &str =
+    include_str!("../fixtures/darwin-vault-creation-code.hex");
+
+/// Deploy the DARWIN vault's code on `network`'s chain, paid in its token,
+/// with the DARWIN vault's batch limit (512), and return the network with it
+/// as the payment vault.
+pub async fn deploy_darwin_vault(network: &EvmNetwork, private_key: &str) -> EvmNetwork {
+    use alloy::network::{EthereumWallet, TransactionBuilder};
+    use alloy::primitives::U256;
+    use alloy::providers::{Provider, ProviderBuilder};
+    use alloy::rpc::types::TransactionRequest;
+    use alloy::signers::local::PrivateKeySigner;
+    use alloy::sol_types::SolValue;
+
+    let mut code = hex::decode(DARWIN_VAULT_CREATION_CODE.trim()).expect("vault creation code");
+    code.extend((*network.payment_token_address(), U256::from(512u64)).abi_encode_params());
+    let signer: PrivateKeySigner = private_key.parse().expect("wallet key");
+    let provider = ProviderBuilder::new()
+        .wallet(EthereumWallet::from(signer))
+        .connect_http(network.rpc_url().clone());
+    let receipt = provider
+        .send_transaction(TransactionRequest::default().with_deploy_code(code))
+        .await
+        .expect("send vault deployment")
+        .get_receipt()
+        .await
+        .expect("vault deployment receipt");
+    assert!(receipt.status(), "vault deployment reverted");
+    let vault = receipt.contract_address.expect("vault address");
+    EvmNetwork::Custom(ant_protocol::evm::CustomNetwork {
+        rpc_url_http: network.rpc_url().clone(),
+        payment_token_address: *network.payment_token_address(),
+        payment_vault_address: vault,
+    })
 }

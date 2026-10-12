@@ -3,7 +3,8 @@
 //! Connects quote collection, on-chain EVM payment, and proof serialization.
 //! Every PUT to the network requires a valid payment proof.
 
-use crate::data::client::batch::SingleNodeQuotePayment;
+use crate::data::client::batch::{ChunkPaymentPlan, SingleNodeQuotePayment};
+use crate::data::client::occupied::{occupied_error, MAX_OCCUPIED_REQUOTES};
 use crate::data::client::quote::median_paid_quote_issuer;
 use crate::data::client::Client;
 use crate::data::error::{Error, Result};
@@ -11,7 +12,7 @@ use ant_protocol::evm::{EncodedPeerId, ProofOfPayment, Wallet};
 use ant_protocol::payment::{serialize_single_node_proof, PaymentProof};
 use ant_protocol::transport::{MultiAddr, PeerId};
 use std::sync::Arc;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 pub(crate) use crate::payment_policy::SINGLE_NODE_PAYMENT_MULTIPLIER;
 
@@ -56,9 +57,15 @@ impl Client {
     /// is stable for its life: paying against it would buy every future update
     /// at once.
     ///
+    /// After paying, the paid quote's vault record is read back. If it isn't
+    /// the payment (someone recorded the quote first, and the vault skipped
+    /// the payment), the record is quoted and paid again, up to
+    /// [`MAX_OCCUPIED_REQUOTES`] times.
+    ///
     /// # Errors
     ///
-    /// As [`Self::pay_for_storage`].
+    /// As [`Self::pay_for_storage`], and an error starting with
+    /// [`QUOTES_OCCUPIED`](crate::data::QUOTES_OCCUPIED) when every quote was occupied.
     pub async fn pay_for_storage_split(
         &self,
         routing: &[u8; 32],
@@ -66,6 +73,37 @@ impl Client {
         data_size: u64,
         data_type: u32,
     ) -> Result<(Vec<u8>, Vec<(PeerId, Vec<MultiAddr>)>)> {
+        let mut history = Vec::new();
+        for requote in 0..=MAX_OCCUPIED_REQUOTES {
+            let (proof, put_peers, plan) = self
+                .pay_for_storage_once(routing, content, data_size, data_type)
+                .await?;
+            let occupied = self.occupied_quotes(std::slice::from_ref(&plan)).await;
+            if occupied.is_empty() {
+                return Ok((proof, put_peers));
+            }
+            history.extend(occupied);
+            if requote < MAX_OCCUPIED_REQUOTES {
+                warn!(
+                    "the vault already held another payment's record for the quote paid for \
+                     {}; quoting it again ({} of {MAX_OCCUPIED_REQUOTES})",
+                    hex::encode(content),
+                    requote + 1
+                );
+            }
+        }
+        Err(occupied_error(&history))
+    }
+
+    /// One quote and payment of [`Self::pay_for_storage_split`]. Also returns
+    /// the payment as a plan, to read its vault record back.
+    async fn pay_for_storage_once(
+        &self,
+        routing: &[u8; 32],
+        content: &[u8; 32],
+        data_size: u64,
+        data_type: u32,
+    ) -> Result<(Vec<u8>, Vec<(PeerId, Vec<MultiAddr>)>, ChunkPaymentPlan)> {
         let address = content;
         // A refusal established by any earlier upload on this client stops
         // this one before it spends. The verdict is about this build, not
@@ -141,7 +179,9 @@ impl Client {
 
         // 5. Build and serialize proof with version tag
         let proof = PaymentProof {
-            proof_of_payment: ProofOfPayment { peer_quotes },
+            proof_of_payment: ProofOfPayment {
+                peer_quotes: peer_quotes.clone(),
+            },
             tx_hashes,
             commitment_sidecars,
         };
@@ -149,7 +189,15 @@ impl Client {
         let proof_bytes = serialize_single_node_proof(&proof)
             .map_err(|e| Error::Serialization(format!("Failed to serialize payment proof: {e}")))?;
 
-        Ok((proof_bytes, quoted_peers))
+        let plan = ChunkPaymentPlan {
+            address: *address,
+            data_size,
+            quoted_peers: Vec::new(),
+            payment,
+            peer_quotes,
+            commitment_sidecars: Vec::new(),
+        };
+        Ok((proof_bytes, quoted_peers, plan))
     }
 
     /// Approve the wallet to spend tokens on the payment vault contract.

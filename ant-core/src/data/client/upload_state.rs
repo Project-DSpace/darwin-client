@@ -270,6 +270,30 @@ impl UploadState {
         Ok(())
     }
 
+    /// Take the records whose paid quote turned out to be occupied out of the
+    /// pending single payment, and forget their plans, so they are quoted and
+    /// paid again. Returns their addresses. The attempt ends once none is left.
+    pub(crate) fn release_occupied(
+        &mut self,
+        occupied: &[super::occupied::OccupiedQuote],
+    ) -> Vec<XorName> {
+        let mut released = occupied.iter().map(|q| q.address).collect::<Vec<_>>();
+        released.sort_unstable();
+        released.dedup();
+        if let Some(attempt) = self.pending_payment.as_mut().filter(|a| !a.merkle) {
+            attempt
+                .addresses
+                .retain(|address| released.binary_search(address).is_err());
+            if attempt.addresses.is_empty() {
+                self.pending_payment = None;
+            }
+        }
+        for address in &released {
+            self.plans.remove(address);
+        }
+        released
+    }
+
     /// Attach an existing proof to refreshed native or browser PUT targets.
     pub fn reuse_prepared(&self, prepared: &PreparedChunk, now: SystemTime) -> Option<PaidChunk> {
         let proof_bytes = self.proofs.get(&prepared.address)?;

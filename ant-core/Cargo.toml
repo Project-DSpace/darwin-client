@@ -224,6 +224,10 @@ name = "e2e_payment"
 path = "tests/e2e_payment.rs"
 
 [[test]]
+name = "e2e_occupied_quotes"
+path = "tests/e2e_occupied_quotes.rs"
+
+[[test]]
 name = "e2e_security"
 path = "tests/e2e_security.rs"
 

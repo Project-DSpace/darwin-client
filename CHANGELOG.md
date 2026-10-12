@@ -21,6 +21,11 @@ told apart by the commit `darwin --version` prints. Upstream's entries follow.
 - Uploads pay per chunk: `darwin file upload` and `darwin file cost` no longer use batch (merkle)
   payments, which the vault lets a payer steer and can charge twice when re-sent, and refuse
   `--merkle`; `--no-merkle` is accepted and does nothing (2026-10-09).
+- Uploads read every paid quote's vault record back after paying. A quote someone else recorded
+  first (the vault then skips the payment, with no revert and no event) is quoted again and paid
+  again, up to 3 times per chunk; after that the chunk fails with a `quotes occupied` error naming
+  the node that issued the quotes. Applies to uploads paid by the wallet or an outside payer, and
+  to single records (`chunk_put`, pointers). Browser builds don't read records back.
 - Reads of payments fall back to other RPCs, and uploads recover a payment the RPC errored on.
 - Payments are signed for the payment network's chain only (4663, or a devnet manifest's
   `evm.chain_id`), so an RPC that reports another chain gets nothing signed.

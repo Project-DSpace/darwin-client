@@ -62,6 +62,7 @@ pub use client::merkle::{
     finalize_merkle_batch, MerkleBatchPaymentResult, PaymentMode, PreparedMerkleBatch,
     DEFAULT_MERKLE_THRESHOLD,
 };
+pub use client::occupied::{OccupiedQuote, VaultRecord, MAX_OCCUPIED_REQUOTES, QUOTES_OCCUPIED};
 pub use client::upload::{MerkleUploadPayment, UploadPayment};
 
 // Re-export self-encryption types

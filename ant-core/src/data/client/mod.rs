@@ -23,6 +23,7 @@ pub mod listings;
 pub mod merkle;
 #[cfg(feature = "native")]
 mod native_payment;
+pub mod occupied;
 pub mod payment;
 pub mod pointer;
 pub mod quote;

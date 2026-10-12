@@ -5,6 +5,7 @@
 
 use super::batch::{ChunkPaymentPlan, PaidChunk, WaveAggregateStats};
 use super::merkle::PaymentMode;
+use super::occupied::{occupied_error, skipped_amount, OccupiedQuote, MAX_OCCUPIED_REQUOTES};
 use super::upload_state::UploadState;
 use super::{adaptive::observe_op, classify_error, Client};
 use crate::data::error::{Error, PartialUploadSpend, Result};
@@ -445,7 +446,7 @@ impl Client {
         let mut failed = Vec::new();
         let mut held = None;
         for (wave_index, wave) in waves.iter().enumerate() {
-            let plans = match prefetched.take() {
+            let mut plans = match prefetched.take() {
                 Some(plans) => plans?,
                 None => {
                     self.prepare_upload_wave(wave, state, adapter, total)
@@ -469,45 +470,19 @@ impl Client {
                 order_by_quote_hash(&mut payable);
             }
             adapter.checkpoint(state, None).await?;
-            let payment = if payable.is_empty() {
-                UploadPayment::default()
-            } else {
-                self.ensure_upload_payment_allowed()?;
-                state.start_payment(false, payable.iter().map(|plan| plan.address).collect())?;
-                if let Some(attempt) = &mut state.pending_payment {
-                    adapter.initialize_payment_attempt(attempt);
-                }
-                adapter.checkpoint(state, None).await?;
-                if let Err(error) = self.ensure_upload_payment_allowed() {
-                    state.pending_payment = None;
-                    adapter.checkpoint(state, None).await?;
-                    return Err(error);
-                }
-                adapter.submit_payment(&payable, state).await?
-            };
-            let expected = payable.iter().try_fold(Amount::ZERO, |sum, plan| {
-                sum.checked_add(plan.payment.total_amount())
-                    .ok_or_else(|| Error::Payment("payment total overflow".into()))
-            })?;
-            if payment.amount != expected {
-                return Err(Error::Payment(
-                    "wallet reported a different payment total".into(),
-                ));
-            }
-            state.confirm(
-                &plans
-                    .iter()
-                    .filter_map(|(_, plan)| plan.as_ref().map(|p| p.address))
-                    .collect::<Vec<_>>(),
-                &payment.transactions,
-                crate::runtime::system_time(),
-            )?;
+            let (payment, found_stored, unpaid) = self
+                .pay_wave(payable, &mut plans, state, adapter, last.is_some(), total)
+                .await?;
+            failed.extend(unpaid);
             outcome.amount = outcome
                 .amount
                 .checked_add(payment.amount)
                 .ok_or_else(|| Error::Payment("payment total overflow".into()))?;
             outcome.gas = outcome.gas.saturating_add(payment.gas);
-            adapter.checkpoint(state, Some(&payment)).await?;
+            for address in found_stored {
+                outcome.addresses.push(address);
+                adapter.stored(outcome.addresses.len(), total);
+            }
             let max_size = wave.iter().map(|r| r.size as usize).max().unwrap_or(1);
             let recovery = &*state;
             let live_stored = std::sync::atomic::AtomicUsize::new(outcome.addresses.len());
@@ -654,8 +629,17 @@ impl Client {
                 let plans = state.pending_plans()?;
                 let payment = adapter.reconcile_payment(&plans, state).await?;
                 validate_payment_total(&plans, &payment)?;
+                // Records whose quote was occupied stay unpaid: the waves
+                // below quote them again.
+                let occupied = self.occupied_quotes(&plans).await;
+                let released = state.release_occupied(&occupied);
                 state.confirm(
-                    &attempt.addresses,
+                    &attempt
+                        .addresses
+                        .iter()
+                        .copied()
+                        .filter(|address| !released.contains(address))
+                        .collect::<Vec<_>>(),
                     &payment.transactions,
                     crate::runtime::system_time(),
                 )?;
@@ -664,6 +648,132 @@ impl Client {
             adapter.checkpoint(state, None).await?;
         }
         Ok(())
+    }
+
+    /// Pay a wave's `payable` plans, then read every paid quote's vault record
+    /// back. A record that isn't the payment means someone recorded the quote
+    /// first and the vault skipped the payment: that record is quoted again,
+    /// its plan in `plans` replaced, and paid again, up to
+    /// [`MAX_OCCUPIED_REQUOTES`] times. Returns the spend (without the skipped
+    /// payments, which moved no tokens), the records found already stored when
+    /// quoted again, and the records left unpaid because their quotes were
+    /// occupied every time, with why (their plans in `plans` become `None`).
+    async fn pay_wave<A: UploadAdapter>(
+        &self,
+        mut payable: Vec<ChunkPaymentPlan>,
+        plans: &mut [(UploadRecord, Option<ChunkPaymentPlan>)],
+        state: &mut UploadState,
+        adapter: &A,
+        envelope: bool,
+        total: usize,
+    ) -> Result<(UploadPayment, Vec<[u8; 32]>, Vec<([u8; 32], String)>)> {
+        let mut spent = UploadPayment::default();
+        let mut found_stored = Vec::new();
+        let mut history: Vec<OccupiedQuote> = Vec::new();
+        if payable.is_empty() {
+            adapter.checkpoint(state, Some(&spent)).await?;
+        }
+        for requote in 0..=MAX_OCCUPIED_REQUOTES {
+            if payable.is_empty() {
+                break;
+            }
+            self.ensure_upload_payment_allowed()?;
+            state.start_payment(false, payable.iter().map(|plan| plan.address).collect())?;
+            if let Some(attempt) = &mut state.pending_payment {
+                adapter.initialize_payment_attempt(attempt);
+            }
+            adapter.checkpoint(state, None).await?;
+            if let Err(error) = self.ensure_upload_payment_allowed() {
+                state.pending_payment = None;
+                adapter.checkpoint(state, None).await?;
+                return Err(error);
+            }
+            let payment = adapter.submit_payment(&payable, state).await?;
+            validate_payment_total(&payable, &payment)?;
+            let occupied = self.occupied_quotes(&payable).await;
+            let released = state.release_occupied(&occupied);
+            state.confirm(
+                &payable
+                    .iter()
+                    .map(|plan| plan.address)
+                    .filter(|address| !released.contains(address))
+                    .collect::<Vec<_>>(),
+                &payment.transactions,
+                crate::runtime::system_time(),
+            )?;
+            let paid = UploadPayment {
+                amount: payment
+                    .amount
+                    .checked_sub(skipped_amount(&occupied))
+                    .ok_or_else(|| Error::Payment("payment total underflow".into()))?,
+                gas: payment.gas,
+                transactions: payment.transactions,
+            };
+            adapter.checkpoint(state, Some(&paid)).await?;
+            spent.amount = spent
+                .amount
+                .checked_add(paid.amount)
+                .ok_or_else(|| Error::Payment("payment total overflow".into()))?;
+            spent.gas = spent.gas.saturating_add(paid.gas);
+            spent.transactions.extend(paid.transactions);
+            if occupied.is_empty() {
+                break;
+            }
+            history.extend(occupied);
+            if requote == MAX_OCCUPIED_REQUOTES {
+                let unpaid_history = history
+                    .iter()
+                    .filter(|quote| released.contains(&quote.address))
+                    .cloned()
+                    .collect::<Vec<_>>();
+                let reason = occupied_error(&unpaid_history).to_string();
+                tracing::warn!("{reason}");
+                let mut unpaid = Vec::new();
+                for (record, plan) in plans.iter_mut() {
+                    if released.contains(&record.address) {
+                        *plan = None;
+                        unpaid.push((record.address, reason.clone()));
+                    }
+                }
+                return Ok((spent, found_stored, unpaid));
+            }
+            tracing::warn!(
+                "the vault already held another payment's record for {} paid quote(s); \
+                 quoting those records again ({} of {MAX_OCCUPIED_REQUOTES})",
+                released.len(),
+                requote + 1
+            );
+            payable.clear();
+            for (record, plan) in plans
+                .iter_mut()
+                .filter(|(record, _)| released.contains(&record.address))
+            {
+                let mut fresh = observe_op(
+                    &self.controller().quote,
+                    || self.prepare_chunk_payment_plan(record.address, record.size),
+                    classify_error,
+                )
+                .await?;
+                match fresh.as_mut() {
+                    Some(fresh) => {
+                        adapter.admit(fresh).await?;
+                        adapter.quoted(record.index + 1, total);
+                        state.prepare(fresh.clone());
+                        payable.push(fresh.clone());
+                    }
+                    None => {
+                        adapter.already_stored(record.index + 1, total);
+                        found_stored.push(record.address);
+                    }
+                }
+                *plan = fresh;
+            }
+            if envelope {
+                order_by_quote_hash(&mut payable);
+            }
+            adapter.checkpoint(state, None).await?;
+        }
+        Ok((spent, found_stored, Vec::new()))
     }
 
     async fn prepare_upload_wave<A: UploadAdapter>(
