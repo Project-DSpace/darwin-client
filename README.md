@@ -977,9 +977,11 @@ Darwin supports two payment strategies:
 
 | Mode | Description |
 |------|-------------|
-| `PaymentMode::Single` | One EVM transaction per chunk. Simple but more gas for many chunks. |
-| `PaymentMode::Merkle` | Single EVM transaction for a batch of chunks via merkle proof. Lower gas for large uploads. |
-| `PaymentMode::Auto` | Default. Uses merkle when chunk count >= 64, otherwise per-chunk. |
+| `PaymentMode::Single` | Default. Per-chunk payments, in transactions of up to 64 chunks; every paid quote's vault record is read back, and an occupied quote is quoted and paid again (see "How it works" above). |
+| `PaymentMode::Merkle` | Single EVM transaction for a batch of chunks via merkle proof. Lower gas for large uploads, but the DARWIN vault lets the payer steer a batch's payout and can charge a re-sent batch twice. |
+| `PaymentMode::Auto` | Uses merkle when chunk count >= 64, otherwise per-chunk. |
+
+`PaymentMode::default()`, `Client::file_upload` and the browser API (no `paymentMode`) pay per chunk. Until 2026-10 they defaulted to `Auto`.
 
 ### Local Development with Devnet
 

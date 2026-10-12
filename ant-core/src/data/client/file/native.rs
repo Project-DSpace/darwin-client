@@ -2118,16 +2118,18 @@ impl super::super::upload::UploadAdapter for SpillUploadAdapter<'_> {
 impl Client {
     /// Upload a file to the network using streaming self-encryption.
     ///
-    /// Automatically selects merkle batch payment for files that produce
-    /// 64+ chunks (saves gas). Encrypted chunks are spilled to a temp
-    /// directory so peak memory stays at ~256 MB regardless of file size.
+    /// Pays per chunk ([`PaymentMode::Single`], the default; see
+    /// [`PaymentMode`] for why not in merkle batches). Encrypted chunks are
+    /// spilled to a temp directory so peak memory stays at ~256 MB regardless
+    /// of file size.
     ///
     /// # Errors
     ///
     /// Returns an error if the file cannot be read, encryption fails,
     /// or any chunk cannot be stored.
     pub async fn file_upload(&self, path: &Path) -> Result<FileUploadResult> {
-        self.file_upload_with_mode(path, PaymentMode::Auto).await
+        self.file_upload_with_mode(path, PaymentMode::default())
+            .await
     }
 
     /// Estimate the cost of uploading a file without actually uploading.
@@ -2442,15 +2444,15 @@ impl Client {
 
     /// Phase 1 of external-signer upload with progress events.
     ///
-    /// Equivalent to [`Client::file_prepare_upload_with_mode`] with
-    /// [`PaymentMode::Auto`] — see that method for details.
+    /// Equivalent to [`Client::file_prepare_upload_with_mode`] with the
+    /// default [`PaymentMode::Single`] — see that method for details.
     pub async fn file_prepare_upload_with_progress(
         &self,
         path: &Path,
         visibility: Visibility,
         progress: Option<mpsc::Sender<UploadEvent>>,
     ) -> Result<PreparedUpload> {
-        self.file_prepare_upload_with_mode(path, visibility, PaymentMode::Auto, progress)
+        self.file_prepare_upload_with_mode(path, visibility, PaymentMode::default(), progress)
             .await
     }
 

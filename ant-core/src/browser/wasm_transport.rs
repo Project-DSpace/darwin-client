@@ -2698,8 +2698,9 @@ fn parse_payment_network(value: JsValue) -> Result<BrowserPaymentNetwork, JsValu
 
 fn parse_payment_mode(value: Option<&str>) -> Result<PaymentMode, JsValue> {
     match value {
-        None | Some("auto") => Ok(PaymentMode::Auto),
-        Some("single") => Ok(PaymentMode::Single),
+        // Per chunk unless asked: see `PaymentMode`'s default.
+        None | Some("single") => Ok(PaymentMode::Single),
+        Some("auto") => Ok(PaymentMode::Auto),
         Some("merkle") => Ok(PaymentMode::Merkle),
         Some(_) => Err(JsValue::from_str("unknown payment mode")),
     }

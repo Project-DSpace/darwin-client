@@ -29,6 +29,9 @@ told apart by the commit `darwin --version` prints. Upstream's entries follow.
 - A record whose quotes storers refuse for rate (darwin-node's per-peer and per-IP quote limits,
   met by several uploads at once from one address) is quoted again after 1, 2 and 4 seconds
   instead of failing the upload.
+- `PaymentMode::Single` is the default of the library (`PaymentMode::default()`,
+  `Client::file_upload`, `file_prepare_upload`) and of the browser API, so programs built on
+  ant-core pay per chunk unless they ask for batches.
 - Reads of payments fall back to other RPCs, and uploads recover a payment the RPC errored on.
 - Payments are signed for the payment network's chain only (4663, or a devnet manifest's
   `evm.chain_id`), so an RPC that reports another chain gets nothing signed.

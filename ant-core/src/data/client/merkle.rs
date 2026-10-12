@@ -294,15 +294,21 @@ const fn is_version_unaware(error: &Error) -> bool {
 }
 
 /// Payment mode for uploads.
+///
+/// The default is [`PaymentMode::Single`]: the DARWIN vault picks a merkle
+/// batch's paid pool from inputs the payer chooses, so a payer can steer a
+/// batch's payout, and a re-sent batch can be charged twice (payment-vault's
+/// README, "Known behaviour"). Programs built on this library pay per chunk
+/// unless they ask for batches.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PaymentMode {
     /// Automatically choose: merkle for batches >= threshold, single otherwise.
-    #[default]
     Auto,
     /// Force merkle batch payment regardless of batch size (min 2 chunks).
     Merkle,
-    /// Force single-node payment (one tx per chunk).
+    /// Single-node payment per chunk, in transactions of up to 64 chunks. The default.
+    #[default]
     Single,
 }
 
@@ -2403,8 +2409,8 @@ mod tests {
     }
 
     #[test]
-    fn test_default_mode_is_auto() {
-        assert_eq!(PaymentMode::default(), PaymentMode::Auto);
+    fn test_default_mode_is_single() {
+        assert_eq!(PaymentMode::default(), PaymentMode::Single);
     }
 
     #[test]
