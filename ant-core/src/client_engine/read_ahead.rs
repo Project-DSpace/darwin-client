@@ -1,21 +1,24 @@
 //! Read-ahead planning for random-access file readers. Transport-neutral: the
 //! adapter fetches the records a plan names and releases the ones it marks.
 //! DataMap sizes are untrusted, so plans bound records, never declared bytes.
-use super::files::FileIndex;
+use self_encryption::DataMapIndex;
 #[cfg(test)]
 use self_encryption::{ChunkInfo, DataMap};
 use std::ops::Range;
 #[cfg(test)]
 use xor_name::XorName;
 
-impl FileIndex {
-    /// The read-ahead window: records from the one holding `start` that overlap
-    /// `length` plaintext bytes, at most `max_records`. Undersized records
-    /// shorten the window rather than lengthen it.
-    pub(crate) fn window(&self, start: u64, length: usize, max_records: usize) -> Range<usize> {
-        let records = self.chunks_overlapping(start..start.saturating_add(length as u64));
-        records.start..records.end.min(records.start.saturating_add(max_records))
-    }
+/// The read-ahead window of `index`: records from the one holding `start` that
+/// overlap `length` plaintext bytes, at most `max_records`. Undersized records
+/// shorten the window rather than lengthen it.
+pub(crate) fn read_ahead_window(
+    index: &DataMapIndex,
+    start: u64,
+    length: usize,
+    max_records: usize,
+) -> Range<usize> {
+    let records = index.chunks_overlapping(start..start.saturating_add(length as u64));
+    records.start..records.end.min(records.start.saturating_add(max_records))
 }
 
 /// Held records to release so that at most `budget` stay held, never one that is
@@ -44,7 +47,7 @@ pub(crate) fn releasable(
 mod tests {
     use super::*;
 
-    fn layout(sizes: &[usize]) -> FileIndex {
+    fn layout(sizes: &[usize]) -> DataMapIndex {
         let infos = sizes
             .iter()
             .enumerate()
@@ -55,19 +58,19 @@ mod tests {
                 src_size,
             })
             .collect();
-        FileIndex::new(&DataMap::new(infos)).unwrap()
+        DataMapIndex::new(&DataMap::new(infos)).unwrap()
     }
 
     #[test]
     fn undersized_records_shorten_the_window_instead_of_lengthening_it() {
         let small = layout(&[10; 40]);
         // Every record overlaps the window's bytes; only the record cap is taken.
-        assert_eq!(small.window(0, 1_000, 10), 0..10);
-        assert_eq!(small.window(15, 25, 10), 1..4);
-        assert!(small.window(400, 10, 10).is_empty());
+        assert_eq!(read_ahead_window(&small, 0, 1_000, 10), 0..10);
+        assert_eq!(read_ahead_window(&small, 15, 25, 10), 1..4);
+        assert!(read_ahead_window(&small, 400, 10, 10).is_empty());
         // Positions past 4 GiB address records exactly on every platform.
         let large = layout(&[1 << 30; 6]);
-        assert_eq!(large.window((1 << 32) + 1, 1, 10), 4..5);
+        assert_eq!(read_ahead_window(&large, (1 << 32) + 1, 1, 10), 4..5);
     }
 
     #[test]

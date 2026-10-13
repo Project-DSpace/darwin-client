@@ -37,7 +37,7 @@ fn main() {
     assert_eq!(root.original_file_size() as u64, size);
     let mut retained = records;
     let map_bytes = rmp_serde::to_vec(&map).unwrap();
-    let address = *blake3::hash(&map_bytes).as_bytes();
+    let address = ant_protocol::compute_address(&map_bytes);
     retained.insert(self_encryption::XorName(address), Bytes::from(map_bytes));
     let mut records: Vec<_> = retained.into_iter().map(|(hash, content)| {
         serde_json::json!({"address": hex::encode(hash.0), "content": hex::encode(content)})

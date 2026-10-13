@@ -432,7 +432,7 @@ impl Client {
     #[cfg(all(feature = "browser-wasm", target_arch = "wasm32"))]
     pub(crate) async fn data_download_indexed_range<H>(
         &self,
-        index: &crate::client_engine::files::FileIndex,
+        index: &self_encryption::DataMapIndex,
         start: u64,
         length: usize,
         held: impl Fn([u8; 32]) -> H,
@@ -461,27 +461,55 @@ impl Client {
         .map_err(map_read_error)
     }
 
+    /// Fetch and decrypt every chunk of a file as a complete download does:
+    /// within the adaptive fetch cap and `concurrency`, missing records retried
+    /// together in deferred rounds. Each chunk goes to `deliver` as it arrives,
+    /// in any order.
+    #[cfg(all(feature = "browser-wasm", target_arch = "wasm32"))]
+    pub(crate) async fn data_download_indexed_chunks(
+        &self,
+        index: &self_encryption::DataMapIndex,
+        concurrency: usize,
+        deliver: impl Fn(usize, Bytes) -> std::result::Result<(), String>,
+    ) -> Result<()> {
+        crate::client_engine::files::read_chunks(
+            index,
+            0..index.infos().len(),
+            &|address| self.fetch_data_record(address),
+            &|| self.controller().fetch.current().min(concurrency),
+            &crate::runtime::sleep,
+            retry_data_fetch,
+            deliver,
+        )
+        .await
+        .map_err(map_read_error)
+    }
+
     /// Fetch and decrypt one chunk, retrying it on its own deferred schedule.
     #[cfg(all(feature = "browser-wasm", target_arch = "wasm32"))]
     pub(crate) async fn data_download_indexed_chunk(
         &self,
-        index: &crate::client_engine::files::FileIndex,
+        index: &self_encryption::DataMapIndex,
         chunk: usize,
     ) -> Result<Bytes> {
-        let mut chunks = crate::client_engine::files::read_chunks(
+        let plaintext = std::cell::Cell::new(None);
+        crate::client_engine::files::read_chunks(
             index,
             chunk..chunk + 1,
             &|address| self.fetch_data_record(address),
             &|| 1,
             &crate::runtime::sleep,
             retry_data_fetch,
+            |_, bytes| {
+                plaintext.set(Some(bytes));
+                Ok(())
+            },
         )
         .await
         .map_err(map_read_error)?;
-        let (_, plaintext) = chunks
-            .pop()
-            .expect("a completed pass delivers its one chunk");
-        Ok(plaintext)
+        Ok(plaintext
+            .take()
+            .expect("a completed pass delivers its one chunk"))
     }
 
     async fn fetch_data_record(&self, address: [u8; 32]) -> Result<Bytes> {

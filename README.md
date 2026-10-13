@@ -44,9 +44,9 @@ Uploads retain their existing size limits.
 
 `downloadPublicFile(file, concurrency?, onProgress?, { maxMemoryBytes?, signal? })`
 and its private-file counterpart allocate the output as one JavaScript
-`Uint8Array` and copy each decrypted chunk into it, holding at most 32 MiB of
-plaintext in WASM. Progress is reported as `Downloaded chunk n/total`, and an
-`AbortSignal` cancels the download. `maxMemoryBytes` limits the output buffer,
+`Uint8Array` and copy each decrypted chunk into place as it arrives, so WASM
+holds only the records in flight. Progress is reported as
+`Downloaded chunk n/total`, and an `AbortSignal` cancels the download. `maxMemoryBytes` limits the output buffer,
 not total process memory; without it, allocation is attempted up to the
 JavaScript engine's buffer limit. Allocation errors reject with guidance to use
 streaming, since browsers do not expose a reliable amount of free memory.

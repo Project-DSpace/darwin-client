@@ -202,6 +202,7 @@ test("invalid pipeTo calls reject without touching the destination", async () =>
       [{ start: -1 }, /safe integer/],
       [{ onProgress: "no" }, /onProgress must be a function/],
       [{ signal: {} }, /AbortSignal/],
+      [{ signal: new EventTarget() }, /AbortSignal/],
       [{}, /closed/, true],
     ]) {
       if (close) reader.close();

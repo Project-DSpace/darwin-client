@@ -2127,7 +2127,7 @@ struct ResolvedBrowserFile {
     /// Descriptor without a chunk list; `index` holds the chunk metadata.
     file: PublicFileDescriptor,
     data_map_node: Option<BrowserNode>,
-    index: crate::client_engine::files::FileIndex,
+    index: self_encryption::DataMapIndex,
 }
 
 struct UploadRecord {
@@ -2685,7 +2685,7 @@ impl BrowserNetworkClient {
             "Ready to stream {} ({} bytes, {} chunks)",
             resolved.file.name,
             resolved.file.size,
-            resolved.index.chunk_count()
+            resolved.index.infos().len()
         ));
         Ok(BrowserFileReader::new(
             Rc::clone(&self.shared),
@@ -2822,12 +2822,16 @@ impl BrowserNetworkClient {
         .await
         .map_err(|error| error.to_string())?;
 
-        let index = crate::client_engine::files::FileIndex::new(&root_data_map)?;
-        if index.size() > super::manifest::MAX_SAFE_JS_INTEGER {
+        let index = self_encryption::DataMapIndex::new(&root_data_map)
+            .map_err(|error| error.to_string())?;
+        if index.infos().len() < crate::client_engine::files::MIN_FILE_CHUNKS {
+            return Err("ant-core returned an invalid public DataMap".to_string());
+        }
+        if index.file_size() > super::manifest::MAX_SAFE_JS_INTEGER {
             return Err("file size exceeds JavaScript's exact integer range".into());
         }
 
-        file.size = index.size();
+        file.size = index.file_size();
         file.chunks = Vec::new(); // Listed from the index once the file is read.
         file.data_map_size = encoded_data_map.len();
         file.blake3.clear(); // Computed when plaintext is read; not a second content identity.
