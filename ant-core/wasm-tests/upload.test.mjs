@@ -38,7 +38,7 @@ for (const existing of [1, 3]) {
       const result = await upload(client, signer);
       assert.equal(signer.calls.length, 1);
       assert.equal(result.file.replicas, 4);
-      assert.equal(rtc.requests.filter(({ method }) => method === "put_chunk").length, result.records * 4);
+      assert.equal(rtc.requests.filter(({ method }) => method === "put_chunk").length, result.records * 7);
     } finally {
       client.close();
     }
@@ -78,10 +78,9 @@ test("four already-stored votes whose nodes don't hold the records are paid and 
     assert.equal(signer.calls[0].quotes.length, result.records);
     assert.ok(signer.calls[0].quotes.every(({ quote }) => !claimants.includes(quote.peer_id)),
       "unproven claimants are not paid");
-    const puts = rtc.requests.filter(({ method }) => method === "put_chunk");
-    assert.ok(puts.length >= result.records * 4);
+    assert.equal(rtc.requests.filter(({ method }) => method === "put_chunk").length, result.records * 7);
     for (const record of encryptPublicFile(content).records) {
-      assert.ok(rtc.stores.filter(store => store.has(record.address)).length >= 4);
+      assert.equal(rtc.stores.filter(store => store.has(record.address)).length, 7);
     }
   } finally {
     client.close();
@@ -204,9 +203,10 @@ for (const scenario of priceCases) {
             assert.equal(paid.quote.peer_id, peerIds[closestFirst(paid.quote.content).filter(peer => !options[peer.index].invalidQuote)[2].index]);
           }
           const puts = rtc.requests.filter(request => request.method === "put_chunk" && request.address === paid.quote.content);
-          assert.equal(puts.length, 4);
-          // The four primary stores run concurrently, so their observed RPC
-          // arrival order can differ from the target order.
+          assert.equal(puts.length, 7);
+          // Every record goes to all seven nearest nodes. The stores run
+          // concurrently, so their observed RPC arrival order can differ
+          // from the target order.
           for (const put of puts) {
             assert.equal(put.quoteHash, paid.quoteHash, "storage proof must use the paid quote");
             assert.notEqual(options[put.node].uploads, false);
@@ -273,8 +273,8 @@ for (const staged of [false, true]) {
       assert.equal(signer.calls.length, 1, "fallback must reuse the existing payment");
       const paid = signer.calls[0].quotes.find(quote => quote.quote.content === address);
       const puts = rtc.requests.filter(request => request.method === "put_chunk" && request.address === address);
-      assert.equal(puts.length, 11, "seven declines followed by four successful fallback stores");
-      assert.equal(puts.filter(request => !rejecting.has(request.node)).length, 4);
+      assert.equal(puts.length, 14, "seven declines followed by seven successful fallback stores");
+      assert.equal(puts.filter(request => !rejecting.has(request.node)).length, 7);
       assert.ok(puts.every(request => request.quoteHash === paid.quoteHash));
     } finally { client.close(); }
   });
@@ -287,7 +287,7 @@ for (const staged of [false, true]) {
       const result = await run(client, signer);
       assert.equal(result.file.replicas, 4);
       assert.equal(signer.calls.length, 1);
-      assert.equal(rtc.requests.filter(({ method }) => method === "put_chunk").length, result.records * 4);
+      assert.equal(rtc.requests.filter(({ method }) => method === "put_chunk").length, result.records * 7);
     } finally { client.close(); }
   });
 }
@@ -610,7 +610,7 @@ test("Auto fallback shares single-node payment waves and deduplicates records", 
       async index => records[index].content, signer.pay, undefined, undefined, undefined, "auto");
     assert.equal(result.records, 66);
     assert.deepEqual(signer.calls.map(call => call.quotes.length), [64, 1]);
-    assert.equal(rtc.requests.filter(request => request.method === "put_chunk").length, 65 * 4);
+    assert.equal(rtc.requests.filter(request => request.method === "put_chunk").length, 65 * 7);
   } finally { client.close(); }
 });
 
@@ -666,7 +666,7 @@ test("partial storage in the first wave still pays and stores the second wave", 
       index => records[index].content, pay, undefined, undefined, undefined, "single"),
       /partial upload: 1\/65 stored, 64 failed/);
     assert.deepEqual(signer.calls.map(call => call.quotes.length), [64, 1]);
-    assert.equal(rtc.stores.filter(store => store.has(records.at(-1).address)).length, 4);
+    assert.equal(rtc.stores.filter(store => store.has(records.at(-1).address)).length, 7);
   } finally { client.close(); }
 });
 

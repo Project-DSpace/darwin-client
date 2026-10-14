@@ -41,6 +41,13 @@ told apart by the commit `darwin --version` prints. Upstream's entries follow.
   chunk). Applies to every quote: uploads, `chunk_put`, cost estimates and merkle preflight.
   Pointer states are never proven this way (honest nodes make no such claim for them), so a
   claim about one is ignored.
+- A new chunk is sent to its `CLOSE_GROUP_SIZE` (7) nearest nodes at once instead of the first
+  `CLOSE_GROUP_MAJORITY` (4), each one that fails or is full replaced by the next nearest as
+  before, and still counts as stored once 4 accept it. Every PUT started runs to its end, so 4
+  nodes that answer first, and need not store anything, can no longer keep a chunk from the rest
+  of its close group. Costs about 7/4 of the upload traffic of before, and a store now waits for
+  the slowest of its 7 nodes (each PUT has its usual time limit). Applies to the native client
+  and the browser build alike.
 - `PaymentMode::Single` is the default of the library (`PaymentMode::default()`,
   `Client::file_upload`, `file_prepare_upload`) and of the browser API, so programs built on
   ant-core pay per chunk unless they ask for batches.

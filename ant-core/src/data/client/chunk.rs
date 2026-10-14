@@ -222,7 +222,7 @@ use ant_protocol::transport::{MultiAddr, PeerId};
 use ant_protocol::{
     compute_address, detect_proof_type, ChunkGetRequest, ChunkGetResponse, ChunkMessage,
     ChunkMessageBody, ChunkPutRequest, ChunkPutResponse, DataChunk, ProofType, ProtocolError,
-    XorName, CLOSE_GROUP_MAJORITY,
+    XorName, CLOSE_GROUP_MAJORITY, CLOSE_GROUP_SIZE,
 };
 use bytes::Bytes;
 use futures::stream::{self, StreamExt};
@@ -485,7 +485,8 @@ impl Client {
     /// Checks if the chunk already exists before paying. If it does,
     /// returns the address immediately without incurring on-chain costs.
     /// Otherwise collects quotes, pays on-chain, then stores with proof
-    /// to `CLOSE_GROUP_MAJORITY` peers.
+    /// on the close group, needing `CLOSE_GROUP_MAJORITY` peers to accept
+    /// (`chunk_put_to_close_group`).
     ///
     /// # Errors
     ///
@@ -546,16 +547,22 @@ impl Client {
         self.chunk_put_to_close_group(content, proof, &peers).await
     }
 
-    /// Store a chunk to `CLOSE_GROUP_MAJORITY` peers, falling back past full or
-    /// over-priced members of the supplied put-target set (ADR-0002).
+    /// Store a chunk on the `CLOSE_GROUP_SIZE` first peers of the supplied
+    /// put-target set, falling back past full or over-priced members of it
+    /// (ADR-0002), and count it stored once `CLOSE_GROUP_MAJORITY` accept.
     ///
-    /// Sends the PUT concurrently to the first `CLOSE_GROUP_MAJORITY` peers. On
+    /// Sends the PUT concurrently to the first `CLOSE_GROUP_SIZE` peers. On
     /// each failure it advances to the next peer in `peers` — which the caller
     /// supplies as the chunk's closest ~K neighbourhood, so no further DHT
     /// lookup is needed. Every peer reuses the same payment proof: a node
     /// accepts it as long as one of the proof's quote issuers is within that
     /// peer's own local closest view, so the client never needs to re-quote or
     /// re-pay to route around a full node.
+    ///
+    /// Every PUT started runs to its end, even once a majority has accepted:
+    /// stopping at the first `CLOSE_GROUP_MAJORITY` answers would let that
+    /// many peers that answer fast, and need not store anything, keep the
+    /// chunk from the rest of its close group.
     ///
     /// # Errors
     ///
@@ -571,6 +578,7 @@ impl Client {
 
         let outcome = crate::client_engine::quorum_with_fallback(
             peers.iter().cloned(),
+            CLOSE_GROUP_SIZE,
             CLOSE_GROUP_MAJORITY,
             |(peer_id, addrs)| {
                 let content = content.clone();
@@ -1144,7 +1152,8 @@ impl Client {
     /// [`PreparedChunk`] (from [`Client::prepare_chunk_payment`]) and a
     /// `quote_hash -> tx_hash` map containing receipts for every non-zero
     /// quote in the chunk's payment. Builds the `PaymentProof` and stores
-    /// the chunk on `CLOSE_GROUP_MAJORITY` peers, returning its address.
+    /// the chunk on its close group, at least `CLOSE_GROUP_MAJORITY` peers
+    /// (`chunk_put_to_close_group`), returning its address.
     ///
     /// Wave-batch payment shape only. Single-chunk publishes don't need
     /// Merkle batching: one chunk's worth of quotes is well below the

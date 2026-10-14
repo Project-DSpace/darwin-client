@@ -46,14 +46,19 @@ pub(crate) struct QuorumOutcome<T, E> {
     pub(crate) reached: bool,
 }
 
-/// Run an operation against the first `required` targets concurrently, using
-/// later targets one-for-one as fallbacks when an attempt fails.
+/// Run an operation against the first `wanted` targets concurrently, using
+/// later targets one-for-one as fallbacks when an attempt fails, until
+/// `wanted` succeed or the targets run out. Quorum is reached once `required`
+/// succeed.
 ///
-/// The function returns as soon as quorum is reached and drops any remaining
-/// in-flight work. This is the transport-neutral close-group delivery policy
-/// shared by native QUIC and browser WebRTC uploads.
+/// With `wanted == required` the function returns as soon as quorum is
+/// reached. A larger `wanted` keeps every attempt it started running to the
+/// end, so a quorum of fast answers can't cut the others short. This is the
+/// transport-neutral close-group delivery policy shared by native QUIC and
+/// browser WebRTC uploads.
 pub(crate) async fn quorum_with_fallback<T, F, Fut, V, E>(
     targets: impl IntoIterator<Item = T>,
+    wanted: usize,
     required: usize,
     operation: F,
 ) -> QuorumOutcome<T, E>
@@ -62,7 +67,8 @@ where
     F: Fn(T) -> Fut,
     Fut: Future<Output = Result<V, E>>,
 {
-    if required == 0 {
+    let wanted = wanted.max(required);
+    if wanted == 0 {
         return QuorumOutcome {
             successful_targets: Vec::new(),
             failures: Vec::new(),
@@ -76,22 +82,20 @@ where
         async move { (target, future.await) }
     };
     let mut in_flight = FuturesUnordered::new();
-    for target in targets.by_ref().take(required) {
+    for target in targets.by_ref().take(wanted) {
         in_flight.push(launch(target));
     }
 
-    let mut successful_targets = Vec::with_capacity(required);
+    let mut successful_targets = Vec::with_capacity(wanted);
     let mut failures = Vec::new();
+    // A target is launched only to replace a failure, so once `wanted` have
+    // succeeded nothing is left in flight.
     while let Some((target, result)) = in_flight.next().await {
         match result {
             Ok(_) => {
                 successful_targets.push(target);
-                if successful_targets.len() >= required {
-                    return QuorumOutcome {
-                        successful_targets,
-                        failures,
-                        reached: true,
-                    };
+                if successful_targets.len() >= wanted {
+                    break;
                 }
             }
             Err(error) => {
@@ -103,10 +107,11 @@ where
         }
     }
 
+    let reached = successful_targets.len() >= required;
     QuorumOutcome {
         successful_targets,
         failures,
-        reached: false,
+        reached,
     }
 }
 
@@ -350,7 +355,7 @@ mod tests {
         let outcome = futures::executor::block_on({
             let launched = Rc::clone(&launched);
             async move {
-                quorum_with_fallback(0_u8..7, 4, move |_| {
+                quorum_with_fallback(0_u8..7, 4, 4, move |_| {
                     launched.set(launched.get() + 1);
                     futures_util::future::ready(Ok::<(), ()>(()))
                 })
@@ -373,7 +378,7 @@ mod tests {
         let outcome = futures::executor::block_on({
             let launched = Rc::clone(&launched);
             async move {
-                quorum_with_fallback(0_u8..7, 4, move |target| {
+                quorum_with_fallback(0_u8..7, 4, 4, move |target| {
                     launched.set(launched.get() + 1);
                     futures_util::future::ready(if target < 2 { Err(target) } else { Ok(()) })
                 })
@@ -393,7 +398,7 @@ mod tests {
     #[test]
     fn quorum_reports_exhausted_target_set() {
         let outcome = futures::executor::block_on(async {
-            quorum_with_fallback(0_u8..7, 4, |target| {
+            quorum_with_fallback(0_u8..7, 4, 4, |target| {
                 futures_util::future::ready(Err::<(), _>(target))
             })
             .await
@@ -408,7 +413,7 @@ mod tests {
     #[test]
     fn quorum_reports_partial_success_targets_when_exhausted() {
         let outcome = futures::executor::block_on(async {
-            quorum_with_fallback(0_u8..7, 4, |target| {
+            quorum_with_fallback(0_u8..7, 4, 4, |target| {
                 futures_util::future::ready(if target < 3 { Ok(()) } else { Err(target) })
             })
             .await
@@ -420,6 +425,80 @@ mod tests {
         successful_targets.sort_unstable();
         assert_eq!(successful_targets, vec![0, 1, 2]);
         assert_eq!(outcome.failures.len(), 4);
+    }
+
+    #[test]
+    fn a_wider_spread_starts_every_wanted_target_and_replaces_failures() {
+        for (targets, failing, launched, stored) in [
+            // Every one of the seven wanted targets is sent to.
+            (7_u8, 0_u8, 7, 7),
+            // Failures are replaced by later targets until seven succeed.
+            (10, 3, 10, 7),
+            // Too few targets to replace them: the quorum still counts.
+            (7, 3, 7, 4),
+        ] {
+            let launched_count = Rc::new(Cell::new(0usize));
+            let outcome = futures::executor::block_on({
+                let launched_count = Rc::clone(&launched_count);
+                async move {
+                    quorum_with_fallback(0_u8..targets, 7, 4, move |target| {
+                        launched_count.set(launched_count.get() + 1);
+                        futures_util::future::ready(if target < failing {
+                            Err(target)
+                        } else {
+                            Ok(())
+                        })
+                    })
+                    .await
+                }
+            });
+            assert!(outcome.reached);
+            assert_eq!(launched_count.get(), launched);
+            assert_eq!(outcome.successful_targets.len(), stored);
+            assert_eq!(outcome.failures.len(), usize::from(failing));
+        }
+
+        let outcome = futures::executor::block_on(quorum_with_fallback(0_u8..7, 7, 4, |target| {
+            futures_util::future::ready(if target < 4 { Err(target) } else { Ok(()) })
+        }));
+        assert!(!outcome.reached, "three stores are short of the quorum");
+        assert_eq!(outcome.successful_targets.len(), 3);
+    }
+
+    #[test]
+    fn a_wider_spread_waits_for_slow_targets_after_quorum() {
+        use futures::channel::oneshot;
+        use futures_util::FutureExt as _;
+
+        let mut senders = Vec::new();
+        let mut receivers = Vec::new();
+        for _ in 0..3 {
+            let (sender, receiver) = oneshot::channel::<()>();
+            senders.push(sender);
+            receivers.push(Some(receiver));
+        }
+        let receivers = std::cell::RefCell::new(receivers);
+        futures::executor::block_on(async {
+            let spread = quorum_with_fallback(0_usize..7, 7, 4, |target| {
+                let slow = (target >= 4).then(|| receivers.borrow_mut()[target - 4].take());
+                async move {
+                    match slow.flatten() {
+                        Some(receiver) => receiver.await.map_err(|_| target),
+                        None => Ok(()),
+                    }
+                }
+            });
+            futures_util::pin_mut!(spread);
+            // Four fast stores reach the quorum, but the three slow ones
+            // still run: they are not dropped.
+            assert!(spread.as_mut().now_or_never().is_none());
+            for sender in senders {
+                sender.send(()).expect("store still awaited");
+            }
+            let outcome = spread.await;
+            assert!(outcome.reached);
+            assert_eq!(outcome.successful_targets.len(), 7);
+        });
     }
 
     #[test]

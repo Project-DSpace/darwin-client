@@ -155,7 +155,7 @@ test("a just-uploaded file downloads and streams after its holders fail discover
     }));
     assert.equal(uploaded.file.replicas, 4);
     const holders = rtc.stores.map((records, index) => records.has(uploaded.file.address) ? index : -1).filter(index => index >= 0);
-    assert.equal(holders.length, 4);
+    assert.equal(holders.length, 7, "a new record is sent to all seven nearest nodes");
     for (const index of holders) nodes[index].respond = failDiscovery;
     const downloaded = await client.downloadPublicFile(uploaded.file, 3);
     assert.deepEqual(downloaded.content, content);
