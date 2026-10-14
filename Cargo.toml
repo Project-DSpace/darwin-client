@@ -5,4 +5,4 @@ resolver = "2"
 
 # Temporary: DataMapIndex from WithAutonomi/self_encryption#447, until 0.36.2 is published.
 [patch.crates-io]
-self_encryption = { git = "https://github.com/WithAutonomi/self_encryption", rev = "e8aa39ee1337c11f52628356d97fa86ac0d1007d" }
+self_encryption = { git = "https://github.com/WithAutonomi/self_encryption", rev = "869b2f94d5b3b2c5a488e74c477939b5544ffc22" }

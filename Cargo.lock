@@ -5810,7 +5810,7 @@ dependencies = [
 [[package]]
 name = "self_encryption"
 version = "0.36.2"
-source = "git+https://github.com/WithAutonomi/self_encryption?rev=e8aa39ee1337c11f52628356d97fa86ac0d1007d#e8aa39ee1337c11f52628356d97fa86ac0d1007d"
+source = "git+https://github.com/WithAutonomi/self_encryption?rev=869b2f94d5b3b2c5a488e74c477939b5544ffc22#869b2f94d5b3b2c5a488e74c477939b5544ffc22"
 dependencies = [
  "bincode",
  "blake3",
