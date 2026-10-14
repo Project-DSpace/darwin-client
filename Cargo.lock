@@ -5810,7 +5810,8 @@ dependencies = [
 [[package]]
 name = "self_encryption"
 version = "0.36.2"
-source = "git+https://github.com/WithAutonomi/self_encryption?rev=869b2f94d5b3b2c5a488e74c477939b5544ffc22#869b2f94d5b3b2c5a488e74c477939b5544ffc22"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6a6c9e93b470f0fb747a609cfd7c4a23ea39bfbc1813de3d00fa429a9dc99e38"
 dependencies = [
  "bincode",
  "blake3",
