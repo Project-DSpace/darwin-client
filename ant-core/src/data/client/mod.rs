@@ -38,7 +38,7 @@ use crate::data::network::Network;
 use crate::data::network::NetworkHealth;
 #[cfg(feature = "native")]
 use crate::data::peer_cache;
-use ant_protocol::evm::Wallet;
+use ant_protocol::evm::{Amount, Wallet};
 #[cfg(feature = "native")]
 use ant_protocol::transport::P2PNode;
 use ant_protocol::transport::{MultiAddr, PeerId};
@@ -531,6 +531,15 @@ pub struct ClientConfig {
     /// several transfers at once should set a fixed budget, so downloads
     /// don't each claim a share of whatever is free.
     pub download_memory_bytes: Option<u64>,
+    /// The most a storer's quote may ask to store one chunk, in the payment
+    /// token's base units. A quote, or merkle candidate, asking more is
+    /// dropped as if its node hadn't answered, and no payment is planned on
+    /// one. The client pays three times the price of the median quote it
+    /// keeps, so a chunk then costs at most three times this. A payment
+    /// planned before the ceiling was set or lowered, and saved by an
+    /// interrupted upload, is resumed as saved, so it is never made twice.
+    /// `None` (the default): no ceiling.
+    pub max_chunk_price: Option<Amount>,
 }
 
 impl Default for ClientConfig {
@@ -548,6 +557,7 @@ impl Default for ClientConfig {
             ipv6: true,
             merkle_external_batch_cap: None,
             download_memory_bytes: None,
+            max_chunk_price: None,
         }
     }
 }

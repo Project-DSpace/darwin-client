@@ -173,3 +173,35 @@ pub(crate) fn validate_commitment_binding<P: QuotePrice, C: Commitment>(
     }
     Ok(())
 }
+
+/// The caller's price ceiling: the most a quote may ask for one chunk
+/// (`ClientConfig::max_chunk_price`), checked after the price is known to be
+/// the one its commitment forces. A quote asking more is dropped before
+/// payment, as if its node hadn't answered. `None`: no ceiling.
+pub(crate) fn validate_price_ceiling<P: QuotePrice + Ord>(
+    price: P,
+    ceiling: Option<P>,
+) -> Result<(), String> {
+    match ceiling {
+        Some(ceiling) if price > ceiling => Err(format!(
+            "price {price} is above the price ceiling {ceiling}"
+        )),
+        _ => Ok(()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ant_protocol::evm::Amount;
+
+    #[test]
+    fn a_price_ceiling_drops_only_quotes_above_it() {
+        let price = Amount::from(1_000u64);
+        assert!(validate_price_ceiling(price, None).is_ok(), "no ceiling");
+        assert!(validate_price_ceiling(price, Some(price)).is_ok());
+        assert!(validate_price_ceiling(price, Some(Amount::from(1_001u64))).is_ok());
+        let error = validate_price_ceiling(price, Some(Amount::from(999u64))).unwrap_err();
+        assert_eq!(error, "price 1000 is above the price ceiling 999");
+    }
+}

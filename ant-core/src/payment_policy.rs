@@ -9,7 +9,7 @@ use ant_protocol::CLOSE_GROUP_SIZE;
 pub(crate) const SINGLE_NODE_PAYMENT_MULTIPLIER: u64 = 3;
 
 /// Arithmetic supplied by each adapter without narrowing native U256 amounts.
-pub(crate) trait PaymentAmount: Copy + Ord {
+pub(crate) trait PaymentAmount: Copy + Ord + std::fmt::Display {
     const ZERO: Self;
     fn checked_mul_multiplier(self, multiplier: u64) -> Option<Self>;
 }
@@ -34,6 +34,8 @@ pub(crate) enum PaymentPlanError {
     InvalidQuoteCount(usize),
     #[error("Price overflow when calculating 3x median")]
     PriceOverflow,
+    #[error("the quote to be paid asks {price}, above the price ceiling {ceiling}")]
+    AboveCeiling { price: String, ceiling: String },
 }
 
 struct RankedQuotes {
@@ -82,13 +84,31 @@ pub(crate) struct SingleNodePaymentPlan<P> {
 
 impl<P: PaymentAmount> SingleNodePaymentPlan<P> {
     pub(crate) fn from_prices(prices: &[P]) -> Result<Self, PaymentPlanError> {
+        Self::from_prices_within(prices, None)
+    }
+
+    /// As [`Self::from_prices`], refusing to plan a payment on a quote asking
+    /// more than `ceiling` (`ClientConfig::max_chunk_price`): the last line
+    /// behind the quote checks, which drop such quotes first. `None`: no
+    /// ceiling.
+    pub(crate) fn from_prices_within(
+        prices: &[P],
+        ceiling: Option<P>,
+    ) -> Result<Self, PaymentPlanError> {
         if !(1..=CLOSE_GROUP_SIZE).contains(&prices.len()) {
             return Err(PaymentPlanError::InvalidQuoteCount(prices.len()));
         }
         let ranked =
             rank_quotes(prices).ok_or(PaymentPlanError::InvalidQuoteCount(prices.len()))?;
         let paid_quote_index = ranked.quote_indices[ranked.paid_position];
-        let amount = enhanced_payment_amount(prices[paid_quote_index])?;
+        let paid_price = prices[paid_quote_index];
+        if let Some(ceiling) = ceiling.filter(|ceiling| paid_price > *ceiling) {
+            return Err(PaymentPlanError::AboveCeiling {
+                price: paid_price.to_string(),
+                ceiling: ceiling.to_string(),
+            });
+        }
+        let amount = enhanced_payment_amount(paid_price)?;
         Ok(Self {
             quotes: ranked
                 .quote_indices
@@ -173,6 +193,33 @@ mod tests {
                 .amount,
             3,
         );
+    }
+
+    #[test]
+    fn a_price_ceiling_refuses_a_plan_paying_above_it() {
+        // The median quote, 30, is the one paid.
+        let prices = [10_u128, 30, 40, 20];
+        for ceiling in [None, Some(30), Some(u128::MAX)] {
+            let plan = SingleNodePaymentPlan::from_prices_within(&prices, ceiling).unwrap();
+            assert_eq!(plan.paid_quote().amount, 90);
+        }
+        assert_eq!(
+            SingleNodePaymentPlan::from_prices_within(&prices, Some(29)).unwrap_err(),
+            PaymentPlanError::AboveCeiling {
+                price: "30".into(),
+                ceiling: "29".into()
+            },
+        );
+        // Only the paid quote matters: an unpaid one above the ceiling costs
+        // nothing.
+        assert!(SingleNodePaymentPlan::from_prices_within(&[1_u128, 1, 1_000], Some(1)).is_ok());
+        {
+            use ant_protocol::evm::Amount;
+            let native = prices.map(Amount::from);
+            assert!(
+                SingleNodePaymentPlan::from_prices_within(&native, Some(Amount::from(29))).is_err()
+            );
+        }
     }
 
     #[test]

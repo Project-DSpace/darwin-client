@@ -1,4 +1,4 @@
-use ant_core::data::MultiAddr;
+use ant_core::data::{MultiAddr, U256};
 use clap::{ArgAction, Parser, Subcommand};
 use std::path::PathBuf;
 
@@ -95,6 +95,14 @@ pub struct Cli {
     #[arg(long)]
     pub evm_network: Option<String>,
 
+    /// The most a node's quote may ask to store one chunk, in the payment
+    /// token's base units (10^-18 of a token). Quotes asking more are
+    /// ignored, as if their node hadn't answered, and no payment is made on
+    /// one. A chunk is paid 3 times the median quote, so it then costs at
+    /// most 3 times this. Default: no ceiling.
+    #[arg(long, value_name = "BASE_UNITS", value_parser = parse_base_units)]
+    pub max_chunk_price: Option<U256>,
+
     #[command(subcommand)]
     pub command: Commands,
 }
@@ -141,6 +149,16 @@ pub enum Commands {
     Update(UpdateArgs),
 }
 
+/// clap value parser for an amount of the payment token in its base units:
+/// a whole decimal number, as the chain counts it.
+fn parse_base_units(s: &str) -> Result<U256, String> {
+    if s.is_empty() || !s.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err("not a whole number of base units".to_string());
+    }
+    s.parse::<U256>()
+        .map_err(|e| format!("not a number of base units: {e}"))
+}
+
 /// clap value parser that rejects 0 for the deprecated concurrency
 /// pins (a pin of 0 silently disables itself in the controller, which
 /// is confusing — fail fast at parse time instead).
@@ -184,5 +202,30 @@ mod bootstrap_tests {
             "address"
         ])
         .is_err());
+    }
+
+    #[test]
+    fn a_chunk_price_ceiling_is_optional_and_in_base_units() {
+        let cli = Cli::try_parse_from(["darwin", "wallet", "address"]).unwrap();
+        assert_eq!(cli.max_chunk_price, None, "no ceiling unless asked");
+        let cli = Cli::try_parse_from([
+            "darwin",
+            "--max-chunk-price",
+            "1250000000000000000",
+            "wallet",
+            "address",
+        ])
+        .unwrap();
+        assert_eq!(
+            cli.max_chunk_price,
+            Some(U256::from(1_250_000_000_000_000_000u128))
+        );
+        for bad in ["1.25", "-1", "", "0x10", "1 DARWIN"] {
+            assert!(
+                Cli::try_parse_from(["darwin", "--max-chunk-price", bad, "wallet", "address"])
+                    .is_err(),
+                "{bad:?}"
+            );
+        }
     }
 }

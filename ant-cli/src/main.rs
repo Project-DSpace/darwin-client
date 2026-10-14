@@ -81,6 +81,7 @@ async fn run() -> anyhow::Result<()> {
         chunk_get_timeout_secs,
         verbose: _,
         evm_network,
+        max_chunk_price,
         quote_concurrency,
         store_concurrency,
     } = cli;
@@ -95,6 +96,7 @@ async fn run() -> anyhow::Result<()> {
         store_timeout_secs,
         chunk_get_timeout_secs,
         evm_network,
+        max_chunk_price,
         quote_concurrency,
         store_concurrency,
     };
@@ -226,6 +228,7 @@ struct DataCliContext {
     store_timeout_secs: Option<u64>,
     chunk_get_timeout_secs: Option<u64>,
     evm_network: Option<String>,
+    max_chunk_price: Option<ant_core::data::U256>,
     quote_concurrency: Option<usize>,
     store_concurrency: Option<usize>,
 }
@@ -331,6 +334,7 @@ async fn build_data_client(
 
     let mut config = ClientConfig {
         quote_timeout_secs: ctx.quote_timeout_secs,
+        max_chunk_price: ctx.max_chunk_price,
         ..Default::default()
     };
     if let Some(t) = ctx.store_timeout_secs {

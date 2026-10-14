@@ -155,8 +155,11 @@ impl Client {
         }
 
         // 3. Create single-node payment (sorts by price, selects median)
-        let payment = SingleNodeQuotePayment::from_quotes(quotes_for_payment)
-            .map_err(|e| Error::Payment(format!("Failed to create payment: {e}")))?;
+        let payment = SingleNodeQuotePayment::from_quotes_within(
+            quotes_for_payment,
+            self.config().max_chunk_price,
+        )
+        .map_err(|e| Error::Payment(format!("Failed to create payment: {e}")))?;
 
         info!(
             "Selected SNP median paid quote issuer {} for address {} (median price: {})",

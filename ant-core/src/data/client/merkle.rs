@@ -1657,6 +1657,15 @@ impl Client {
                         failures.push(format!("{peer_id}: bad commitment binding ({detail})"));
                         continue;
                     }
+                    // The caller's price ceiling, as for a single-node quote.
+                    if let Err(detail) = crate::quote_validation::validate_price_ceiling(
+                        candidate.price,
+                        self.config().max_chunk_price,
+                    ) {
+                        warn!("Dropping merkle candidate {peer_id}: {detail}");
+                        failures.push(format!("{peer_id}: {detail}"));
+                        continue;
+                    }
                     valid.push((candidate_peer, candidate));
                 }
                 // A storer that has explicitly declared this client

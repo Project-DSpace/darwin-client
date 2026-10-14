@@ -61,6 +61,14 @@ told apart by the commit `darwin --version` prints. Upstream's entries follow.
   dspace-gateway, until the first payer paid or gave up). Wallet uploads without an envelope
   keep their shared checkpoint. A payer's upload interrupted under an earlier build, without an
   envelope, isn't resumed by this one: finish or drain such uploads before upgrading.
+- An optional price ceiling: `--max-chunk-price <BASE_UNITS>`, or `ClientConfig::max_chunk_price`
+  in the library, the most a node's quote may ask to store one chunk, in the token's base units.
+  A quote or merkle candidate asking more is dropped as if its node hadn't answered, and the
+  payment planner refuses to plan a payment on one as a last line, so a chunk costs at most 3
+  times the ceiling. Unset, the default, there is no ceiling, as before: nodes can ask up to the
+  price of the 1,000,000 records a commitment may count, 31,250 DARWIN, so 93,750 DARWIN for one
+  chunk. A payment planned before the ceiling and saved by an interrupted upload is resumed as
+  saved, never made twice.
 - `PaymentMode::Single` is the default of the library (`PaymentMode::default()`,
   `Client::file_upload`, `file_prepare_upload`) and of the browser API, so programs built on
   ant-core pay per chunk unless they ask for batches.

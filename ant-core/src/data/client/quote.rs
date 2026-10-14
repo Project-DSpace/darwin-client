@@ -516,6 +516,19 @@ where
     collect().await
 }
 
+/// Drop a quote asking more than `ceiling` (`ClientConfig::max_chunk_price`)
+/// as if its node hadn't answered: collection counts it a failure and asks
+/// the next peer. A claim to hold the chunk already, which is paid nothing,
+/// passes through.
+fn within_price_ceiling(
+    quote_result: Result<(PaymentQuote, Amount, Option<Vec<u8>>)>,
+    ceiling: Option<Amount>,
+) -> Result<(PaymentQuote, Amount, Option<Vec<u8>>)> {
+    let (quote, price, commitment) = quote_result?;
+    crate::quote_validation::validate_price_ceiling(price, ceiling).map_err(Error::Payment)?;
+    Ok((quote, price, commitment))
+}
+
 /// Fold one peer's quote result into the collection state.
 ///
 /// Returns `Err` only when collection must stop outright: a storer has said
@@ -1254,6 +1267,7 @@ impl Client {
         // can discard it. Checked before any quote plan is built.
         let mut settlement_refusal: Option<Error> = None;
         let refusals = self.settlement_refusals();
+        let ceiling = self.config().max_chunk_price;
 
         if staged_witnessed_collection {
             let mut quote_futures = FuturesUnordered::new();
@@ -1304,7 +1318,7 @@ impl Client {
                         record_store_quote_result(
                             peer_id,
                             addrs,
-                            quote_result,
+                            within_price_ceiling(quote_result, ceiling),
                             &mut quotes,
                             &mut already_stored_peers,
                             &mut failures,
@@ -1359,7 +1373,7 @@ impl Client {
                         record_store_quote_result(
                             peer_id,
                             addrs,
-                            quote_result,
+                            within_price_ceiling(quote_result, ceiling),
                             &mut quotes,
                             &mut already_stored_peers,
                             &mut failures,
@@ -3138,6 +3152,51 @@ mod tests {
         assert!(outcome.is_ok());
         assert!(quotes.is_empty() && failures.is_empty());
         assert_eq!(already_stored, vec![(peer, addrs)]);
+    }
+
+    /// A quote above the caller's price ceiling is a failure, so collection
+    /// asks the next peer, as if its node hadn't answered. At the ceiling it
+    /// is kept, and a claim to hold the chunk passes through.
+    #[test]
+    fn a_quote_above_the_price_ceiling_is_dropped_as_if_unanswered() {
+        let mut quotes = Vec::new();
+        let mut already_stored = Vec::new();
+        let mut failures = Vec::new();
+        let mut bad_quotes = 0usize;
+        let mut refusal_slot: Option<Error> = None;
+        let refusals = SettlementRefusals::default();
+        let (peer, addrs, quote, price, commitment) = synthetic_quote(0x49, 1_000);
+
+        for ceiling in [Amount::from(999u64), price] {
+            let result = within_price_ceiling(
+                Ok((quote.clone(), price, commitment.clone())),
+                Some(ceiling),
+            );
+            record_store_quote_result(
+                peer,
+                addrs.clone(),
+                result,
+                &mut quotes,
+                &mut already_stored,
+                &mut failures,
+                &mut bad_quotes,
+                &mut refusal_slot,
+                &refusals,
+            )
+            .unwrap();
+        }
+
+        assert_eq!(quotes.len(), 1, "only the quote at the ceiling is kept");
+        assert_eq!(failures.len(), 1);
+        assert!(
+            failures[0].contains("price 1000 is above the price ceiling 999"),
+            "{failures:?}"
+        );
+        assert!(within_price_ceiling(Ok((quote, price, commitment)), None).is_ok());
+        assert!(matches!(
+            within_price_ceiling(Err(Error::AlreadyStored), Some(Amount::ZERO)),
+            Err(Error::AlreadyStored)
+        ));
     }
 
     /// A storer being behind must NOT abort. Otherwise one lagging peer in the

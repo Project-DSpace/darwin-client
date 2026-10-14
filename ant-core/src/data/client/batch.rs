@@ -56,9 +56,19 @@ impl SingleNodeQuotePayment {
     /// price, and every other quote is included with a zero amount so proof and
     /// payment intent construction stay aligned.
     pub fn from_quotes(quotes: Vec<PaymentQuote>) -> Result<Self> {
+        Self::from_quotes_within(quotes, None)
+    }
+
+    /// As [`Self::from_quotes`], refusing a payment whose paid quote asks
+    /// more than `ceiling` (`ClientConfig::max_chunk_price`).
+    pub(crate) fn from_quotes_within(
+        quotes: Vec<PaymentQuote>,
+        ceiling: Option<Amount>,
+    ) -> Result<Self> {
         let prices = quotes.iter().map(|quote| quote.price).collect::<Vec<_>>();
-        let plan = crate::payment_policy::SingleNodePaymentPlan::from_prices(&prices)
-            .map_err(|error| Error::Payment(error.to_string()))?;
+        let plan =
+            crate::payment_policy::SingleNodePaymentPlan::from_prices_within(&prices, ceiling)
+                .map_err(|error| Error::Payment(error.to_string()))?;
         let quotes = plan
             .quotes
             .into_iter()
@@ -370,11 +380,13 @@ pub(crate) fn build_plan_proof(
 }
 
 /// Turn a verified quote plan into a payment plan: the median payment and the
-/// quotes and commitments its proof carries.
+/// quotes and commitments its proof carries. A payment above `ceiling`
+/// (`ClientConfig::max_chunk_price`) is refused.
 fn payment_plan_from_quotes(
     address: XorName,
     data_size: u64,
     quote_plan: StoreQuotePlan,
+    ceiling: Option<Amount>,
 ) -> Result<ChunkPaymentPlan> {
     let quotes_with_peers = quote_plan.quotes;
 
@@ -399,7 +411,7 @@ fn payment_plan_from_quotes(
         }
     }
 
-    let payment = SingleNodeQuotePayment::from_quotes(quotes_for_payment)
+    let payment = SingleNodeQuotePayment::from_quotes_within(quotes_for_payment, ceiling)
         .map_err(|e| Error::Payment(format!("Failed to create payment: {e}")))?;
 
     Ok(ChunkPaymentPlan {
@@ -476,7 +488,13 @@ impl Client {
             }
             Err(e) => return Err(e),
         };
-        payment_plan_from_quotes(address, data_size, quote_plan).map(Some)
+        payment_plan_from_quotes(
+            address,
+            data_size,
+            quote_plan,
+            self.config().max_chunk_price,
+        )
+        .map(Some)
     }
 
     /// Quote `content` from the close group around `routing` and plan its
@@ -497,7 +515,12 @@ impl Client {
         let quote_plan = self
             .get_store_quote_plan_split(routing, content, data_size, data_type)
             .await?;
-        payment_plan_from_quotes(*content, data_size, quote_plan)
+        payment_plan_from_quotes(
+            *content,
+            data_size,
+            quote_plan,
+            self.config().max_chunk_price,
+        )
     }
 
     /// Pay for multiple chunks in a single EVM transaction.
