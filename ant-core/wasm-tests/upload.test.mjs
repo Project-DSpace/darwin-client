@@ -45,8 +45,11 @@ for (const existing of [1, 3]) {
   });
 }
 
-test("four distinct already-stored votes skip both payment and PUTs", async () => {
+test("four distinct already-stored votes that serve the records skip both payment and PUTs", async () => {
   const rtc = mockWebRtc(Array.from({ length: 7 }, (_, i) => ({ alreadyStored: i < 4 })));
+  for (const record of encryptPublicFile(content).records) {
+    for (const store of rtc.stores.slice(0, 4)) store.set(record.address, record.content);
+  }
   const client = new BrowserNetworkClient(rtc.endpoints);
   const signer = wallet();
   try {
@@ -55,6 +58,31 @@ test("four distinct already-stored votes skip both payment and PUTs", async () =
     assert.equal(result.storageCostAtto, "0");
     assert.equal(result.file.replicas, 4);
     assert.equal(rtc.requests.filter(({ method }) => method === "put_chunk").length, 0);
+    // Each claim was proven by reading the record back from all four claimants.
+    const reads = rtc.requests.filter(({ method }) => method === "get_chunk");
+    assert.equal(reads.length, result.records * 4);
+    assert.ok(reads.every(({ node }) => node < 4));
+  } finally {
+    client.close();
+  }
+});
+
+test("four already-stored votes whose nodes don't hold the records are paid and stored", async () => {
+  const rtc = mockWebRtc(Array.from({ length: 7 }, (_, i) => ({ alreadyStored: i < 4 })));
+  const claimants = rtc.endpoints.slice(0, 4).map(endpoint => parseWebRtcDirectMultiaddr(endpoint).peerId);
+  const client = new BrowserNetworkClient(rtc.endpoints);
+  const signer = wallet();
+  try {
+    const result = await upload(client, signer);
+    assert.equal(signer.calls.length, 1, "an unproven claim must not skip the payment");
+    assert.equal(signer.calls[0].quotes.length, result.records);
+    assert.ok(signer.calls[0].quotes.every(({ quote }) => !claimants.includes(quote.peer_id)),
+      "unproven claimants are not paid");
+    const puts = rtc.requests.filter(({ method }) => method === "put_chunk");
+    assert.ok(puts.length >= result.records * 4);
+    for (const record of encryptPublicFile(content).records) {
+      assert.ok(rtc.stores.filter(store => store.has(record.address)).length >= 4);
+    }
   } finally {
     client.close();
   }

@@ -158,27 +158,54 @@ pub(crate) fn scope_views<K: Peer>(
         .collect()
 }
 
-pub(crate) fn already_stored<K: Peer>(
+/// The peers claiming to hold the record among the closest `CLOSE_GROUP_SIZE`
+/// valid responses, closest first. Only these claims count: the record is
+/// already stored only if `CLOSE_GROUP_MAJORITY` of them prove it
+/// ([`proven_by_majority`]).
+pub(crate) fn counted_holders<K: Peer>(
     payable: impl IntoIterator<Item = K>,
     holders: impl IntoIterator<Item = K>,
     address: &[u8; 32],
-) -> bool {
+) -> Vec<K> {
     let mut responses = payable
         .into_iter()
-        .map(|peer| (false, distance(&peer, address)))
-        .chain(
-            holders
-                .into_iter()
-                .map(|peer| (true, distance(&peer, address))),
-        )
+        .map(|peer| (false, peer))
+        .chain(holders.into_iter().map(|peer| (true, peer)))
         .collect::<Vec<_>>();
-    responses.sort_by_key(|response| response.1);
+    responses.sort_by_key(|response| distance(&response.1, address));
     responses
-        .iter()
+        .into_iter()
         .take(CLOSE_GROUP_SIZE)
         .filter(|response| response.0)
-        .count()
-        >= CLOSE_GROUP_MAJORITY
+        .map(|response| response.1)
+        .collect()
+}
+
+/// Whether `CLOSE_GROUP_MAJORITY` of `claimants` prove they hold a record.
+/// Claimants are asked one at a time, in the order given, so at most one
+/// proof is in flight; asking stops once that many have proved it, or once
+/// too few are left to. A claimant whose proof fails, for whatever reason,
+/// does not count.
+pub(crate) async fn proven_by_majority<C, F, Fut>(claimants: Vec<C>, mut prove: F) -> bool
+where
+    F: FnMut(C) -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    let mut left = claimants.len();
+    let mut proven = 0usize;
+    for claimant in claimants {
+        if proven + left < CLOSE_GROUP_MAJORITY {
+            break;
+        }
+        left -= 1;
+        if prove(claimant).await {
+            proven += 1;
+            if proven >= CLOSE_GROUP_MAJORITY {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 fn visit_subsets(
@@ -373,20 +400,49 @@ mod tests {
 
     #[test]
     fn storage_votes_only_count_in_closest_seven_valid_responses() {
-        assert!(!already_stored(
-            (1..=7).map(peer),
-            (8..=11).map(peer),
-            &[0; 32]
+        assert!(counted_holders((1..=7).map(peer), (8..=11).map(peer), &[0; 32]).is_empty());
+        assert_eq!(
+            counted_holders((5..=7).map(peer), [4, 2, 3, 1].map(peer), &[0; 32]),
+            (1..=4).map(peer).collect::<Vec<_>>(),
+            "the claims counted, closest first"
+        );
+        assert_eq!(
+            counted_holders((4..=7).map(peer), (1..=3).map(peer), &[0; 32]).len(),
+            CLOSE_GROUP_MAJORITY - 1
+        );
+    }
+
+    fn prove_with(results: &[bool]) -> (bool, Vec<usize>) {
+        let asked = std::cell::RefCell::new(Vec::new());
+        let proven = futures::executor::block_on(proven_by_majority(
+            (0..results.len()).collect(),
+            |claimant| {
+                asked.borrow_mut().push(claimant);
+                std::future::ready(results[claimant])
+            },
         ));
-        assert!(already_stored(
-            (5..=7).map(peer),
-            (1..=4).map(peer),
-            &[0; 32]
-        ));
-        assert!(!already_stored(
-            (4..=7).map(peer),
-            (1..=3).map(peer),
-            &[0; 32]
-        ));
+        (proven, asked.into_inner())
+    }
+
+    #[test]
+    fn a_claim_counts_only_once_a_majority_proves_it() {
+        // Every claimant proves it: the first majority suffices.
+        assert_eq!(prove_with(&[true; 7]), (true, vec![0, 1, 2, 3]));
+        // Failed proofs don't count; later claimants make up for them.
+        assert_eq!(
+            prove_with(&[false, true, false, true, true, true, true]),
+            (true, vec![0, 1, 2, 3, 4, 5])
+        );
+        // Asking stops as soon as a majority is out of reach.
+        assert_eq!(
+            prove_with(&[false, false, false, false, true, true, true]),
+            (false, vec![0, 1, 2, 3])
+        );
+        assert_eq!(prove_with(&[true, true, true]), (false, Vec::new()));
+        assert_eq!(prove_with(&[]), (false, Vec::new()));
+        assert_eq!(
+            prove_with(&[true, true, true, false]),
+            (false, vec![0, 1, 2, 3])
+        );
     }
 }

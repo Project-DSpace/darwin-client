@@ -29,6 +29,18 @@ told apart by the commit `darwin --version` prints. Upstream's entries follow.
 - A record whose quotes storers refuse for rate (darwin-node's per-peer and per-IP quote limits,
   met by several uploads at once from one address) is quoted again after 1, 2 and 4 seconds
   instead of failing the upload.
+- Uploads no longer take a node's word that it already holds a chunk. A chunk is skipped, unpaid,
+  only when `CLOSE_GROUP_MAJORITY` (4) of the 7 nearest nodes claim it and prove it by serving
+  it: the client reads it from the claimants one at a time, nearest first, and checks the bytes
+  against the address, stopping once 4 have. A failed, timed-out or wrong answer doesn't count.
+  Otherwise the chunk is quoted, paid and stored as usual, and the claimants that didn't prove
+  it aren't paid, as before for claims short of a majority. Before, 4 nodes placed near an
+  address could keep any new chunk there from being paid for or stored, and the upload
+  reported success. Re-running an interrupted upload still pays nothing for the chunks it
+  stored, and now reads each of them back from 4 nodes (4 × the chunk's size, at most 16 MB per
+  chunk). Applies to every quote: uploads, `chunk_put`, cost estimates and merkle preflight.
+  Pointer states are never proven this way (honest nodes make no such claim for them), so a
+  claim about one is ignored.
 - `PaymentMode::Single` is the default of the library (`PaymentMode::default()`,
   `Client::file_upload`, `file_prepare_upload`) and of the browser API, so programs built on
   ant-core pay per chunk unless they ask for batches.

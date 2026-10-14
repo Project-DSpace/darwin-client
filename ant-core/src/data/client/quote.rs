@@ -24,8 +24,8 @@ use ant_protocol::payment::verify_quote_signature;
 use ant_protocol::transport::{DHTNode, MultiAddr, PeerId, ResponderView, WitnessedCloseGroup};
 use ant_protocol::{
     client_update_required_message, ChunkMessage, ChunkMessageBody, ChunkQuoteRequest,
-    ChunkQuoteRequestV2, ChunkQuoteResponse, ProtocolError, CLOSE_GROUP_SIZE,
-    CURRENT_SETTLEMENT_VERSION,
+    ChunkQuoteRequestV2, ChunkQuoteResponse, ProtocolError, CLOSE_GROUP_MAJORITY, CLOSE_GROUP_SIZE,
+    CURRENT_SETTLEMENT_VERSION, DATA_TYPE_CHUNK,
 };
 use futures::stream::{FuturesUnordered, StreamExt};
 use std::collections::{HashMap, HashSet};
@@ -155,7 +155,8 @@ fn quote_commitment_binding_is_valid(
 ///
 /// - `Ok((quote, price))` — the response is honoured as a quote.
 /// - `Err(Error::AlreadyStored)` — the peer claims the chunk is already
-///   present AND the quote it provided binds to its peer ID. Vote counts.
+///   present AND the quote it provided binds to its peer ID. Vote counts,
+///   once the peer proves it by serving the chunk (`Client::claims_proven`).
 /// - `Err(Error::BadQuoteBinding { .. })` — bad binding (mirrors the
 ///   storer-side rejection). Outer collector counts these via the typed
 ///   variant (no string matching).
@@ -525,9 +526,8 @@ fn record_store_quote_result(
     peer_id: PeerId,
     addrs: Vec<MultiAddr>,
     quote_result: Result<(PaymentQuote, Amount, Option<Vec<u8>>)>,
-    address: &[u8; 32],
     quotes: &mut Vec<StoreQuote>,
-    already_stored_peers: &mut Vec<(PeerId, [u8; 32])>,
+    already_stored_peers: &mut Vec<(PeerId, Vec<MultiAddr>)>,
     failures: &mut Vec<String>,
     bad_quote_count: &mut usize,
     settlement_refusal: &mut Option<Error>,
@@ -537,10 +537,11 @@ fn record_store_quote_result(
         Ok((quote, price, commitment)) => {
             quotes.push((peer_id, addrs, quote, price, commitment));
         }
+        // Kept with its addresses: the claim is believed only once proven
+        // (`Client::claims_proven`).
         Err(Error::AlreadyStored) => {
             info!("Peer {peer_id} reports chunk already stored");
-            let dist = peer_xor_distance(&peer_id, address);
-            already_stored_peers.push((peer_id, dist));
+            already_stored_peers.push((peer_id, addrs));
         }
         // A storer that has explicitly declared this client incompatible ends
         // quote collection here. Recording it as one more failed peer would
@@ -981,8 +982,10 @@ impl Client {
     /// proceed, but still pays the median quote from the selected set when more
     /// quotes were successfully fetched.
     ///
-    /// Returns `Error::AlreadyStored` early if `CLOSE_GROUP_MAJORITY` peers
-    /// report the chunk is already stored.
+    /// Returns `Error::AlreadyStored` if `CLOSE_GROUP_MAJORITY` of the closest
+    /// peers report the chunk is already stored and prove it by serving it.
+    /// Claims that aren't proven are left out, as when too few are made, and
+    /// the chunk is quoted as usual.
     ///
     /// # Errors
     ///
@@ -1237,7 +1240,7 @@ impl Client {
         // the closest witnessed peers first and only falls back to further
         // witnessed peers when a closer peer fails to produce a usable quote.
         let mut quotes = Vec::with_capacity(peer_query_count);
-        let mut already_stored_peers: Vec<(PeerId, [u8; 32])> = Vec::new();
+        let mut already_stored_peers: Vec<(PeerId, Vec<MultiAddr>)> = Vec::new();
         let mut failures: Vec<String> = Vec::new();
 
         // Track storer-rejecting peers separately (binding, content, signature
@@ -1302,7 +1305,6 @@ impl Client {
                             peer_id,
                             addrs,
                             quote_result,
-                            address,
                             &mut quotes,
                             &mut already_stored_peers,
                             &mut failures,
@@ -1358,7 +1360,6 @@ impl Client {
                             peer_id,
                             addrs,
                             quote_result,
-                            address,
                             &mut quotes,
                             &mut already_stored_peers,
                             &mut failures,
@@ -1407,16 +1408,32 @@ impl Client {
             bad_quote_count += bad_dropped;
         }
 
-        if crate::quote_policy::already_stored(
+        let holders = crate::quote_policy::counted_holders(
             quotes.iter().map(|quote| quote.0),
             already_stored_peers.iter().map(|peer| peer.0),
             address,
-        ) {
-            debug!(
-                "Chunk {} already stored on a close-group majority",
+        );
+        if holders.len() >= CLOSE_GROUP_MAJORITY {
+            let claimants = holders
+                .iter()
+                .filter_map(|holder| already_stored_peers.iter().find(|peer| peer.0 == *holder))
+                .cloned()
+                .collect();
+            // Boxed, like the network adapter's lookups, so the chunk reads
+            // don't deepen the type of every upload future that quotes.
+            if Box::pin(self.claims_proven(address, data_type, claimants)).await {
+                debug!(
+                    "Chunk {} already stored on a close-group majority, which served it",
+                    hex::encode(address)
+                );
+                return Err(Error::AlreadyStored);
+            }
+            warn!(
+                "{} of the closest peers claim to hold {}, but fewer than {CLOSE_GROUP_MAJORITY} \
+                 served it; quoting and paying for it as usual",
+                holders.len(),
                 hex::encode(address)
             );
-            return Err(Error::AlreadyStored);
         }
 
         let already_stored_count = already_stored_peers.len();
@@ -1461,6 +1478,49 @@ impl Client {
              {bad_quote_count} with mismatched peer bindings). Failures: [{}]",
             failures.join("; ")
         )))
+    }
+
+    /// Whether the peers claiming to hold the chunk at `address` prove it, by
+    /// serving it: `CLOSE_GROUP_MAJORITY` of `claimants` (closest first) must
+    /// return bytes that hash to the address. They are asked one at a time
+    /// ([`crate::quote_policy::proven_by_majority`]), so a proof costs about
+    /// that many chunk downloads and holds one chunk in memory at a time. A
+    /// failed, timed-out or wrong answer doesn't count.
+    ///
+    /// A storer reports a chunk already stored from its own store alone, so
+    /// the claim proves nothing by itself: believed as given, a few peers
+    /// placed near an address could keep a new chunk from ever being paid for
+    /// or stored. Only chunks can be proven this way; honest storers make the
+    /// claim for nothing else.
+    async fn claims_proven(
+        &self,
+        address: &[u8; 32],
+        data_type: u32,
+        claimants: Vec<(PeerId, Vec<MultiAddr>)>,
+    ) -> bool {
+        if data_type != DATA_TYPE_CHUNK {
+            return false;
+        }
+        crate::quote_policy::proven_by_majority(claimants, |(peer, addrs)| async move {
+            match self.chunk_get_from_peer(address, &peer, &addrs).await {
+                Ok(Some(_)) => true,
+                Ok(None) => {
+                    warn!(
+                        "Peer {peer} claimed to hold {} but doesn't have it",
+                        hex::encode(address)
+                    );
+                    false
+                }
+                Err(e) => {
+                    warn!(
+                        "Peer {peer} claimed to hold {} but didn't serve it: {e}",
+                        hex::encode(address)
+                    );
+                    false
+                }
+            }
+        })
+        .await
     }
 }
 
@@ -3026,7 +3086,6 @@ mod tests {
                     Err(Error::ClientUpdateRequired(
                         "too old, run ant update".into(),
                     )),
-                    &[0x11; 32],
                     &mut quotes,
                     &mut already_stored,
                     failures,
@@ -3051,6 +3110,36 @@ mod tests {
         );
     }
 
+    /// A claim to hold the chunk already is no quote and no failure: it is
+    /// kept with the claimant's addresses, so the collector can ask the
+    /// claimant to prove it by serving the chunk.
+    #[test]
+    fn an_already_stored_claim_is_kept_with_its_addresses_to_be_proven() {
+        let mut quotes = Vec::new();
+        let mut already_stored = Vec::new();
+        let mut failures = Vec::new();
+        let mut bad_quotes = 0usize;
+        let mut refusal_slot: Option<Error> = None;
+        let peer = PeerId::from_bytes([0x48; 32]);
+        let addrs: Vec<MultiAddr> = vec!["/ip4/198.51.100.1/udp/9000/quic".parse().unwrap()];
+
+        let outcome = record_store_quote_result(
+            peer,
+            addrs.clone(),
+            Err(Error::AlreadyStored),
+            &mut quotes,
+            &mut already_stored,
+            &mut failures,
+            &mut bad_quotes,
+            &mut refusal_slot,
+            &SettlementRefusals::default(),
+        );
+
+        assert!(outcome.is_ok());
+        assert!(quotes.is_empty() && failures.is_empty());
+        assert_eq!(already_stored, vec![(peer, addrs)]);
+    }
+
     /// A storer being behind must NOT abort. Otherwise one lagging peer in the
     /// close group fails an upload that the rest of the group could serve.
     #[test]
@@ -3065,7 +3154,6 @@ mod tests {
             PeerId::from_bytes([0x45; 32]),
             Vec::new(),
             Err(Error::StorerUpdateRequired("node behind".into())),
-            &[0x11; 32],
             &mut quotes,
             &mut already_stored,
             &mut failures,
@@ -3109,7 +3197,6 @@ mod tests {
                 Err(Error::ClientUpdateRequired(
                     "too old, run ant update".into(),
                 )),
-                &[0x11; 32],
                 &mut quotes,
                 &mut already_stored,
                 &mut failures,
