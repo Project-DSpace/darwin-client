@@ -15,13 +15,12 @@
 //! read waited for inform the reads' adaptive concurrency, and read-ahead keeps
 //! its records out of the shared chunk cache.
 use super::{BrowserNetworkCore, SharedNetworkAdapter};
-use crate::client_engine::files::RecordLayout;
-use crate::client_engine::read_ahead::releasable;
+use crate::client_engine::read_ahead::{read_ahead_window, releasable};
 use crate::client_engine::read_budget::ReadBudget;
 use crate::data::{ChunkCache, Client, ClientConfig, Error, Network};
 use bytes::Bytes;
 use futures::future::{AbortHandle, Abortable, FutureExt, LocalBoxFuture, Shared};
-use self_encryption::{DataMap, MAX_CHUNK_SIZE};
+use self_encryption::{DataMapIndex, MAX_CHUNK_SIZE};
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::ops::Range;
@@ -207,13 +206,14 @@ impl ReadAheadPool {
 /// Read-ahead of one file reader.
 pub(super) struct ReadAhead {
     pool: Rc<ReadAheadPool>,
-    layout: RecordLayout,
+    /// The reader's index of the file, shared with it.
+    layout: Rc<DataMapIndex>,
     /// Every read starts a sequential stream, as media playback's reads do.
     streaming: bool,
     /// Ends of recent reads; a read starting at one continues it.
-    recent_ends: RefCell<VecDeque<usize>>,
+    recent_ends: RefCell<VecDeque<u64>>,
     /// Start of the latest sequential read; the read-ahead window starts here.
-    anchor: Cell<Option<usize>>,
+    anchor: Cell<Option<u64>>,
     /// Records of each read in progress, by read id. Like the window, they are
     /// never cancelled or released.
     reads: RefCell<BTreeMap<u64, Range<usize>>>,
@@ -228,14 +228,13 @@ pub(super) struct ReadAhead {
 }
 
 impl ReadAhead {
-    /// Read-ahead for one reader of `root`. A DataMap whose layout range reads
-    /// reject gets read-ahead that never fetches, so the reader still opens and
-    /// its reads report the error.
-    pub(super) fn new(pool: &Rc<ReadAheadPool>, root: &DataMap, streaming: bool) -> Rc<Self> {
-        let (layout, closed) = match RecordLayout::new(root) {
-            Ok(layout) => (layout, false),
-            Err(_) => (RecordLayout::default(), true),
-        };
+    /// Read-ahead for one reader of the file `layout` indexes. Positions are
+    /// 64-bit, so read-ahead follows reads past 4 GiB on every platform.
+    pub(super) fn new(
+        pool: &Rc<ReadAheadPool>,
+        layout: Rc<DataMapIndex>,
+        streaming: bool,
+    ) -> Rc<Self> {
         let reader = Rc::new(Self {
             pool: Rc::clone(pool),
             layout,
@@ -247,7 +246,7 @@ impl ReadAhead {
             last_read: Cell::new(Instant::now()),
             slots: RefCell::default(),
             next_id: Cell::new(0),
-            closed: Cell::new(closed),
+            closed: Cell::new(false),
         });
         pool.readers.borrow_mut().push(Rc::downgrade(&reader));
         reader
@@ -263,8 +262,10 @@ impl ReadAhead {
     /// the start of the file also fetches the last record, where containers such
     /// as MP4 and WebM often keep the index a player reads next. A read that
     /// needs no records, such as one of zero length, changes nothing.
-    pub(super) fn begin_read(self: &Rc<Self>, start: usize, length: usize) -> ReadLease {
-        let needed = self.layout.overlapping(start, length);
+    pub(super) fn begin_read(self: &Rc<Self>, start: u64, length: usize) -> ReadLease {
+        let needed = self
+            .layout
+            .chunks_overlapping(start..start.saturating_add(length as u64));
         if self.closed.get() || needed.is_empty() {
             return ReadLease {
                 read_ahead: Rc::clone(self),
@@ -276,7 +277,7 @@ impl ReadAhead {
         let read = self.next_id();
         let addresses = needed
             .clone()
-            .map(|index| self.layout.address(index))
+            .map(|index| self.layout.infos()[index].dst_hash.0)
             .collect::<Vec<_>>();
         let indices = needed
             .clone()
@@ -309,11 +310,11 @@ impl ReadAhead {
         }
         if sequential {
             self.fill();
-        } else if needed.end < self.layout.len() {
+        } else if needed.end < self.layout.infos().len() {
             self.prefetch(needed.end);
         }
         if self.streaming && start == 0 {
-            if let Some(last) = self.layout.len().checked_sub(1) {
+            if let Some(last) = self.layout.infos().len().checked_sub(1) {
                 self.prefetch(last);
             }
         }
@@ -322,7 +323,7 @@ impl ReadAhead {
             if recent.len() == RECENT_READS {
                 recent.pop_front();
             }
-            recent.push_back(start.saturating_add(length));
+            recent.push_back(start.saturating_add(length as u64));
         }
         ReadLease {
             read_ahead: Rc::clone(self),
@@ -357,8 +358,7 @@ impl ReadAhead {
 
     fn window(&self) -> Range<usize> {
         self.anchor.get().map_or(0..0, |anchor| {
-            self.layout
-                .window(anchor, READ_AHEAD_BYTES, MAX_WINDOW_RECORDS)
+            read_ahead_window(&self.layout, anchor, READ_AHEAD_BYTES, MAX_WINDOW_RECORDS)
         })
     }
 
@@ -426,7 +426,7 @@ impl ReadAhead {
         }
         let id = self.next_id();
         let (abort, registration) = AbortHandle::new_pair();
-        let address = self.layout.address(index);
+        let address = self.layout.infos()[index].dst_hash.0;
         let this = Rc::clone(self);
         let fetch = async move {
             let result = Abortable::new(this.pool.fetch(address), registration).await;
