@@ -127,19 +127,37 @@ test("cold closer hints cannot occupy the read slots before a connected holder",
   } finally { clearTimeout(deadline); reader?.close(); client.close(); }
 });
 
-test("shared Client rejects corrupt content immediately, matching native GET", async () => {
+test("shared Client fails on corrupt content once no node serves the record, matching native GET", async () => {
   const rtc = mockWebRtc(Array.from({ length: 24 }, () => ({ chunk: new Uint8Array([1, 2, 3]), respond: failDiscovery })));
   const client = new BrowserNetworkClient(rtc.endpoints);
   try {
     await assert.rejects(client.openPublicFile(datamap.address), /BLAKE3 mismatch/);
     const gets = rtc.requests.filter(request => request.method === "get_chunk");
-    // Discovery can finish while the first response yields to the event loop.
-    // The shared policy then permits one ordinary GET alongside the early GET.
-    assert.ok(gets.length >= 1 && gets.length <= 2, "at most the already-racing GETs may run");
+    assert.ok(gets.length > 2, "one node's corrupt bytes send the read to the next node");
     await new Promise(resolve => setTimeout(resolve, 20));
     assert.equal(rtc.requests.filter(request => request.method === "get_chunk").length, gets.length,
-      "integrity failure must cancel the race without fallback or retry");
+      "no GET outlives the failed read");
   } finally { client.close(); }
+});
+
+test("nodes serving corrupt content are passed over for one that serves the record", async () => {
+  const nodes = Array.from({ length: 7 }, () => ({}));
+  const rtc = mockWebRtc(nodes);
+  const target = BigInt(`0x${datamap.address}`);
+  const distance = i => BigInt(`0x${parseWebRtcDirectMultiaddr(rtc.endpoints[i]).peerId}`) ^ target;
+  const ordered = nodes.map((_, i) => i).sort((a, b) => distance(a) < distance(b) ? -1 : 1);
+  const corrupt = ordered.slice(0, 3);
+  for (const i of corrupt) nodes[i].chunk = new Uint8Array([1, 2, 3]);
+  nodes[ordered[3]].chunk = datamap.content;
+  const client = new BrowserNetworkClient(rtc.endpoints);
+  let reader;
+  try {
+    reader = await client.openPublicFile(datamap.address);
+    assert.equal(reader.size, content.length);
+    const gets = rtc.requests.filter(request => request.method === "get_chunk");
+    assert.ok(gets.some(request => corrupt.includes(request.node)), "a corrupt node was asked first");
+    assert.ok(gets.some(request => request.node === ordered[3]));
+  } finally { reader?.close(); client.close(); }
 });
 
 

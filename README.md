@@ -308,6 +308,8 @@ Download complete!
 
 A private file's envelope address can't be downloaded from: its envelope stores only a salted hash of the data map, and the download says so. Use `--datamap`, or `--proof` with a proof that reveals it.
 
+Every chunk read is checked against its address. A node that serves bytes that don't match is passed over for the next nearest node (and named in the `-v` log); a read fails on bad bytes only when no node serves the chunk intact. The same holds in the browser build.
+
 #### `darwin file prove <RECORD>`
 
 Writes a proof of an upload from its record (`<filename>.record`) to `<filename>.proof` (or `-o <PATH>`). For a private file the proof reveals the data map and salt, so whoever has it can read the file and check that the envelope is for it; `--no-reveal` proves only that the envelope was paid for. Hand it to anyone who should be able to check the upload, including fields you hid. It never writes over the record (which holds the salt), and replaces an existing proof only with `--force`.

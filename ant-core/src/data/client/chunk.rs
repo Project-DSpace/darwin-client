@@ -453,6 +453,44 @@ impl Client {
     }
 }
 
+/// Whether a peer's failed answer to a chunk GET leaves the next peer worth
+/// asking. Bytes that don't match the address (`InvalidData`) are that peer's
+/// fault, like a timeout: another peer may hold the chunk intact.
+fn retry_on_next_peer(error: &Error) -> bool {
+    matches!(
+        error,
+        Error::Timeout(_) | Error::Network(_) | Error::Protocol(_) | Error::InvalidData(_)
+    )
+}
+
+/// The last answer to a chunk read whose bytes didn't match the address. The
+/// read asks the next peer after one, and fails with it only if no peer
+/// serves the chunk intact.
+#[derive(Default)]
+struct BadBytes(std::sync::Mutex<Option<String>>);
+
+impl BadBytes {
+    /// [`retry_on_next_peer`] for the read engine, which calls it once for
+    /// each peer's failed answer, keeping bad bytes.
+    fn retry_on_next_peer(&self, error: &Error) -> bool {
+        if let Error::InvalidData(reason) = error {
+            *self.0.lock().unwrap_or_else(|e| e.into_inner()) = Some(reason.clone());
+        }
+        retry_on_next_peer(error)
+    }
+
+    /// What the read found, or else the bad bytes it met, if any.
+    fn result<T>(self, found: Option<T>) -> Result<Option<T>> {
+        match (
+            found,
+            self.0.into_inner().unwrap_or_else(|e| e.into_inner()),
+        ) {
+            (None, Some(reason)) => Err(Error::InvalidData(reason)),
+            (found, _) => Ok(found),
+        }
+    }
+}
+
 /// Map a `chunk_get` outcome to an adaptive controller `Outcome`.
 ///
 /// This is the result-aware classifier used by the file-download paths.
@@ -823,6 +861,7 @@ impl Client {
 
         #[cfg(feature = "native")]
         let observation = diag.map(|_| std::sync::Mutex::new(ReadObservation::default()));
+        let bad_bytes = BadBytes::default();
         let result = crate::client_engine::read::retrieve_progressive(
             *address,
             // Use the same bounded fallback allowance while discovery is in
@@ -949,12 +988,7 @@ impl Client {
                     self.chunk_get_from_peer(address, &peer, &addrs).await
                 }
             },
-            |error| {
-                matches!(
-                    error,
-                    Error::Timeout(_) | Error::Network(_) | Error::Protocol(_)
-                )
-            },
+            |error| bad_bytes.retry_on_next_peer(error),
             crate::runtime::sleep,
         )
         .await?;
@@ -970,6 +1004,7 @@ impl Client {
                 );
             }
         }
+        let result = bad_bytes.result(result)?;
         if let Some(chunk) = &result {
             self.chunk_cache().put(chunk.address, chunk.content.clone());
         }
@@ -1102,6 +1137,7 @@ impl Client {
                     content,
                 }) => {
                     if addr != *address {
+                        warn!("Peer {peer} answered a GET for {addr_hex} with another chunk");
                         return Some(Err(Error::InvalidData(format!(
                             "Mismatched chunk address: expected {addr_hex}, got {}",
                             hex::encode(addr)
@@ -1109,6 +1145,7 @@ impl Client {
                     }
 
                     if let Err(error) = crate::record::verify(&addr, &content) {
+                        warn!("Peer {peer} served bytes that don't match chunk {addr_hex}");
                         return Some(Err(Error::InvalidData(error)));
                     }
 
@@ -1459,6 +1496,75 @@ mod tests {
             chunk_get_outcome(&Err(Error::Protocol("p".into()))),
             Outcome::ApplicationError,
         );
+    }
+
+    #[test]
+    fn bad_bytes_from_one_peer_send_the_read_to_the_next() {
+        for retried in [
+            Error::Timeout("t".into()),
+            Error::Network("n".into()),
+            Error::Protocol("p".into()),
+            Error::InvalidData("BLAKE3 mismatch".into()),
+        ] {
+            assert!(retry_on_next_peer(&retried), "{retried}");
+        }
+        for fatal in [
+            Error::Serialization("s".into()),
+            Error::Payment("p".into()),
+            Error::Cancelled("c".into()),
+        ] {
+            assert!(!retry_on_next_peer(&fatal), "{fatal}");
+        }
+    }
+
+    /// Reads one record through the shared read engine from peers 1, 2 and 3,
+    /// each giving `answers[peer - 1]`, as `chunk_get` does.
+    fn read_from(answers: [Result<Option<u8>>; 3]) -> (Result<Option<u8>>, Vec<u8>) {
+        let asked = std::sync::Mutex::new(Vec::new());
+        let bad_bytes = BadBytes::default();
+        let found = futures::executor::block_on(crate::client_engine::read::retrieve_progressive(
+            [0; 32],
+            0,
+            |_| async {
+                crate::client_engine::read::ReadCandidates {
+                    closest: vec![[1u8; 32], [2; 32], [3; 32]],
+                    known: Vec::new(),
+                }
+            },
+            |peer| *peer,
+            |peer, _| {
+                asked.lock().unwrap().push(peer[0]);
+                let answer = match &answers[usize::from(peer[0]) - 1] {
+                    Ok(found) => Ok(*found),
+                    Err(Error::InvalidData(reason)) => Err(Error::InvalidData(reason.clone())),
+                    Err(error) => Err(Error::Network(error.to_string())),
+                };
+                async move { answer }
+            },
+            |error| bad_bytes.retry_on_next_peer(error),
+            |_| async {},
+        ));
+        let result = found.and_then(|found| bad_bytes.result(found));
+        (result, asked.into_inner().unwrap())
+    }
+
+    #[test]
+    fn a_read_fails_on_bad_bytes_only_when_no_peer_serves_the_chunk() {
+        let bad = || Err(Error::InvalidData("BLAKE3 mismatch".into()));
+        // The closest peer's bytes don't match: the next peer serves it.
+        let (result, asked) = read_from([bad(), Ok(Some(7)), Ok(None)]);
+        assert!(matches!(result, Ok(Some(7))), "{result:?}");
+        assert_eq!(asked, vec![1, 2]);
+        // No peer serves it intact: the read fails with the bad bytes, not
+        // as a record missing from the network.
+        let (result, _) = read_from([Ok(None), bad(), Ok(None)]);
+        assert!(
+            matches!(&result, Err(Error::InvalidData(reason)) if reason.contains("BLAKE3")),
+            "{result:?}"
+        );
+        // Nothing found and no bad bytes: absent, as before.
+        let (result, _) = read_from([Ok(None), Ok(None), Ok(None)]);
+        assert!(matches!(result, Ok(None)), "{result:?}");
     }
 
     #[test]

@@ -48,6 +48,11 @@ told apart by the commit `darwin --version` prints. Upstream's entries follow.
   of its close group. Costs about 7/4 of the upload traffic of before, and a store now waits for
   the slowest of its 7 nodes (each PUT has its usual time limit). Applies to the native client
   and the browser build alike.
+- A chunk read that gets bytes not matching the address from one node asks the next node, like
+  after a timeout, instead of failing the whole read (downloads, range reads, the browser
+  viewer's reads and read-ahead, `chunk_get`). It fails with the same `InvalidData` error only
+  when no node serves the chunk intact. Before, one node serving bad bytes could block a file.
+  The node is named in a warning.
 - `PaymentMode::Single` is the default of the library (`PaymentMode::default()`,
   `Client::file_upload`, `file_prepare_upload`) and of the browser API, so programs built on
   ant-core pay per chunk unless they ask for batches.
