@@ -79,9 +79,10 @@ LINEAR_CLOSES = re.compile(
 )
 
 # Release-promotion PRs (the promote step of the release train) are mechanical
-# version-bump PRs opened from an rc-* branch. Both checks self-pass on them —
-# they must pass rather than be skipped because linear-link/pr-template are
-# required status checks. Matched on BOTH the conventional-commit title prefix
+# version-bump PRs opened from an rc-* branch. Both checks self-pass on them
+# rather than being skipped with a job-level `if:` (which GitHub would also count
+# as passing), so the run log says why and the self-test matrix covers the rule.
+# Matched on BOTH the conventional-commit title prefix
 # and the rc-* head branch so an ordinary PR cannot opt out via its title alone.
 RELEASE_TITLE = re.compile(r"^chore\(release\):")
 RC_BRANCH = re.compile(r"^rc-")
