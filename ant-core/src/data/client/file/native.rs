@@ -1276,6 +1276,26 @@ fn envelope_checkpoint_scope(options: &EnvelopeOptions, payer: &[u8]) -> Vec<u8>
     scope
 }
 
+/// What names an upload's checkpoint ([`open_upload_checkpoint`]): the
+/// payment network and the content records, with an envelope upload's scope
+/// (`envelope`, [`envelope_checkpoint_scope`], which names its payer), or
+/// else an outside payer's [`UploadPayer::checkpoint_scope`] (`payer`). A
+/// wallet upload without an envelope has neither, and shares the checkpoint
+/// of its records as before.
+fn upload_checkpoint_scope(
+    network: &ant_protocol::evm::Network,
+    records: &[([u8; 32], u64)],
+    envelope: Option<&[u8]>,
+    payer: Option<&[u8]>,
+) -> Result<Vec<u8>> {
+    match (envelope, payer) {
+        (Some(envelope), _) => rmp_serde::to_vec(&(network, records, envelope)),
+        (None, Some(payer)) => rmp_serde::to_vec(&(network, records, "payer", payer)),
+        (None, None) => rmp_serde::to_vec(&(network, records)),
+    }
+    .map_err(|e| Error::Serialization(e.to_string()))
+}
+
 /// Open the checkpoint for uploading `records` on `network`: its path, the
 /// lock held while the upload runs, and the state an earlier, interrupted
 /// attempt saved (`None` if there was none).
@@ -1285,10 +1305,15 @@ fn envelope_checkpoint_scope(options: &EnvelopeOptions, payer: &[u8]) -> Vec<u8>
 /// [`envelope_checkpoint_scope`]), not by the envelope's address, which a
 /// private envelope's random salt changes: the salt is saved next to the
 /// checkpoint ([`upload_salt`]) so a resumed upload builds the same envelope.
+/// An outside payer's upload without an envelope is scoped by its payer
+/// (`payer`) too, so payers uploading the same file neither resume each
+/// other's payments nor wait on each other's lock, which an upload holds
+/// while it waits for its payment.
 async fn open_upload_checkpoint(
     network: &ant_protocol::evm::Network,
     records: &[super::super::upload::UploadRecord],
     envelope: Option<&[u8]>,
+    payer: Option<&[u8]>,
 ) -> Result<(
     PathBuf,
     std::fs::File,
@@ -1298,11 +1323,7 @@ async fn open_upload_checkpoint(
         .iter()
         .map(|r| (r.address, r.size))
         .collect::<Vec<_>>();
-    let scope = match envelope {
-        None => rmp_serde::to_vec(&(network, records)),
-        Some(envelope) => rmp_serde::to_vec(&(network, records, envelope)),
-    }
-    .map_err(|e| Error::Serialization(e.to_string()))?;
+    let scope = upload_checkpoint_scope(network, &records, envelope, payer)?;
     let cache_dir = crate::config::data_dir()
         .map_err(|e| Error::Config(e.to_string()))?
         .join("payments/upload");
@@ -1956,11 +1977,13 @@ pub trait UploadPayer: Send + Sync {
     ) -> Result<super::super::upload::MerkleUploadPayment>;
 
     /// Bytes naming who pays, such as an account id or a wallet address.
-    /// An envelope upload's checkpoint, and the record a completed one keeps
-    /// ([`forget_upload_record`]), belong to this payer: only the same payer
-    /// resumes an interrupted envelope upload, reusing its salt and payment,
-    /// or gets a kept record back. A payer used for several accounts must
-    /// return a different value for each. Empty by default.
+    /// An upload's checkpoint, with an envelope or without, and the record a
+    /// completed envelope upload keeps ([`forget_upload_record`]), belong to
+    /// this payer: only the same payer resumes an interrupted upload, reusing
+    /// its payment (and an envelope's salt), or gets a kept record back, and
+    /// uploads of the same file by other payers don't wait for it. A payer
+    /// used for several accounts must return a different value for each.
+    /// Empty by default, which every payer that doesn't name itself shares.
     fn checkpoint_scope(&self) -> Vec<u8> {
         Vec::new()
     }
@@ -3566,10 +3589,10 @@ impl Client {
     /// paying twice. In [`PaymentMode::Merkle`] a network too small for a batch
     /// payment fails before any payment; [`PaymentMode::Auto`] falls back to
     /// per-chunk payments. An envelope upload is paid and stored as
-    /// [`Client::file_upload_with_visibility_and_progress`] describes; its
-    /// checkpoint and kept record belong to the payer
-    /// ([`UploadPayer::checkpoint_scope`]), so a payer serving several
-    /// accounts must name each.
+    /// [`Client::file_upload_with_visibility_and_progress`] describes. The
+    /// upload's checkpoint, and an envelope upload's kept record, belong to
+    /// the payer ([`UploadPayer::checkpoint_scope`]), so a payer serving
+    /// several accounts must name each.
     ///
     /// # Errors
     ///
@@ -3670,8 +3693,13 @@ impl Client {
         let envelope_scope = visibility
             .envelope_options()
             .map(|options| envelope_checkpoint_scope(options, &payer_scope));
-        let (cache_path, _lock, saved) =
-            open_upload_checkpoint(network, &records, envelope_scope.as_deref()).await?;
+        let (cache_path, _lock, saved) = open_upload_checkpoint(
+            network,
+            &records,
+            envelope_scope.as_deref(),
+            payer.map(|_| payer_scope.as_slice()),
+        )
+        .await?;
         let mut envelope = match &visibility {
             Visibility::Envelope(options) => {
                 let salt = if options.readable {
@@ -5461,6 +5489,39 @@ mod tests {
         assert_eq!(
             priced_confidence(true, 5, 1_000),
             AllSamplesAlreadyStoredIncomplete
+        );
+    }
+
+    #[test]
+    fn an_outside_payers_checkpoint_is_its_own() {
+        let network = ant_protocol::evm::Network::ArbitrumOne;
+        let records = [([1u8; 32], 10u64), ([2u8; 32], 20)];
+        let scope = |envelope: Option<&[u8]>, payer: Option<&[u8]>| {
+            upload_checkpoint_scope(&network, &records, envelope, payer).unwrap()
+        };
+        // A wallet upload without an envelope: as before, so its saved
+        // checkpoints still resume.
+        assert_eq!(
+            scope(None, None),
+            rmp_serde::to_vec(&(&network, records.to_vec())).unwrap()
+        );
+        // Each payer's own, even without an envelope, so two payers of the
+        // same file neither share a payment nor wait on one lock.
+        let one = scope(None, Some(b"upload one"));
+        assert_eq!(one, scope(None, Some(b"upload one")));
+        assert_ne!(one, scope(None, Some(b"upload two")));
+        assert_ne!(one, scope(None, None));
+        // A payer that names no one still never shares a wallet's.
+        assert_ne!(scope(None, Some(b"")), scope(None, None));
+        // An envelope's scope names its payer already: unchanged.
+        let envelope = envelope_checkpoint_scope(&EnvelopeOptions::private(), b"upload one");
+        assert_eq!(
+            scope(Some(&envelope), Some(b"upload one")),
+            rmp_serde::to_vec(&(&network, records.to_vec(), &envelope[..])).unwrap()
+        );
+        assert_eq!(
+            scope(Some(&envelope), Some(b"upload one")),
+            scope(Some(&envelope), None)
         );
     }
 

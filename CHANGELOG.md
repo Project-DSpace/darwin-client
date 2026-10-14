@@ -53,6 +53,14 @@ told apart by the commit `darwin --version` prints. Upstream's entries follow.
   viewer's reads and read-ahead, `chunk_get`). It fails with the same `InvalidData` error only
   when no node serves the chunk intact. Before, one node serving bad bytes could block a file.
   The node is named in a warning.
+- An upload paid by an outside payer (`file_upload_with_payer`) has a checkpoint of its own,
+  named by the payer's `checkpoint_scope()`, with an envelope or without. Before, uploads of the
+  same file without an envelope shared one checkpoint whoever paid: one payer's upload could
+  resume another's payment state, and since an upload holds its checkpoint's lock while it
+  waits for its payment, a second payer's upload of the same file waited for the first (through
+  dspace-gateway, until the first payer paid or gave up). Wallet uploads without an envelope
+  keep their shared checkpoint. A payer's upload interrupted under an earlier build, without an
+  envelope, isn't resumed by this one: finish or drain such uploads before upgrading.
 - `PaymentMode::Single` is the default of the library (`PaymentMode::default()`,
   `Client::file_upload`, `file_prepare_upload`) and of the browser API, so programs built on
   ant-core pay per chunk unless they ask for batches.
