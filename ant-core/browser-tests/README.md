@@ -75,3 +75,26 @@ or node RPC mocks are installed. It also checks that a closed network client
 rejects reconnection. Temporary node data is removed on shutdown.
 The suite uses local funds only and verifies that the RPC belongs to the local
 Anvil devnet before invoking the wallet.
+
+## Large-file disk streaming
+
+`large-file.mjs` is an opt-in check, not run in CI, that a file larger than
+4 GiB streams to disk in real Chromium. Build the production bindings as above
+and a release CLI (`cargo build --release --bin ant` in the workspace root),
+start `node start-devnet.mjs` in another terminal, then run:
+
+```sh
+node large-file.mjs [path to ant]
+```
+
+It writes the 4,303,347,835-byte plaintext of the
+[`large-file.json`](../wasm-tests/fixtures/large-file.json) fixture to a
+temporary file and uploads it with `ant`, under a throwaway home so the upload
+stays out of your upload history, and checks it lands on the fixture's
+address. Chromium then opens the file, reads across 4 GiB, and pipes all of it
+into the origin private file system with `pipeTo`. The run checks the BLAKE3
+hash and the stored size and bytes, and that a complete in-memory download over
+a 64 MiB budget fails and points to `pipeTo`. It exits non-zero if any check
+fails and needs about 5 GB of free disk. The file is one repeated byte, so its
+records compress to about 67 KB: the run checks correctness and local
+decryption and writing, not network throughput.

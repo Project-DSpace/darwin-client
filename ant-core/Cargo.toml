@@ -24,7 +24,7 @@ rmp-serde = "1"
 serde = { version = "1", features = ["derive"] }
 serde_bytes = "0.11"
 serde_json = "1"
-self_encryption = "0.36"
+self_encryption = "0.36.2"
 # Portable WebRTC Direct profile shared with ant-node.
 saorsa-transport = { version = "0.37.0", default-features = false, features = ["webrtc"] }
 thiserror = "2"
@@ -91,6 +91,7 @@ serde-wasm-bindgen = { version = "0.6", optional = true }
 wasm-bindgen = { version = "0.2", optional = true }
 wasm-bindgen-futures = { version = "0.4", optional = true }
 web-sys = { version = "0.3", optional = true, features = [
+    "AbortSignal",
     "Event",
     "MessageEvent",
     "RtcConfiguration",
@@ -104,6 +105,8 @@ web-sys = { version = "0.3", optional = true, features = [
     "RtcSdpType",
     "RtcSessionDescription",
     "RtcSessionDescriptionInit",
+    "WritableStream",
+    "WritableStreamDefaultWriter",
 ] }
 gloo-timers = { version = "0.3", features = ["futures"], optional = true }
 # Deterministic mock-node signing for generated-WASM transport regression tests.
