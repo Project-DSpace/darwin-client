@@ -869,7 +869,7 @@ dependencies = [
  "rand 0.8.6",
  "reqwest 0.12.28",
  "rmp-serde",
- "saorsa-transport",
+ "saorsa-transport 0.37.0",
  "self-replace",
  "self_encryption",
  "semver 1.0.28",
@@ -912,9 +912,8 @@ dependencies = [
 
 [[package]]
 name = "ant-node"
-version = "0.21.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8afebae6037bc8d219f3089305cad8803bde439484aa9d00979486c5ea554271"
+version = "0.22.0"
+source = "git+https://github.com/WithAutonomi/ant-node.git?rev=beec6ba48e9a2107fad928c1b642b22655060523#beec6ba48e9a2107fad928c1b642b22655060523"
 dependencies = [
  "ant-protocol",
  "bao",
@@ -935,19 +934,20 @@ dependencies = [
  "mimalloc",
  "objc2",
  "objc2-foundation",
- "page_size",
  "parking_lot",
  "postcard",
  "rand 0.8.6",
  "reqwest 0.13.4",
  "rmp-serde",
+ "rustix",
  "saorsa-core",
  "saorsa-pqc",
- "saorsa-transport",
+ "saorsa-transport 0.38.0",
  "self-replace",
  "self_encryption",
  "semver 1.0.28",
  "serde",
+ "serde_bytes",
  "serde_json",
  "sha2",
  "tar",
@@ -965,9 +965,8 @@ dependencies = [
 
 [[package]]
 name = "ant-protocol"
-version = "3.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cb1f2e060c4283457a718c094d5fd594efd1d4eeec7cc6ca3ea113df17cce382"
+version = "4.0.0"
+source = "git+https://github.com/WithAutonomi/ant-protocol?rev=718f60682bb3704b68fbba0bea34f2a0416fa876#718f60682bb3704b68fbba0bea34f2a0416fa876"
 dependencies = [
  "blake3",
  "bytes",
@@ -5543,9 +5542,9 @@ dependencies = [
 
 [[package]]
 name = "saorsa-core"
-version = "0.28.0"
+version = "0.29.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "84923dc4955c42dfad8e06cfc34ef75b8e89d4d2fed048b18b81dc9ebadf790b"
+checksum = "efd8c6152246053fa3497fa5e5d1ddc49ec1882fe24cf1ef3e529b03562c3c6a"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -5562,7 +5561,7 @@ dependencies = [
  "postcard",
  "rand 0.8.6",
  "saorsa-pqc",
- "saorsa-transport",
+ "saorsa-transport 0.38.0",
  "serde",
  "serde_json",
  "tempfile",
@@ -5615,6 +5614,30 @@ name = "saorsa-transport"
 version = "0.37.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "261ed20ee1ed8555594fef412b428fa20c21d2cbeebfe3f11868c7df9489a410"
+dependencies = [
+ "anyhow",
+ "base64",
+ "blake3",
+ "chacha20poly1305",
+ "core-foundation 0.9.4",
+ "hex",
+ "libc",
+ "saorsa-pqc",
+ "serde",
+ "serde_bytes",
+ "serde_json",
+ "system-configuration",
+ "thiserror 2.0.18",
+ "web-time",
+ "windows 0.61.3",
+ "zeroize",
+]
+
+[[package]]
+name = "saorsa-transport"
+version = "0.38.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f201fce78c610eda6da22ee8d9ad7a84c4a7ffe8e91b5603b6c025f53742ce73"
 dependencies = [
  "anyhow",
  "async-trait",

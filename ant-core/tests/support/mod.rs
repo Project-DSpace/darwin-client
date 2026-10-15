@@ -26,7 +26,7 @@ use ant_node::payment::{
 };
 use ant_node::pointer::{service::PointerService, store::PointerStore};
 use ant_node::replication::commitment_state::{BuiltCommitment, ResponderCommitmentState};
-use ant_node::storage::{AntProtocol, ChunkStore, ChunkStoreConfig, MigrationConfig};
+use ant_node::storage::{AntProtocol, ChunkStore, ChunkStoreConfig};
 // Wire / transport / EVM types: route through ant-protocol so the test
 // harness exercises the same surface the client does.
 use ant_protocol::chunk::{ChunkGetRequest, ChunkMessage, ChunkMessageBody};
@@ -415,15 +415,13 @@ impl MiniTestnet {
 
         // Create the chunk store. ant-node #216 replaced the LMDB chunk store
         // with one file per chunk; `AntProtocol::new` now takes an
-        // `Arc<ChunkStore>`. These nodes start with no legacy environment, so
-        // the store comes up directly on the file backend and the migration
-        // never runs — this harness gives no LMDB-to-file migration coverage.
+        // `Arc<ChunkStore>`. ant-node 0.22.0 dropped the LMDB map size and the
+        // migration config along with the old backend, so the store comes up
+        // on the file backend with nothing to migrate.
         let storage_config = ChunkStoreConfig {
             root_dir: data_dir.to_path_buf(),
             verify_on_read: true,
-            max_map_size: 0,
             disk_reserve: 0,
-            migration: MigrationConfig::default(),
         };
         let storage = Arc::new(
             ChunkStore::new(storage_config)

@@ -61,9 +61,9 @@ network, so the suite checks this client against older nodes. It is currently
 the 0.21.0 release: its one runtime change renames `fetch_update` to
 `try_update`, the same method. CI builds the pin without `-D warnings`, because
 each new toolchain can add warnings to an old release. This integration pin is
-separate from the native `ant-node` registry dependency, which has no git
-`rev`. Update the pin only with a passing paid browser integration run against
-the replacement. In CI, the run fails unless every test ran and passed:
+separate from the native `ant-node` dependency in `ant-core/Cargo.toml`. Update
+the pin only with a passing paid browser integration run against the
+replacement. In CI, the run fails unless every test ran and passed:
 `run-guard.js` fails a run with a skipped or unfinished test, and `.only` is
 rejected. Anvil must be installed and available on PATH.
 
