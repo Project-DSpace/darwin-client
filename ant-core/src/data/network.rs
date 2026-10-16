@@ -107,6 +107,8 @@ pub(crate) fn bootstrap_read_peers(
     local: &PeerId,
 ) -> PeerAddresses {
     let mut peers: PeerAddresses = Vec::new();
+    // Where each peer is in `peers`.
+    let mut index = std::collections::HashMap::<PeerId, usize>::new();
     for seed in seeds {
         let Some(peer) = seed.peer_id() else {
             continue;
@@ -114,13 +116,16 @@ pub(crate) fn bootstrap_read_peers(
         if peer == local {
             continue;
         }
-        match peers.iter_mut().find(|(known, _)| known == peer) {
+        match index.get(peer).and_then(|&at| peers.get_mut(at)) {
             Some((_, addrs)) => {
                 if !addrs.contains(seed) {
                     addrs.push(seed.clone());
                 }
             }
-            None => peers.push((*peer, vec![seed.clone()])),
+            None => {
+                index.insert(*peer, peers.len());
+                peers.push((*peer, vec![seed.clone()]));
+            }
         }
     }
     peers.sort_by_key(|(peer, _)| ant_protocol::transport::xor_distance(peer.as_bytes(), target));
@@ -270,6 +275,23 @@ impl Network {
         allow_loopback: bool,
         ipv6: bool,
     ) -> Result<Self> {
+        let network = Self::unstarted(bootstrap_peers, allow_loopback, ipv6).await?;
+        network
+            .node
+            .start()
+            .await
+            .map_err(|e| Error::Network(format!("Failed to start P2P node: {e}")))?;
+        Ok(network)
+    }
+
+    /// The network [`Network::new_multiaddrs`] starts: a client node that
+    /// bootstraps from `bootstrap_peers`, which reads also ask.
+    #[cfg(feature = "native")]
+    async fn unstarted(
+        bootstrap_peers: &[MultiAddr],
+        allow_loopback: bool,
+        ipv6: bool,
+    ) -> Result<Self> {
         let seeds = bootstrap_peers
             .iter()
             .map(|addr| crate::network_defaults::parse_quic_seed(&addr.to_string()))
@@ -296,10 +318,6 @@ impl Network {
             .await
             .map_err(|e| Error::Network(format!("Failed to create P2P node: {e}")))?;
 
-        node.start()
-            .await
-            .map_err(|e| Error::Network(format!("Failed to start P2P node: {e}")))?;
-
         Ok(Self {
             node: Arc::new(node),
             bootstrap: seeds,
@@ -321,6 +339,14 @@ impl Network {
     #[cfg(feature = "native")]
     pub(crate) fn set_bootstrap_peers(&mut self, seeds: &[MultiAddr]) {
         self.bootstrap = seeds.to_vec();
+    }
+
+    /// The bootstrap addresses chunk and pointer reads also ask, as the
+    /// network was given them. Reads use those that carry a peer ID.
+    #[must_use]
+    #[cfg(feature = "native")]
+    pub fn bootstrap_peers(&self) -> &[MultiAddr] {
+        &self.bootstrap
     }
 
     /// Get a reference to the underlying P2P node.
@@ -748,6 +774,40 @@ mod tests {
         assert_eq!(peers.len(), 1);
         assert_eq!(peers[0].0, PeerId::from_bytes([1; 32]));
         assert_eq!(peers[0].1, vec![seed(1, 10000), seed(1, 10001)]);
+    }
+
+    /// A client node built from seeds reads from those of them that carry a
+    /// peer ID, and a client given seeds later reads from those instead. The
+    /// node is never started, so nothing is dialled.
+    #[cfg(feature = "native")]
+    #[tokio::test]
+    async fn reads_ask_the_seeds_a_network_and_a_client_are_given() {
+        let plain: MultiAddr = "/ip4/127.0.0.1/udp/10003/quic".parse().unwrap();
+        let seeds = [seed(0x80, 10000), plain, seed(0x10, 10001)];
+        let network = Network::unstarted(&seeds, true, false).await.unwrap();
+        assert_eq!(network.bootstrap_peers(), &seeds);
+        let near = |network: &Network| {
+            network
+                .bootstrap_peers_near(&[0x11; 32])
+                .into_iter()
+                .map(|(peer, addrs)| (peer.as_bytes()[0], addrs))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            near(&network),
+            vec![
+                (0x10, vec![seed(0x10, 10001)]),
+                (0x80, vec![seed(0x80, 10000)])
+            ]
+        );
+
+        let client = crate::data::Client::from_node(Arc::clone(network.node()), Default::default());
+        assert!(near(client.network()).is_empty(), "a node alone names none");
+        let client = client.with_bootstrap_peers(&[seed(0x42, 10002)]);
+        assert_eq!(
+            near(client.network()),
+            vec![(0x42, vec![seed(0x42, 10002)])]
+        );
     }
 
     #[test]

@@ -1089,6 +1089,66 @@ async fn pointer_resolve_refuses_cycles_broken_chains_and_chains_past_its_depth(
     testnet.teardown().await;
 }
 
+/// Bootstrap peers named by `/p2p/` address are read directly. Two members
+/// of the close group are a reader's bootstrap peers and only they answer
+/// pointer GETs: a read of the close group alone falls short, and one that
+/// also asks the bootstrap peers returns the state, whether they were given to
+/// a client built on a node or are the seeds it connected through.
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn a_read_asks_bootstrap_peers_by_peer_id() {
+    let (client, testnet) = setup().await;
+    let (pk, sk) = owner();
+    let address = client
+        .pointer_create(&sk, &pk, chunk_target(1))
+        .await
+        .expect("create");
+    let group = close_group(&client, &testnet, &address).await;
+    let (answering, _) = group.split_at_checked(2).expect("a full close group");
+    let seeds: Vec<MultiAddr> = answering
+        .iter()
+        .flat_map(|member| {
+            member
+                .addrs
+                .iter()
+                .map(|addr| addr.clone().with_peer_id(member.peer_id))
+        })
+        .collect();
+
+    let read = read_answered_by(&client, &testnet, &address, answering).await;
+    assert!(
+        matches!(&read, Err(Error::CloseGroupShortfall(message))
+            if message.contains("only 2 of the close group answered")),
+        "two answers are not a quorum of the close group: {read:?}"
+    );
+
+    let node = testnet.node(CLIENT_NODE).expect("client node");
+    let given = Client::from_node(node, test_client_config()).with_bootstrap_peers(&seeds);
+    let connected = Client::connect_multiaddrs(
+        &seeds,
+        ClientConfig {
+            allow_loopback: true,
+            ipv6: false,
+            ..test_client_config()
+        },
+    )
+    .await
+    .expect("connect through the seeds");
+    for reader in [&given, &connected] {
+        let read = read_answered_by(reader, &testnet, &address, answering)
+            .await
+            .expect("the bootstrap peers answer")
+            .expect("present");
+        assert_eq!(read.address(), address);
+        assert_eq!(read.counter(), 0);
+    }
+
+    drop(connected);
+    drop(given);
+    drop(client);
+    testnet.teardown().await;
+}
+
 /// A pointer that does not exist reads as absent, not as an error.
 #[tokio::test(flavor = "multi_thread")]
 #[serial]

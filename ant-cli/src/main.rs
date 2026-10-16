@@ -401,11 +401,7 @@ async fn build_data_client(
     }
 
     let peer_cache_path = use_peer_cache.then(peer_cache::cache_path).flatten();
-    // Reads also ask the resolved bootstrap peers that carry a peer ID (the
-    // bundled seeds do), not the node's own bootstrap list, which also holds
-    // cached peers.
-    let mut client = Client::from_node_with_peer_cache(node, config, peer_cache_path)
-        .with_bootstrap_peers(&bootstrap);
+    let mut client = data_client(node, config, peer_cache_path, &bootstrap);
 
     if needs_wallet {
         let key = private_key
@@ -418,6 +414,18 @@ async fn build_data_client(
     }
 
     Ok(client)
+}
+
+/// The client a data command runs on `node`. Its reads also ask the resolved
+/// bootstrap peers that carry a peer ID (the bundled seeds do), not the node's
+/// own bootstrap list, which also holds cached peers.
+fn data_client(
+    node: Arc<P2PNode>,
+    config: ClientConfig,
+    peer_cache_path: Option<PathBuf>,
+    bootstrap: &[MultiAddr],
+) -> Client {
+    Client::from_node_with_peer_cache(node, config, peer_cache_path).with_bootstrap_peers(bootstrap)
 }
 
 /// Build the EnvFilter directives string for `-v` / `-vv`.
@@ -583,4 +591,27 @@ async fn promote_client_peer_cache(node: &P2PNode) {
         return;
     };
     peer_cache::promote_connected_direct_peers(node, &cache_path, node.dht().k_value()).await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The resolved seeds reach the client's reads. The node is never
+    /// started, so nothing is dialled.
+    #[tokio::test]
+    async fn a_data_client_reads_from_the_resolved_bootstrap_peers() {
+        let seeds: Vec<MultiAddr> = [
+            format!("/ip4/127.0.0.1/udp/10000/quic/p2p/{}", "ab".repeat(32)),
+            "/ip4/127.0.0.1/udp/10001/quic".to_string(),
+        ]
+        .iter()
+        .map(|seed| seed.parse().expect("a QUIC multiaddress"))
+        .collect();
+        let node = create_client_node_raw(&[], true, true, false)
+            .await
+            .expect("a client node");
+        let client = data_client(node, ClientConfig::default(), None, &seeds);
+        assert_eq!(client.network().bootstrap_peers(), &seeds[..]);
+    }
 }

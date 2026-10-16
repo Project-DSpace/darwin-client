@@ -140,6 +140,49 @@ test("a pointer only the seeds hold is read when its close group holds none", as
   }
 });
 
+test("a seed the seed policy rejected is not counted among the bootstrap peers", async () => {
+  // Write the pointer on one network to get its record.
+  const source = mockWebRtc(Array.from({ length: 7 }, () => ({})));
+  const writer = new BrowserNetworkClient(source.endpoints);
+  let record;
+  try {
+    await writer.createPointer(seed, target(1), "chunk", paymentNetwork, wallet().pay,
+      value => { record = value.record; });
+  } finally {
+    writer.close();
+  }
+  // On another, the seven nodes nearest the pointer, its close group, hold
+  // none. The four farthest are the seeds: one is on another network, one
+  // fails every pointer GET and two hold the pointer. Two answers are a
+  // quorum of the three seeds left once the rejected one is left out, but not
+  // of all four, and the read would then fail.
+  const nodes = Array.from({ length: 11 }, () => ({}));
+  const rtc = mockWebRtc(nodes);
+  const address = pointerAddress(seed);
+  const distance = (index) =>
+    BigInt(`0x${parseWebRtcDirectMultiaddr(rtc.endpoints[index]).peerId}`) ^ BigInt(`0x${address}`);
+  const seeds = nodes.map((_, index) => index).sort((a, b) => (distance(a) < distance(b) ? -1 : 1)).slice(7);
+  const [rejected, failing, ...holders] = seeds;
+  nodes[rejected].payment = { ...paymentNetwork, chain_id: 1 };
+  nodes[failing].respond = (channel, method) => {
+    if (method !== "get_pointer") return;
+    channel.emit(new ArrayBuffer(0));
+    return false;
+  };
+  for (const index of holders) rtc.stores[index].set(`pointer:${address}`, record);
+  const client = new BrowserNetworkClient(seeds.map((index) => rtc.endpoints[index]));
+  try {
+    await client.connect(paymentNetwork);
+    // Let the other seeds' HELLOs, the rejected one's among them, complete.
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    const read = await client.getPointer(address);
+    assert.equal(read?.target, target(1));
+    assert.ok(!rtc.requests.some(({ node, method }) => node === rejected && method === "get_pointer"));
+  } finally {
+    client.close();
+  }
+});
+
 test("a node that does not advertise pointers is never sent one", async () => {
   const rtc = mockWebRtc(Array.from({ length: 7 }, (_, i) => ({ pointers: i !== 0 })));
   const client = new BrowserNetworkClient(rtc.endpoints);
