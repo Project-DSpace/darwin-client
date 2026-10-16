@@ -84,7 +84,7 @@ fn corroboration(peers: usize) -> usize {
     peers.min(2)
 }
 
-/// The outcome of asking a close group.
+/// The outcome of asking a set of peers: a close group, or the bootstrap peers.
 #[derive(Default)]
 struct Answered {
     /// How many peers gave a usable answer.
@@ -153,7 +153,7 @@ async fn ask_the_group<T>(
 /// holds, and a healthy pointer would read back as uncorroborated. That is not
 /// only an attack; it is what an ordinary read during an update looks like.
 ///
-/// At most one entry per peer, so this is never longer than the close group.
+/// At most one entry per peer, so this is never longer than the set asked.
 #[derive(Default)]
 struct Replies {
     /// Each distinct state offered, and how many peers offered it.

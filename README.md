@@ -1224,7 +1224,8 @@ without a peer ID are only dialled, as before.
 
 So every read reaches the bootstrap peers: a chunk read sends its first GET to
 the one nearest the chunk, connected or not, and a pointer read sends one to
-each of them outside the close group (16 at most with the bundled seeds).
+each of them outside the close group (16 at most with the bundled seeds), all at
+once, dialling any it is not yet connected to.
 
 The config directory is `ant`'s: `~/.config/ant` on Linux,
 `~/Library/Application Support/ant` on macOS, `%APPDATA%\ant` on Windows. A
