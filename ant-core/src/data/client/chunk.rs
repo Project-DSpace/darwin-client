@@ -869,6 +869,9 @@ impl Client {
             // speculation on stale hints before a live holder is discovered.
             // The final close-group size and absence rules still use peer_count.
             crate::client_engine::read::MAX_GET_FALLBACK_PEERS,
+            // Asked from the start alongside discovery, nearest first, and
+            // before the read can report the chunk absent.
+            self.network().bootstrap_peers_near(address),
             |sender| {
                 #[cfg(feature = "native")]
                 let observation = &observation;
@@ -1520,21 +1523,38 @@ mod tests {
     /// Reads one record through the shared read engine from peers 1, 2 and 3,
     /// each giving `answers[peer - 1]`, as `chunk_get` does.
     fn read_from(answers: [Result<Option<u8>>; 3]) -> (Result<Option<u8>>, Vec<u8>) {
+        read_with_bootstrap(&answers, &[])
+    }
+
+    /// As [`read_from`], with peers 1, 2 and 3 as the close group and peers 4
+    /// on as bootstrap peers, peer `n` giving `answers[n - 1]`. There are no
+    /// early reads, so the order asked is the final candidates' order.
+    fn read_with_bootstrap(
+        closest: &[Result<Option<u8>>],
+        bootstrap: &[Result<Option<u8>>],
+    ) -> (Result<Option<u8>>, Vec<u8>) {
+        let answers: Vec<_> = closest.iter().chain(bootstrap).collect();
+        let peers = |range: std::ops::Range<usize>| {
+            range
+                .map(|n| [u8::try_from(n + 1).unwrap(); 32])
+                .collect::<Vec<_>>()
+        };
         let asked = std::sync::Mutex::new(Vec::new());
         let bad_bytes = BadBytes::default();
         let found = futures::executor::block_on(crate::client_engine::read::retrieve_progressive(
             [0; 32],
             0,
+            peers(closest.len()..answers.len()),
             |_| async {
                 crate::client_engine::read::ReadCandidates {
-                    closest: vec![[1u8; 32], [2; 32], [3; 32]],
+                    closest: peers(0..closest.len()),
                     known: Vec::new(),
                 }
             },
             |peer| *peer,
             |peer, _| {
                 asked.lock().unwrap().push(peer[0]);
-                let answer = match &answers[usize::from(peer[0]) - 1] {
+                let answer = match answers[usize::from(peer[0]) - 1] {
                     Ok(found) => Ok(*found),
                     Err(Error::InvalidData(reason)) => Err(Error::InvalidData(reason.clone())),
                     Err(error) => Err(Error::Network(error.to_string())),
@@ -1565,6 +1585,32 @@ mod tests {
         // Nothing found and no bad bytes: absent, as before.
         let (result, _) = read_from([Ok(None), Ok(None), Ok(None)]);
         assert!(matches!(result, Ok(None)), "{result:?}");
+    }
+
+    #[test]
+    fn a_chunk_only_a_bootstrap_peer_holds_is_read() {
+        let none = || -> [Result<Option<u8>>; 3] { [Ok(None), Ok(None), Ok(None)] };
+        let silent = || Err(Error::Timeout("no answer".into()));
+        // The close group holds none: the bootstrap peers are asked next,
+        // nearest first, and bad bytes from one move the read to the next.
+        let (result, asked) = read_with_bootstrap(
+            &none(),
+            &[
+                Err(Error::InvalidData("BLAKE3 mismatch".into())),
+                Ok(Some(7)),
+            ],
+        );
+        assert!(matches!(result, Ok(Some(7))), "{result:?}");
+        assert_eq!(asked, vec![1, 2, 3, 4, 5]);
+        // The close group does not answer at all.
+        let (result, asked) =
+            read_with_bootstrap(&[silent(), silent(), silent()], &[Ok(None), Ok(Some(7))]);
+        assert!(matches!(result, Ok(Some(7))), "{result:?}");
+        assert_eq!(asked, vec![1, 2, 3, 4, 5]);
+        // Nobody holds it: absent once the bootstrap peers have been asked too.
+        let (result, asked) = read_with_bootstrap(&none(), &[Ok(None), Ok(None)]);
+        assert!(matches!(result, Ok(None)), "{result:?}");
+        assert_eq!(asked, vec![1, 2, 3, 4, 5]);
     }
 
     #[test]

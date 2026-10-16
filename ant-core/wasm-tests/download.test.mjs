@@ -161,6 +161,25 @@ test("nodes serving corrupt content are passed over for one that serves the reco
 });
 
 
+test("every seed is asked before a read reports a record missing", async () => {
+  // Thirty seeds, and only the farthest from the record holds it: beyond the
+  // seven nearest that discovery finds and the twenty more known peers a read
+  // falls back to.
+  const nodes = Array.from({ length: 30 }, () => ({}));
+  const rtc = mockWebRtc(nodes);
+  const target = BigInt(`0x${datamap.address}`);
+  const distance = i => BigInt(`0x${parseWebRtcDirectMultiaddr(rtc.endpoints[i]).peerId}`) ^ target;
+  const farthest = nodes.map((_, i) => i).sort((a, b) => distance(a) < distance(b) ? -1 : 1).at(-1);
+  nodes[farthest].chunk = datamap.content;
+  const client = new BrowserNetworkClient(rtc.endpoints);
+  let reader;
+  try {
+    reader = await client.openPublicFile(datamap.address);
+    assert.equal(reader.size, content.length);
+    assert.ok(rtc.requests.some(r => r.node === farthest && r.method === "get_chunk"));
+  } finally { reader?.close(); client.close(); }
+});
+
 test("a just-uploaded file downloads and streams after its holders fail discovery", async () => {
   const nodes = Array.from({ length: 7 }, () => ({}));
   const rtc = mockWebRtc(nodes);

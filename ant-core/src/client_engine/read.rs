@@ -62,19 +62,25 @@ pub(crate) struct ReadCandidates<P> {
     pub known: Vec<P>,
 }
 
-/// Keep primary peers first, ordered by XOR distance, then bounded, deduplicated
-/// known peers. Discovery failure suppression must not filter the latter.
-pub(crate) fn read_targets<P>(
+/// Keep primary peers first, ordered by XOR distance, then the bootstrap peers,
+/// then bounded, deduplicated known peers, each ordered the same way. Discovery
+/// failure suppression must not filter the latter two. Every bootstrap peer is
+/// kept, so a round establishes absence only after all of them have answered.
+pub(crate) fn read_targets<P: Clone>(
     candidates: ReadCandidates<P>,
+    bootstrap: &[P],
     target: &[u8; 32],
     key: impl Fn(&P) -> [u8; 32],
 ) -> Vec<P> {
     let mut primary = candidates.closest;
+    let mut bootstrap = bootstrap.to_vec();
     let mut known = candidates.known;
     primary.sort_by_key(|p| ant_protocol::transport::xor_distance(&key(p), target));
+    bootstrap.sort_by_key(|p| ant_protocol::transport::xor_distance(&key(p), target));
     known.sort_by_key(|p| ant_protocol::transport::xor_distance(&key(p), target));
     let mut seen = HashSet::new();
     primary.retain(|p| seen.insert(key(p)));
+    primary.extend(bootstrap.into_iter().filter(|p| seen.insert(key(p))));
     primary.extend(
         known
             .into_iter()
@@ -89,9 +95,15 @@ pub(crate) fn read_targets<P>(
 /// a delay, on both native and WASM. At most two GETs run, including after discovery.
 /// A peer is queried at most once per round, and only the completed final candidate
 /// set can establish absence.
+///
+/// `bootstrap` peers are hints from the start of every round, before discovery
+/// offers any, whether or not they are connected, and follow the closest peers
+/// in the final candidate set. With none, reads use discovery alone.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn retrieve_progressive<P, T, E, D, DF, G, GF, S, SF>(
     target: [u8; 32],
     early_limit: usize,
+    bootstrap: Vec<P>,
     discover: D,
     key: impl Fn(&P) -> [u8; 32],
     get: G,
@@ -113,7 +125,7 @@ where
         if attempt > 0 {
             sleep(CLOSE_GROUP_RETRY_DELAY).await;
         }
-        let (sender, mut updates) = tokio::sync::watch::channel(Vec::new());
+        let (sender, mut updates) = tokio::sync::watch::channel(bootstrap.clone());
         let mut discovery = Box::pin(discover(sender));
         let mut attempted = HashSet::new();
         let not_found = std::sync::Mutex::new(HashSet::new());
@@ -206,7 +218,7 @@ where
                 },
             }
         };
-        let peers = read_targets(candidates, &target, &key);
+        let peers = read_targets(candidates, &bootstrap, &target, &key);
         let final_ids = peers.iter().map(&key).collect::<HashSet<_>>();
         // Discovery may finish with two early reads still active. Start the
         // ordinary path only once one retires; never create a third wire GET.
@@ -290,6 +302,7 @@ where
     retrieve_progressive(
         target,
         0,
+        Vec::new(),
         |_| discover(),
         key,
         |peer, _| get(peer),
@@ -320,6 +333,7 @@ mod tests {
         let read = retrieve_progressive(
             peer(0),
             7,
+            Vec::new(),
             |updates| async move {
                 updates.send_replace(vec![peer(1)]);
                 tokio::time::sleep(Duration::from_millis(500)).await;
@@ -360,6 +374,7 @@ mod tests {
         let future = retrieve_progressive(
             peer(0),
             7,
+            Vec::new(),
             |updates| {
                 let found_rx = found_rx.borrow_mut().take().unwrap();
                 async move {
@@ -420,6 +435,7 @@ mod tests {
         let read = retrieve_progressive(
             peer(0),
             allowance,
+            Vec::new(),
             |updates| async move {
                 updates.send_replace((200..).take(allowance).map(peer).collect());
                 tokio::time::sleep(Duration::from_secs(10)).await;
@@ -449,6 +465,7 @@ mod tests {
         let read = retrieve_progressive(
             peer(0),
             allowance,
+            Vec::new(),
             |updates| async move {
                 // A close group of attempted peers is nearer than the late hint.
                 updates.send_replace((1..).take(allowance).map(peer).collect());
@@ -479,6 +496,7 @@ mod tests {
         let read = retrieve_progressive(
             peer(0),
             1,
+            Vec::new(),
             |updates| async move {
                 updates.send_replace(vec![peer(200)]);
                 tokio::time::sleep(Duration::from_secs(1)).await;
@@ -515,6 +533,7 @@ mod tests {
         let read = retrieve_progressive(
             peer(0),
             7,
+            Vec::new(),
             |updates| async move {
                 updates.send_replace(vec![peer(1), peer(2)]);
                 futures::future::pending().await
@@ -541,6 +560,7 @@ mod tests {
         let result = futures::executor::block_on(retrieve_progressive(
             peer(0),
             7,
+            Vec::new(),
             |updates| async move {
                 updates.send_replace(vec![peer(1)]);
                 futures::future::pending().await
@@ -563,6 +583,7 @@ mod tests {
         let result = retrieve_progressive(
             peer(0),
             7,
+            Vec::new(),
             |updates| async move {
                 updates.send_replace((1..=7).map(peer).collect());
                 futures::future::pending().await
@@ -590,6 +611,7 @@ mod tests {
         let result = futures::executor::block_on(retrieve_progressive(
             peer(0),
             7,
+            Vec::new(),
             |updates| {
                 let receive = receive.borrow_mut().take().unwrap();
                 async move {
@@ -630,6 +652,7 @@ mod tests {
         let result = futures::executor::block_on(retrieve_progressive(
             peer(0),
             2,
+            Vec::new(),
             |updates| {
                 let receive = receive.borrow_mut().take().unwrap();
                 async move {
@@ -664,6 +687,7 @@ mod tests {
         let result = futures::executor::block_on(retrieve_progressive(
             peer(0),
             7,
+            Vec::new(),
             |updates| async move {
                 updates.send_replace(vec![peer(1)]);
                 futures::future::pending().await
@@ -767,12 +791,195 @@ mod tests {
                 closest: vec![peer(3), peer(1), peer(1)],
                 known: (0..30).rev().map(peer).collect(),
             },
+            &[],
             &peer(0),
             |p| *p,
         );
         assert_eq!(&targets[..4], &[peer(1), peer(3), peer(0), peer(2)]);
         assert_eq!(targets.len(), 22);
         assert_eq!(targets.iter().collect::<HashSet<_>>().len(), 22);
+    }
+
+    #[test]
+    fn bootstrap_peers_follow_the_closest_and_are_all_kept() {
+        // Thirty bootstrap peers, one of which is also among the closest.
+        let bootstrap: Vec<_> = (40..70).rev().chain([1]).map(peer).collect();
+        let targets = read_targets(
+            ReadCandidates {
+                closest: vec![peer(3), peer(1)],
+                known: (0..30).chain(40..45).rev().map(peer).collect(),
+            },
+            &bootstrap,
+            &peer(0),
+            |p| *p,
+        );
+        assert_eq!(&targets[..2], &[peer(1), peer(3)]);
+        // Every bootstrap peer, nearest first, more than the known peers' bound.
+        assert_eq!(&targets[2..32], &(40..70).map(peer).collect::<Vec<_>>()[..]);
+        // Then the known peers not already listed, bounded as before.
+        assert_eq!(&targets[32..35], &[peer(0), peer(2), peer(4)]);
+        assert_eq!(targets.len(), 32 + MAX_GET_FALLBACK_PEERS);
+        assert_eq!(targets.iter().collect::<HashSet<_>>().len(), targets.len());
+    }
+
+    #[test]
+    fn bootstrap_peers_are_read_before_discovery_offers_anything() {
+        use futures::FutureExt;
+        let gets = RefCell::new(Vec::new());
+        // Discovery never finishes, so only the bootstrap peers can answer.
+        let result = retrieve_progressive(
+            peer(0),
+            7,
+            vec![peer(9), peer(3)],
+            |_| futures::future::pending::<ReadCandidates<[u8; 32]>>(),
+            |p| *p,
+            |p, early| {
+                gets.borrow_mut().push((p, early));
+                async move { Ok::<_, ReadError>((p == peer(9)).then_some(42)) }
+            },
+            |_| true,
+            |_| async {},
+        )
+        .now_or_never();
+        assert_eq!(result, Some(Ok(Some(42))));
+        // Nearest first: a miss moves on to the next.
+        assert_eq!(*gets.borrow(), vec![(peer(3), true), (peer(9), true)]);
+    }
+
+    #[test]
+    fn without_bootstrap_peers_nothing_is_read_before_discovery_offers_hints() {
+        use futures::FutureExt;
+        let gets = Cell::new(0);
+        let result = retrieve_progressive(
+            peer(0),
+            7,
+            Vec::new(),
+            |_| futures::future::pending::<ReadCandidates<[u8; 32]>>(),
+            |p| *p,
+            |_, _| {
+                gets.set(gets.get() + 1);
+                async { Ok::<Option<()>, ReadError>(None) }
+            },
+            |_| true,
+            |_| async {},
+        )
+        .now_or_never();
+        assert!(result.is_none());
+        assert_eq!(gets.get(), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_bootstrap_holder_is_read_while_the_close_group_is_silent() {
+        let close_group = || (1..=7).map(peer);
+        let gets = RefCell::new(Vec::new());
+        let start = tokio::time::Instant::now();
+        let result = retrieve_progressive(
+            peer(0),
+            MAX_GET_FALLBACK_PEERS,
+            vec![peer(100)],
+            |_| async move {
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                ReadCandidates {
+                    closest: close_group().collect(),
+                    known: vec![],
+                }
+            },
+            |p| *p,
+            |p, early| {
+                gets.borrow_mut().push((p, early));
+                let silent = close_group().any(|member| member == p);
+                async move {
+                    if silent {
+                        // As a GET that never gets an answer: a timeout.
+                        tokio::time::sleep(Duration::from_secs(10)).await;
+                        Err(ReadError::Transport)
+                    } else {
+                        tokio::time::sleep(Duration::from_secs(2)).await;
+                        Ok(Some(42))
+                    }
+                }
+            },
+            |error| *error == ReadError::Transport,
+            tokio::time::sleep,
+        )
+        .await;
+        assert_eq!(result, Ok(Some(42)));
+        // Asked from the start, it answers before any close-group GET times out.
+        assert_eq!(start.elapsed(), Duration::from_secs(2));
+        assert_eq!(*gets.borrow(), vec![(peer(100), true), (peer(1), false)]);
+    }
+
+    #[test]
+    fn a_bootstrap_holder_is_read_after_the_close_group_answers_not_found() {
+        let gets = RefCell::new(Vec::new());
+        // No early reads: the final candidates alone, in order.
+        let result = futures::executor::block_on(retrieve_progressive(
+            peer(0),
+            0,
+            vec![peer(100), peer(50)],
+            |_| async {
+                ReadCandidates {
+                    closest: (1..=7).map(peer).collect(),
+                    known: vec![peer(8)],
+                }
+            },
+            |p| *p,
+            |p, early| {
+                gets.borrow_mut().push((p, early));
+                async move { Ok::<_, ReadError>((p == peer(100)).then_some(42)) }
+            },
+            |_| true,
+            |_| async {},
+        ));
+        assert_eq!(result, Ok(Some(42)));
+        let expected: Vec<_> = (1..=7)
+            .chain([50, 100])
+            .map(|id| (peer(id), false))
+            .collect();
+        assert_eq!(*gets.borrow(), expected);
+    }
+
+    #[test]
+    fn absence_is_established_only_once_every_bootstrap_peer_has_answered() {
+        // A bootstrap peer that fails to answer keeps a round from establishing
+        // absence, like any final candidate. When every one answers, one round
+        // is enough.
+        for (failing, expected_rounds) in [(None, 1), (Some(peer(100)), 2)] {
+            let rounds = Cell::new(0);
+            let gets = RefCell::new(Vec::new());
+            let result = futures::executor::block_on(retrieve_progressive(
+                peer(0),
+                0,
+                vec![peer(50), peer(100)],
+                |_| {
+                    rounds.set(rounds.get() + 1);
+                    async {
+                        ReadCandidates {
+                            closest: (1..=7).map(peer).collect(),
+                            known: vec![],
+                        }
+                    }
+                },
+                |p| *p,
+                |p, _| {
+                    gets.borrow_mut().push(p);
+                    async move {
+                        if Some(p) == failing {
+                            Err(ReadError::Transport)
+                        } else {
+                            Ok::<Option<()>, _>(None)
+                        }
+                    }
+                },
+                |error| *error == ReadError::Transport,
+                |_| async {},
+            ));
+            assert_eq!(result, Ok(None));
+            assert_eq!(rounds.get(), expected_rounds);
+            // Each round asks the close group, then every bootstrap peer.
+            let round: Vec<_> = (1..=7).chain([50, 100]).map(peer).collect();
+            assert_eq!(*gets.borrow(), round.repeat(expected_rounds));
+        }
     }
 
     #[test]

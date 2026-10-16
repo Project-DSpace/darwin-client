@@ -240,6 +240,23 @@ impl BrowserNetwork for SharedNetworkAdapter {
             .collect()
     }
 
+    /// The configured seeds, each carrying its peer ID, except those whose node
+    /// the seed policy rejected: every request to one fails at once.
+    fn bootstrap_peers(&self) -> Vec<MultiAddr> {
+        self.inner
+            .seeds
+            .iter()
+            .filter(|endpoint| {
+                self.inner
+                    .pool
+                    .bootstrap_policy
+                    .check(&endpoint.multiaddr)
+                    .is_ok()
+            })
+            .filter_map(|endpoint| endpoint.multiaddr.parse().ok())
+            .collect()
+    }
+
     fn request<'a>(
         &'a self,
         peer: &'a PeerId,

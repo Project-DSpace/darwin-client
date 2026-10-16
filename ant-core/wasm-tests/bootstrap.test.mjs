@@ -25,14 +25,17 @@ test("network connect returns a fast seed and retains its authenticated associat
 });
 
 test("cold discovery reaches a non-seed holder before the slow seed authenticates", async () => {
-  const rtc = mockWebRtc([{ view: [0, 2] }, { connectDelay: 800 }, { chunk: map.content, view: [0, 2] }]);
+  // Reads ask the seeds from the start. The slow seed is the nearer of the two
+  // to the record, so it takes the first early GET; the holder that discovery
+  // finds through the fast seed is read once the hedge allows a second.
+  const rtc = mockWebRtc([{ view: [0, 2] }, { connectDelay: 3000 }, { chunk: map.content, view: [0, 2] }]);
   const client = new BrowserNetworkClient(rtc.endpoints.slice(0, 2));
   let reader;
   try {
     const started = performance.now();
     reader = await client.openPublicFile(map.address);
     assert.equal(reader.size, content.length);
-    assert.ok(performance.now() - started < 600, "discovery must start before all seeds authenticate");
+    assert.ok(performance.now() - started < 2000, "discovery must start before all seeds authenticate");
     assert.ok(rtc.requests.some(r => r.node === 2 && r.method === "get_chunk"));
   } finally { reader?.close(); reader?.free(); client.close(); client.free(); }
 });

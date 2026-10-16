@@ -401,7 +401,11 @@ async fn build_data_client(
     }
 
     let peer_cache_path = use_peer_cache.then(peer_cache::cache_path).flatten();
-    let mut client = Client::from_node_with_peer_cache(node, config, peer_cache_path);
+    // Reads also ask the resolved bootstrap peers that carry a peer ID (the
+    // bundled seeds do), not the node's own bootstrap list, which also holds
+    // cached peers.
+    let mut client = Client::from_node_with_peer_cache(node, config, peer_cache_path)
+        .with_bootstrap_peers(&bootstrap);
 
     if needs_wallet {
         let key = private_key

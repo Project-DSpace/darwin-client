@@ -86,12 +86,46 @@ pub(crate) struct ClosestPeerDiagnostics {
 pub struct Network {
     #[cfg(feature = "native")]
     node: Arc<P2PNode>,
+    /// The bootstrap addresses reads also ask, as configured. Only those
+    /// carrying a peer ID are used: see [`Network::bootstrap_peers_near`].
+    #[cfg(feature = "native")]
+    bootstrap: Vec<MultiAddr>,
     #[cfg(not(feature = "native"))]
     backend: std::rc::Rc<dyn BrowserNetwork>,
 }
 
 /// Peer identities and the addresses that can reach them.
 pub type PeerAddresses = Vec<(PeerId, Vec<MultiAddr>)>;
+
+/// The bootstrap peers among `seeds` that a read can ask: each one whose
+/// address carries a peer ID, with all of its addresses, nearest to `target`
+/// by XOR distance first. Addresses without a peer ID, and the local peer,
+/// are left out.
+pub(crate) fn bootstrap_read_peers(
+    seeds: &[MultiAddr],
+    target: &[u8; 32],
+    local: &PeerId,
+) -> PeerAddresses {
+    let mut peers: PeerAddresses = Vec::new();
+    for seed in seeds {
+        let Some(peer) = seed.peer_id() else {
+            continue;
+        };
+        if peer == local {
+            continue;
+        }
+        match peers.iter_mut().find(|(known, _)| known == peer) {
+            Some((_, addrs)) => {
+                if !addrs.contains(seed) {
+                    addrs.push(seed.clone());
+                }
+            }
+            None => peers.push((*peer, vec![seed.clone()])),
+        }
+    }
+    peers.sort_by_key(|(peer, _)| ant_protocol::transport::xor_distance(peer.as_bytes(), target));
+    peers
+}
 
 /// Bounded, latest-value hints for an immutable read in progress. Hints only
 /// start authenticated GETs; they never establish closeness, absence or payment
@@ -177,6 +211,12 @@ pub trait BrowserNetwork {
     fn connected_read_peers(&self) -> Vec<PeerId> {
         Vec::new()
     }
+    /// Bootstrap addresses that chunk and pointer reads also ask, alongside
+    /// discovery. Only those carrying a peer ID are used. Adapters without
+    /// them read through discovery alone.
+    fn bootstrap_peers(&self) -> Vec<MultiAddr> {
+        Vec::new()
+    }
     /// Execute one authenticated request, preserving its request identifier.
     fn request<'a>(
         &'a self,
@@ -223,6 +263,7 @@ impl Network {
     }
 
     /// Connect using QUIC multiaddresses, preserving optional peer identity pins.
+    /// Chunk and pointer reads also ask the seeds that carry a peer ID.
     #[cfg(feature = "native")]
     pub async fn new_multiaddrs(
         bootstrap_peers: &[MultiAddr],
@@ -249,7 +290,7 @@ impl Network {
         // silently drop legitimate testnet peers that share an IP or /24.
         core_config.diversity_config = Some(IPDiversityConfig::permissive());
 
-        core_config.bootstrap_peers = seeds;
+        core_config.bootstrap_peers = seeds.clone();
 
         let node = P2PNode::new(core_config)
             .await
@@ -261,14 +302,25 @@ impl Network {
 
         Ok(Self {
             node: Arc::new(node),
+            bootstrap: seeds,
         })
     }
 
-    /// Create a network from an existing P2P node.
+    /// Create a network from an existing P2P node. Reads ask no bootstrap
+    /// peers unless the client is given some (`Client::with_bootstrap_peers`).
     #[must_use]
     #[cfg(feature = "native")]
     pub fn from_node(node: Arc<P2PNode>) -> Self {
-        Self { node }
+        Self {
+            node,
+            bootstrap: Vec::new(),
+        }
+    }
+
+    /// Replace the bootstrap addresses reads also ask.
+    #[cfg(feature = "native")]
+    pub(crate) fn set_bootstrap_peers(&mut self, seeds: &[MultiAddr]) {
+        self.bootstrap = seeds.to_vec();
     }
 
     /// Get a reference to the underlying P2P node.
@@ -500,10 +552,29 @@ impl Network {
         }
     }
 
+    /// The bootstrap peers a read of `target` also asks, nearest first: those
+    /// whose configured address carries a peer ID. Native clients use the
+    /// addresses they connected through or were given; browser clients use
+    /// their seeds, less any whose node the seed policy rejected. Empty when
+    /// no bootstrap address carries a peer ID, and reads then use discovery
+    /// alone.
+    pub(crate) fn bootstrap_peers_near(&self, target: &[u8; 32]) -> PeerAddresses {
+        #[cfg(feature = "native")]
+        {
+            bootstrap_read_peers(&self.bootstrap, target, self.peer_id())
+        }
+        #[cfg(not(feature = "native"))]
+        {
+            bootstrap_read_peers(&self.backend.bootstrap_peers(), target, self.peer_id())
+        }
+    }
+
     /// Speculate on already-connected peers on both platforms. Discovery owns
     /// cold dialing; a dead address must not occupy an early GET slot while a
     /// reachable holder is being discovered. Ordinary fallback still sees all
-    /// known peers, including those requiring a new connection.
+    /// known peers, including those requiring a new connection. Bootstrap
+    /// peers are the exception: reads offer them from the start, connected or
+    /// not ([`Network::bootstrap_peers_near`]).
     pub(crate) async fn seed_read_candidates(&self, progress: &ReadProgress) {
         #[cfg(feature = "native")]
         let connected = self.node.connected_peers().await;
@@ -631,5 +702,67 @@ mod tests {
         assert_eq!(h.connected_peers, u32::MAX);
         assert_eq!(h.routing_table_size, u32::MAX);
         assert!(h.write_ready);
+    }
+
+    fn seed(peer: u8, port: u16) -> MultiAddr {
+        format!(
+            "/ip4/127.0.0.1/udp/{port}/quic/p2p/{}",
+            hex::encode([peer; 32])
+        )
+        .parse()
+        .unwrap()
+    }
+
+    #[test]
+    fn bootstrap_read_peers_are_nearest_to_the_target_first() {
+        let seeds = [seed(0x80, 1), seed(0x11, 2), seed(0x30, 3), seed(0x10, 4)];
+        let peers = bootstrap_read_peers(&seeds, &[0x10; 32], &PeerId::from_bytes([0xff; 32]));
+        let order: Vec<_> = peers.iter().map(|(peer, _)| peer.as_bytes()[0]).collect();
+        // XOR distances from 0x10..: 0x00.., 0x01.., 0x20.., 0x90..
+        assert_eq!(order, vec![0x10, 0x11, 0x30, 0x80]);
+        assert_eq!(
+            bootstrap_read_peers(&seeds, &[0x80; 32], &PeerId::from_bytes([0xff; 32]))[0].0,
+            PeerId::from_bytes([0x80; 32])
+        );
+    }
+
+    #[test]
+    fn bootstrap_read_peers_need_a_peer_id_and_leave_out_the_local_peer() {
+        let local = PeerId::from_bytes([7; 32]);
+        let plain: MultiAddr = "/ip4/127.0.0.1/udp/10000/quic".parse().unwrap();
+        // Addresses without a peer ID give reads no bootstrap peers at all.
+        assert!(bootstrap_read_peers(std::slice::from_ref(&plain), &[0; 32], &local).is_empty());
+        assert!(bootstrap_read_peers(&[], &[0; 32], &local).is_empty());
+        // One peer's addresses stay together, once each.
+        let peers = bootstrap_read_peers(
+            &[
+                seed(1, 10000),
+                plain,
+                seed(1, 10001),
+                seed(1, 10000),
+                seed(7, 10002),
+            ],
+            &[0; 32],
+            &local,
+        );
+        assert_eq!(peers.len(), 1);
+        assert_eq!(peers[0].0, PeerId::from_bytes([1; 32]));
+        assert_eq!(peers[0].1, vec![seed(1, 10000), seed(1, 10001)]);
+    }
+
+    #[test]
+    fn the_bundled_seeds_are_sixteen_bootstrap_read_peers_on_each_transport() {
+        let seeds = crate::network_defaults::bundled_bootstrap_seeds().unwrap();
+        let webrtc: Vec<MultiAddr> = seeds.webrtc.iter().map(|s| s.parse().unwrap()).collect();
+        let local = PeerId::from_bytes([0xff; 32]);
+        let target = [0x42; 32];
+        let native = bootstrap_read_peers(&seeds.quic, &target, &local);
+        let browser = bootstrap_read_peers(&webrtc, &target, &local);
+        assert_eq!(native.len(), 16);
+        assert_eq!(browser.len(), 16);
+        assert!(native.iter().all(|(_, addrs)| addrs.len() == 1));
+        // The same nodes, in the same order, whichever transport reaches them.
+        let ids = |peers: &PeerAddresses| peers.iter().map(|(peer, _)| *peer).collect::<Vec<_>>();
+        assert_eq!(ids(&native), ids(&browser));
     }
 }

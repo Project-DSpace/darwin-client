@@ -813,6 +813,8 @@ impl Client {
     }
 
     /// Connect using native QUIC multiaddresses without discarding peer pins.
+    /// Chunk and pointer reads also ask the bootstrap peers among them that
+    /// carry a peer ID, as with [`Client::with_bootstrap_peers`].
     #[cfg(feature = "native")]
     pub async fn connect_multiaddrs(
         bootstrap_peers: &[ant_protocol::transport::MultiAddr],
@@ -841,6 +843,23 @@ impl Client {
             persist_path,
             peer_cache_path: None,
         })
+    }
+
+    /// Also ask these bootstrap peers in chunk and pointer reads, alongside the
+    /// close group and from the start of each read: those whose address
+    /// carries a `/p2p/` peer ID, nearest to the address being read first. The
+    /// nodes that were nearest to a record when it was stored may still hold
+    /// it after the nodes nearest to it have changed.
+    ///
+    /// Pass the bootstrap addresses the client was configured with, such as
+    /// those [`crate::config::resolve_bootstrap_multiaddrs`] returns. A client
+    /// built from a node asks none until given them here; addresses without
+    /// a peer ID add none.
+    #[must_use]
+    #[cfg(feature = "native")]
+    pub fn with_bootstrap_peers(mut self, seeds: &[MultiAddr]) -> Self {
+        self.network.set_bootstrap_peers(seeds);
+        self
     }
 
     /// Set the wallet for payment operations.
