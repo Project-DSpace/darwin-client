@@ -7,35 +7,42 @@ const content = new TextEncoder().encode("Pooled bootstrap and progressive disco
 const map = encryptPublicFile(content).records.at(-1);
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 
-test("network connect returns a fast seed and retains its authenticated association", async () => {
-  const rtc = mockWebRtc([{ connectDelay: 800 }, { chunk: map.content }]);
-  const client = new BrowserNetworkClient(rtc.endpoints);
-  let reader;
-  try {
-    const started = performance.now();
-    const hello = await client.connect(paymentNetwork);
-    assert.equal(hello.peer_id, parseWebRtcDirectMultiaddr(rtc.endpoints[1]).peerId);
-    reader = await client.openPublicFile(map.address);
-    assert.equal(reader.size, content.length);
-    assert.ok(performance.now() - started < 600, "a slow seed must not delay authentication or the read");
-    assert.equal(rtc.connections.filter(c => c.remoteSeed === 2).length, 1, "the read must reuse the authenticated bootstrap association");
-  } finally { reader?.close(); reader?.free(); client.close(); client.free(); }
-  await closesSettled();
-  assert.ok(rtc.connections.every(c => c.closed));
-});
+// Reads also ask the seeds, nearest to the record first, from the start. Of
+// the first two mock nodes, the second is the nearer to `map`.
+for (const slowSeedIsNearer of [false, true]) {
+  test(`network connect returns a fast seed and retains its authenticated association (slow seed ${slowSeedIsNearer ? "nearer to" : "farther from"} the record)`, async () => {
+    const [slow, holder] = slowSeedIsNearer ? [1, 0] : [0, 1];
+    const nodes = [];
+    nodes[slow] = { connectDelay: 800 };
+    nodes[holder] = { chunk: map.content };
+    const rtc = mockWebRtc(nodes);
+    const distance = i => BigInt(`0x${parseWebRtcDirectMultiaddr(rtc.endpoints[i]).peerId}`) ^ BigInt(`0x${map.address}`);
+    assert.ok(distance(1) < distance(0));
+    const client = new BrowserNetworkClient(rtc.endpoints);
+    let reader;
+    try {
+      const started = performance.now();
+      const hello = await client.connect(paymentNetwork);
+      assert.equal(hello.peer_id, parseWebRtcDirectMultiaddr(rtc.endpoints[holder]).peerId);
+      reader = await client.openPublicFile(map.address);
+      assert.equal(reader.size, content.length);
+      assert.ok(performance.now() - started < 600, "a slow seed must not delay authentication or the read");
+      assert.equal(rtc.connections.filter(c => c.remoteSeed === holder + 1).length, 1, "the read must reuse the authenticated bootstrap association");
+    } finally { reader?.close(); reader?.free(); client.close(); client.free(); }
+    await closesSettled();
+    assert.ok(rtc.connections.every(c => c.closed));
+  });
+}
 
 test("cold discovery reaches a non-seed holder before the slow seed authenticates", async () => {
-  // Reads ask the seeds from the start. The slow seed is the nearer of the two
-  // to the record, so it takes the first early GET; the holder that discovery
-  // finds through the fast seed is read once the hedge allows a second.
-  const rtc = mockWebRtc([{ view: [0, 2] }, { connectDelay: 3000 }, { chunk: map.content, view: [0, 2] }]);
+  const rtc = mockWebRtc([{ view: [0, 2] }, { connectDelay: 800 }, { chunk: map.content, view: [0, 2] }]);
   const client = new BrowserNetworkClient(rtc.endpoints.slice(0, 2));
   let reader;
   try {
     const started = performance.now();
     reader = await client.openPublicFile(map.address);
     assert.equal(reader.size, content.length);
-    assert.ok(performance.now() - started < 2000, "discovery must start before all seeds authenticate");
+    assert.ok(performance.now() - started < 600, "discovery must start before all seeds authenticate");
     assert.ok(rtc.requests.some(r => r.node === 2 && r.method === "get_chunk"));
   } finally { reader?.close(); reader?.free(); client.close(); client.free(); }
 });

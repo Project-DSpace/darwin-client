@@ -573,8 +573,8 @@ impl Network {
     /// cold dialing; a dead address must not occupy an early GET slot while a
     /// reachable holder is being discovered. Ordinary fallback still sees all
     /// known peers, including those requiring a new connection. Bootstrap
-    /// peers are the exception: reads offer them from the start, connected or
-    /// not ([`Network::bootstrap_peers_near`]).
+    /// peers are the exception: reads ask them from the start, connected or
+    /// not, in a GET slot of their own ([`Network::bootstrap_peers_near`]).
     pub(crate) async fn seed_read_candidates(&self, progress: &ReadProgress) {
         #[cfg(feature = "native")]
         let connected = self.node.connected_peers().await;

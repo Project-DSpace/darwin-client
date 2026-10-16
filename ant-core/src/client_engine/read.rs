@@ -90,15 +90,42 @@ pub(crate) fn read_targets<P: Clone>(
     primary
 }
 
+/// What one GET's result means for a read: a verified record or a fatal error
+/// ends it, a miss counts towards absence, and a retryable failure moves on.
+fn conclusive<T, E>(
+    id: [u8; 32],
+    result: Result<Option<T>, E>,
+    not_found: &std::sync::Mutex<HashSet<[u8; 32]>>,
+    retryable: impl Fn(&E) -> bool,
+) -> Option<Result<Option<T>, E>> {
+    match result {
+        Ok(Some(value)) => Some(Ok(Some(value))),
+        Ok(None) => {
+            not_found
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(id);
+            None
+        }
+        Err(error) if !retryable(&error) => Some(Err(error)),
+        Err(_) => None,
+    }
+}
+
 /// Discover and read concurrently. Early hints are never absence votes or
 /// close-group authority. A stalled early GET may race one other candidate after
 /// a delay, on both native and WASM. At most two GETs run, including after discovery.
 /// A peer is queried at most once per round, and only the completed final candidate
 /// set can establish absence.
 ///
-/// `bootstrap` peers are hints from the start of every round, before discovery
-/// offers any, whether or not they are connected, and follow the closest peers
-/// in the final candidate set. With none, reads use discovery alone.
+/// `bootstrap` peers are read in a lane of their own from the start of every
+/// round, nearest to the target first, one at a time and whether or not they
+/// are connected, until each has been asked. The lane holds one of the two
+/// GETs, so a slow or silent bootstrap peer holds up only the next one:
+/// discovery's hints, and after discovery the ordinary path, keep the other,
+/// and a stalled hint is raced only while the lane is idle. In the final
+/// candidate set they follow the closest peers. With none, reads use discovery
+/// alone.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn retrieve_progressive<P, T, E, D, DF, G, GF, S, SF>(
     target: [u8; 32],
@@ -121,25 +148,46 @@ where
 {
     let allowance = early_limit.min(MAX_GET_FALLBACK_PEERS);
     let max_early_reads = allowance * MAX_EARLY_READS_PER_ALLOWANCE;
+    let mut bootstrap = bootstrap;
+    bootstrap.sort_by_key(|p| ant_protocol::transport::xor_distance(&key(p), &target));
+    let mut listed = HashSet::new();
+    bootstrap.retain(|p| listed.insert(key(p)));
     for attempt in 0..2 {
         if attempt > 0 {
             sleep(CLOSE_GROUP_RETRY_DELAY).await;
         }
-        let (sender, mut updates) = tokio::sync::watch::channel(bootstrap.clone());
+        let (sender, mut updates) = tokio::sync::watch::channel(Vec::new());
         let mut discovery = Box::pin(discover(sender));
         let mut attempted = HashSet::new();
         let not_found = std::sync::Mutex::new(HashSet::new());
+        // Early GETs, each marked with whether the bootstrap lane sent it.
         let mut active = FuturesUnordered::new();
+        let early_get = |peer: P, from_bootstrap: bool| {
+            let id = key(&peer);
+            let future = get(peer, true);
+            async move { (id, from_bootstrap, future.await) }
+        };
+        let mut bootstrap_busy = false;
+        // Early GETs on discovery's hints, which the allowance bounds.
+        let mut hinted = 0;
         let mut hedge_timer = None;
         let mut hedge_ready = false;
         let mut updates_open = true;
         let candidates = loop {
-            if (active.is_empty() || (active.len() == 1 && hedge_ready))
-                && attempted.len() < max_early_reads
+            if !bootstrap_busy {
+                if let Some(peer) = bootstrap.iter().find(|p| !attempted.contains(&key(p))) {
+                    attempted.insert(key(peer));
+                    bootstrap_busy = true;
+                    active.push(early_get(peer.clone(), true));
+                }
+            }
+            let hint_reads = active.len().saturating_sub(usize::from(bootstrap_busy));
+            if (hint_reads == 0 || (hint_reads == 1 && hedge_ready && !bootstrap_busy))
+                && hinted < max_early_reads
             {
                 // Stale hints can use the allowance before discovery reaches the
                 // holders; hints converging on the target remain eligible.
-                let within_allowance = attempted.len() < allowance;
+                let within_allowance = hinted < allowance;
                 let next = updates
                     .borrow_and_update()
                     .iter()
@@ -148,14 +196,13 @@ where
                     .filter(|peer| within_allowance || may_hold(&attempted, &key(peer), &target))
                     .cloned();
                 if let Some(peer) = next {
-                    let id = key(&peer);
-                    attempted.insert(id);
-                    if active.is_empty() {
+                    attempted.insert(key(&peer));
+                    hinted += 1;
+                    if hint_reads == 0 {
                         hedge_ready = false;
                         hedge_timer = Some(Box::pin(sleep(EARLY_READ_HEDGE_DELAY)));
                     }
-                    let future = get(peer, true);
-                    active.push(async move { (id, future.await) });
+                    active.push(early_get(peer, false));
                 }
             }
             let event = {
@@ -167,10 +214,9 @@ where
                     }
                 };
                 let read = async {
-                    if active.is_empty() {
-                        futures::future::pending().await
-                    } else {
-                        active.next().await.expect("nonempty early reads")
+                    match active.next().await {
+                        Some(read) => read,
+                        None => futures::future::pending().await,
                     }
                 };
                 let hedge = async {
@@ -205,73 +251,89 @@ where
                     hedge_ready = true;
                     hedge_timer = None;
                 }
-                Either::Right(Either::Left((id, result))) => match result {
-                    Ok(Some(value)) => return Ok(Some(value)),
-                    Ok(None) => {
-                        not_found
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner())
-                            .insert(id);
+                Either::Right(Either::Left((id, from_bootstrap, result))) => {
+                    if from_bootstrap {
+                        bootstrap_busy = false;
                     }
-                    Err(error) if !retryable(&error) => return Err(error),
-                    Err(_) => {}
-                },
+                    if let Some(read) = conclusive(id, result, &not_found, &retryable) {
+                        return read;
+                    }
+                }
             }
         };
         let peers = read_targets(candidates, &bootstrap, &target, &key);
         let final_ids = peers.iter().map(&key).collect::<HashSet<_>>();
-        // Discovery may finish with two early reads still active. Start the
-        // ordinary path only once one retires; never create a third wire GET.
-        let (slot, slot_available) = futures::channel::oneshot::channel();
-        let wait_for_slot = active.len() == 2;
+        // Discovery may finish with two early reads still active. Each one that
+        // retires frees its slot, for the ordinary path first and then the
+        // bootstrap lane; never create a third wire GET.
+        let (ordinary_slot, ordinary_turn) = futures::channel::oneshot::channel();
+        let (bootstrap_slot, bootstrap_turn) = futures::channel::oneshot::channel();
+        let mut slots = [ordinary_slot, bootstrap_slot].into_iter();
+        for slot in slots.by_ref().take(2usize.saturating_sub(active.len())) {
+            let _ = slot.send(());
+        }
+        let attempted = std::sync::Mutex::new(attempted);
+        // Claims `peer` for one lane, once per round.
+        let claim = |peer: &P| {
+            attempted
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(key(peer))
+        };
         let pending_early = (!active.is_empty()).then(|| {
             let not_found = &not_found;
             let retryable = &retryable;
             async move {
-                let mut slot = Some(slot);
-                while let Some((id, result)) = active.next().await {
-                    if let Some(slot) = slot.take() {
+                while let Some((id, _, result)) = active.next().await {
+                    if let Some(slot) = slots.next() {
                         let _ = slot.send(());
                     }
-                    match result {
-                        Ok(Some(value)) => return Ok(Some(value)),
-                        Ok(None) => {
-                            not_found
-                                .lock()
-                                .unwrap_or_else(|e| e.into_inner())
-                                .insert(id);
-                        }
-                        Err(error) if !retryable(&error) => return Err(error),
-                        Err(_) => {}
+                    if let Some(read) = conclusive(id, result, not_found, retryable) {
+                        return read;
                     }
                 }
                 Ok(None)
             }
         });
         let ordinary = async {
-            if wait_for_slot {
-                let _ = slot_available.await;
-            }
+            let _ = ordinary_turn.await;
             for peer in peers {
-                let id = key(&peer);
-                if attempted.contains(&id) {
+                if !claim(&peer) {
                     continue;
                 }
-                match get(peer, false).await {
-                    Ok(Some(value)) => return Ok(Some(value)),
-                    Ok(None) => {
-                        not_found
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner())
-                            .insert(id);
-                    }
-                    Err(error) if !retryable(&error) => return Err(error),
-                    Err(_) => {}
+                let id = key(&peer);
+                if let Some(read) = conclusive(id, get(peer, false).await, &not_found, &retryable) {
+                    return read;
                 }
             }
             Ok(None)
         };
-        if let Some(value) = race_cached_read(pending_early, ordinary, &retryable).await? {
+        // The bootstrap peers not yet asked, alongside the ordinary path.
+        let bootstrap_lane = async {
+            let untried = |peer: &P| {
+                !attempted
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .contains(&key(peer))
+            };
+            if !bootstrap.iter().any(untried) {
+                return Ok(None);
+            }
+            let _ = bootstrap_turn.await;
+            for peer in &bootstrap {
+                if !claim(peer) {
+                    continue;
+                }
+                let id = key(peer);
+                let result = get(peer.clone(), false).await;
+                if let Some(read) = conclusive(id, result, &not_found, &retryable) {
+                    return read;
+                }
+            }
+            Ok(None)
+        };
+        let lanes = race_cached_read(Some(bootstrap_lane), ordinary, &retryable);
+        if let Some(value) = race_cached_read(pending_early, lanes, &retryable).await? {
             return Ok(Some(value));
         }
         let misses = not_found.lock().unwrap_or_else(|e| e.into_inner());
@@ -324,6 +386,56 @@ mod tests {
     enum ReadError {
         Transport,
         Integrity,
+    }
+
+    /// GETs on a simulated network, for reads in paused time: each takes
+    /// `latency`, or waits out a ten-second timeout for a silent peer. Keeps
+    /// every GET asked, and the most that were in flight at once.
+    #[derive(Default)]
+    struct Simulated {
+        gets: RefCell<Vec<([u8; 32], bool)>>,
+        in_flight: Cell<usize>,
+        most: Cell<usize>,
+    }
+
+    /// One GET in flight, until it answers or is dropped.
+    struct InFlight<'a>(&'a Cell<usize>);
+
+    impl Drop for InFlight<'_> {
+        fn drop(&mut self) {
+            self.0.set(self.0.get() - 1);
+        }
+    }
+
+    impl Simulated {
+        fn get(
+            &self,
+            p: [u8; 32],
+            early: bool,
+            latency: Duration,
+            silent: bool,
+            holds: bool,
+        ) -> impl Future<Output = Result<Option<u32>, ReadError>> + '_ {
+            self.gets.borrow_mut().push((p, early));
+            async move {
+                self.in_flight.set(self.in_flight.get() + 1);
+                self.most.set(self.most.get().max(self.in_flight.get()));
+                let _in_flight = InFlight(&self.in_flight);
+                if silent {
+                    tokio::time::sleep(Duration::from_secs(10)).await;
+                    Err(ReadError::Transport)
+                } else {
+                    tokio::time::sleep(latency).await;
+                    Ok(holds.then_some(42))
+                }
+            }
+        }
+
+        fn asked(&self) -> Vec<[u8; 32]> {
+            let mut asked: Vec<_> = self.gets.borrow().iter().map(|(p, _)| *p).collect();
+            asked.sort_unstable();
+            asked
+        }
     }
 
     #[tokio::test(start_paused = true)]
@@ -802,7 +914,7 @@ mod tests {
 
     #[test]
     fn bootstrap_peers_follow_the_closest_and_are_all_kept() {
-        // Thirty bootstrap peers, one of which is also among the closest.
+        // Thirty bootstrap peers, plus one that is also among the closest.
         let bootstrap: Vec<_> = (40..70).rev().chain([1]).map(peer).collect();
         let targets = read_targets(
             ReadCandidates {
@@ -909,11 +1021,14 @@ mod tests {
         assert_eq!(*gets.borrow(), vec![(peer(100), true), (peer(1), false)]);
     }
 
-    #[test]
-    fn a_bootstrap_holder_is_read_after_the_close_group_answers_not_found() {
-        let gets = RefCell::new(Vec::new());
-        // No early reads: the final candidates alone, in order.
-        let result = futures::executor::block_on(retrieve_progressive(
+    #[tokio::test(start_paused = true)]
+    async fn a_bootstrap_holder_is_read_alongside_the_ordinary_path() {
+        // The close group answers "not found", and the farther of two
+        // bootstrap peers holds the record. No early reads on hints.
+        let latency = Duration::from_millis(100);
+        let net = Simulated::default();
+        let start = tokio::time::Instant::now();
+        let result = retrieve_progressive(
             peer(0),
             0,
             vec![peer(100), peer(50)],
@@ -924,19 +1039,21 @@ mod tests {
                 }
             },
             |p| *p,
-            |p, early| {
-                gets.borrow_mut().push((p, early));
-                async move { Ok::<_, ReadError>((p == peer(100)).then_some(42)) }
-            },
+            |p, early| net.get(p, early, latency, false, p == peer(100)),
             |_| true,
-            |_| async {},
-        ));
+            tokio::time::sleep,
+        )
+        .await;
         assert_eq!(result, Ok(Some(42)));
-        let expected: Vec<_> = (1..=7)
-            .chain([50, 100])
-            .map(|id| (peer(id), false))
-            .collect();
-        assert_eq!(*gets.borrow(), expected);
+        // The bootstrap lane asks the nearer one, then the holder, while the
+        // ordinary path asks the close group: two round trips, not nine.
+        assert_eq!(start.elapsed(), 2 * latency);
+        assert_eq!(
+            net.asked(),
+            [1, 2, 50, 100].map(peer).to_vec(),
+            "each peer at most once"
+        );
+        assert_eq!(net.most.get(), 2);
     }
 
     #[test]
@@ -976,10 +1093,162 @@ mod tests {
             ));
             assert_eq!(result, Ok(None));
             assert_eq!(rounds.get(), expected_rounds);
-            // Each round asks the close group, then every bootstrap peer.
-            let round: Vec<_> = (1..=7).chain([50, 100]).map(peer).collect();
-            assert_eq!(*gets.borrow(), round.repeat(expected_rounds));
+            // Each round asks the close group and every bootstrap peer, once.
+            let mut asked = gets.borrow().clone();
+            asked.sort_unstable();
+            let mut expected = (1..=7)
+                .chain([50, 100])
+                .map(peer)
+                .collect::<Vec<_>>()
+                .repeat(expected_rounds);
+            expected.sort_unstable();
+            assert_eq!(asked, expected);
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_silent_bootstrap_peer_does_not_hold_up_a_connected_holder() {
+        // The bootstrap peer nearest the record never answers. A connected
+        // holder offered at once is read at once, not after the hedge delay.
+        let latency = Duration::from_millis(50);
+        let net = Simulated::default();
+        let start = tokio::time::Instant::now();
+        let result = retrieve_progressive(
+            peer(0),
+            MAX_GET_FALLBACK_PEERS,
+            vec![peer(1)],
+            |updates| async move {
+                updates.send_replace(vec![peer(9)]);
+                futures::future::pending().await
+            },
+            |p| *p,
+            |p, early| net.get(p, early, latency, p == peer(1), p == peer(9)),
+            |error| *error == ReadError::Transport,
+            tokio::time::sleep,
+        )
+        .await;
+        assert_eq!(result, Ok(Some(42)));
+        assert_eq!(start.elapsed(), latency);
+        assert_eq!(*net.gets.borrow(), vec![(peer(1), true), (peer(9), true)]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn silent_bootstrap_peers_leave_a_slot_to_the_ordinary_path() {
+        // Both bootstrap peers are nearest the record and never answer, and
+        // discovery finds the holder after a second and a half.
+        let latency = Duration::from_millis(50);
+        let net = Simulated::default();
+        let start = tokio::time::Instant::now();
+        let result = retrieve_progressive(
+            peer(0),
+            MAX_GET_FALLBACK_PEERS,
+            vec![peer(1), peer(2)],
+            |_| async {
+                tokio::time::sleep(Duration::from_millis(1500)).await;
+                ReadCandidates {
+                    closest: vec![peer(9)],
+                    known: vec![],
+                }
+            },
+            |p| *p,
+            |p, early| net.get(p, early, latency, p != peer(9), p == peer(9)),
+            |error| *error == ReadError::Transport,
+            tokio::time::sleep,
+        )
+        .await;
+        assert_eq!(result, Ok(Some(42)));
+        assert_eq!(start.elapsed(), Duration::from_millis(1500) + latency);
+        assert_eq!(
+            *net.gets.borrow(),
+            vec![(peer(1), true), (peer(9), false)],
+            "the second bootstrap peer waits for the first"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_bootstrap_lane_keeps_asking_after_discovery() {
+        // Sixteen bootstrap peers, the tenth nearest of which holds the
+        // record, while no close-group peer answers a GET.
+        let latency = Duration::from_millis(60);
+        let close_group = || (1..=7).map(peer);
+        let net = Simulated::default();
+        let start = tokio::time::Instant::now();
+        let result = retrieve_progressive(
+            peer(0),
+            MAX_GET_FALLBACK_PEERS,
+            (101..=116).rev().map(peer).collect(),
+            |_| async move {
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                ReadCandidates {
+                    closest: close_group().collect(),
+                    known: vec![],
+                }
+            },
+            |p| *p,
+            |p, early| {
+                let silent = close_group().any(|member| member == p);
+                net.get(p, early, latency, silent, p == peer(110))
+            },
+            |error| *error == ReadError::Transport,
+            tokio::time::sleep,
+        )
+        .await;
+        assert_eq!(result, Ok(Some(42)));
+        // One bootstrap peer after another, nearest first, from the start and
+        // past the end of discovery: ten round trips, while the close group's
+        // GETs wait out their timeout.
+        assert_eq!(start.elapsed(), 10 * latency);
+        let bootstrap_gets: Vec<_> = net
+            .gets
+            .borrow()
+            .iter()
+            .filter(|(p, _)| p[0] > 100)
+            .copied()
+            .collect();
+        let expected: Vec<_> = (101..=110).map(|id| (peer(id), id < 110)).collect();
+        assert_eq!(bootstrap_gets, expected);
+        assert_eq!(net.most.get(), 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_stalled_hint_is_raced_once_the_bootstrap_lane_is_idle() {
+        // The only bootstrap peer answers "not found" after two seconds. The
+        // first hint never answers, and a second, which holds the record,
+        // arrives while both GETs are in flight.
+        let net = Simulated::default();
+        let start = tokio::time::Instant::now();
+        let result = retrieve_progressive(
+            peer(0),
+            MAX_GET_FALLBACK_PEERS,
+            vec![peer(50)],
+            |updates| async move {
+                updates.send_replace(vec![peer(1)]);
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                updates.send_replace(vec![peer(1), peer(2)]);
+                futures::future::pending().await
+            },
+            |p| *p,
+            |p, early| {
+                let latency = if p == peer(50) {
+                    Duration::from_secs(2)
+                } else {
+                    Duration::ZERO
+                };
+                net.get(p, early, latency, p == peer(1), p == peer(2))
+            },
+            |error| *error == ReadError::Transport,
+            tokio::time::sleep,
+        )
+        .await;
+        assert_eq!(result, Ok(Some(42)));
+        // Not at the one-second hedge: the bootstrap lane holds the other GET
+        // until it has asked its last peer.
+        assert_eq!(start.elapsed(), Duration::from_secs(2));
+        assert_eq!(
+            *net.gets.borrow(),
+            vec![(peer(50), true), (peer(1), true), (peer(2), true)]
+        );
+        assert_eq!(net.most.get(), 2);
     }
 
     #[test]

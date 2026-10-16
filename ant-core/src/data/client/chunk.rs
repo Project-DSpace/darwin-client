@@ -1526,9 +1526,10 @@ mod tests {
         read_with_bootstrap(&answers, &[])
     }
 
-    /// As [`read_from`], with peers 1, 2 and 3 as the close group and peers 4
-    /// on as bootstrap peers, peer `n` giving `answers[n - 1]`. There are no
-    /// early reads, so the order asked is the final candidates' order.
+    /// As [`read_from`], with peers 1 to `closest.len()` as the close group and
+    /// the peers after them as bootstrap peers, peer `n` giving `answers[n - 1]`.
+    /// There are no early reads on hints: the close group is asked in order,
+    /// and the bootstrap peers in their own lane alongside it.
     fn read_with_bootstrap(
         closest: &[Result<Option<u8>>],
         bootstrap: &[Result<Option<u8>>],
@@ -1591,26 +1592,26 @@ mod tests {
     fn a_chunk_only_a_bootstrap_peer_holds_is_read() {
         let none = || -> [Result<Option<u8>>; 3] { [Ok(None), Ok(None), Ok(None)] };
         let silent = || Err(Error::Timeout("no answer".into()));
-        // The close group holds none: the bootstrap peers are asked next,
-        // nearest first, and bad bytes from one move the read to the next.
-        let (result, asked) = read_with_bootstrap(
-            &none(),
-            &[
-                Err(Error::InvalidData("BLAKE3 mismatch".into())),
-                Ok(Some(7)),
-            ],
-        );
-        assert!(matches!(result, Ok(Some(7))), "{result:?}");
-        assert_eq!(asked, vec![1, 2, 3, 4, 5]);
-        // The close group does not answer at all.
-        let (result, asked) =
-            read_with_bootstrap(&[silent(), silent(), silent()], &[Ok(None), Ok(Some(7))]);
-        assert!(matches!(result, Ok(Some(7))), "{result:?}");
-        assert_eq!(asked, vec![1, 2, 3, 4, 5]);
-        // Nobody holds it: absent once the bootstrap peers have been asked too.
-        let (result, asked) = read_with_bootstrap(&none(), &[Ok(None), Ok(None)]);
+        let bad = || Err(Error::InvalidData("BLAKE3 mismatch".into()));
+        // The close group holds none, or does not answer: the bootstrap
+        // peers' lane asks them nearest first, and bad bytes from one move it
+        // to the next. Here it answers before the close group is asked.
+        for closest in [none(), [silent(), silent(), silent()]] {
+            let (result, asked) = read_with_bootstrap(&closest, &[bad(), Ok(Some(7))]);
+            assert!(matches!(result, Ok(Some(7))), "{result:?}");
+            assert_eq!(asked, vec![4, 5]);
+        }
+        // Nobody holds it: absent once every peer has been asked, each once.
+        let (result, mut asked) = read_with_bootstrap(&none(), &[Ok(None), Ok(None)]);
         assert!(matches!(result, Ok(None)), "{result:?}");
+        asked.sort_unstable();
         assert_eq!(asked, vec![1, 2, 3, 4, 5]);
+        // Only bad bytes from a bootstrap peer: the read fails with them.
+        let (result, _) = read_with_bootstrap(&none(), &[bad(), Ok(None)]);
+        assert!(
+            matches!(&result, Err(Error::InvalidData(reason)) if reason.contains("BLAKE3")),
+            "{result:?}"
+        );
     }
 
     #[test]
