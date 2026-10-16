@@ -183,6 +183,55 @@ test("a seed the seed policy rejected is not counted among the bootstrap peers",
   }
 });
 
+// Writes the pointer on one network to get its record. On another, of
+// nineteen nodes, the seven nearest the pointer are its close group and hold
+// none, and the twelve after them, nearest first, are the client's seeds:
+// those at the positions in `holding` hold the pointer. Returns the read, and
+// whether each seed was sent a pointer GET.
+async function readWithTwelveSeeds(holding) {
+  const source = mockWebRtc(Array.from({ length: 7 }, () => ({})));
+  const writer = new BrowserNetworkClient(source.endpoints);
+  let record;
+  try {
+    await writer.createPointer(seed, target(1), "chunk", paymentNetwork, wallet().pay,
+      value => { record = value.record; });
+  } finally {
+    writer.close();
+  }
+  const rtc = mockWebRtc(Array.from({ length: 19 }, () => ({})));
+  const address = pointerAddress(seed);
+  const distance = (index) =>
+    BigInt(`0x${parseWebRtcDirectMultiaddr(rtc.endpoints[index]).peerId}`) ^ BigInt(`0x${address}`);
+  const nodes = rtc.endpoints.map((_, index) => index).sort((a, b) => (distance(a) < distance(b) ? -1 : 1));
+  const seeds = nodes.slice(7);
+  for (const at of holding) rtc.stores[seeds[at]].set(`pointer:${address}`, record);
+  const client = new BrowserNetworkClient(seeds.map((index) => rtc.endpoints[index]));
+  try {
+    const read = await client.getPointer(address);
+    const asked = (node) => rtc.requests.some((request) => request.node === node && request.method === "get_pointer");
+    return { read, seeds: seeds.map(asked) };
+  } finally {
+    client.close();
+  }
+}
+
+test("a pointer the eighth and ninth nearest of twelve seeds hold is read from them", async () => {
+  // Two of the five answers the nine nearest seeds need name it. The three
+  // farther seeds are not asked.
+  const { read, seeds } = await readWithTwelveSeeds([7, 8]);
+  assert.equal(read?.target, target(1));
+  assert.deepEqual(seeds.slice(9), [false, false, false]);
+});
+
+test("a pointer only seeds outside the nine nearest it hold is not looked for there", async () => {
+  // The nine nearest of twelve seeds all answer that they hold none before
+  // the pointer reads as absent, and the three farther ones, which hold it,
+  // are not asked.
+  const { read, seeds } = await readWithTwelveSeeds([9, 10, 11]);
+  assert.equal(read, null);
+  assert.deepEqual(seeds, [...Array(9).fill(true), false, false, false]);
+});
+
 test("a node that does not advertise pointers is never sent one", async () => {
   const rtc = mockWebRtc(Array.from({ length: 7 }, (_, i) => ({ pointers: i !== 0 })));
   const client = new BrowserNetworkClient(rtc.endpoints);

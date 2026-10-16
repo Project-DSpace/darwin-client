@@ -417,8 +417,9 @@ async fn build_data_client(
 }
 
 /// The client a data command runs on `node`. Its reads also ask the resolved
-/// bootstrap peers that carry a peer ID (the bundled seeds do), not the node's
-/// own bootstrap list, which also holds cached peers.
+/// bootstrap peers that carry a peer ID (the bundled seeds do), the nine
+/// nearest each address read, not the node's own bootstrap list, which also
+/// holds cached peers.
 fn data_client(
     node: Arc<P2PNode>,
     config: ClientConfig,

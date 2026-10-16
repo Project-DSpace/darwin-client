@@ -97,10 +97,23 @@ pub struct Network {
 /// Peer identities and the addresses that can reach them.
 pub type PeerAddresses = Vec<(PeerId, Vec<MultiAddr>)>;
 
-/// The bootstrap peers among `seeds` that a read can ask: each one whose
-/// address carries a peer ID, with all of its addresses, nearest to `target`
-/// by XOR distance first. Addresses without a peer ID, and the local peer,
-/// are left out.
+/// The most bootstrap peers a read asks: the nine nearest the address read.
+///
+/// Nine is the nodes' storage retention width: the close group
+/// ([`ant_protocol::CLOSE_GROUP_SIZE`], seven) plus the storage admission
+/// margin of two (darwin-node's `storage_admission_width`, in
+/// `src/replication/config.rs`). A node keeps and serves a record it admitted
+/// while it was among the nine nodes nearest the record. A bootstrap peer that
+/// is among the nine nodes nearest an address out of the whole network is also
+/// among the nine nearest out of the bootstrap peers, so asking the nine
+/// bootstrap peers nearest the address asks every bootstrap peer that can hold
+/// the record.
+pub(crate) const MAX_BOOTSTRAP_READ_PEERS: usize = ant_protocol::CLOSE_GROUP_SIZE + 2;
+
+/// The bootstrap peers among `seeds` that a read of `target` asks: the
+/// [`MAX_BOOTSTRAP_READ_PEERS`] nearest to it by XOR distance, or all of them
+/// when there are fewer, nearest first, each with all of its addresses. Only
+/// addresses that carry a peer ID count, and the local peer is left out.
 pub(crate) fn bootstrap_read_peers(
     seeds: &[MultiAddr],
     target: &[u8; 32],
@@ -129,6 +142,7 @@ pub(crate) fn bootstrap_read_peers(
         }
     }
     peers.sort_by_key(|(peer, _)| ant_protocol::transport::xor_distance(peer.as_bytes(), target));
+    peers.truncate(MAX_BOOTSTRAP_READ_PEERS);
     peers
 }
 
@@ -217,8 +231,8 @@ pub trait BrowserNetwork {
         Vec::new()
     }
     /// Bootstrap addresses that chunk and pointer reads also ask, alongside
-    /// discovery. Only those carrying a peer ID are used. Adapters without
-    /// them read through discovery alone.
+    /// discovery: of those carrying a peer ID, the nine nearest the address
+    /// read. Adapters without them read through discovery alone.
     fn bootstrap_peers(&self) -> Vec<MultiAddr> {
         Vec::new()
     }
@@ -268,7 +282,8 @@ impl Network {
     }
 
     /// Connect using QUIC multiaddresses, preserving optional peer identity pins.
-    /// Chunk and pointer reads also ask the seeds that carry a peer ID.
+    /// Chunk and pointer reads also ask the seeds that carry a peer ID, the
+    /// nine nearest the address read.
     #[cfg(feature = "native")]
     pub async fn new_multiaddrs(
         bootstrap_peers: &[MultiAddr],
@@ -342,7 +357,8 @@ impl Network {
     }
 
     /// The bootstrap addresses chunk and pointer reads also ask, as the
-    /// network was given them. Reads use those that carry a peer ID.
+    /// network was given them. A read asks the nine nearest the address read
+    /// of those that carry a peer ID.
     #[must_use]
     #[cfg(feature = "native")]
     pub fn bootstrap_peers(&self) -> &[MultiAddr] {
@@ -578,12 +594,13 @@ impl Network {
         }
     }
 
-    /// The bootstrap peers a read of `target` also asks, nearest first: those
-    /// whose configured address carries a peer ID. Native clients use the
-    /// addresses they connected through or were given; browser clients use
-    /// their seeds, less any whose node the seed policy rejected. Empty when
-    /// no bootstrap address carries a peer ID, and reads then use discovery
-    /// alone.
+    /// The bootstrap peers a read of `target` also asks, nearest first: the
+    /// [`MAX_BOOTSTRAP_READ_PEERS`] nearest it of those whose configured
+    /// address carries a peer ID ([`bootstrap_read_peers`]). Native clients
+    /// use the addresses they connected through or were given; browser clients
+    /// use their seeds, less any whose node the seed policy rejected. Empty
+    /// when no bootstrap address carries a peer ID, and reads then use
+    /// discovery alone.
     pub(crate) fn bootstrap_peers_near(&self, target: &[u8; 32]) -> PeerAddresses {
         #[cfg(feature = "native")]
         {
@@ -776,6 +793,56 @@ mod tests {
         assert_eq!(peers[0].1, vec![seed(1, 10000), seed(1, 10001)]);
     }
 
+    /// The peer IDs of `seeds`, nearest to `target` first.
+    fn nearest_first(seeds: &[MultiAddr], target: &[u8; 32]) -> Vec<PeerId> {
+        let mut peers: Vec<PeerId> = seeds.iter().filter_map(|s| s.peer_id()).copied().collect();
+        peers.sort_by_key(|peer| ant_protocol::transport::xor_distance(peer.as_bytes(), target));
+        peers.dedup();
+        peers
+    }
+
+    #[test]
+    fn a_read_asks_the_nine_bootstrap_peers_nearest_the_target() {
+        // The close group and the storage admission margin of two.
+        assert_eq!(MAX_BOOTSTRAP_READ_PEERS, 9);
+        let local = PeerId::from_bytes([0xff; 32]);
+        let ids =
+            |peers: PeerAddresses| peers.into_iter().map(|(peer, _)| peer).collect::<Vec<_>>();
+        // Thirty seeds, of which the nine nearest differ from target to target.
+        let seeds: Vec<_> = (1..=30u8)
+            .map(|n| seed(n * 8, 10000 + u16::from(n)))
+            .collect();
+        for target in [[0x00; 32], [0x42; 32], [0x9c; 32], [0xf0; 32]] {
+            let asked = ids(bootstrap_read_peers(&seeds, &target, &local));
+            assert_eq!(
+                asked,
+                nearest_first(&seeds, &target)[..MAX_BOOTSTRAP_READ_PEERS]
+            );
+            // Fewer than nine: all of them, nearest first.
+            let few = &seeds[..MAX_BOOTSTRAP_READ_PEERS - 1];
+            let asked = ids(bootstrap_read_peers(few, &target, &local));
+            assert_eq!(asked, nearest_first(few, &target));
+            assert_eq!(asked.len(), MAX_BOOTSTRAP_READ_PEERS - 1);
+        }
+        // A peer counts once however many addresses it has, and neither the
+        // local peer nor an address without a peer ID takes one of the nine
+        // places.
+        let plain: MultiAddr = "/ip4/127.0.0.1/udp/10100/quic".parse().unwrap();
+        let mut seeds: Vec<_> = (1..=10u8)
+            .flat_map(|n| [seed(n, 10000 + u16::from(n)), seed(n, 11000 + u16::from(n))])
+            .collect();
+        seeds.extend([plain, seed(0, 10200)]);
+        let peers = bootstrap_read_peers(&seeds, &[0; 32], &PeerId::from_bytes([0; 32]));
+        assert_eq!(
+            peers
+                .iter()
+                .map(|(peer, _)| peer.as_bytes()[0])
+                .collect::<Vec<_>>(),
+            (1..=9).collect::<Vec<_>>()
+        );
+        assert!(peers.iter().all(|(_, addrs)| addrs.len() == 2));
+    }
+
     /// A client node built from seeds reads from those of them that carry a
     /// peer ID, and a client given seeds later reads from those instead. The
     /// node is never started, so nothing is dialled.
@@ -808,21 +875,33 @@ mod tests {
             near(client.network()),
             vec![(0x42, vec![seed(0x42, 10002)])]
         );
+        // Of twelve, the nine nearest the address read.
+        let twelve: Vec<_> = (1..=12u8)
+            .map(|n| seed(n * 16, 10010 + u16::from(n)))
+            .collect();
+        let client = client.with_bootstrap_peers(&twelve);
+        let asked: Vec<_> = near(client.network())
+            .into_iter()
+            .map(|(id, _)| PeerId::from_bytes([id; 32]))
+            .collect();
+        assert_eq!(asked, nearest_first(&twelve, &[0x11; 32])[..9]);
     }
 
     #[test]
-    fn the_bundled_seeds_are_sixteen_bootstrap_read_peers_on_each_transport() {
+    fn a_read_asks_nine_of_the_sixteen_bundled_seeds_on_each_transport() {
         let seeds = crate::network_defaults::bundled_bootstrap_seeds().unwrap();
         let webrtc: Vec<MultiAddr> = seeds.webrtc.iter().map(|s| s.parse().unwrap()).collect();
+        assert_eq!(nearest_first(&seeds.quic, &[0; 32]).len(), 16);
         let local = PeerId::from_bytes([0xff; 32]);
-        let target = [0x42; 32];
-        let native = bootstrap_read_peers(&seeds.quic, &target, &local);
-        let browser = bootstrap_read_peers(&webrtc, &target, &local);
-        assert_eq!(native.len(), 16);
-        assert_eq!(browser.len(), 16);
-        assert!(native.iter().all(|(_, addrs)| addrs.len() == 1));
-        // The same nodes, in the same order, whichever transport reaches them.
         let ids = |peers: &PeerAddresses| peers.iter().map(|(peer, _)| *peer).collect::<Vec<_>>();
-        assert_eq!(ids(&native), ids(&browser));
+        for target in [[0x42; 32], [0x00; 32], [0xff; 32]] {
+            let native = bootstrap_read_peers(&seeds.quic, &target, &local);
+            let browser = bootstrap_read_peers(&webrtc, &target, &local);
+            assert!(native.iter().all(|(_, addrs)| addrs.len() == 1));
+            // The nine of the sixteen nearest the address, in the same order
+            // whichever transport reaches them.
+            assert_eq!(ids(&native), nearest_first(&seeds.quic, &target)[..9]);
+            assert_eq!(ids(&native), ids(&browser));
+        }
     }
 }

@@ -138,17 +138,20 @@ while preserving the two-GET maximum even when discovery completes. Shared tests
 cover the delay, slot handoff, deduplication, and fatal integrity errors. The lane
 tests check that a failed cold dial is not repeated by the other queued lane.
 Early candidates use authenticated connections, with WebRTC preconnections
-publishing hints once ready. The seeds are the exception: as bootstrap peers
-they are read from the start of every read, connected or not, one at a time in a
-GET slot of their own, and all of them are asked before a read reports a record
-missing. Download regressions cover cold closer addresses blocking neither slot
-ahead of a ready holder, retaining the twenty-peer fallback allowance after more
-than seven early misses, a record only the farthest of thirty seeds holds, and a
-missing record asked of all thirty. The bootstrap tests check that a slow seed
-delays neither authentication nor the read, nearer to the record or not.
-`pointer.test.mjs` reads a pointer that only seeds outside its close group hold,
-and leaves a seed the seed policy rejected out of the bootstrap peers a read
-waits for.
+publishing hints once ready. The seeds are the exception: as bootstrap peers,
+the nine nearest the record (all of them when there are fewer) are read from the
+start of every read, connected or not, one at a time in a GET slot of their own,
+and each is asked before a read reports a record missing. Download regressions
+cover cold closer addresses blocking neither slot ahead of a ready holder,
+retaining the twenty-peer fallback allowance after more than seven early misses,
+a record only the farthest of eight seeds holds, a record only a seed outside
+the nine nearest holds, which is not looked for there, and a missing record
+reported once the nine nearest seeds and the usual candidates have answered. The
+bootstrap tests check that a slow seed delays neither authentication nor the
+read, nearer to the record or not. `pointer.test.mjs` reads a pointer that only
+seeds outside its close group hold, leaves a seed the seed policy rejected out
+of the bootstrap peers a read waits for, and of twelve seeds asks the nine
+nearest the pointer, not the three farther ones, even when only those hold it.
 
 `parallel-lanes.test.mjs` checks the two-channel transport profile: discovery and
 quotes use the control channel; GET/PUT use an independent authenticated data

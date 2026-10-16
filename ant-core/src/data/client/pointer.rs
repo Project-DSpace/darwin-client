@@ -197,7 +197,8 @@ impl Replies {
 enum Asked {
     /// The close group of the address.
     CloseGroup,
-    /// The bootstrap peers the client knows by peer ID.
+    /// The bootstrap peers nearest the address, of those the client knows by
+    /// peer ID.
     Bootstrap,
 }
 
@@ -362,10 +363,11 @@ async fn read_pointer_from(
 }
 
 /// Read the pointer at `address` from its close group and from `bootstrap`,
-/// the bootstrap peers the client knows by peer ID, at once, and combine the
-/// two reads by [`newest_pointer`]. `close_group` looks the close group up, and
-/// `get` asks one peer. Without bootstrap peers this is a read of the close
-/// group alone.
+/// the bootstrap peers nearest it of those the client knows by peer ID (nine
+/// at most: [`crate::data::network::bootstrap_read_peers`]), at once, and
+/// combine the two reads by [`newest_pointer`]. `close_group` looks the close
+/// group up, and `get` asks one peer. Without bootstrap peers this is a read of
+/// the close group alone.
 ///
 /// The bootstrap peers are asked from the start and the close group as soon as
 /// it is known. A peer in both sets is asked once, and its answer counts in
@@ -974,14 +976,15 @@ impl Client {
     /// the pointer says.
     ///
     /// The close group is asked, and at the same time so are the bootstrap
-    /// peers the client knows by peer ID, as a second set with its own quorum
-    /// and corroboration; a peer in both is asked once. The answer is the newer
-    /// state of the two, and a state the bootstrap peers name is returned even
-    /// when the close group holds none or does not answer; see `read_pointer`
-    /// and `newest_pointer`. The read then takes as long as the slower of the
-    /// two sets, and reports the pointer absent only once every bootstrap peer
-    /// has answered or failed. Without such bootstrap peers only the close
-    /// group is asked.
+    /// peers nearest the address, nine at most of those the client knows by
+    /// peer ID, as a second set with its own quorum and corroboration (five
+    /// answers and two naming the state, of nine); a peer in both is asked
+    /// once. The answer is the newer state of the two, and a state the
+    /// bootstrap peers name is returned even when the close group holds none or
+    /// does not answer; see `read_pointer` and `newest_pointer`. The read then
+    /// takes as long as the slower of the two sets, and reports the pointer
+    /// absent only once each of those bootstrap peers has answered or failed.
+    /// Without such bootstrap peers only the close group is asked.
     ///
     /// # Errors
     ///
@@ -1629,16 +1632,16 @@ mod tests {
         let new = old.update(&sk, chunk_target(2)).expect("update");
         for (close_group, bootstrap) in [(&new, &old), (&old, &new)] {
             let mut answers = answering(1..=7, 50, || Ok(Some(close_group.clone())));
-            answers.extend(answering(101..=116, 100, || Ok(Some(bootstrap.clone()))));
-            let (read, _, _) = simulated_read(old.address(), 0, 1..=7, 101..=116, answers).await;
+            answers.extend(answering(101..=109, 100, || Ok(Some(bootstrap.clone()))));
+            let (read, _, _) = simulated_read(old.address(), 0, 1..=7, 101..=109, answers).await;
             assert_eq!(state_of(read), new.state_id());
         }
         // Agreement is per set: a newer state only one bootstrap peer names
         // does not replace the close group's.
         let mut answers = answering(1..=7, 50, || Ok(Some(old.clone())));
-        answers.extend(answering(101..=115, 100, || Ok(None)));
-        answers.extend(answering([116], 100, || Ok(Some(new.clone()))));
-        let (read, _, _) = simulated_read(old.address(), 0, 1..=7, 101..=116, answers).await;
+        answers.extend(answering(101..=108, 100, || Ok(None)));
+        answers.extend(answering([109], 100, || Ok(Some(new.clone()))));
+        let (read, _, _) = simulated_read(old.address(), 0, 1..=7, 101..=109, answers).await;
         assert_eq!(state_of(read), old.state_id());
     }
 
@@ -1651,20 +1654,20 @@ mod tests {
         let held = Pointer::create(&sk, &pk, chunk_target(1)).expect("create");
         let address = held.address();
         let none = |peers: std::ops::RangeInclusive<u8>| answering(peers, 50, || Ok(None));
-        let read = |answers| simulated_read(address, 0, 1..=7, 101..=116, answers);
+        let read = |answers| simulated_read(address, 0, 1..=7, 101..=109, answers);
 
-        let (found, _, _) = read(joined([none(1..=7), none(101..=116)])).await;
+        let (found, _, _) = read(joined([none(1..=7), none(101..=109)])).await;
         assert!(found.expect("a read").is_none());
-        let (found, _, _) = read(none(101..=116)).await;
+        let (found, _, _) = read(none(101..=109)).await;
         assert!(matches!(found, Err(Error::Timeout(_))), "{found:?}");
-        let (found, _, _) = read(joined([none(1..=3), none(101..=116)])).await;
+        let (found, _, _) = read(joined([none(1..=3), none(101..=109)])).await;
         assert!(
             matches!(&found, Err(Error::CloseGroupShortfall(message))
                 if message.starts_with("only 3 of the close group answered")),
             "{found:?}"
         );
         let mut lone = none(1..=7);
-        lone.extend(none(102..=116));
+        lone.extend(none(102..=109));
         lone.extend(answering([101], 50, || Ok(Some(held.clone()))));
         let (found, _, _) = read(lone).await;
         assert!(found.expect("a read").is_none());
@@ -1721,7 +1724,7 @@ mod tests {
         let old = Pointer::create(&sk, &pk, chunk_target(1)).expect("create");
         let new = old.update(&sk, chunk_target(2)).expect("update");
         let naming = |state: &Pointer, peers| answering(peers, 50, || Ok(Some(state.clone())));
-        let read = |answers| simulated_read(old.address(), 0, 1..=7, 101..=116, answers);
+        let read = |answers| simulated_read(old.address(), 0, 1..=7, 101..=109, answers);
         let shortfall = |found: &Result<Option<Pointer>>, of: &str| {
             matches!(found, Err(Error::CloseGroupShortfall(message))
                 if message.starts_with(&format!("only 2 of {of} answered")))
@@ -1729,7 +1732,7 @@ mod tests {
 
         // Two of the close group name the newer state, and the rest do not
         // answer: the bootstrap peers' older state is not the answer.
-        let (found, _, _) = read(joined([naming(&new, 1..=2), naming(&old, 101..=116)])).await;
+        let (found, _, _) = read(joined([naming(&new, 1..=2), naming(&old, 101..=109)])).await;
         assert!(shortfall(&found, "the close group"), "{found:?}");
         // Two bootstrap peers name the newer state, and the rest do not answer:
         // neither the close group's older state nor its absence is.
@@ -1740,7 +1743,7 @@ mod tests {
         let (found, _, _) = read(answers).await;
         assert!(shortfall(&found, "the bootstrap peers"), "{found:?}");
         // What a short set corroborates only ever holds back older states.
-        let (found, _, _) = read(joined([naming(&old, 1..=2), naming(&new, 101..=116)])).await;
+        let (found, _, _) = read(joined([naming(&old, 1..=2), naming(&new, 101..=109)])).await;
         assert_eq!(state_of(found), new.state_id());
     }
 
@@ -1778,27 +1781,61 @@ mod tests {
     }
 
     /// When the close group holds none, the bootstrap peers are asked until
-    /// every one has answered, so a state only two of sixteen hold is found
-    /// even when nine others answer first. An absent pointer is reported only
-    /// then: one bootstrap peer that does not answer holds it up for its GET
-    /// timeout.
+    /// every one has answered, so a state only two of the nine hold is found
+    /// even when five others, a quorum, answer first. An absent pointer is
+    /// reported only then: one bootstrap peer that does not answer holds it up
+    /// for its GET timeout.
     #[tokio::test(start_paused = true)]
     async fn a_state_few_bootstrap_peers_hold_is_found_when_the_close_group_has_none() {
         let (pk, sk) = keypair(19);
         let held = Pointer::create(&sk, &pk, chunk_target(1)).expect("create");
         let mut answers = answering(1..=7, 50, || Ok(None));
-        answers.extend(answering(101..=109, 50, || Ok(None)));
-        answers.extend(answering(110..=111, 300, || Ok(Some(held.clone()))));
-        answers.extend(answering(112..=116, 400, || Ok(None)));
-        let (found, took, _) = simulated_read(held.address(), 0, 1..=7, 101..=116, answers).await;
+        answers.extend(answering(101..=105, 50, || Ok(None)));
+        answers.extend(answering(106..=107, 300, || Ok(Some(held.clone()))));
+        answers.extend(answering(108..=109, 400, || Ok(None)));
+        let (found, took, _) = simulated_read(held.address(), 0, 1..=7, 101..=109, answers).await;
         assert_eq!(state_of(found), held.state_id());
         assert_eq!(took, Duration::from_millis(300));
 
         let mut answers = answering(1..=7, 50, || Ok(None));
-        answers.extend(answering(101..=115, 50, || Ok(None)));
-        let (found, took, _) = simulated_read(held.address(), 0, 1..=7, 101..=116, answers).await;
+        answers.extend(answering(101..=108, 50, || Ok(None)));
+        let (found, took, _) = simulated_read(held.address(), 0, 1..=7, 101..=109, answers).await;
         assert!(found.expect("a read").is_none());
         assert_eq!(took, Duration::from_secs(10));
+    }
+
+    /// Nine bootstrap peers, the most a read is given, need five answers, and
+    /// two of them naming a state, for the set to return it.
+    #[tokio::test(start_paused = true)]
+    async fn nine_bootstrap_peers_read_on_five_answers_with_two_naming_the_state() {
+        let nine = crate::data::network::MAX_BOOTSTRAP_READ_PEERS;
+        assert_eq!((read_quorum(nine), corroboration(nine)), (5, 2));
+        let (pk, sk) = keypair(24);
+        let held = Pointer::create(&sk, &pk, chunk_target(1)).expect("create");
+        let none = |peers: std::ops::RangeInclusive<u8>| answering(peers, 50, || Ok(None));
+        let holding =
+            |peers: std::ops::RangeInclusive<u8>| answering(peers, 100, || Ok(Some(held.clone())));
+        let read = |answers| simulated_read(held.address(), 0, 1..=7, 101..=109, answers);
+
+        // The close group holds none. Two bootstrap peers name the state and
+        // three hold none: five answers, and the state is the read's.
+        let (found, took, _) =
+            read(joined([none(1..=7), holding(101..=102), none(103..=105)])).await;
+        assert_eq!(state_of(found), held.state_id());
+        assert_eq!(took, Duration::from_millis(100));
+        // Two name it and two hold none: four answers are too few, and the
+        // read fails rather than report the pointer absent.
+        let (found, took, _) =
+            read(joined([none(1..=7), holding(101..=102), none(103..=104)])).await;
+        assert!(
+            matches!(&found, Err(Error::CloseGroupShortfall(message))
+                if message.starts_with("only 4 of the bootstrap peers answered")),
+            "{found:?}"
+        );
+        assert_eq!(took, Duration::from_secs(10));
+        // One names it and the other eight hold none: absent.
+        let (found, _, _) = read(joined([none(1..=7), holding(101..=101), none(102..=109)])).await;
+        assert!(found.expect("a read").is_none());
     }
 
     /// Once the close group has returned a state, the bootstrap peers stop at
@@ -1813,16 +1850,16 @@ mod tests {
 
         let mut answers = answering(1..=7, 50, || Ok(Some(new.clone())));
         answers.extend(answering([101], 50, || Ok(Some(old.clone()))));
-        answers.extend(answering(102..=115, 50, || Ok(None)));
-        let (found, took, _) = simulated_read(old.address(), 0, 1..=7, 101..=116, answers).await;
+        answers.extend(answering(102..=108, 50, || Ok(None)));
+        let (found, took, _) = simulated_read(old.address(), 0, 1..=7, 101..=109, answers).await;
         assert_eq!(state_of(found), new.state_id());
         assert_eq!(took, Duration::from_millis(50));
 
         let mut answers = answering(1..=7, 50, || Ok(Some(old.clone())));
         answers.extend(answering([101], 50, || Ok(Some(new.clone()))));
-        answers.extend(answering(102..=115, 50, || Ok(None)));
-        answers.extend(answering([116], 2000, || Ok(Some(new.clone()))));
-        let (found, took, _) = simulated_read(old.address(), 0, 1..=7, 101..=116, answers).await;
+        answers.extend(answering(102..=108, 50, || Ok(None)));
+        answers.extend(answering([109], 2000, || Ok(Some(new.clone()))));
+        let (found, took, _) = simulated_read(old.address(), 0, 1..=7, 101..=109, answers).await;
         assert_eq!(state_of(found), new.state_id());
         assert_eq!(took, Duration::from_secs(2));
     }
@@ -1834,14 +1871,14 @@ mod tests {
     async fn a_peer_in_both_sets_is_asked_once() {
         let (pk, sk) = keypair(21);
         let held = Pointer::create(&sk, &pk, chunk_target(1)).expect("create");
-        let bootstrap = || (1..=3).chain(101..=113);
+        let bootstrap = || (1..=3).chain(101..=106);
         for lookup in [50, 500] {
-            let answers = answering((1..=7).chain(101..=113), 100, || Ok(Some(held.clone())));
+            let answers = answering((1..=7).chain(101..=106), 100, || Ok(Some(held.clone())));
             let (found, _, asked) =
                 simulated_read(held.address(), lookup, 1..=7, bootstrap(), answers).await;
             assert_eq!(state_of(found), held.state_id());
             assert!(asked.values().all(|gets| *gets == 1), "{asked:?}");
-            assert_eq!(asked.len(), 20);
+            assert_eq!(asked.len(), 13);
         }
         // Three of the close group are bootstrap peers and answered before it
         // was known, one more answers once it is, and nobody else does: the

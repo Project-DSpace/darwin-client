@@ -814,7 +814,8 @@ impl Client {
 
     /// Connect using native QUIC multiaddresses without discarding peer pins.
     /// Chunk and pointer reads also ask the bootstrap peers among them that
-    /// carry a peer ID, as with [`Client::with_bootstrap_peers`].
+    /// carry a peer ID, the nine nearest the address read, as with
+    /// [`Client::with_bootstrap_peers`].
     #[cfg(feature = "native")]
     pub async fn connect_multiaddrs(
         bootstrap_peers: &[ant_protocol::transport::MultiAddr],
@@ -846,10 +847,15 @@ impl Client {
     }
 
     /// Also ask these bootstrap peers in chunk and pointer reads, alongside the
-    /// close group and from the start of each read: those whose address
-    /// carries a `/p2p/` peer ID, nearest to the address being read first. The
-    /// nodes that were nearest to a record when it was stored may still hold
-    /// it after the nodes nearest to it have changed.
+    /// close group and from the start of each read: of those whose address
+    /// carries a `/p2p/` peer ID, the nine nearest to the address being read
+    /// (all of them when there are fewer), nearest first. The nodes that were
+    /// nearest to a record when it was stored may still hold it after the
+    /// nodes nearest to it have changed. Nine is the nodes' storage retention
+    /// width, the close group of seven plus a margin of two: a node keeps and
+    /// serves a record it admitted while it was among the nine nodes nearest
+    /// the record, and a bootstrap peer among the nine nodes nearest an
+    /// address is also among the nine bootstrap peers nearest it.
     ///
     /// Pass the bootstrap addresses the client was configured with, such as
     /// those [`crate::config::resolve_bootstrap_multiaddrs`] returns. A client

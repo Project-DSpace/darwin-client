@@ -309,7 +309,7 @@ Download complete!
 
 A private file's envelope address can't be downloaded from: its envelope stores only a salted hash of the data map, and the download says so. Use `--datamap`, or `--proof` with a proof that reveals it.
 
-Every chunk read is checked against its address. A node that serves bytes that don't match is passed over for the next nearest node (and named in the `-v` log); a read fails on bad bytes only when no node serves the chunk intact. The same holds in the browser build. Reads also ask the bootstrap peers, from the start; see [Bootstrap multiaddresses and browser defaults](#bootstrap-multiaddresses-and-browser-defaults).
+Every chunk read is checked against its address. A node that serves bytes that don't match is passed over for the next nearest node (and named in the `-v` log); a read fails on bad bytes only when no node serves the chunk intact. The same holds in the browser build. Reads also ask the bootstrap peers nearest the chunk, from the start; see [Bootstrap multiaddresses and browser defaults](#bootstrap-multiaddresses-and-browser-defaults).
 
 #### `darwin file prove <RECORD>`
 
@@ -420,7 +420,8 @@ Requires `SECRET_KEY` to pay for the new state.
 #### `darwin pointer get <ADDRESS>`
 
 Print a pointer's counter, target and state. The close group and the bootstrap
-peers are asked at once, and the newer state either set agrees on is printed.
+peers nearest the pointer (nine at most) are asked at once, and the newer state
+either set agrees on is printed.
 
 ```
 $ darwin pointer get 9f3c...
@@ -1206,26 +1207,36 @@ are selected for native dialing. `darwin -v` logs "using N bundled bootstrap
 seed(s)" when it falls back to the bundled ones.
 
 Chunk and pointer reads also ask the bootstrap peers whose peer IDs the client
-knows: the selected QUIC seeds that carry `/p2p/<peer-id>`, or a browser
-client's seeds. The nodes that were nearest to a record when it was stored may
-still hold it after the nodes nearest to it have changed. A chunk read asks them
-from the start of each round, nearest to the chunk first and one at a time, in
-one of its two GET slots; discovery's hints, then the close group, keep the
-other, so a slow or silent bootstrap peer holds up only the next one. It reports
-a chunk missing only once every one of them has answered. A pointer read asks
-the bootstrap peers from the start and the close group once it is found, each
-set on its own quorum and corroboration (a peer in both is asked once), and
-returns the newer of the two states: a state the bootstrap peers agree on is
-returned even when the close group holds none or does not answer. When the
-close group has a state, the read waits for a quorum of the bootstrap peers;
-when it has none, for all of them, so it takes as long as the slower set, up to
-the GET timeout when a bootstrap peer doesn't answer. Bootstrap addresses
-without a peer ID are only dialled, as before.
+knows (the selected QUIC seeds that carry `/p2p/<peer-id>`, or a browser
+client's seeds): the nine nearest the address read, or all of them when there
+are fewer. The nodes that were nearest to a record when it was stored may still
+hold it after the nodes nearest to it have changed. Nine is the nodes' storage
+retention width, the close group of seven plus a margin of two: a node keeps and
+serves a record it admitted while it was among the nine nodes nearest the
+record. A bootstrap peer that is among the nine nodes nearest an address out of
+the whole network is also among the nine nearest out of the bootstrap peers, so
+asking the nine bootstrap peers nearest the address asks every bootstrap peer
+that can hold the record.
+
+A chunk read asks them from the start of each round, nearest to the chunk first
+and one at a time, in one of its two GET slots; discovery's hints, then the
+close group, keep the other, so a slow or silent bootstrap peer holds up only
+the next one. It reports a chunk missing only once each of them has answered.
+A pointer read asks them from the start and the close group once it is found,
+each set on its own quorum and corroboration (a peer in both is asked once; of
+nine bootstrap peers, five must answer and two name the state), and returns the
+newer of the two states: a state the bootstrap peers agree on is returned even
+when the close group holds none or does not answer. When the close group has a
+state, the read waits for a quorum of the bootstrap peers; when it has none, for
+all of them, so it takes as long as the slower set, up to the GET timeout when a
+bootstrap peer doesn't answer. Bootstrap addresses without a peer ID are only
+dialled, as before.
 
 So every read reaches the bootstrap peers: a chunk read sends its first GET to
-the one nearest the chunk, connected or not, and a pointer read sends one to
-each of them outside the close group (16 at most with the bundled seeds), all at
-once, dialling any it is not yet connected to.
+the one nearest the chunk, connected or not, and one to each of them in a round
+that finds nothing; a pointer read sends one to each of them that is not in the
+close group, all at once, dialling any it is not yet connected to. With the 16
+bundled seeds, a read asks at most 9 of them, not all 16.
 
 The config directory is `ant`'s: `~/.config/ant` on Linux,
 `~/Library/Application Support/ant` on macOS, `%APPDATA%\ant` on Windows. A

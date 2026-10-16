@@ -161,31 +161,56 @@ test("nodes serving corrupt content are passed over for one that serves the reco
 });
 
 
-test("a record only the farthest of thirty seeds holds is read", async () => {
-  // Beyond the seven nearest that discovery finds and the twenty more known
-  // peers a read falls back to.
-  const nodes = Array.from({ length: 30 }, () => ({}));
-  const rtc = mockWebRtc(nodes);
+// The mock nodes of `rtc`, nearest to the record first.
+function nearestFirst(rtc) {
   const target = BigInt(`0x${datamap.address}`);
   const distance = i => BigInt(`0x${parseWebRtcDirectMultiaddr(rtc.endpoints[i]).peerId}`) ^ target;
-  const farthest = nodes.map((_, i) => i).sort((a, b) => distance(a) < distance(b) ? -1 : 1).at(-1);
-  nodes[farthest].chunk = datamap.content;
-  const client = new BrowserNetworkClient(rtc.endpoints);
+  return rtc.endpoints.map((_, i) => i).sort((a, b) => distance(a) < distance(b) ? -1 : 1);
+}
+
+test("a record only the farthest of eight seeds holds is read", async () => {
+  // Fewer than nine seeds: a read asks every one. The eight farthest of forty
+  // nodes are the seeds, so the farthest is beyond the seven nearest that
+  // discovery finds and the known peers a read falls back to.
+  const nodes = Array.from({ length: 40 }, () => ({}));
+  const rtc = mockWebRtc(nodes);
+  const seeds = nearestFirst(rtc).slice(-8);
+  nodes[seeds.at(-1)].chunk = datamap.content;
+  const client = new BrowserNetworkClient(seeds.map(i => rtc.endpoints[i]));
   let reader;
   try {
     reader = await client.openPublicFile(datamap.address);
     assert.equal(reader.size, content.length);
-    assert.ok(rtc.requests.some(r => r.node === farthest && r.method === "get_chunk"));
+    assert.ok(rtc.requests.some(r => r.node === seeds.at(-1) && r.method === "get_chunk"));
   } finally { reader?.close(); client.close(); }
 });
 
-test("every seed is asked before a read reports a record missing", async () => {
+test("a record only a seed outside the nine nearest it holds is not looked for there", async () => {
+  // Of thirty seeds, the farthest: beyond the nine nearest the record that a
+  // read asks, and beyond the twenty more known peers it falls back to.
+  const nodes = Array.from({ length: 30 }, () => ({}));
+  const rtc = mockWebRtc(nodes);
+  const farthest = nearestFirst(rtc).at(-1);
+  nodes[farthest].chunk = datamap.content;
+  const client = new BrowserNetworkClient(rtc.endpoints);
+  try {
+    await assert.rejects(client.openPublicFile(datamap.address), /not found/);
+    assert.ok(!rtc.requests.some(r => r.node === farthest && r.method === "get_chunk"));
+  } finally { client.close(); }
+});
+
+test("a missing record is reported once the nine seeds nearest it and the usual candidates have answered", async () => {
   const rtc = mockWebRtc(Array.from({ length: 30 }, () => ({})));
+  const ordered = nearestFirst(rtc);
   const client = new BrowserNetworkClient(rtc.endpoints);
   try {
     await assert.rejects(client.openPublicFile(datamap.address), /not found/);
     const asked = new Set(rtc.requests.filter(r => r.method === "get_chunk").map(r => r.node));
-    assert.equal(asked.size, 30);
+    // The seven nearest, two more of the nine nearest seeds, and the twenty
+    // known peers after them: every seed but the farthest.
+    assert.ok(ordered.slice(0, 9).every(i => asked.has(i)));
+    assert.equal(asked.size, 29);
+    assert.ok(!asked.has(ordered.at(-1)));
   } finally { client.close(); }
 });
 

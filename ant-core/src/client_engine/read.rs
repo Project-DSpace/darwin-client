@@ -65,7 +65,9 @@ pub(crate) struct ReadCandidates<P> {
 /// Keep primary peers first, ordered by XOR distance, then the bootstrap peers,
 /// then bounded, deduplicated known peers, each ordered the same way. Discovery
 /// failure suppression must not filter the latter two. Every bootstrap peer is
-/// kept, so a round establishes absence only after all of them have answered.
+/// kept, so a round establishes absence only after all of them have answered:
+/// a read is given the nine nearest the record at most
+/// ([`crate::data::network::MAX_BOOTSTRAP_READ_PEERS`]).
 pub(crate) fn read_targets<P: Clone>(
     candidates: ReadCandidates<P>,
     bootstrap: &[P],
@@ -118,14 +120,15 @@ fn conclusive<T, E>(
 /// A peer is queried at most once per round, and only the completed final candidate
 /// set can establish absence.
 ///
-/// `bootstrap` peers are read in a lane of their own from the start of every
-/// round, nearest to the target first, one at a time and whether or not they
-/// are connected, until each has been asked. The lane holds one of the two
-/// GETs, so a slow or silent bootstrap peer holds up only the next one:
-/// discovery's hints, and after discovery the ordinary path, keep the other,
-/// and a stalled hint is raced only while the lane is idle. In the final
-/// candidate set they follow the closest peers. With none, reads use discovery
-/// alone.
+/// `bootstrap` peers, the nine nearest the target at most
+/// ([`crate::data::network::bootstrap_read_peers`]), are read in a lane of
+/// their own from the start of every round, nearest to the target first, one
+/// at a time and whether or not they are connected, until each has been asked.
+/// The lane holds one of the two GETs, so a slow or silent bootstrap peer holds
+/// up only the next one: discovery's hints, and after discovery the ordinary
+/// path, keep the other, and a stalled hint is raced only while the lane is
+/// idle. In the final candidate set they follow the closest peers. With none,
+/// reads use discovery alone.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn retrieve_progressive<P, T, E, D, DF, G, GF, S, SF>(
     target: [u8; 32],
@@ -914,8 +917,13 @@ mod tests {
 
     #[test]
     fn bootstrap_peers_follow_the_closest_and_are_all_kept() {
-        // Thirty bootstrap peers, plus one that is also among the closest.
-        let bootstrap: Vec<_> = (40..70).rev().chain([1]).map(peer).collect();
+        // The nine bootstrap peers a read is given at most, one of which is
+        // also among the closest.
+        let bootstrap: Vec<_> = (40..48).rev().chain([1]).map(peer).collect();
+        assert_eq!(
+            bootstrap.len(),
+            crate::data::network::MAX_BOOTSTRAP_READ_PEERS
+        );
         let targets = read_targets(
             ReadCandidates {
                 closest: vec![peer(3), peer(1)],
@@ -926,11 +934,11 @@ mod tests {
             |p| *p,
         );
         assert_eq!(&targets[..2], &[peer(1), peer(3)]);
-        // Every bootstrap peer, nearest first, more than the known peers' bound.
-        assert_eq!(&targets[2..32], &(40..70).map(peer).collect::<Vec<_>>()[..]);
+        // Every other bootstrap peer, nearest first, ahead of the known peers.
+        assert_eq!(&targets[2..10], &(40..48).map(peer).collect::<Vec<_>>()[..]);
         // Then the known peers not already listed, bounded as before.
-        assert_eq!(&targets[32..35], &[peer(0), peer(2), peer(4)]);
-        assert_eq!(targets.len(), 32 + MAX_GET_FALLBACK_PEERS);
+        assert_eq!(&targets[10..13], &[peer(0), peer(2), peer(4)]);
+        assert_eq!(targets.len(), 10 + MAX_GET_FALLBACK_PEERS);
         assert_eq!(targets.iter().collect::<HashSet<_>>().len(), targets.len());
     }
 
@@ -1167,16 +1175,16 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn the_bootstrap_lane_keeps_asking_after_discovery() {
-        // Sixteen bootstrap peers, the tenth nearest of which holds the
-        // record, while no close-group peer answers a GET.
-        let latency = Duration::from_millis(60);
+        // Nine bootstrap peers, the most a read is given, the farthest of
+        // which holds the record, while no close-group peer answers a GET.
+        let latency = Duration::from_millis(70);
         let close_group = || (1..=7).map(peer);
         let net = Simulated::default();
         let start = tokio::time::Instant::now();
         let result = retrieve_progressive(
             peer(0),
             MAX_GET_FALLBACK_PEERS,
-            (101..=116).rev().map(peer).collect(),
+            (101..=109).rev().map(peer).collect(),
             |_| async move {
                 tokio::time::sleep(Duration::from_millis(500)).await;
                 ReadCandidates {
@@ -1187,7 +1195,7 @@ mod tests {
             |p| *p,
             |p, early| {
                 let silent = close_group().any(|member| member == p);
-                net.get(p, early, latency, silent, p == peer(110))
+                net.get(p, early, latency, silent, p == peer(109))
             },
             |error| *error == ReadError::Transport,
             tokio::time::sleep,
@@ -1195,9 +1203,9 @@ mod tests {
         .await;
         assert_eq!(result, Ok(Some(42)));
         // One bootstrap peer after another, nearest first, from the start and
-        // past the end of discovery: ten round trips, while the close group's
+        // past the end of discovery: nine round trips, while the close group's
         // GETs wait out their timeout.
-        assert_eq!(start.elapsed(), 10 * latency);
+        assert_eq!(start.elapsed(), 9 * latency);
         let bootstrap_gets: Vec<_> = net
             .gets
             .borrow()
@@ -1205,7 +1213,7 @@ mod tests {
             .filter(|(p, _)| p[0] > 100)
             .copied()
             .collect();
-        let expected: Vec<_> = (101..=110).map(|id| (peer(id), id < 110)).collect();
+        let expected: Vec<_> = (101..=109).map(|id| (peer(id), id < 109)).collect();
         assert_eq!(bootstrap_gets, expected);
         assert_eq!(net.most.get(), 2);
     }

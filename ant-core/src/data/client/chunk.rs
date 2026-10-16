@@ -869,8 +869,9 @@ impl Client {
             // speculation on stale hints before a live holder is discovered.
             // The final close-group size and absence rules still use peer_count.
             crate::client_engine::read::MAX_GET_FALLBACK_PEERS,
-            // Asked from the start alongside discovery, nearest first, and
-            // before the read can report the chunk absent.
+            // The bootstrap peers nearest the chunk, nine at most: asked from
+            // the start alongside discovery, nearest first, and before the
+            // read can report the chunk absent.
             self.network().bootstrap_peers_near(address),
             |sender| {
                 #[cfg(feature = "native")]
@@ -1612,6 +1613,71 @@ mod tests {
             matches!(&result, Err(Error::InvalidData(reason)) if reason.contains("BLAKE3")),
             "{result:?}"
         );
+    }
+
+    /// Reads the chunk at `[0; 32]` through the shared read engine with the
+    /// bootstrap peers `bootstrap_read_peers` chooses from sixteen seeds, 101
+    /// to 116 (nearest the chunk first), as `chunk_get` does. Peers 1 to 7 are
+    /// the close group, and only `holder` holds the chunk. Returns the read
+    /// and the peers asked.
+    fn read_with_sixteen_seeds(holder: Option<u8>) -> (Result<Option<u8>>, Vec<u8>) {
+        let seeds: Vec<MultiAddr> = (101..=116u8)
+            .rev()
+            .map(|n| {
+                format!(
+                    "/ip4/127.0.0.1/udp/{}/quic/p2p/{}",
+                    10_000 + u16::from(n),
+                    hex::encode([n; 32])
+                )
+                .parse()
+                .unwrap()
+            })
+            .collect();
+        let bootstrap = crate::data::network::bootstrap_read_peers(
+            &seeds,
+            &[0; 32],
+            &PeerId::from_bytes([0xff; 32]),
+        );
+        let asked = std::sync::Mutex::new(Vec::new());
+        let found = futures::executor::block_on(crate::client_engine::read::retrieve_progressive(
+            [0; 32],
+            0,
+            bootstrap,
+            |_| async {
+                crate::client_engine::read::ReadCandidates {
+                    closest: (1..=7u8)
+                        .map(|n| (PeerId::from_bytes([n; 32]), Vec::new()))
+                        .collect(),
+                    known: Vec::new(),
+                }
+            },
+            |(peer, _)| *peer.as_bytes(),
+            |(peer, _), _| {
+                let n = peer.as_bytes()[0];
+                asked.lock().unwrap().push(n);
+                async move { Ok::<_, Error>((Some(n) == holder).then_some(n)) }
+            },
+            |_| true,
+            |_| async {},
+        ));
+        (found, asked.into_inner().unwrap())
+    }
+
+    #[test]
+    fn a_chunk_read_asks_the_nine_bootstrap_peers_nearest_the_chunk() {
+        // The ninth nearest seed holds the chunk: it is read.
+        let (result, asked) = read_with_sixteen_seeds(Some(109));
+        assert!(matches!(result, Ok(Some(109))), "{result:?}");
+        assert!(asked.iter().all(|&n| n <= 109), "{asked:?}");
+        // A seed past the ninth holds it, or nobody does: it is not looked for
+        // there, and the chunk is reported missing once the close group and
+        // the nine nearest seeds have answered, each once.
+        for holder in [Some(110), Some(116), None] {
+            let (result, mut asked) = read_with_sixteen_seeds(holder);
+            assert!(matches!(result, Ok(None)), "{result:?}");
+            asked.sort_unstable();
+            assert_eq!(asked, (1..=7).chain(101..=109).collect::<Vec<u8>>());
+        }
     }
 
     #[test]
