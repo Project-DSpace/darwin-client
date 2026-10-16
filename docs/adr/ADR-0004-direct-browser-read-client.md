@@ -126,6 +126,12 @@ owner-signed preconnections publish additional hints after HELLO completes. Cold
 addresses remain available to ordinary discovery and final fallback, rather than
 occupying speculative GET slots for an entire ICE timeout.
 
+Bootstrap peers known by peer ID are the exception: every round reads them from
+the start, nearest to the record first, one at a time and whether or not they
+are connected, in one of the two GET slots. Hints and the ordinary path keep the
+other slot, and a stalled hint is raced only once the bootstrap peers have all
+been asked (see the README's bootstrap section).
+
 An immutable read begins with one speculative GET while ordinary XOR discovery
 continues. If it is still pending after one second, a second candidate may race
 it. The existing limit of two simultaneous GETs per record is retained: when

@@ -139,12 +139,16 @@ cover the delay, slot handoff, deduplication, and fatal integrity errors. The la
 tests check that a failed cold dial is not repeated by the other queued lane.
 Early candidates use authenticated connections, with WebRTC preconnections
 publishing hints once ready. The seeds are the exception: as bootstrap peers
-they are candidates from the start of every read, connected or not, and all of
-them are asked before a read reports a record missing. Download regressions
-cover cold closer addresses blocking neither slot ahead of a ready holder,
-retaining the twenty-peer fallback allowance after more than seven early misses,
-and a record only the farthest of thirty seeds holds. `pointer.test.mjs` reads a
-pointer that only seeds outside its close group hold.
+they are read from the start of every read, connected or not, one at a time in a
+GET slot of their own, and all of them are asked before a read reports a record
+missing. Download regressions cover cold closer addresses blocking neither slot
+ahead of a ready holder, retaining the twenty-peer fallback allowance after more
+than seven early misses, a record only the farthest of thirty seeds holds, and a
+missing record asked of all thirty. The bootstrap tests check that a slow seed
+delays neither authentication nor the read, nearer to the record or not.
+`pointer.test.mjs` reads a pointer that only seeds outside its close group hold,
+and leaves a seed the seed policy rejected out of the bootstrap peers a read
+waits for.
 
 `parallel-lanes.test.mjs` checks the two-channel transport profile: discovery and
 quotes use the control channel; GET/PUT use an independent authenticated data

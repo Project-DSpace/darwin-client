@@ -1208,16 +1208,23 @@ seed(s)" when it falls back to the bundled ones.
 Chunk and pointer reads also ask the bootstrap peers whose peer IDs the client
 knows: the selected QUIC seeds that carry `/p2p/<peer-id>`, or a browser
 client's seeds. The nodes that were nearest to a record when it was stored may
-still hold it after the nodes nearest to it have changed. A chunk read offers
-them to its early reads from the start, nearest to the chunk first, alongside
-what discovery finds and within the same limits (two GETs at a time, the second
-after a one-second stall); it asks the rest after the close group, and reports a
-chunk missing only once every one of them has been asked. A pointer read asks
-the close group and the bootstrap peers at once, each set on its own quorum and
-corroboration, and returns the newer of the two states: a state the bootstrap
-peers agree on is returned even when the close group holds none or does not
-answer, while absence and failures are the close group's to report. Bootstrap
-addresses without a peer ID are only dialled, as before.
+still hold it after the nodes nearest to it have changed. A chunk read asks them
+from the start of each round, nearest to the chunk first and one at a time, in
+one of its two GET slots; discovery's hints, then the close group, keep the
+other, so a slow or silent bootstrap peer holds up only the next one. It reports
+a chunk missing only once every one of them has answered. A pointer read asks
+the bootstrap peers from the start and the close group once it is found, each
+set on its own quorum and corroboration (a peer in both is asked once), and
+returns the newer of the two states: a state the bootstrap peers agree on is
+returned even when the close group holds none or does not answer. When the
+close group has a state, the read waits for a quorum of the bootstrap peers;
+when it has none, for all of them, so it takes as long as the slower set, up to
+the GET timeout when a bootstrap peer doesn't answer. Bootstrap addresses
+without a peer ID are only dialled, as before.
+
+So every read reaches the bootstrap peers: a chunk read sends its first GET to
+the one nearest the chunk, connected or not, and a pointer read sends one to
+each of them outside the close group (16 at most with the bundled seeds).
 
 The config directory is `ant`'s: `~/.config/ant` on Linux,
 `~/Library/Application Support/ant` on macOS, `%APPDATA%\ant` on Windows. A
@@ -1228,8 +1235,8 @@ Delete or rename that file to use the bundled seeds.
 Native library callers can use `config::resolve_bootstrap_multiaddrs()` and
 `Client::connect_multiaddrs()` to retain peer pins, which reads then use; a
 client built from a node (`Client::from_node`) gets them through
-`Client::with_bootstrap_peers()`. Existing socket-address APIs remain
-available. `network_defaults::browser_mainnet_defaults()` and the WASM
+`Client::with_bootstrap_peers()`, and `Network::bootstrap_peers()` lists them.
+Existing socket-address APIs remain available. `network_defaults::browser_mainnet_defaults()` and the WASM
 `mainnetNetworkDefaults()` export return the bundled WebRTC seeds, the payment
 identity (chain 4663, the DARWIN token and vault) and the bundled RPC URL,
 without connecting to any network.

@@ -72,19 +72,30 @@ told apart by the commit `darwin --version` prints. Upstream's entries follow.
 - Chunk and pointer reads also ask the bootstrap peers whose peer IDs the client knows, from the
   start, nearest to the address first: the nodes that were nearest to a record when it was
   stored may still hold it after the nodes nearest to it have changed. `bootstrap_peers.toml`
-  lists all 16 server nodes on QUIC (both nodes of each server, on 10000 and 10001) with their
-  peer IDs; the CLI and `Client::connect_multiaddrs` hand the selected seeds that carry one to
-  reads (`Client::with_bootstrap_peers` for a client built from a node), and a browser client
-  asks its seeds. A chunk read offers them to its early reads alongside discovery, within the
-  same limits (two GETs at a time, the second after a one-second stall), asks the rest after the
-  close group, and reports a chunk missing only once all of them have been asked. A missing
-  chunk therefore costs up to one more GET per bootstrap peer, and one that doesn't answer makes
-  the read take its second round, as an unanswering close-group node does. A pointer read asks
-  the close group and the bootstrap peers at once, each set on its own quorum and corroboration,
-  and returns the newer of the two states: a state the bootstrap peers agree on is returned even
-  when the close group holds none or does not answer, while absence and failures are reported
-  from the close group alone. It sends one more GET per bootstrap peer (16 with the bundled
-  seeds; a pointer is at most 5.3 KB). Bootstrap addresses without a peer ID add nothing.
+  lists all 16 server nodes on QUIC (both nodes of each server, on 10000 and 10001, every
+  server's 10000 node first) with their peer IDs; the CLI and `Client::connect_multiaddrs` hand
+  the selected seeds that carry one to reads (`Client::with_bootstrap_peers` for a client built
+  from a node; `Network::bootstrap_peers` lists them), and a browser client asks its seeds.
+  Bootstrap addresses without a peer ID add nothing.
+- A chunk read asks the bootstrap peers one after another in one of its two GET slots, from the
+  start of each round until each has been asked; discovery's hints, then the close group, keep
+  the other. A slow or silent bootstrap peer holds up only the next one, and a stalled hint is
+  raced only once the bootstrap peers have all been asked. Every chunk read sends its first GET
+  to the bootstrap peer nearest the chunk, connected or not, and a chunk is reported missing
+  only once all of them have answered. A missing chunk therefore costs up to one more GET per
+  bootstrap peer in each round, and one that doesn't answer makes the read take its second
+  round, which asks them all again, as an unanswering close-group node does.
+- A pointer read asks the bootstrap peers from the start and the close group once it is found,
+  each set on its own quorum and corroboration, a peer in both once, and returns the newer of the
+  two states. A state the bootstrap peers agree on is returned even when the close group holds
+  none or does not answer. When too few of a set answer, the state those that did agree on still
+  holds the read back: it fails with that shortfall rather than return an older state, or none.
+  When the close group has a state, the bootstrap peers are waited for until a quorum of them
+  has answered, and until a second confirms a newer state one of them names; when it has none,
+  until every one has answered or failed, so a pointer is reported absent only then. A read
+  takes as long as the slower set, up to the GET timeout when bootstrap peers don't answer, and
+  sends one GET to each bootstrap peer outside the close group (16 at most with the bundled
+  seeds; a pointer is at most 5.3 KB). Writes read first, so they wait the same way.
 - `PaymentMode::Single` is the default of the library (`PaymentMode::default()`,
   `Client::file_upload`, `file_prepare_upload`) and of the browser API, so programs built on
   ant-core pay per chunk unless they ask for batches.
