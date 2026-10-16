@@ -35,7 +35,7 @@ use ant_protocol::transport::{MultiAddr, PeerId};
 use ant_protocol::XorName;
 use bytes::Bytes;
 use futures::stream::{FuturesUnordered, StreamExt};
-use tracing::warn;
+use tracing::{debug, warn};
 use web_time::Duration;
 
 use crate::client_engine::{store_retry_delay, STORE_MAX_RETRIES};
@@ -185,6 +185,128 @@ impl Replies {
     /// Whether any peer named a state at all.
     fn any(&self) -> bool {
         !self.seen.is_empty()
+    }
+}
+
+/// Which peers a pointer read asked.
+#[derive(Clone, Copy)]
+enum Asked {
+    /// The close group of the address.
+    CloseGroup,
+    /// The bootstrap peers the client knows by peer ID.
+    Bootstrap,
+}
+
+impl Asked {
+    /// The set, as in "only 3 of the close group answered".
+    fn set(self) -> &'static str {
+        match self {
+            Self::CloseGroup => "the close group",
+            Self::Bootstrap => "the bootstrap peers",
+        }
+    }
+
+    /// One of its peers, as in "no close-group peer answered".
+    fn member(self) -> &'static str {
+        match self {
+            Self::CloseGroup => "close-group peer",
+            Self::Bootstrap => "bootstrap peer",
+        }
+    }
+}
+
+/// Read the pointer at `address` from one set of peers, all asked at once:
+/// `in_flight` holds their verified replies, and `peers` is how many there are.
+///
+/// Every reply is verified independently, so a dishonest peer can only offer a
+/// record that is genuinely signed and genuinely belongs here. What it must not
+/// be able to do is decide the answer alone: any peer may legitimately hold a
+/// stale record, so taking the first reply would let one pin a reader to it.
+/// The read needs [`read_quorum`] of the set to answer and returns the best
+/// state at least [`corroboration`] of them name, both taken from the set's own
+/// size. Asking concurrently also means one slow peer cannot stall the read
+/// behind the store timeout.
+async fn read_pointer_from(
+    in_flight: FuturesUnordered<impl Future<Output = Result<Option<Pointer>>>>,
+    peers: usize,
+    address: &XorName,
+    asked: Asked,
+) -> Result<Option<Pointer>> {
+    let wanted = read_quorum(peers);
+    let needed = corroboration(peers);
+    let mut replies = Replies::default();
+    let answered = ask_the_group(in_flight, wanted, |found| {
+        replies.add(found);
+        // Answers alone settle a read that found nothing. A state is
+        // settled only once enough peers have named it — until then the
+        // read keeps asking, because the peers that would confirm it may
+        // simply not have answered yet.
+        !replies.any() || replies.corroborated(needed).is_some()
+    })
+    .await;
+    let corroborated = replies.corroborated(needed).cloned();
+
+    if answered.count == 0 {
+        return Err(answered.failure().unwrap_or_else(|| {
+            Error::Protocol(format!("no {} answered for the pointer", asked.member()))
+        }));
+    }
+    // A single answer is not a network verdict: one reachable peer holding
+    // a stale record, before replication has reached it, looks exactly like
+    // the whole group agreeing. Say so rather than presenting it as the
+    // value.
+    if answered.count < wanted {
+        return Err(Error::CloseGroupShortfall(format!(
+            "only {} of {} answered for pointer {}",
+            answered.count,
+            asked.set(),
+            hex::encode(address)
+        )));
+    }
+    // States were offered, but none by enough peers to call it the
+    // network's answer. Either the write is still settling, or what was
+    // offered is a state no honest node holds. Neither is a value to hand
+    // back as current.
+    if corroborated.is_none() && replies.any() {
+        return Err(Error::CloseGroupShortfall(format!(
+            "no state for pointer {} was named by {needed} of the {} peers that answered",
+            hex::encode(address),
+            answered.count
+        )));
+    }
+    Ok(corroborated)
+}
+
+/// Combine a read of the close group with a read of the bootstrap peers, each
+/// made by [`read_pointer_from`] on its own set.
+///
+/// A state either read returns is the state that set corroborates, verified
+/// against the address and its owner's signature, so the answer is the newer of
+/// the two by the merge rule ([`Pointer::replaces`]). Both reads are complete
+/// before they are combined, so a state from one set never replaces a newer
+/// one from the other. A state from the bootstrap peers is returned even when
+/// the close group is silent, falls short or holds none. When the bootstrap
+/// peers name no state, or fail, the close group's outcome stands unchanged:
+/// whether a pointer exists, and why a read failed, are the close group's to
+/// say.
+fn newest_pointer(
+    close_group: Result<Option<Pointer>>,
+    bootstrap: Result<Option<Pointer>>,
+) -> Result<Option<Pointer>> {
+    match (close_group, bootstrap) {
+        (Ok(Some(held)), Ok(Some(other))) => {
+            Ok(Some(if other.replaces(&held) { other } else { held }))
+        }
+        (_, Ok(Some(other))) => {
+            debug!(
+                "pointer {} read from the bootstrap peers at counter {}: the close group \
+                 gave no state",
+                hex::encode(other.address()),
+                other.counter()
+            );
+            Ok(Some(other))
+        }
+        (close_group, _) => close_group,
     }
 }
 
@@ -565,69 +687,53 @@ impl Client {
     /// must be named by more than one of them, so no single peer decides what
     /// the pointer says.
     ///
+    /// The close group is asked, and at the same time so are the bootstrap
+    /// peers the client knows by peer ID, as a second set with its own quorum
+    /// and corroboration. The answer is the newer state of the two, and a state
+    /// the bootstrap peers name is returned even when the close group holds
+    /// none or does not answer; see `newest_pointer`. Without such bootstrap
+    /// peers only the close group is asked.
+    ///
     /// # Errors
     ///
     /// Returns an error if no peer answers, if too few of the group do, or if
     /// the best state found has too few peers behind it to be the network's
-    /// answer rather than one peer's.
+    /// answer rather than one peer's, unless the bootstrap peers name a state.
     pub async fn pointer_get(&self, address: &XorName) -> Result<Option<Pointer>> {
-        let peers = self.pointer_group(address).await?;
+        let close_group = async {
+            let peers = self.pointer_group(address).await?;
+            read_pointer_from(
+                self.ask_for_pointer(address, &peers),
+                peers.len(),
+                address,
+                Asked::CloseGroup,
+            )
+            .await
+        };
+        let bootstrap = self.network().bootstrap_peers_near(address);
+        if bootstrap.is_empty() {
+            return close_group.await;
+        }
+        let from_bootstrap = read_pointer_from(
+            self.ask_for_pointer(address, &bootstrap),
+            bootstrap.len(),
+            address,
+            Asked::Bootstrap,
+        );
+        let (close_group, bootstrap) = futures::join!(close_group, from_bootstrap);
+        newest_pointer(close_group, bootstrap)
+    }
 
-        // Ask the whole close group at once and keep the best answer.
-        //
-        // Every reply is verified independently, so a dishonest peer can only
-        // offer a record that is genuinely signed and genuinely belongs here.
-        // What it must not be able to do is decide the answer alone: any peer
-        // may legitimately hold a stale record, so taking the first reply would
-        // let one pin a reader to it. Asking concurrently also means one slow
-        // peer cannot stall the read behind the store timeout.
-        let in_flight = FuturesUnordered::new();
-        for (peer_id, addrs) in &peers {
-            in_flight.push(self.send_pointer_get(*address, *peer_id, addrs.clone()));
-        }
-
-        let wanted = read_quorum(peers.len());
-        let needed = corroboration(peers.len());
-        let mut replies = Replies::default();
-        let answered = ask_the_group(in_flight, wanted, |found| {
-            replies.add(found);
-            // Answers alone settle a read that found nothing. A state is
-            // settled only once enough peers have named it — until then the
-            // read keeps asking, because the peers that would confirm it may
-            // simply not have answered yet.
-            !replies.any() || replies.corroborated(needed).is_some()
-        })
-        .await;
-        let corroborated = replies.corroborated(needed).cloned();
-
-        if answered.count == 0 {
-            return Err(answered.failure().unwrap_or_else(|| {
-                Error::Protocol("no close-group peer answered for the pointer".to_string())
-            }));
-        }
-        // A single answer is not a network verdict: one reachable peer holding
-        // a stale record, before replication has reached it, looks exactly like
-        // the whole group agreeing. Say so rather than presenting it as the
-        // value.
-        if answered.count < wanted {
-            return Err(Error::CloseGroupShortfall(format!(
-                "only {} of the close group answered for pointer {}",
-                answered.count,
-                hex::encode(address)
-            )));
-        }
-        // States were offered, but none by enough peers to call it the
-        // network's answer. Either the write is still settling, or what was
-        // offered is a state no honest node holds. Neither is a value to hand
-        // back as current.
-        if corroborated.is_none() && replies.any() {
-            return Err(Error::CloseGroupShortfall(format!(
-                "no state for pointer {} was named by {needed} of the {} peers that answered",
-                hex::encode(address),
-                answered.count
-            )));
-        }
-        Ok(corroborated)
+    /// Send a pointer GET to every one of `peers` at once.
+    fn ask_for_pointer<'a>(
+        &'a self,
+        address: &XorName,
+        peers: &[(PeerId, Vec<MultiAddr>)],
+    ) -> FuturesUnordered<impl Future<Output = Result<Option<Pointer>>> + 'a> {
+        peers
+            .iter()
+            .map(|(peer_id, addrs)| self.send_pointer_get(*address, *peer_id, addrs.clone()))
+            .collect()
     }
 
     /// Follow a pointer chain to the chunk it ends at.
@@ -1141,6 +1247,185 @@ mod tests {
             "the refusal is what the write reports"
         );
         assert!(matches!(answered.last_error, Some(Error::Timeout(_))));
+    }
+
+    /// One set of peers' replies, as the network would hand them to a read.
+    fn replies_from(
+        replies: Vec<Result<Option<Pointer>>>,
+    ) -> FuturesUnordered<BoxFuture<'static, Result<Option<Pointer>>>> {
+        replies
+            .into_iter()
+            .map(|reply| Box::pin(async move { reply }) as BoxFuture<'static, _>)
+            .collect()
+    }
+
+    /// A read as `pointer_get` makes one with bootstrap peers: the close group
+    /// and the bootstrap peers read at once, each on its own quorum, then
+    /// combined.
+    async fn read_both(
+        address: XorName,
+        close_group: Vec<Result<Option<Pointer>>>,
+        bootstrap: Vec<Result<Option<Pointer>>>,
+    ) -> Result<Option<Pointer>> {
+        let (close_count, bootstrap_count) = (close_group.len(), bootstrap.len());
+        let (close_group, bootstrap) = futures::join!(
+            read_pointer_from(
+                replies_from(close_group),
+                close_count,
+                &address,
+                Asked::CloseGroup
+            ),
+            read_pointer_from(
+                replies_from(bootstrap),
+                bootstrap_count,
+                &address,
+                Asked::Bootstrap
+            ),
+        );
+        newest_pointer(close_group, bootstrap)
+    }
+
+    /// A peer that does not answer: its GET times out.
+    fn silent() -> Result<Option<Pointer>> {
+        Err(Error::Timeout("pointer GET timed out".to_string()))
+    }
+
+    fn every(
+        size: usize,
+        reply: impl Fn() -> Result<Option<Pointer>>,
+    ) -> Vec<Result<Option<Pointer>>> {
+        (0..size).map(|_| reply()).collect()
+    }
+
+    /// A state the bootstrap peers corroborate is the answer when the close
+    /// group gives none: it does not answer, too few of it answer, or it holds
+    /// none.
+    #[tokio::test]
+    async fn a_state_the_bootstrap_peers_hold_is_read_when_the_close_group_has_none() {
+        let (pk, sk) = keypair(13);
+        let held = Pointer::create(&sk, &pk, chunk_target(1)).expect("create");
+        let bootstrap = || vec![Ok(Some(held.clone())), Ok(Some(held.clone())), Ok(None)];
+        for close_group in [
+            every(7, silent),
+            every(7, || Ok(None)),
+            vec![
+                Ok(None),
+                Ok(None),
+                Ok(None),
+                silent(),
+                silent(),
+                silent(),
+                silent(),
+            ],
+        ] {
+            let read = read_both(held.address(), close_group, bootstrap()).await;
+            assert_eq!(
+                read.expect("a read").expect("a state").state_id(),
+                held.state_id()
+            );
+        }
+    }
+
+    /// Both sets answer: the newer corroborated state is the answer, whichever
+    /// set names it, so an older state from one cannot roll back the other's.
+    #[tokio::test]
+    async fn the_newer_state_wins_whichever_set_names_it() {
+        let (pk, sk) = keypair(14);
+        let old = Pointer::create(&sk, &pk, chunk_target(1)).expect("create");
+        let new = old.update(&sk, chunk_target(2)).expect("update");
+        let naming = |state: &Pointer, size: usize| every(size, || Ok(Some(state.clone())));
+        for (close_group, bootstrap) in [
+            (naming(&new, 7), naming(&old, 16)),
+            (naming(&old, 7), naming(&new, 16)),
+        ] {
+            let read = read_both(old.address(), close_group, bootstrap).await;
+            assert_eq!(
+                read.expect("a read").expect("a state").state_id(),
+                new.state_id()
+            );
+        }
+        // Agreement is per set: a newer state only one bootstrap peer names
+        // does not replace the close group's.
+        let mut bootstrap = every(15, || Ok(None));
+        bootstrap.push(Ok(Some(new.clone())));
+        let read = read_both(old.address(), naming(&old, 7), bootstrap).await;
+        assert_eq!(
+            read.expect("a read").expect("a state").state_id(),
+            old.state_id()
+        );
+    }
+
+    /// Whether a pointer exists, and why a read failed, are the close group's
+    /// to report: the bootstrap peers holding none, failing, or naming a state
+    /// only one of them holds changes nothing.
+    #[tokio::test]
+    async fn absence_and_failure_are_the_close_groups_to_report() {
+        let (pk, sk) = keypair(15);
+        let held = Pointer::create(&sk, &pk, chunk_target(1)).expect("create");
+        let address = held.address();
+        let none = |size| every(size, || Ok(None));
+
+        assert!(read_both(address, none(7), none(16))
+            .await
+            .expect("a read")
+            .is_none());
+        let read = read_both(address, every(7, silent), none(16)).await;
+        assert!(matches!(read, Err(Error::Timeout(_))), "{read:?}");
+        let mut short = none(3);
+        short.extend(every(4, silent));
+        let read = read_both(address, short, none(16)).await;
+        assert!(
+            matches!(&read, Err(Error::CloseGroupShortfall(message))
+                if message.starts_with("only 3 of the close group answered")),
+            "{read:?}"
+        );
+        let lone = vec![Ok(Some(held.clone())), Ok(None), Ok(None)];
+        assert!(read_both(address, none(7), lone)
+            .await
+            .expect("a read")
+            .is_none());
+        let read = read_both(
+            address,
+            every(7, || Ok(Some(held.clone()))),
+            every(16, silent),
+        )
+        .await;
+        assert_eq!(
+            read.expect("a read").expect("a state").state_id(),
+            held.state_id()
+        );
+    }
+
+    /// With no state from the bootstrap peers, the close group's outcome is
+    /// returned exactly as it was.
+    #[test]
+    fn the_close_groups_outcome_stands_without_a_bootstrap_state() {
+        let (pk, sk) = keypair(16);
+        let held = Pointer::create(&sk, &pk, chunk_target(1)).expect("create");
+        let outcomes = || -> Vec<Result<Option<Pointer>>> {
+            vec![
+                Ok(None),
+                Ok(Some(held.clone())),
+                Err(Error::CloseGroupShortfall(
+                    "only 3 of the close group answered".into(),
+                )),
+            ]
+        };
+        for bootstrap_failed in [false, true] {
+            for (close_group, expected) in outcomes().into_iter().zip(outcomes()) {
+                let bootstrap = if bootstrap_failed { silent() } else { Ok(None) };
+                match (newest_pointer(close_group, bootstrap), expected) {
+                    (Ok(read), Ok(expected)) => assert_eq!(
+                        read.map(|state| state.state_id()),
+                        expected.map(|state| state.state_id())
+                    ),
+                    (Err(read), Err(expected)) => {
+                        assert_eq!(read.to_string(), expected.to_string())
+                    }
+                    (read, expected) => panic!("read {read:?}, expected {expected:?}"),
+                }
+            }
+        }
     }
 
     /// A write quorum and a read quorum must intersect at every group width.

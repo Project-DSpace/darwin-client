@@ -4,7 +4,7 @@
 import { BrowserNetworkClient } from "./client-fixture.mjs";
 import assert from "node:assert/strict";
 import test from "node:test";
-import { pointerAddress } from "./pkg/ant_core.js";
+import { parseWebRtcDirectMultiaddr, pointerAddress } from "./pkg/ant_core.js";
 import { mockWebRtc, paymentNetwork } from "./mock-webrtc.mjs";
 
 const seed = new Uint8Array(32).fill(7);
@@ -100,6 +100,41 @@ test("an address nobody wrote reads as null", async () => {
   const client = new BrowserNetworkClient(rtc.endpoints);
   try {
     assert.equal(await client.getPointer(target(0x42)), null);
+  } finally {
+    client.close();
+  }
+});
+
+test("a pointer only the seeds hold is read when its close group holds none", async () => {
+  // Write the pointer on one network to get its record.
+  const source = mockWebRtc(Array.from({ length: 7 }, () => ({})));
+  const writer = new BrowserNetworkClient(source.endpoints);
+  let record;
+  try {
+    await writer.createPointer(seed, target(1), "chunk", paymentNetwork, wallet().pay,
+      value => { record = value.record; });
+  } finally {
+    writer.close();
+  }
+  // On another, the three nodes farthest from it are the seeds and hold it;
+  // the seven nearest, its close group, hold none.
+  const rtc = mockWebRtc(Array.from({ length: 10 }, () => ({})));
+  const address = pointerAddress(seed);
+  const distance = (endpoint) =>
+    BigInt(`0x${parseWebRtcDirectMultiaddr(endpoint).peerId}`) ^ BigInt(`0x${address}`);
+  const nodes = rtc.endpoints
+    .map((endpoint, index) => ({ endpoint, index }))
+    .sort((a, b) => (distance(a.endpoint) < distance(b.endpoint) ? -1 : 1));
+  const closeGroup = new Set(nodes.slice(0, 7).map(({ index }) => index));
+  const bootstrap = nodes.slice(7);
+  for (const { index } of bootstrap) rtc.stores[index].set(`pointer:${address}`, record);
+  const client = new BrowserNetworkClient(bootstrap.map(({ endpoint }) => endpoint));
+  try {
+    const read = await client.getPointer(address);
+    assert.equal(read?.target, target(1));
+    assert.equal(read.counter, "0");
+    const asked = rtc.requests.filter(({ method }) => method === "get_pointer");
+    assert.ok(asked.some(({ node }) => closeGroup.has(node)), "the close group is asked too");
   } finally {
     client.close();
   }
