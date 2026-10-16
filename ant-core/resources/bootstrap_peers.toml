@@ -1,16 +1,26 @@
 # Our network's bootstrap seeds, used when no --bootstrap, manifest or config
 # file names others. Shared by native releases and WASM.
 # Preserve optional /p2p/<peer-id> suffixes on QUIC addresses.
-# One QUIC seed per server: each runs two nodes, on 10000 and 10001.
+# 16 QUIC seeds: both nodes on each server, on 10000 and 10001, each with its
+# peer ID, which reads need to ask a seed directly. A node's QUIC port is its
+# WebRTC port (below) minus 1000, under the same peer ID.
 quic = [
-    "/ip4/142.93.32.90/udp/10000/quic",  # storage-1
-    "/ip4/165.22.193.90/udp/10000/quic",  # storage-2
-    "/ip4/142.93.96.232/udp/10000/quic",  # storage-3
-    "/ip4/139.59.179.241/udp/10000/quic",  # storage-4
-    "/ip4/144.126.202.63/udp/10000/quic",  # storage-5
-    "/ip4/104.248.85.30/udp/10000/quic",  # storage-6
-    "/ip4/64.227.71.7/udp/10000/quic",  # storage-7
-    "/ip4/139.59.150.26/udp/10000/quic",  # storage-8
+    "/ip4/142.93.32.90/udp/10000/quic/p2p/39963bc09fccdf7a61757dbdf8834631051beb2476414584217ad2a1219added",  # storage-1
+    "/ip4/142.93.32.90/udp/10001/quic/p2p/4b20f2601ec433990e5b37276a9c7009d2616b74a71d0baf7061d04931ac3070",  # storage-1
+    "/ip4/165.22.193.90/udp/10000/quic/p2p/ee1ef26c5e73312d1eff27b23cc23bf40f53cfbcc418511cd1a61b75e8de5cb5",  # storage-2
+    "/ip4/165.22.193.90/udp/10001/quic/p2p/1008b92051c595eb46fa80639d390db653226a89241793e221199dd530213125",  # storage-2
+    "/ip4/142.93.96.232/udp/10000/quic/p2p/c2e84f347cab586eb7597040a222621678bd4d28f2e1dc838d35cc6dcff13a19",  # storage-3
+    "/ip4/142.93.96.232/udp/10001/quic/p2p/ece1a31ec33a4cc265ea0c63c29e5f6529731d9c3535e616e5c2c97eb9c614b9",  # storage-3
+    "/ip4/139.59.179.241/udp/10000/quic/p2p/7bd8f171e0308a019ab8a3c8b89cc93fd7881db2b1ca7ee3f27c74d55921030c",  # storage-4
+    "/ip4/139.59.179.241/udp/10001/quic/p2p/f794a0e6d9300138775e02572d6c8080102a0a3426a46eb5bd8509355b45f1ac",  # storage-4
+    "/ip4/144.126.202.63/udp/10000/quic/p2p/e450ffe96225f3a373ab93fd103f25411a019fce920240e225edc9c91bf42f88",  # storage-5
+    "/ip4/144.126.202.63/udp/10001/quic/p2p/f3ba32ca63ee53088baec16e2c34dff8439d4ded431e83d33dce702a5fb98468",  # storage-5
+    "/ip4/104.248.85.30/udp/10000/quic/p2p/bc8f239703eed6b778b2e57692a7b582c9cc9c17d61d460b5a1f151bace7d067",  # storage-6
+    "/ip4/104.248.85.30/udp/10001/quic/p2p/5b3bf65853c3258e4a3fda821931b6e0a3a266d7a68abce61da611f6f95836b0",  # storage-6
+    "/ip4/64.227.71.7/udp/10000/quic/p2p/737472ae43526c866e9007812c1934960441336036f3bb71d2cedc612d2990d0",  # storage-7
+    "/ip4/64.227.71.7/udp/10001/quic/p2p/d67a77c3d85a14a7d7e7bd98a97c597edc4ce8ba1bbc2f1e87413c2c40cf1b1d",  # storage-7
+    "/ip4/139.59.150.26/udp/10000/quic/p2p/b1220441b40e1ef046c1d8b967a7a270dfa042b4a85fd68e9a6feefb2128b829",  # storage-8
+    "/ip4/139.59.150.26/udp/10001/quic/p2p/f4b971858c6642d5a75170bf7d3bde298a295f7c9bb4e7d47e6caf92df349904",  # storage-8
 ]
 
 # Browser seeds: every node also serves WebRTC Direct, on 11000 and 11001.

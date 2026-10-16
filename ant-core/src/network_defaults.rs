@@ -143,6 +143,41 @@ mod tests {
     }
 
     #[test]
+    fn bundled_quic_seeds_are_both_nodes_of_every_server_with_their_peer_ids() {
+        let seeds = bundled_bootstrap_seeds().unwrap();
+        assert_eq!(seeds.quic.len(), 16);
+        assert_eq!(seeds.webrtc.len(), 16);
+        // Each node's browser address, by IP and port, and its peer ID.
+        let browser: std::collections::HashMap<_, _> = seeds
+            .webrtc
+            .iter()
+            .map(|seed| {
+                let address: MultiAddr = seed.parse().unwrap();
+                let id = *address.peer_id().unwrap();
+                ((address.ip().unwrap(), address.port().unwrap()), id)
+            })
+            .collect();
+        let mut ids = HashSet::new();
+        let mut servers = HashSet::new();
+        for seed in &seeds.quic {
+            let id = seed
+                .peer_id()
+                .unwrap_or_else(|| panic!("{seed} has no peer ID"));
+            let socket = seed.socket_addr().unwrap();
+            assert!(matches!(socket.port(), 10000 | 10001), "{seed}");
+            // The same node serves QUIC 1000 below its browser port.
+            assert_eq!(
+                browser.get(&(socket.ip(), socket.port() + 1000)),
+                Some(id),
+                "{seed}"
+            );
+            assert!(ids.insert(*id), "{seed} repeats a peer ID");
+            servers.insert(socket.ip());
+        }
+        assert_eq!(servers.len(), 8);
+    }
+
+    #[test]
     fn preserves_quic_peer_pins_and_legacy_sockets() {
         let pin = format!("/ip6/::1/udp/10000/quic/p2p/{}", "ab".repeat(32));
         let seeds = parse_bootstrap_seeds(&format!("quic = [\"{pin}\"]\nwebrtc = []")).unwrap();
