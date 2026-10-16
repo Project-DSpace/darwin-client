@@ -138,9 +138,13 @@ while preserving the two-GET maximum even when discovery completes. Shared tests
 cover the delay, slot handoff, deduplication, and fatal integrity errors. The lane
 tests check that a failed cold dial is not repeated by the other queued lane.
 Early candidates use authenticated connections, with WebRTC preconnections
-publishing hints once ready. Download regressions cover cold closer addresses
-blocking neither slot ahead of a ready holder, and retaining the twenty-peer
-fallback allowance after more than seven early misses.
+publishing hints once ready. The seeds are the exception: as bootstrap peers
+they are candidates from the start of every read, connected or not, and all of
+them are asked before a read reports a record missing. Download regressions
+cover cold closer addresses blocking neither slot ahead of a ready holder,
+retaining the twenty-peer fallback allowance after more than seven early misses,
+and a record only the farthest of thirty seeds holds. `pointer.test.mjs` reads a
+pointer that only seeds outside its close group hold.
 
 `parallel-lanes.test.mjs` checks the two-channel transport profile: discovery and
 quotes use the control channel; GET/PUT use an independent authenticated data

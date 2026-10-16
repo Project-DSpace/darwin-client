@@ -69,6 +69,22 @@ told apart by the commit `darwin --version` prints. Upstream's entries follow.
   price of the 1,000,000 records a commitment may count, 31,250 DARWIN, so 93,750 DARWIN for one
   chunk. A payment planned before the ceiling and saved by an interrupted upload is resumed as
   saved, never made twice.
+- Chunk and pointer reads also ask the bootstrap peers whose peer IDs the client knows, from the
+  start, nearest to the address first: the nodes that were nearest to a record when it was
+  stored may still hold it after the nodes nearest to it have changed. `bootstrap_peers.toml`
+  lists all 16 server nodes on QUIC (both nodes of each server, on 10000 and 10001) with their
+  peer IDs; the CLI and `Client::connect_multiaddrs` hand the selected seeds that carry one to
+  reads (`Client::with_bootstrap_peers` for a client built from a node), and a browser client
+  asks its seeds. A chunk read offers them to its early reads alongside discovery, within the
+  same limits (two GETs at a time, the second after a one-second stall), asks the rest after the
+  close group, and reports a chunk missing only once all of them have been asked. A missing
+  chunk therefore costs up to one more GET per bootstrap peer, and one that doesn't answer makes
+  the read take its second round, as an unanswering close-group node does. A pointer read asks
+  the close group and the bootstrap peers at once, each set on its own quorum and corroboration,
+  and returns the newer of the two states: a state the bootstrap peers agree on is returned even
+  when the close group holds none or does not answer, while absence and failures are reported
+  from the close group alone. It sends one more GET per bootstrap peer (16 with the bundled
+  seeds; a pointer is at most 5.3 KB). Bootstrap addresses without a peer ID add nothing.
 - `PaymentMode::Single` is the default of the library (`PaymentMode::default()`,
   `Client::file_upload`, `file_prepare_upload`) and of the browser API, so programs built on
   ant-core pay per chunk unless they ask for batches.

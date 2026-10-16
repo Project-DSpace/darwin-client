@@ -309,7 +309,7 @@ Download complete!
 
 A private file's envelope address can't be downloaded from: its envelope stores only a salted hash of the data map, and the download says so. Use `--datamap`, or `--proof` with a proof that reveals it.
 
-Every chunk read is checked against its address. A node that serves bytes that don't match is passed over for the next nearest node (and named in the `-v` log); a read fails on bad bytes only when no node serves the chunk intact. The same holds in the browser build.
+Every chunk read is checked against its address. A node that serves bytes that don't match is passed over for the next nearest node (and named in the `-v` log); a read fails on bad bytes only when no node serves the chunk intact. The same holds in the browser build. Reads also ask the bootstrap peers, from the start; see [Bootstrap multiaddresses and browser defaults](#bootstrap-multiaddresses-and-browser-defaults).
 
 #### `darwin file prove <RECORD>`
 
@@ -419,7 +419,8 @@ Requires `SECRET_KEY` to pay for the new state.
 
 #### `darwin pointer get <ADDRESS>`
 
-Print a pointer's counter, target and state.
+Print a pointer's counter, target and state. The close group and the bootstrap
+peers are asked at once, and the newer state either set agrees on is printed.
 
 ```
 $ darwin pointer get 9f3c...
@@ -1189,10 +1190,12 @@ Unless you explicitly state otherwise, any contribution intentionally submitted 
 ## Bootstrap multiaddresses and browser defaults
 
 `ant-core/resources/bootstrap_peers.toml` is the shared release resource. Its
-`quic` list holds one native seed per storage server, on port 10000. Its
-`webrtc` list holds every node's WebRTC Direct address (ports 11000 and 11001)
-with its certificate hash and peer ID, the same list as storage-viewer's
-`network.json`; a node's entry changes when its identity or certificate does.
+`quic` list holds both nodes of every storage server (ports 10000 and 10001),
+each with its `/p2p/` peer ID. Its `webrtc` list holds every node's WebRTC
+Direct address (ports 11000 and 11001) with its certificate hash and peer ID,
+the same list as storage-viewer's `network.json`; a node's entries change when
+its identity or certificate does. A node's QUIC port is its WebRTC port minus
+1000, under the same peer ID.
 
 The CLI accepts `--bootstrap /ip4/127.0.0.1/udp/10000/quic` (including optional
 `/p2p/<peer-id>`). Legacy `ip:port` arguments and installed `peers = [...]`
@@ -1202,6 +1205,20 @@ config directory, which takes precedence over the bundled seeds. Only QUIC seeds
 are selected for native dialing. `darwin -v` logs "using N bundled bootstrap
 seed(s)" when it falls back to the bundled ones.
 
+Chunk and pointer reads also ask the bootstrap peers whose peer IDs the client
+knows: the selected QUIC seeds that carry `/p2p/<peer-id>`, or a browser
+client's seeds. The nodes that were nearest to a record when it was stored may
+still hold it after the nodes nearest to it have changed. A chunk read offers
+them to its early reads from the start, nearest to the chunk first, alongside
+what discovery finds and within the same limits (two GETs at a time, the second
+after a one-second stall); it asks the rest after the close group, and reports a
+chunk missing only once every one of them has been asked. A pointer read asks
+the close group and the bootstrap peers at once, each set on its own quorum and
+corroboration, and returns the newer of the two states: a state the bootstrap
+peers agree on is returned even when the close group holds none or does not
+answer, while absence and failures are the close group's to report. Bootstrap
+addresses without a peer ID are only dialled, as before.
+
 The config directory is `ant`'s: `~/.config/ant` on Linux,
 `~/Library/Application Support/ant` on macOS, `%APPDATA%\ant` on Windows. A
 `bootstrap_peers.toml` left there by Autonomi's `ant` installer names Autonomi's
@@ -1209,8 +1226,10 @@ network, and `darwin` would join it (the price check then refuses to pay).
 Delete or rename that file to use the bundled seeds.
 
 Native library callers can use `config::resolve_bootstrap_multiaddrs()` and
-`Client::connect_multiaddrs()` to retain peer pins. Existing socket-address APIs
-remain available. `network_defaults::browser_mainnet_defaults()` and the WASM
+`Client::connect_multiaddrs()` to retain peer pins, which reads then use; a
+client built from a node (`Client::from_node`) gets them through
+`Client::with_bootstrap_peers()`. Existing socket-address APIs remain
+available. `network_defaults::browser_mainnet_defaults()` and the WASM
 `mainnetNetworkDefaults()` export return the bundled WebRTC seeds, the payment
 identity (chain 4663, the DARWIN token and vault) and the bundled RPC URL,
 without connecting to any network.
