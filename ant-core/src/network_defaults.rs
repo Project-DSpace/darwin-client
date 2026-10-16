@@ -175,6 +175,21 @@ mod tests {
             servers.insert(socket.ip());
         }
         assert_eq!(servers.len(), 8);
+        // Seeds are dialled in order, a few at a time: every server's first
+        // node comes before any server's second, so the first dials spread.
+        let (first, second) = seeds.quic.split_at(8);
+        let ips = |seeds: &[MultiAddr], port| {
+            seeds
+                .iter()
+                .map(|seed| {
+                    let socket = seed.socket_addr().unwrap();
+                    assert_eq!(socket.port(), port, "{seed}");
+                    socket.ip()
+                })
+                .collect::<HashSet<_>>()
+        };
+        assert_eq!(ips(first, 10000), servers);
+        assert_eq!(ips(second, 10001), servers);
     }
 
     #[test]
