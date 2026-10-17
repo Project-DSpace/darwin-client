@@ -211,6 +211,9 @@ async fn run() -> anyhow::Result<()> {
             result?;
         }
         Commands::Manifest { action } => {
+            // Bad upload choices fail before SECRET_KEY or the network, as
+            // for `darwin file upload`.
+            action.validate()?;
             if !action.needs_network() {
                 return action.execute_offline(json);
             }

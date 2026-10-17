@@ -730,6 +730,12 @@ mod tests {
             assert!(options.metadata.is_empty());
         }
         assert_eq!(EnvelopeOptions::default(), EnvelopeOptions::private());
+        // An upload that names no visibility stores the private envelope,
+        // every payment field shown.
+        assert_eq!(
+            Visibility::default(),
+            Visibility::Envelope(EnvelopeOptions::private())
+        );
         // The flag bytes the format examples give.
         assert_eq!(EnvelopeOptions::listed().flags().to_byte(), 0x3f);
         assert_eq!(EnvelopeOptions::unlisted().flags().to_byte(), 0x1f);

@@ -1,5 +1,5 @@
 //! ADR-0006 end-to-end: build a manifest from a directory, share it as a
-//! `.ant` file and as a manifest link, and extract it against a real
+//! `.darwin` file and as a manifest link, and extract it against a real
 //! in-process testnet with Anvil payments.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
@@ -11,12 +11,14 @@ use std::num::NonZeroUsize;
 use std::path::Path;
 use std::sync::Arc;
 
+use ant_core::ant_listings::Envelope;
 use ant_core::data::{
     apply_compaction, data_map_address, embeddable_data_map, embedded_len, extract_manifest,
-    manifest_link, parse_link, plan_compaction, publish_data_maps, read_manifest_file,
-    record_upload, write_manifest_file, BuildEvent, BuildOptions, Client, ContentRef, EntryStatus,
-    ExtractOptions, Link, Manifest, ManifestBuilder, ManifestEntry, ManifestError, PaymentMode,
-    ReferenceMode, Visibility, MAX_EMBEDDED_ROOT_MAP_BYTES,
+    forget_upload_record, manifest_link, parse_link, plan_compaction, publish_data_maps,
+    read_manifest_file, record_upload, write_manifest_file, BuildEvent, BuildOptions, Client,
+    ContentRef, EntryStatus, EnvelopeOptions, ExtractOptions, Link, ListingChain, Manifest,
+    ManifestBuilder, ManifestEntry, ManifestError, PaymentMode, ReferenceMode, Visibility,
+    MAX_EMBEDDED_ROOT_MAP_BYTES,
 };
 use self_encryption::{shrink_data_map, ChunkInfo, DataMap};
 use serial_test::serial;
@@ -138,8 +140,8 @@ async fn manifest_round_trips_through_file_and_link() {
         .filter(|e| e.path.as_deref() != Some("extra/extra.bin"))
         .all(|e| matches!(e.source, ContentRef::Embedded { .. })));
 
-    // .ant file round trip.
-    let ant_path = source.path().join("..").join("tree.ant");
+    // Manifest file round trip.
+    let ant_path = source.path().join("..").join("tree.darwin");
     write_manifest_file(&ant_path, &built.manifest, true).unwrap();
     let from_file = read_manifest_file(&ant_path).unwrap();
     assert_eq!(from_file, built.manifest);
@@ -284,6 +286,14 @@ async fn failed_build_keeps_completed_uploads_for_history_and_extraction() {
             .entries
             .iter()
             .any(|entry| entry.path.as_deref() == Some("later.bin")));
+        // The paid file's envelope, uploaded by default as a private one,
+        // comes back with the partial result, so its record can be saved.
+        assert_eq!(partial.envelopes.len(), 1);
+        assert_eq!(partial.envelopes[0].path, "first.bin");
+        let envelope = &partial.envelopes[0].envelope;
+        assert!(envelope.salt.is_some());
+        assert!(envelope.proof.is_some(), "{:?}", envelope.proof_problem);
+        forget_upload_record(&envelope.address()).expect("forget the kept record");
 
         let history = TempDir::new().unwrap();
         let record = record_upload(history.path(), &partial.manifest, None).unwrap();
@@ -323,6 +333,130 @@ async fn failed_build_keeps_completed_uploads_for_history_and_extraction() {
     assert_eq!(cancelled.files_uploaded, 0);
     assert_eq!(cancelled.total_to_upload, 2);
     assert_eq!(cancelled.manifest.entries.len(), 1);
+    assert!(cancelled.envelopes.is_empty());
+
+    drop(client);
+    testnet.teardown().await;
+}
+
+/// A manifest's files are uploaded as a file upload uploads one: by default
+/// each in a private envelope that shows every payment field, with a record
+/// that checks out against the chain; readable with the unlisted envelope,
+/// and then named in a compact manifest by the envelope's address.
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn a_build_stores_each_file_in_an_envelope_with_its_record() {
+    let (client, testnet) = setup().await;
+    let chain = ListingChain::new(testnet.evm_network()).expect("chain reader");
+
+    let source = TempDir::new().unwrap();
+    write_tree(source.path());
+    let mut builder = ManifestBuilder::new(&client, BuildOptions::default());
+    builder.add_directory(source.path(), None).unwrap();
+    let built = builder.finish(None).await.expect("build");
+    assert_eq!(built.files_uploaded, 3);
+    let mut paths: Vec<&str> = built.envelopes.iter().map(|e| e.path.as_str()).collect();
+    paths.sort_unstable();
+    assert_eq!(paths, ["a.bin", "docs/b.bin", "docs/c.bin"]);
+    for uploaded in &built.envelopes {
+        let envelope = &uploaded.envelope;
+        assert!(envelope.salt.is_some(), "a private envelope has a salt");
+        assert!(envelope.proof_checked, "{:?}", envelope.proof_problem);
+        let record = envelope.proof.clone().expect("a record");
+        assert_eq!(record.address, envelope.address());
+        let proven = chain
+            .check_proof(&record)
+            .await
+            .expect("the record checks out against the chain");
+        // The record reveals the data map the manifest embeds.
+        let entry = built
+            .manifest
+            .entries
+            .iter()
+            .find(|entry| entry.path.as_deref() == Some(uploaded.path.as_str()))
+            .expect("the file's entry");
+        let ContentRef::Embedded { data_map } = &entry.source else {
+            panic!("a private file's data map is embedded");
+        };
+        assert!(proven.data_map.as_ref() == Some(data_map));
+        // The stored envelope withholds the data map and shows every
+        // payment field.
+        let chunk = client
+            .chunk_get(&envelope.address())
+            .await
+            .expect("fetch")
+            .expect("the envelope is stored");
+        let stored = Envelope::from_bytes(&chunk.content).expect("an envelope");
+        assert!(stored.is_withheld());
+        assert_eq!(stored.flags(), EnvelopeOptions::private().flags());
+        forget_upload_record(&envelope.address()).expect("forget the kept record");
+    }
+    let out = TempDir::new().unwrap();
+    let report = extract_manifest(
+        &client,
+        &built.manifest,
+        &extract_options(out.path(), vec![]),
+        None,
+    )
+    .await
+    .expect("extract");
+    assert_eq!(report.written(), 3, "{:?}", report.entries);
+    assert_eq!(
+        fs::read(out.path().join("docs/c.bin")).unwrap(),
+        vec![0x33u8; FILE_BYTES]
+    );
+
+    // `--public --compact`: the file is readable at its unlisted envelope's
+    // address, and the manifest names it by that address.
+    let readable = TempDir::new().unwrap();
+    fs::write(readable.path().join("e.bin"), vec![0x5au8; FILE_BYTES]).unwrap();
+    let mut builder = ManifestBuilder::new(
+        &client,
+        BuildOptions {
+            reference_mode: ReferenceMode::Compact,
+            visibility: EnvelopeOptions::unlisted().into_visibility(),
+            ..Default::default()
+        },
+    );
+    builder.add_directory(readable.path(), None).unwrap();
+    let built = builder.finish(None).await.expect("build readable");
+    let [uploaded] = built.envelopes.as_slice() else {
+        panic!("one envelope: {:?}", built.envelopes);
+    };
+    let address = uploaded.envelope.address();
+    assert_eq!(
+        built.manifest.entries[0].source,
+        ContentRef::Public { address }
+    );
+    let record = uploaded.envelope.proof.clone().expect("a record");
+    chain
+        .check_proof(&record)
+        .await
+        .expect("the record checks out against the chain");
+    let chunk = client
+        .chunk_get(&address)
+        .await
+        .expect("fetch")
+        .expect("the envelope is stored");
+    assert_eq!(
+        Envelope::from_bytes(&chunk.content).unwrap().flags(),
+        EnvelopeOptions::unlisted().flags()
+    );
+    forget_upload_record(&address).expect("forget the kept record");
+    let out = TempDir::new().unwrap();
+    let report = extract_manifest(
+        &client,
+        &built.manifest,
+        &extract_options(out.path(), vec![]),
+        None,
+    )
+    .await
+    .expect("extract by the envelope address");
+    assert_eq!(report.written(), 1, "{:?}", report.entries);
+    assert_eq!(
+        fs::read(out.path().join("e.bin")).unwrap(),
+        vec![0x5au8; FILE_BYTES]
+    );
 
     drop(client);
     testnet.teardown().await;
@@ -421,7 +555,14 @@ async fn compact_export_publishes_private_data_maps_then_replaces_them() {
     fs::write(source.path().join("x.bin"), vec![0x77u8; FILE_BYTES]).unwrap();
     fs::write(source.path().join("y.bin"), vec![0x88u8; FILE_BYTES]).unwrap();
 
-    let mut builder = ManifestBuilder::new(&client, BuildOptions::default());
+    // Plain private uploads, with no envelope.
+    let mut builder = ManifestBuilder::new(
+        &client,
+        BuildOptions {
+            visibility: Visibility::Private,
+            ..Default::default()
+        },
+    );
     builder.add_directory(source.path(), None).unwrap();
     let built = builder.finish(None).await.expect("build");
     assert!(built

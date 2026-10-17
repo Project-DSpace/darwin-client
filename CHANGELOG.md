@@ -132,13 +132,16 @@ told apart by the commit `darwin --version` prints. Upstream's entries follow.
   version stay upstream's. Uploads are recorded in the upload history, as manifests under
   `<data dir>/uploads/` that `darwin manifest list` lists and `darwin manifest download` fetches
   again; the record of a `darwin file upload` holds the file's data map, a private upload's too.
-  Here `darwin manifest create` pays per chunk, as `darwin file upload` does, and refuses
-  `--merkle`. Its uploads have no envelope, as upstream's: files are stored as
-  `darwin file upload --hide all` stores them, so they aren't listed and get no `.record`, and
-  with `--public` a file's address is its plain data map chunk.
-  `darwin manifest export --compact` looks for that chunk, so it counts a readable file that
-  `darwin file upload` stored with an envelope as still private, and offers to publish its data
-  map again, at a second address without an envelope. The vendored ant-protocol is 5.0.0, still
+  Here `darwin manifest create` uploads each file as `darwin file upload` uploads it, with the
+  same `--visibility`, `--public`, `--readable`, `--index` and `--hide` choices: private by
+  default, in an envelope that shows every payment field, with the same warnings first, paid
+  per chunk (`--merkle` is refused). Each file's record is saved in `<manifest>.records/` next
+  to the manifest, also when the build fails or is cancelled. In the library,
+  `Visibility::default()` (so `BuildOptions::default()`) is that private envelope, and
+  `BuildResult::envelopes` carries each uploaded file's envelope and record.
+  `darwin manifest export --compact` looks for a file's plain data map chunk, so it counts a
+  readable file stored with an envelope as still private, and offers to publish its data map
+  again, at a second address without an envelope. The vendored ant-protocol is 5.0.0, still
   with the price multiplier, darwin-listings is vendored at 0.2.1 to match, and rustls is
   0.23.46, as on upstream's main.
 

@@ -1,9 +1,13 @@
 //! Building a manifest from local files and public addresses.
 //!
 //! Local files are uploaded through the ordinary file upload with the
-//! visibility the caller chose. Already-public files are added by address
-//! and nothing is uploaded. The builder never stores a DataMap chunk on its
-//! own: a file becomes public only through the caller's upload choice.
+//! visibility the caller chose: by default, as a file upload does, in a
+//! private envelope that shows every payment field. Each envelope stored,
+//! with the record that proves its payment, comes back in
+//! [`BuildResult::envelopes`] for the caller to save. Already-public files
+//! are added by address and nothing is uploaded. The builder never stores a
+//! DataMap chunk on its own: a file becomes public only through the caller's
+//! upload choice.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -13,6 +17,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
+use crate::data::client::envelope::UploadEnvelope;
 use crate::data::client::file::{UploadEvent, Visibility};
 use crate::data::client::merkle::PaymentMode;
 use crate::data::Client;
@@ -49,9 +54,11 @@ pub struct BuildOptions {
     pub torrent: Option<TorrentReference>,
     /// How uploaded files are referenced.
     pub reference_mode: ReferenceMode,
-    /// Visibility of the file uploads themselves. `Public` stores each
-    /// file's DataMap chunk and makes the file public; the manifest still
-    /// embeds the DataMap unless `reference_mode` is `Compact`.
+    /// Visibility of the file uploads themselves, as for a file upload. The
+    /// default, [`Visibility::default`], is a private envelope with every
+    /// payment field shown. A readable one (an unlisted or listed envelope,
+    /// or `Public`) makes each file readable by its address; the manifest
+    /// still embeds the DataMap unless `reference_mode` is `Compact`.
     pub visibility: Visibility,
     /// Payment mode for the uploads.
     pub payment_mode: PaymentMode,
@@ -92,6 +99,18 @@ pub enum BuildEvent {
     },
 }
 
+/// The envelope an uploaded file was stored with, and what proves its
+/// payment.
+#[derive(Debug, Clone)]
+pub struct UploadedEnvelope {
+    /// Manifest path of the file.
+    pub path: String,
+    /// The envelope, a private one's salt, and the record proving its
+    /// payment. The record of a private envelope holds the data map and the
+    /// salt, so it reads the file: save it as safely as the manifest.
+    pub envelope: UploadEnvelope,
+}
+
 /// What [`ManifestBuilder::finish`] produced.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BuildResult {
@@ -114,6 +133,14 @@ pub struct BuildResult {
     pub storage_cost_atto: u128,
     /// Gas paid across all uploads, in wei.
     pub gas_cost_wei: u128,
+    /// The envelope of every file uploaded with one, in upload order,
+    /// including after cancellation or a file failure: each was paid for,
+    /// and its record is the only proof of that payment. Upload records are
+    /// kept under the client's data directory until the caller saves each
+    /// one and calls `forget_upload_record`. Never serialized: a private
+    /// envelope's record holds the data map and the salt.
+    #[serde(skip)]
+    pub envelopes: Vec<UploadedEnvelope>,
 }
 
 struct PendingFile {
@@ -301,6 +328,7 @@ impl<'a> ManifestBuilder<'a> {
         let mut chunks_stored = 0;
         let mut storage_cost_atto: u128 = 0;
         let mut gas_cost_wei: u128 = 0;
+        let mut envelopes = Vec::new();
         let mut cancelled = false;
         let mut failure = None;
 
@@ -364,7 +392,8 @@ impl<'a> ManifestBuilder<'a> {
                 },
             };
 
-            // Keep the upload's usable DataMap before any fallible cost
+            // Keep the upload's usable DataMap, and its envelope with the
+            // record that proves its payment, before any fallible cost
             // parsing or reference optimisation. A later error must not
             // discard the file that has just been paid for and uploaded.
             self.entries.push(ManifestEntry {
@@ -374,6 +403,12 @@ impl<'a> ManifestBuilder<'a> {
                     data_map: result.data_map.clone(),
                 },
             });
+            if let Some(envelope) = result.envelope.clone() {
+                envelopes.push(UploadedEnvelope {
+                    path: file.path.clone(),
+                    envelope,
+                });
+            }
             files_uploaded += 1;
             chunks_stored += result.chunks_stored;
             gas_cost_wei = gas_cost_wei.saturating_add(result.gas_cost_wei);
@@ -428,6 +463,7 @@ impl<'a> ManifestBuilder<'a> {
             chunks_stored,
             storage_cost_atto,
             gas_cost_wei,
+            envelopes,
         };
         match failure {
             Some((path, cause)) => Err(ManifestError::BuildFailed {
@@ -523,6 +559,27 @@ mod tests {
     fn file_name_requires_utf8_and_a_name() {
         assert_eq!(file_name_utf8(Path::new("a/b.txt")).unwrap(), "b.txt");
         assert!(file_name_utf8(Path::new("/")).is_err());
+    }
+
+    /// A manifest's files are uploaded as a file upload is by default: in a
+    /// private envelope that shows all five payment fields.
+    #[test]
+    fn build_options_default_to_a_private_envelope_with_every_field_shown() {
+        use crate::data::client::envelope::EnvelopeOptions;
+        use ant_listings::ShownFields;
+        let options = BuildOptions::default();
+        assert_eq!(
+            options.visibility,
+            Visibility::Envelope(EnvelopeOptions::private())
+        );
+        let Visibility::Envelope(envelope) = &options.visibility else {
+            panic!("an envelope");
+        };
+        assert!(!envelope.readable);
+        assert!(!envelope.in_index);
+        assert_eq!(envelope.shown, ShownFields::ALL);
+        assert!(envelope.metadata.is_empty());
+        assert_eq!(options.visibility.clone().normalized(), options.visibility);
     }
 
     #[test]

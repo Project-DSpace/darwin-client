@@ -128,16 +128,28 @@ pub enum FileChunkPeerStatus {
 /// content is paid per chunk, and stored after every content chunk. Build the
 /// visibility with [`EnvelopeOptions::into_visibility`], which picks
 /// `Private` or `Public` when no envelope is needed.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+///
+/// The default is the envelope a file upload stores unless told otherwise:
+/// private, not in the index, every payment field shown
+/// (`Envelope(EnvelopeOptions::private())`).
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Visibility {
-    /// Keep the data map local; only the holder can retrieve the file.
-    #[default]
+    /// Keep the data map local; only the holder can retrieve the file. No
+    /// envelope is stored, so nothing records the upload's payment.
     Private,
     /// Publish the data map as a network chunk so anyone with the returned
     /// address can retrieve and decrypt the file.
     Public,
     /// Store the data map, or a salted hash of it, in an envelope.
     Envelope(EnvelopeOptions),
+}
+
+impl Default for Visibility {
+    /// A private envelope with every payment field shown, as a file upload
+    /// stores by default.
+    fn default() -> Self {
+        Self::Envelope(EnvelopeOptions::private())
+    }
 }
 
 impl Visibility {

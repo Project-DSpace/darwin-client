@@ -178,6 +178,20 @@ fn parse_positive_usize(s: &str) -> Result<usize, String> {
 }
 
 #[cfg(test)]
+mod definition_tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    /// The whole command line is well formed: among other things, no two
+    /// arguments of a command share an id, as flattened upload choices
+    /// could.
+    #[test]
+    fn the_command_line_is_well_formed() {
+        Cli::command().debug_assert();
+    }
+}
+
+#[cfg(test)]
 mod naming_tests {
     use super::*;
     use clap::CommandFactory;

@@ -49,12 +49,14 @@ fn parse_yes_no(value: &str) -> Result<bool, String> {
     }
 }
 
-/// The upload choices `darwin file upload` and `darwin file cost` take.
+/// The envelope choices every upload takes: who can read a file, whether it
+/// is listed, and which payment fields are hidden. `darwin file upload`,
+/// `darwin file cost` and `darwin manifest create` share them, so a file is
+/// uploaded the same way whichever command uploads it.
 #[derive(clap::Args, Debug, Clone, Default)]
-pub struct UploadChoices {
-    /// Public mode: store the data map on the network (anyone with the
-    /// address can download). Same as `--visibility unlisted`. Default is
-    /// private (data map saved locally).
+pub struct EnvelopeChoices {
+    /// Same as `--visibility unlisted`: anyone with a file's address can
+    /// read it. The default is private.
     #[arg(long)]
     public: bool,
     /// Shorthand for `--readable` and `--index`: `private` (the default:
@@ -75,6 +77,36 @@ pub struct UploadChoices {
     /// the index and has no name or content type stores no envelope.
     #[arg(long, value_delimiter = ',', value_name = "FIELDS")]
     hide: Vec<String>,
+}
+
+impl EnvelopeChoices {
+    /// The upload options these flags ask for, with the envelope metadata
+    /// `name` and `content_type` (both `None` for a manifest's files).
+    pub(super) fn options(
+        &self,
+        name: Option<String>,
+        content_type: Option<String>,
+    ) -> anyhow::Result<EnvelopeOptions> {
+        upload_options(
+            self.public,
+            self.visibility,
+            self.readable,
+            self.index,
+            &self.hide,
+            name,
+            content_type,
+        )
+    }
+}
+
+/// The upload choices `darwin file upload` and `darwin file cost` take: the
+/// envelope choices, and the envelope's metadata.
+#[derive(clap::Args, Debug, Clone, Default)]
+pub struct UploadChoices {
+    /// Who can read the file, whether it is listed, and which payment
+    /// fields are hidden.
+    #[command(flatten)]
+    envelope: EnvelopeChoices,
     /// A name stored in the envelope, on any visibility. Public and
     /// permanent: on a private file, anyone with the envelope's address
     /// can read it, though not the file.
@@ -88,16 +120,9 @@ pub struct UploadChoices {
 
 impl UploadChoices {
     /// The upload options these flags ask for.
-    fn options(&self) -> anyhow::Result<EnvelopeOptions> {
-        upload_options(
-            self.public,
-            self.visibility,
-            self.readable,
-            self.index,
-            &self.hide,
-            self.name.clone(),
-            self.content_type.clone(),
-        )
+    pub(super) fn options(&self) -> anyhow::Result<EnvelopeOptions> {
+        self.envelope
+            .options(self.name.clone(), self.content_type.clone())
     }
 }
 
@@ -406,7 +431,7 @@ impl FileAction {
 /// The upload choices the flags ask for. `--visibility` (or `--public`) sets
 /// `--readable` and `--index` together; without them both default to `no`.
 /// Every payment field is shown unless `--hide` names it.
-fn upload_options(
+pub(super) fn upload_options(
     public: bool,
     visibility: Option<VisibilityArg>,
     readable: Option<bool>,
@@ -438,7 +463,7 @@ fn upload_options(
 }
 
 /// The names of the payment fields `options` hides.
-fn hidden_names(options: &EnvelopeOptions) -> Vec<&'static str> {
+pub(super) fn hidden_names(options: &EnvelopeOptions) -> Vec<&'static str> {
     options.shown.hidden().map(PaymentField::name).collect()
 }
 
@@ -767,7 +792,7 @@ fn upload_mode(options: &EnvelopeOptions) -> &'static str {
 /// (`has_record` false), or why it wasn't checked against the chain
 /// (`checked` false, `problem` says why). `saved`: whether the record file
 /// was written, so `darwin file verify` can check it later.
-fn record_note(
+pub(super) fn record_note(
     has_record: bool,
     checked: bool,
     problem: Option<&str>,
@@ -785,7 +810,7 @@ fn record_note(
 }
 
 /// Two problems with a record, as one.
-fn join_problems(first: Option<String>, second: Option<String>) -> Option<String> {
+pub(super) fn join_problems(first: Option<String>, second: Option<String>) -> Option<String> {
     match (first, second) {
         (Some(first), Some(second)) => Some(format!("{first}; {second}")),
         (first, second) => first.or(second),
@@ -829,7 +854,7 @@ fn chunks_summary(
 /// What an upload's JSON says about its choices, envelope and record.
 /// `envelope` is the envelope's address and whether its record was checked
 /// against the chain.
-fn upload_choices_json(
+pub(super) fn upload_choices_json(
     options: &EnvelopeOptions,
     envelope: Option<(String, bool)>,
     record: Option<&Path>,
@@ -1588,7 +1613,7 @@ fn print_recorded(manifest_id: Option<&str>) {
 
 /// The fields an upload's JSON has for its choices, envelope and record.
 #[derive(Serialize)]
-struct UploadChoicesJson {
+pub(super) struct UploadChoicesJson {
     /// Whether anyone with the address can read the file.
     readable: bool,
     /// Whether the file is in the listings index.

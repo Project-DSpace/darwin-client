@@ -9,27 +9,35 @@
 //! history under the data directory, so `darwin manifest list` can show it
 //! and `darwin manifest download <ID>` can fetch it again.
 
+use std::ffi::OsString;
 use std::io::{self, BufRead, IsTerminal, Write};
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
+use ant_core::ant_listings::EnvelopeProof;
+use ant_core::data::manifest::path::PATH_SEPARATOR;
 use ant_core::data::{
     apply_compaction, data_map_address, default_history_dir, embeddable_data_map, extract_manifest,
-    format_timestamp, is_link, list_uploads, load_upload, manifest_filename_for,
-    manifest_link_bytes, manifest_link_from_bytes, parse_link, plan_compaction, publish_data_maps,
-    read_manifest_file, record_upload, write_manifest_file, BuildEvent, BuildOptions, BuildResult,
-    Client, ContentRef, DownloadEvent, EntryStatus, ExtractEvent, ExtractOptions, Link, Manifest,
-    ManifestBuilder, ManifestError, PaymentMode, ReferenceMode, TorrentReference, UploadEvent,
-    UploadRecord, Visibility, MANIFEST_LINK_RECOMMENDED_MAX_BYTES,
+    forget_upload_record, format_timestamp, is_link, list_uploads, load_upload,
+    manifest_filename_for, manifest_link_bytes, manifest_link_from_bytes, parse_link,
+    plan_compaction, publish_data_maps, read_manifest_file, record_upload, write_manifest_file,
+    BuildEvent, BuildOptions, BuildResult, Client, CollisionPolicy, ContentRef, DownloadEvent,
+    EntryStatus, EnvelopeOptions, ExtractEvent, ExtractOptions, Link, Manifest, ManifestBuilder,
+    ManifestError, PaymentMode, ReferenceMode, TorrentReference, UploadEvent, UploadRecord,
+    UploadedEnvelope, MANIFEST_LINK_RECOMMENDED_MAX_BYTES,
 };
+use ant_core::datamap_file::write_upload_files;
 use clap::Subcommand;
 use serde_json::json;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::info;
 
-use super::file::payment_mode;
+use super::file::{
+    hidden_names, join_problems, payment_mode, record_note, upload_choices_json, EnvelopeChoices,
+    UploadChoicesJson,
+};
 use crate::progress;
 
 /// Entries downloaded at once unless `--concurrency` says otherwise.
@@ -53,16 +61,19 @@ pub enum ManifestAction {
     /// One directory: its contents become the entries and its name the
     /// manifest name. Otherwise each path is added under its own name.
     ///
-    /// Files are uploaded without an envelope, as
-    /// `darwin file upload --hide all` uploads them: they are not listed,
-    /// and no `.record` proves their payment.
+    /// Each file is uploaded as `darwin file upload` uploads it, with the
+    /// same --visibility, --public, --readable, --index and --hide choices:
+    /// private by default, in an envelope that shows every payment field.
+    /// Each file's record is saved in `<manifest>.records/` next to the
+    /// manifest.
     Create {
         /// Files or directories to upload.
         paths: Vec<PathBuf>,
         /// Where to write the manifest. Defaults to `<name>.darwin` here.
         #[arg(short, long)]
         output: Option<PathBuf>,
-        /// Manifest name, used as the default extraction directory.
+        /// Manifest name, used as the default extraction directory. Not
+        /// stored in any file's envelope.
         #[arg(long)]
         name: Option<String>,
         /// Reference files by public address where their DataMap chunk is
@@ -70,12 +81,10 @@ pub enum ManifestAction {
         /// publishes anything itself.
         #[arg(long)]
         compact: bool,
-        /// Upload the files as public: each file's address is its plain
-        /// DataMap chunk, with no envelope. Anyone with a file's address can
-        /// then download it. The manifest still embeds the DataMaps unless
-        /// --compact is also given.
-        #[arg(long)]
-        public: bool,
+        /// Who can read the files, whether they are listed, and which
+        /// payment fields are hidden, as for `darwin file upload`.
+        #[command(flatten)]
+        choices: EnvelopeChoices,
         /// Follow symlinks to regular files instead of skipping them.
         #[arg(long)]
         follow_symlinks: bool,
@@ -128,9 +137,10 @@ pub enum ManifestAction {
     /// is only possible for DataMaps that are on the network. Any that are
     /// still private are listed and you are asked whether to publish them
     /// first; publishing is paid and makes those files public. A readable
-    /// file that `darwin file upload` stored with an envelope counts as
-    /// still private here: its DataMap is in the envelope, not stored on its
-    /// own, so publishing it gives the file a second address.
+    /// file stored with an envelope (by `darwin file upload` or
+    /// `darwin manifest create`) counts as still private here: its DataMap
+    /// is in the envelope, not stored on its own, so publishing it gives
+    /// the file a second address.
     Export {
         /// A `.darwin` file, a `darwin://manifest/...` link, or an upload id
         /// from `darwin manifest list`.
@@ -173,6 +183,16 @@ pub enum ManifestAction {
 }
 
 impl ManifestAction {
+    /// Check the upload choices of `create` (`--hide` and the visibility
+    /// flags), so a mistake is named before the wallet key is asked for or
+    /// the network is joined, as for `darwin file upload`.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        match self {
+            Self::Create { choices, .. } => create_upload_options(choices).map(|_| ()),
+            _ => Ok(()),
+        }
+    }
+
     /// Whether the command talks to the network.
     pub fn needs_network(&self) -> bool {
         match self {
@@ -262,7 +282,7 @@ impl ManifestAction {
                 output,
                 name,
                 compact,
-                public,
+                choices,
                 follow_symlinks,
                 public_files,
                 embed_public,
@@ -280,7 +300,7 @@ impl ManifestAction {
                         output,
                         name,
                         compact,
-                        public,
+                        upload: create_upload_options(&choices)?,
                         follow_symlinks,
                         public_files,
                         embed_public,
@@ -458,7 +478,8 @@ struct CreateArgs {
     output: Option<PathBuf>,
     name: Option<String>,
     compact: bool,
-    public: bool,
+    /// How each file is uploaded: the choices `darwin file upload` takes.
+    upload: EnvelopeOptions,
     follow_symlinks: bool,
     public_files: Vec<String>,
     embed_public: Vec<String>,
@@ -466,6 +487,12 @@ struct CreateArgs {
     payment_mode: PaymentMode,
     overwrite: bool,
     link: bool,
+}
+
+/// The upload options `create`'s flags ask for: those `darwin file upload`
+/// takes, with no envelope metadata (`--name` names the manifest).
+fn create_upload_options(choices: &EnvelopeChoices) -> anyhow::Result<EnvelopeOptions> {
+    choices.options(None, None)
 }
 
 async fn create(client: &Client, args: CreateArgs, json: bool) -> anyhow::Result<()> {
@@ -489,11 +516,9 @@ async fn create(client: &Client, args: CreateArgs, json: bool) -> anyhow::Result
         } else {
             ReferenceMode::Embedded
         },
-        visibility: if args.public {
-            Visibility::Public
-        } else {
-            Visibility::Private
-        },
+        // As `darwin file upload` uploads: in an envelope, unless the
+        // choices need none (`--hide all`, not in the index).
+        visibility: args.upload.clone().into_visibility(),
         payment_mode: args.payment_mode,
         follow_symlinks: args.follow_symlinks,
         cancel: CancellationToken::new(),
@@ -541,6 +566,21 @@ async fn create(client: &Client, args: CreateArgs, json: bool) -> anyhow::Result
         anyhow::bail!("nothing to add: the given paths contain no regular files");
     }
 
+    // Said before anything is paid, as `darwin file upload` says it; the
+    // choice stays the uploader's. Nothing to say when nothing is uploaded.
+    let warnings: Vec<String> = if builder.pending_count() > 0 {
+        args.upload
+            .warnings()
+            .iter()
+            .map(ToString::to_string)
+            .collect()
+    } else {
+        Vec::new()
+    };
+    for warning in &warnings {
+        eprintln!("warning: {warning}");
+    }
+
     info!("Building manifest from {} file(s)", builder.pending_count());
     let start = Instant::now();
     let built = if json {
@@ -553,8 +593,12 @@ async fn create(client: &Client, args: CreateArgs, json: bool) -> anyhow::Result
         result
     };
 
-    let (result, history_id) =
-        record_build_result(built, |manifest| record_upload_manifest(manifest, None))?;
+    let (result, history_id, records) = record_build_result(
+        built,
+        |manifest| record_upload_manifest(manifest, None),
+        |envelopes| save_records(&out, envelopes),
+        &records_root_for(&out),
+    )?;
     write_manifest(&result.manifest, &out, args.overwrite)?;
     if !json {
         eprintln!(
@@ -570,18 +614,27 @@ async fn create(client: &Client, args: CreateArgs, json: bool) -> anyhow::Result
     report_created(
         &result.manifest,
         &out,
-        Some(&result),
+        Some(&UploadReport {
+            result: &result,
+            options: &args.upload,
+            records: &records,
+            warnings,
+        }),
         history_id,
         args.link,
         json,
     )
 }
 
-/// Persist completed uploads before reporting cancellation or failure.
+/// Persist completed uploads before reporting cancellation or failure: first
+/// each uploaded file's envelope record (`save`), then the manifest in the
+/// upload history (`record`). `records_root` is where `save` puts records.
 fn record_build_result(
     built: Result<BuildResult, ManifestError>,
     record: impl FnOnce(&Manifest) -> Option<String>,
-) -> anyhow::Result<(BuildResult, Option<String>)> {
+    save: impl FnOnce(&[UploadedEnvelope]) -> Vec<SavedRecord>,
+    records_root: &Path,
+) -> anyhow::Result<(BuildResult, Option<String>, Vec<SavedRecord>)> {
     let result = match built {
         Ok(result) => result,
         Err(ManifestError::BuildFailed {
@@ -589,22 +642,218 @@ fn record_build_result(
             cause,
             partial,
         }) => {
+            let records = save(&partial.envelopes);
             let history_id = record(&partial.manifest);
             anyhow::bail!(
-                "manifest build failed at {path:?} after {} of {} file(s): {cause}{}",
+                "manifest build failed at {path:?} after {} of {} file(s): {cause}{}{}",
                 partial.files_uploaded,
                 partial.total_to_upload,
+                saved_records_message(&records, records_root),
                 partial_record_message(history_id.as_deref()),
             );
         }
         Err(error) => return Err(error.into()),
     };
 
+    let records = save(&result.envelopes);
     let history_id = record(&result.manifest);
     if result.cancelled {
-        return Err(cancelled_build_error(&result, history_id.as_deref()));
+        return Err(cancelled_build_error(
+            &result,
+            &saved_records_message(&records, records_root),
+            history_id.as_deref(),
+        ));
     }
-    Ok((result, history_id))
+    Ok((result, history_id, records))
+}
+
+/// Extension of the folder next to a manifest that holds its files' records.
+const RECORDS_EXTENSION: &str = "records";
+
+/// The folder next to the manifest file `out` that holds the records of the
+/// files it uploaded: `out` with the extension `.records`, so `photos.records`
+/// for `photos.darwin`. It is never `out` itself. It sits beside the
+/// manifest, by default outside the uploaded directory, so a later upload of
+/// that directory doesn't take in the records, which a private file's data
+/// map and salt are in.
+fn records_root_for(out: &Path) -> PathBuf {
+    let root = out.with_extension(RECORDS_EXTENSION);
+    if root != out {
+        return root;
+    }
+    // `out` already ends in `.records`: add another.
+    let mut name = out.file_name().map(OsString::from).unwrap_or_default();
+    name.push(".");
+    name.push(RECORDS_EXTENSION);
+    out.with_file_name(name)
+}
+
+/// The folder for the record of the file at `entry_path` in the manifest
+/// `out`: the manifest's records folder plus the entry's parent directories.
+/// Entry paths are portable relative paths, checked before anything was
+/// uploaded.
+fn record_dir_for(out: &Path, entry_path: &str) -> PathBuf {
+    let mut dir = records_root_for(out);
+    if let Some((parent, _)) = entry_path.rsplit_once(PATH_SEPARATOR) {
+        dir.extend(parent.split(PATH_SEPARATOR));
+    }
+    dir
+}
+
+/// Write `proof`, the record of the file at `entry_path`, in the records
+/// folder of the manifest `out`, as `<file name>.record`. An existing record
+/// is never replaced, whatever `--overwrite` says (it is about the manifest
+/// file): the new one gets the first free `-N` suffix, since an old record
+/// holds a salt nothing else keeps.
+fn write_entry_record(
+    out: &Path,
+    entry_path: &str,
+    proof: &EnvelopeProof,
+) -> anyhow::Result<PathBuf> {
+    let dir = record_dir_for(out, entry_path);
+    let name = entry_path
+        .rsplit(PATH_SEPARATOR)
+        .next()
+        .unwrap_or(entry_path);
+    write_upload_files(
+        &dir,
+        name,
+        None,
+        Some(proof),
+        CollisionPolicy::NumericSuffix,
+    )?
+    .record
+    .ok_or_else(|| anyhow::anyhow!("no record was written for {entry_path}"))
+}
+
+/// What became of the envelope record of one uploaded file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SavedRecord {
+    /// Manifest path of the file.
+    path: String,
+    /// The envelope's address: the file's address when it is readable.
+    address: [u8; 32],
+    /// Where the record was saved, if it was.
+    record: Option<PathBuf>,
+    /// Whether the record was checked against the chain.
+    checked: bool,
+    /// Why there is no record, why it wasn't saved, or why it wasn't
+    /// checked.
+    problem: Option<String>,
+}
+
+/// Save every uploaded file's envelope record in the manifest's records
+/// folder, as `darwin file upload` saves a file's next to it, and say what
+/// went wrong. A record kept under the client's data directory is removed
+/// only once its copy is saved.
+fn save_records(out: &Path, envelopes: &[UploadedEnvelope]) -> Vec<SavedRecord> {
+    envelopes
+        .iter()
+        .map(|uploaded| save_record(out, uploaded))
+        .collect()
+}
+
+fn save_record(out: &Path, uploaded: &UploadedEnvelope) -> SavedRecord {
+    let envelope = &uploaded.envelope;
+    let address = envelope.address();
+    let mut saved = None;
+    let mut save_problem = None;
+    if let Some(proof) = &envelope.proof {
+        match write_entry_record(out, &uploaded.path, proof) {
+            Ok(path) => {
+                // The record is saved: the copy the upload kept can go.
+                if let Err(e) = forget_upload_record(&address) {
+                    info!("Could not remove the upload's kept record: {e}");
+                }
+                saved = Some(path);
+            }
+            Err(e) => {
+                if let Ok(text) = proof.to_hex() {
+                    eprintln!(
+                        "The record of {}, which could not be saved (a copy stays under the \
+                         client's data directory, in payments/upload/records/):\n{text}",
+                        uploaded.path
+                    );
+                }
+                save_problem = Some(format!("the record could not be saved: {e}"));
+            }
+        }
+    }
+    let problem = join_problems(
+        save_problem,
+        record_note(
+            envelope.proof.is_some(),
+            envelope.proof_checked,
+            envelope.proof_problem.as_deref(),
+            saved.is_some(),
+        ),
+    );
+    if let Some(note) = &problem {
+        eprintln!("warning: {}: {note}", uploaded.path);
+    }
+    if envelope.proof.is_none() {
+        // Without a record, the salt would be lost: say it once.
+        if let Some(salt) = envelope.salt {
+            eprintln!(
+                "The private envelope's salt of {} (keep it with the manifest to prove the \
+                 file): {}",
+                uploaded.path,
+                hex::encode(salt)
+            );
+        }
+    }
+    SavedRecord {
+        path: uploaded.path.clone(),
+        address,
+        record: saved,
+        checked: envelope.proof_checked,
+        problem,
+    }
+}
+
+/// Where the records of a failed or cancelled build were saved, if any were.
+fn saved_records_message(records: &[SavedRecord], records_root: &Path) -> String {
+    if records.iter().any(|record| record.record.is_some()) {
+        format!(
+            "; the records of the files uploaded are in {}",
+            records_root.display()
+        )
+    } else {
+        String::new()
+    }
+}
+
+/// What `create` reports about the files it uploaded.
+struct UploadReport<'a> {
+    result: &'a BuildResult,
+    /// How the files were uploaded.
+    options: &'a EnvelopeOptions,
+    /// Each envelope's record.
+    records: &'a [SavedRecord],
+    /// What the choices give away, as said before uploading.
+    warnings: Vec<String>,
+}
+
+/// One uploaded file's envelope and record in `create`'s JSON: its path and
+/// the fields `darwin file upload`'s JSON has for them.
+#[derive(serde::Serialize)]
+struct EnvelopeJson<'a> {
+    path: &'a str,
+    #[serde(flatten)]
+    choices: UploadChoicesJson,
+}
+
+fn envelope_json<'a>(options: &EnvelopeOptions, record: &'a SavedRecord) -> EnvelopeJson<'a> {
+    EnvelopeJson {
+        path: &record.path,
+        choices: upload_choices_json(
+            options,
+            Some((hex::encode(record.address), record.checked)),
+            record.record.as_deref(),
+            record.problem.clone(),
+            Vec::new(),
+        ),
+    }
 }
 
 /// The output path: the one given, or `<name>.darwin` in the current
@@ -634,12 +883,15 @@ fn partial_record_message(history_id: Option<&str>) -> String {
         .unwrap_or_default()
 }
 
+/// `records`: where the uploaded files' records were saved
+/// ([`saved_records_message`]).
 fn cancelled_build_error(
     result: &ant_core::data::BuildResult,
+    records: &str,
     history_id: Option<&str>,
 ) -> anyhow::Error {
     anyhow::anyhow!(
-        "cancelled after {} of {} file(s){}",
+        "cancelled after {} of {} file(s){records}{}",
         result.files_uploaded,
         result.total_to_upload,
         partial_record_message(history_id),
@@ -697,7 +949,7 @@ pub fn record_upload_manifest(manifest: &Manifest, label: Option<&str>) -> Optio
 fn report_created(
     manifest: &Manifest,
     out: &Path,
-    result: Option<&ant_core::data::BuildResult>,
+    uploads: Option<&UploadReport<'_>>,
     history_id: Option<String>,
     with_link: bool,
     json: bool,
@@ -717,7 +969,8 @@ fn report_created(
             "link": link_text.as_ref().map(|(link, _)| link),
             "history_id": history_id,
         });
-        if let Some(r) = result {
+        if let Some(uploads) = uploads {
+            let r = uploads.result;
             value["files_uploaded"] = json!(r.files_uploaded);
             value["chunks_stored"] = json!(r.chunks_stored);
             value["storage_cost_atto"] = json!(r.storage_cost_atto.to_string());
@@ -727,6 +980,16 @@ fn report_created(
                 .iter()
                 .map(|p| p.display().to_string())
                 .collect::<Vec<_>>());
+            value["envelopes"] = serde_json::to_value(
+                uploads
+                    .records
+                    .iter()
+                    .map(|record| envelope_json(uploads.options, record))
+                    .collect::<Vec<_>>(),
+            )?;
+            if !uploads.warnings.is_empty() {
+                value["warnings"] = json!(uploads.warnings);
+            }
         }
         println!("{}", serde_json::to_string_pretty(&value)?);
         return Ok(());
@@ -741,6 +1004,33 @@ fn report_created(
             "ies"
         }
     );
+    if let Some(uploads) = uploads.filter(|uploads| !uploads.records.is_empty()) {
+        let hidden = hidden_names(uploads.options);
+        if hidden.is_empty() {
+            println!("Payment: all fields shown");
+        } else {
+            println!("Payment: hidden: {}", hidden.join(", "));
+        }
+        println!("Envelopes:");
+        for record in uploads.records {
+            let address = hex::encode(record.address);
+            match &record.record {
+                Some(saved) => println!(
+                    "  {}: envelope {address}, record {}",
+                    record.path,
+                    saved.display()
+                ),
+                None => println!("  {}: envelope {address}, no record", record.path),
+            }
+        }
+        if !uploads.options.readable && uploads.records.iter().any(|r| r.record.is_some()) {
+            println!(
+                "Keep the records as safe as the manifest: a private file's record holds its \
+                 data map and salt, so it reads the file. `darwin file prove --no-reveal` \
+                 proves only the payment."
+            );
+        }
+    }
     if let Some(id) = history_id {
         println!("Recorded as {id} (darwin manifest download {id})");
     }
@@ -1223,6 +1513,7 @@ mod tests {
             chunks_stored: 3,
             storage_cost_atto: 0,
             gas_cost_wei: 0,
+            envelopes: vec![],
         };
         for index in 0..3 {
             result.manifest.entries.push(ant_core::data::ManifestEntry {
@@ -1233,10 +1524,14 @@ mod tests {
                 },
             });
             assert_eq!(
-                cancelled_build_error(&result, Some("record-id")).to_string(),
+                cancelled_build_error(&result, "", Some("record-id")).to_string(),
                 "cancelled after 1 of 10 file(s); the partial manifest is recorded as record-id"
             );
         }
+        assert_eq!(
+            cancelled_build_error(&result, "; the records are in x.records", None).to_string(),
+            "cancelled after 1 of 10 file(s); the records are in x.records"
+        );
     }
 
     #[test]
@@ -1260,6 +1555,7 @@ mod tests {
                 chunks_stored: 3,
                 storage_cost_atto: 12,
                 gas_cost_wei: 34,
+                envelopes: vec![],
             };
             let built = if cancelled {
                 Ok(partial)
@@ -1271,20 +1567,153 @@ mod tests {
                 })
             };
             let history = tempfile::tempdir().unwrap();
-            let error = record_build_result(built, |manifest| {
-                Some(record_upload(history.path(), manifest, None).unwrap().id)
-            })
+            // The paid files' records are saved first, then the manifest is
+            // recorded, before the error is returned.
+            let saved = std::cell::Cell::new(0);
+            let error = record_build_result(
+                built,
+                |manifest| {
+                    assert_eq!(saved.get(), 1, "records are saved first");
+                    Some(record_upload(history.path(), manifest, None).unwrap().id)
+                },
+                |envelopes| {
+                    saved.set(saved.get() + 1);
+                    assert!(envelopes.is_empty());
+                    vec![SavedRecord {
+                        path: "completed.bin".into(),
+                        address: [7; 32],
+                        record: Some(PathBuf::from("partial.records/completed.bin.record")),
+                        checked: true,
+                        problem: None,
+                    }]
+                },
+                Path::new("partial.records"),
+            )
             .unwrap_err();
+            assert_eq!(saved.get(), 1);
             let listing = list_uploads(history.path()).unwrap();
             assert_eq!(listing.records.len(), 1);
             assert_eq!(listing.records[0].manifest, manifest);
-            assert!(error.to_string().contains(&listing.records[0].id));
-            assert!(error.to_string().contains("1 of 2 file(s)"));
+            let error = error.to_string();
+            assert!(error.contains(&listing.records[0].id), "{error}");
+            assert!(error.contains("1 of 2 file(s)"), "{error}");
+            assert!(
+                error.contains("the records of the files uploaded are in partial.records"),
+                "{error}"
+            );
             if !cancelled {
-                assert!(error.to_string().contains("later.bin"));
-                assert!(error.to_string().contains("forced failure"));
+                assert!(error.contains("later.bin"));
+                assert!(error.contains("forced failure"));
             }
         }
+    }
+
+    /// A manifest's records go in a folder beside it, named after it, under
+    /// each entry's parent directories: never inside the uploaded tree, and
+    /// never the manifest file itself.
+    #[test]
+    fn records_go_in_a_folder_beside_the_manifest() {
+        // `darwin manifest create photos`: entries are relative to photos/,
+        // the manifest is photos.darwin beside it.
+        let out = Path::new("photos.darwin");
+        assert_eq!(records_root_for(out), PathBuf::from("photos.records"));
+        assert_eq!(
+            record_dir_for(out, "a.jpg"),
+            PathBuf::from("photos.records")
+        );
+        assert_eq!(
+            record_dir_for(out, "2026/summer/a.jpg"),
+            ["photos.records", "2026", "summer"]
+                .iter()
+                .collect::<PathBuf>()
+        );
+        assert!(!record_dir_for(out, "2026/a.jpg").starts_with("photos"));
+        let out = Path::new("shared").join("album.darwin");
+        assert_eq!(
+            record_dir_for(&out, "b.bin"),
+            Path::new("shared").join("album.records")
+        );
+        assert_eq!(record_dir_for(&out, "b.bin").parent(), out.parent());
+        // An output without an extension, or already named `.records`.
+        assert_eq!(
+            records_root_for(Path::new("album")),
+            PathBuf::from("album.records")
+        );
+        assert_eq!(
+            records_root_for(Path::new("album.records")),
+            PathBuf::from("album.records.records")
+        );
+    }
+
+    /// A record is never written over another: an existing `x.record`, which
+    /// holds a salt nothing else keeps, makes the new one `x-2.record`.
+    #[test]
+    fn a_record_never_replaces_an_existing_one() {
+        use ant_core::ant_listings::{
+            encode_data_map, self_encryption, Envelope, Metadata, ShownFields,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("album.darwin");
+        let (map, _) = self_encryption::encrypt(bytes::Bytes::from(vec![5u8; 4_000])).unwrap();
+        let salt = [9; 32];
+        let envelope =
+            Envelope::withheld(&map, &salt, Metadata::default(), ShownFields::ALL, false).unwrap();
+        let record = EnvelopeProof {
+            address: envelope.address(),
+            envelope: envelope.to_bytes(),
+            tx_hash: [8; 32],
+            quote: vec![1, 2, 3],
+            data_map: Some(encode_data_map(&map).unwrap()),
+            salt: Some(salt),
+        };
+        let first = write_entry_record(&out, "docs/x", &record).unwrap();
+        assert_eq!(
+            first,
+            dir.path()
+                .join("album.records")
+                .join("docs")
+                .join("x.record")
+        );
+        let second = write_entry_record(&out, "docs/x", &record).unwrap();
+        assert_eq!(
+            second,
+            dir.path()
+                .join("album.records")
+                .join("docs")
+                .join("x-2.record")
+        );
+        assert_eq!(ant_core::datamap_file::read_record(&first).unwrap(), record);
+        assert_eq!(
+            ant_core::datamap_file::read_record(&second).unwrap(),
+            record
+        );
+        // Nothing is written beside the manifest but the records folder.
+        let names: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(names, ["album.records"]);
+    }
+
+    #[test]
+    fn a_failed_build_says_where_its_records_are_only_when_some_were_saved() {
+        let root = Path::new("album.records");
+        let record = |saved: bool| SavedRecord {
+            path: "a.bin".into(),
+            address: [1; 32],
+            record: saved.then(|| root.join("a.bin.record")),
+            checked: false,
+            problem: None,
+        };
+        assert_eq!(saved_records_message(&[], root), "");
+        assert_eq!(saved_records_message(&[record(false)], root), "");
+        assert_eq!(
+            saved_records_message(&[record(false), record(true)], root),
+            format!(
+                "; the records of the files uploaded are in {}",
+                root.display()
+            )
+        );
     }
 
     #[test]
@@ -1354,7 +1783,7 @@ mod tests {
             output: None,
             name: None,
             compact: false,
-            public: false,
+            choices: EnvelopeChoices::default(),
             follow_symlinks: false,
             public_files: vec!["ab".repeat(32)],
             embed_public: vec![],
@@ -1421,5 +1850,191 @@ mod tests {
             help.contains("--merkle") && !help.contains("--no-merkle"),
             "{help}"
         );
+    }
+
+    /// The upload options a `create photos` command line asks for.
+    fn create_options(flags: &[&str]) -> Result<EnvelopeOptions, String> {
+        use clap::Parser;
+        let mut argv = vec!["test", "create", "photos"];
+        argv.extend_from_slice(flags);
+        let cli = TestManifestCli::try_parse_from(argv).map_err(|e| e.to_string())?;
+        match cli.action {
+            ManifestAction::Create { choices, .. } => {
+                create_upload_options(&choices).map_err(|e| e.to_string())
+            }
+            _ => panic!("expected create"),
+        }
+    }
+
+    /// The upload options a `darwin file upload photo.jpg` command line asks
+    /// for.
+    fn file_upload_options(flags: &[&str]) -> Result<EnvelopeOptions, String> {
+        use super::super::file::FileAction;
+        use clap::Parser;
+        #[derive(Debug, clap::Parser)]
+        struct TestFileCli {
+            #[command(subcommand)]
+            action: FileAction,
+        }
+        let mut argv = vec!["test", "upload", "photo.jpg"];
+        argv.extend_from_slice(flags);
+        let cli = TestFileCli::try_parse_from(argv).map_err(|e| e.to_string())?;
+        match cli.action {
+            FileAction::Upload { choices, .. } => choices.options().map_err(|e| e.to_string()),
+            _ => panic!("expected upload"),
+        }
+    }
+
+    /// With no flags, a manifest's files are uploaded as `darwin file
+    /// upload` uploads one: in a private envelope that shows all five
+    /// payment fields.
+    #[test]
+    fn create_defaults_to_private_envelopes_with_every_field_shown() {
+        use ant_core::ant_listings::ShownFields;
+        use ant_core::data::Visibility;
+        let options = create_options(&[]).unwrap();
+        assert_eq!(options, EnvelopeOptions::private());
+        assert_eq!(options.shown, ShownFields::ALL);
+        assert!(!options.readable && !options.in_index);
+        assert_eq!(options, file_upload_options(&[]).unwrap());
+        assert_eq!(
+            options.into_visibility(),
+            Visibility::Envelope(EnvelopeOptions::private())
+        );
+    }
+
+    /// `--public` is the unlisted envelope, as `darwin file upload --public`
+    /// is, not a plain data map chunk.
+    #[test]
+    fn create_public_is_the_unlisted_envelope_file_upload_public_is() {
+        use ant_core::data::Visibility;
+        let public = create_options(&["--public"]).unwrap();
+        assert_eq!(public, EnvelopeOptions::unlisted());
+        assert_eq!(public, file_upload_options(&["--public"]).unwrap());
+        assert_eq!(
+            public.into_visibility(),
+            Visibility::Envelope(EnvelopeOptions::unlisted())
+        );
+    }
+
+    /// `create` takes the envelope choices of `darwin file upload`, with the
+    /// same meaning and the same conflicts.
+    #[test]
+    fn create_takes_file_uploads_envelope_choices() {
+        use ant_core::data::Visibility;
+        for flags in [
+            &["--visibility", "private"][..],
+            &["--visibility", "unlisted"],
+            &["--visibility", "listed"],
+            &["--readable", "yes"],
+            &["--readable", "no"],
+            &["--readable", "yes", "--index", "yes"],
+            &["--index", "yes"],
+            &["--hide", "tx-hash,quote"],
+            &["--hide", "block", "--hide", "log-index"],
+            &["--hide", "all"],
+            &["--hide", "all", "--public"],
+            &["--hide", "all", "--index", "yes"],
+        ] {
+            assert_eq!(
+                create_options(flags).unwrap(),
+                file_upload_options(flags).unwrap(),
+                "{flags:?}"
+            );
+        }
+        assert_eq!(
+            create_options(&["--visibility", "listed"]).unwrap(),
+            EnvelopeOptions::listed()
+        );
+        assert_eq!(
+            create_options(&["--readable", "yes"]).unwrap(),
+            EnvelopeOptions::unlisted()
+        );
+        let dated = create_options(&["--index", "yes"]).unwrap();
+        assert!(!dated.readable && dated.in_index);
+        // Hiding everything on an upload not in the index stores no
+        // envelope: private, or a plain data map chunk when readable.
+        assert_eq!(
+            create_options(&["--hide", "all"])
+                .unwrap()
+                .into_visibility(),
+            Visibility::Private
+        );
+        assert_eq!(
+            create_options(&["--hide", "all", "--public"])
+                .unwrap()
+                .into_visibility(),
+            Visibility::Public
+        );
+        // The conflicts of `darwin file upload`.
+        for flags in [
+            &["--readable", "maybe"][..],
+            &["--visibility", "listed", "--readable", "no"],
+            &["--visibility", "listed", "--index", "no"],
+            &["--public", "--index", "yes"],
+            &["--public", "--readable", "yes"],
+            &["--public", "--visibility", "listed"],
+            &["--hide", "wallet"],
+        ] {
+            assert!(create_options(flags).is_err(), "{flags:?}");
+            assert!(file_upload_options(flags).is_err(), "{flags:?}");
+        }
+    }
+
+    /// `--name` names the manifest; a manifest's files get no envelope
+    /// metadata, and `create` has no `--content-type`.
+    #[test]
+    fn create_name_is_the_manifest_name() {
+        use clap::Parser;
+        let cli = TestManifestCli::try_parse_from(["test", "create", "photos", "--name", "album"])
+            .unwrap();
+        let ManifestAction::Create { name, choices, .. } = cli.action else {
+            panic!("expected create");
+        };
+        assert_eq!(name.as_deref(), Some("album"));
+        let options = create_upload_options(&choices).unwrap();
+        assert!(options.metadata.is_empty());
+        assert_eq!(options, EnvelopeOptions::private());
+        assert!(TestManifestCli::try_parse_from([
+            "test",
+            "create",
+            "photos",
+            "--content-type",
+            "text/plain"
+        ])
+        .is_err());
+    }
+
+    /// Bad choices are refused by `validate`, which `main` calls before it
+    /// reads SECRET_KEY or joins the network.
+    #[test]
+    fn create_rejects_bad_hide_before_the_network() {
+        use clap::Parser;
+        let action = |argv: &[&str]| TestManifestCli::try_parse_from(argv).unwrap().action;
+        let error = action(&["test", "create", "photos", "--hide", "tx_hash"])
+            .validate()
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("tx_hash"), "{error}");
+        assert!(
+            action(&["test", "create", "photos", "--hide", "tx-hash,quote"])
+                .validate()
+                .is_ok()
+        );
+        assert!(action(&["test", "create", "photos"]).validate().is_ok());
+        // A create that uploads nothing is checked the same way.
+        let address = "ab".repeat(32);
+        assert!(action(&[
+            "test",
+            "create",
+            "--public-file",
+            &address,
+            "--hide",
+            "nope"
+        ])
+        .validate()
+        .is_err());
+        assert!(action(&["test", "list"]).validate().is_ok());
+        assert!(action(&["test", "show", "x.darwin"]).validate().is_ok());
     }
 }
