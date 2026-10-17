@@ -37,6 +37,50 @@ transports use `record.rs` for BLAKE3 verification. Native
 `Client::data_download_range` and the browser media reader call the same range
 implementation.
 
+Browser downloads and range reads have no 1 GB file cap. File sizes and offsets
+use 64-bit arithmetic internally; the JavaScript API accepts exact, nonnegative
+`number` positions through `Number.MAX_SAFE_INTEGER` (just under 8 PiB). The
+resolved DataMap and seek index still occupy memory proportional to the number
+of chunks; content buffers stay bounded, including for seeks past 4 GiB.
+Uploads retain their existing size limits.
+
+`downloadPublicFile(file, concurrency?, onProgress?, { maxMemoryBytes?, signal? })`
+and its private-file counterpart allocate the output as one JavaScript
+`Uint8Array` and copy each decrypted chunk into place as it arrives, so WASM
+holds only the records in flight. Progress is reported as
+`Downloaded chunk n/total`, and an `AbortSignal` cancels the download. `maxMemoryBytes` limits the output buffer,
+not total process memory; without it, allocation is attempted up to the
+JavaScript engine's buffer limit. Allocation errors reject with guidance to use
+streaming, since browsers do not expose a reliable amount of free memory.
+
+For large downloads, pass a `WritableStream` to `BrowserFileReader.pipeTo`.
+For example, after the application obtains a file handle from a user gesture:
+
+```js
+const reader = await client.openPublicFile(address);
+try {
+  const writable = await fileHandle.createWritable();
+  const { bytesWritten, hash } = await reader.pipeTo(writable);
+} finally {
+  reader.close();
+}
+```
+
+The same API works with `openPrivateFile({ data_map })`. `pipeTo(writable,
+{ start?, end?, signal?, onProgress? })` optionally streams a half-open byte
+range and reports `(bytesWritten, totalBytes)` after each write. Chunks are
+fetched concurrently and written in order, at most 4 MiB per write; fetching
+continues during writes until 32 MiB of plaintext is held. Invalid calls reject
+without touching the destination; otherwise the destination is closed on
+success, aborted on failure (an abort during its close may come too late to
+undo the commit), and its writer lock released. The result contains
+the byte count and BLAKE3 of the written range, and an `AbortSignal` cancels
+the call. `reader.close()` releases the records read-ahead holds and makes later
+calls fail. `readRange(start, length)` remains available for media and custom
+sinks, with a 4 MiB per-call limit. The application chooses a memory budget and
+supplies its disk destination; the core does not open file pickers or silently
+select a path.
+
 The adapters supply QUIC or WebRTC discovery/GET requests, runtime timers,
 caches, progress callbacks, and output handling. Browser descriptors and wallet
 callbacks remain browser API concerns. Native filesystem streaming still uses
@@ -80,7 +124,9 @@ corroboration and write quorum, and pay each state through the same wallet
 callback file uploads take. The owner key is passed as its 32-byte seed. Only
 nodes that advertise `pointer_protocol` are asked. A write can hand the paid
 record and proof to an `onPaid` callback; `storePaidPointer` stores them later
-without paying again.
+without paying again. `transferPointer` hands a pointer over for good and
+`pointerFinality` asks the whole close group whether it is final (see
+`darwin pointer transfer` below).
 
 Browser protocol v5 and browser manifest v6 advertise only the payment chain ID
 and token/vault addresses. RPC providers belong to the application or wallet;
@@ -104,8 +150,9 @@ notices for the third-party code in it (`THIRD-PARTY-NOTICES.txt`, `RUST-STD-COP
 
 `darwin --version` prints the package version and, on a second line, the git commit the binary
 was built from (`unknown` outside a git checkout of this repository; uncommitted changes don't
-show). Every build says 0.3.9, so go by the commit: builds before `0995cba`
-(2026-10-06) pay the retired test token and can't upload to the current network.
+show). The version is upstream's, 0.3.11 now and 0.3.9 in earlier builds, so go by the
+commit: builds before `0995cba` (2026-10-06) pay the retired test token and can't upload to
+the current network.
 
 `darwin` keeps the data and configuration directories of the `ant` name (for example
 `~/.local/share/ant` and `~/.config/ant` on Linux), so files written by earlier builds are found
@@ -392,6 +439,12 @@ owner key is kept as a 32-byte seed in a file only its owner can read (`0600`
 on Unix; on Windows it takes its directory's permissions, so keep it in your
 user profile). Losing it means the pointer can never be updated again.
 
+The key cannot change hands, but the pointer can: `darwin pointer transfer` signs
+its final state, pointing at a pointer the new owner holds the key to. Readers
+of the address are redirected there, the address stays the same, and the
+former owner's key can change nothing any more (ADR-0018 in Autonomi's
+`ant-node`).
+
 #### `darwin pointer keygen --output <FILE>`
 
 Create a new owner key and print the address of the pointer it controls. Never
@@ -421,7 +474,12 @@ Requires `SECRET_KEY` to pay for the new state.
 
 Print a pointer's counter, target and state. The close group and the bootstrap
 peers nearest the pointer (nine at most) are asked at once, and the newer state
-either set agrees on is printed.
+either set agrees on is printed. Once a final state has been named (see
+`darwin pointer transfer`), a set's answer is the final state a majority of it
+holds. Two final states that no majority holds are a fork, and the read fails,
+unless the fork is among the bootstrap peers and the close group holds a final
+state. `darwin pointer update` first asks every peer of the close group, and is
+refused before paying if any peer that answers holds a final state.
 
 ```
 $ darwin pointer get 9f3c...
@@ -435,6 +493,45 @@ state_id: 5e7d...
 #### `darwin pointer resolve <ADDRESS>`
 
 Follow a chain of pointers to the target at its end.
+
+#### `darwin pointer transfer --key <FILE> <RECIPIENT>`
+
+Hand the pointer over for good to the pointer at `RECIPIENT` (hex), which the
+new owner creates first, with a fresh key for each pointer they receive.
+Requires `SECRET_KEY` to pay for the final state. Refused before paying if any
+peer of the close group holds a final state for the pointer, if not every peer
+of the group answers, or if `RECIPIENT` does not exist or leads back to this
+pointer. Irreversible once stored. Prints the stored state and the result of
+`finality`; a failed `finality` check after the write does not mean the
+transfer failed.
+
+#### `darwin pointer finality <ADDRESS>`
+
+Ask every peer of the close group whether a pointer is final, and on what:
+
+- `open` — no peer that answered holds a final state; its owner can still
+  move it. Check `answered`: a peer that did not answer could hold one.
+- `settling` — one final state, not yet on a majority of the group.
+- `unconfirmed` — one final state on a majority, but not every peer answered,
+  so a rival could be unseen. Ask again.
+- `final` — one final state, held by a majority, every peer answered and none
+  holds a rival. The only status to rely on before treating a transfer as
+  done.
+- `forked` — its owner signed more than one final state. Reads return the one a
+  majority holds, or fail if none does.
+
+```
+$ darwin pointer finality 9f3c...
+address:  9f3c...
+answered: 7 of 7
+status:   final
+state:    pointer 4b1e... (state 77a0..., held by 7 of 7)
+```
+
+#### `darwin pointer controller <ADDRESS>`
+
+Follow a pointer's transfers to the pointer whose owner now decides what it
+resolves to.
 
 ### `darwin wallet` — Wallet Operations
 

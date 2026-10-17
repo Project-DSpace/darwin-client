@@ -2,7 +2,7 @@
 
 - **Status:** Proposed
 - **Date:** 2026-08-03
-- **Last amended:** 2026-09-25
+- **Last amended:** 2026-10-13
 - **Decision owners:** <pending>
 - **Reviewers:** <pending>
 - **Supersedes:** none
@@ -667,3 +667,95 @@ in flight through the shared chunk cache. The bounded read-ahead described under
 streaming reads keeps at most five, so repeat the playback comparison of six and
 ten on it. The method, raw results and scripts are in
 `docs/investigations/2026-09-29-browser-lookup-alpha`.
+
+## Large-file download destinations (2026-10-01)
+
+Related: [V2-1398](https://linear.app/autonominetwork/issue/V2-1398).
+
+The browser download limit is independent of upload limits. Root-map file sizes,
+seek-index offsets, and shared range arithmetic use `u64`; only chunk indices and
+individual buffer lengths use `usize`. The JavaScript facade accepts nonnegative
+safe-integer numbers, rejecting fractional, overflowing and imprecise positions.
+Manifest validation no longer rejects files over 1 GB; it caps a file's chunk
+list at 262,144 entries (about 1 TiB at the native chunk size) to bound the
+sorting and normalisation of an untrusted entry.
+
+A reader retains a `self_encryption::DataMapIndex` of the root map (added in
+self_encryption 0.36.2). It finds overlapping chunks with 64-bit positions and
+binary searches, and decrypts single chunks with their original indices and
+neighbouring source hashes, so self_encryption keeps sole ownership of its KDF,
+DataMap representation and stored ciphertext. Encrypted records are verified
+against their addresses, and each decrypted chunk against the size and source
+hash the map declares; decompression stops at the declared size. The same
+release moves the dependency's `DecryptionStream` range arithmetic onto the
+index, which removes its pointer-sized whole-file sums. The reader indexes the
+map when it opens, so a DataMap with non-contiguous indices fails to open rather
+than opening with read-ahead off as described under streaming reads. Read-ahead
+plans its windows over the same 64-bit index, so it follows reads past 4 GiB on
+wasm32.
+
+A complete download fetches chunks as the native one does: within the client's
+adaptive fetch cap and its `concurrency` argument, with missing records retried
+together in deferred rounds, so retry waits do not add up across records. Each
+chunk is decrypted as it arrives and copied straight into its place in one
+JavaScript `Uint8Array` allocated up front, so WASM memory holds only the records
+in flight, and `Downloaded chunk n/total` counts chunks as they land. The file is
+hashed afterwards, copied back in 4 MiB pieces. The optional `maxMemoryBytes`
+limits the allocation; allocation failure rejects before file-content transfer
+and directs the caller to streaming. Automatic free-memory detection and
+implicit disk spill are not portable browser capabilities; applications own the
+memory budget and the choice of a storage destination.
+
+`BrowserFileReader.pipeTo` must write in file order. It fetches chunks
+concurrently within the adaptive fetch cap, each retried on the deferred schedule
+on its own, and hands them on in file order. Fetching continues while the
+destination writes, holding at most 32 MiB of plaintext; a record waiting to
+retry keeps its place under the cap, so a missing record can hold a stream back
+for the 60 seconds of its retry schedule.
+
+`pipeTo(writable, { start?, end?, signal?, onProgress? })` writes the whole file
+or a half-open range to a caller-owned `WritableStream`, at most 4 MiB per write,
+awaiting each write. Like `ReadableStream.pipeTo`, it rejects invalid calls
+without touching the destination, closes the destination on success, aborts it
+on failure without waiting for a stalled write, and releases the writer lock.
+An abort while the destination is closing still rejects, but per the Streams
+specification the close completes, so the destination may already be committed.
+An `AbortSignal` cancels a `pipeTo` or a complete download, including resolution
+and retry waits. Closing a reader releases its read-ahead records and makes
+later calls fail; it no longer clears the client's shared, bounded chunk cache,
+which other readers may be using. The core does not open file pickers, own
+browser filesystem policy, or change the companion SDK.
+
+Removing only the 1 GB check was rejected because wasm32 offsets would still
+truncate around 4 GiB. Whole-file WASM buffering was rejected because it couples
+supported file size to linear-memory capacity. Disk-only output was rejected
+because small files and consumers needing bytes can use JavaScript memory.
+Routing complete downloads through the in-order stream was rejected: copying
+into a preallocated array needs no order, and the stream's 32 MiB bound and
+per-record retries would cap their concurrency and add up retry waits.
+Decompression of crafted records is bounded for browser reads by
+`DataMapIndex::decrypt_chunk`; native complete downloads still decrypt through
+`self_encryption::decrypt`, which does not bound it.
+
+This changes the public Rust browser descriptor's `size` from `usize` to `u64`
+and Rust signatures of affected WASM exports. `readRange` now rejects fractional,
+negative, missing and imprecise arguments that wasm-bindgen previously coerced.
+The download options object and `pipeTo` are additive. Native
+`data_download_range` keeps its signature. Wire, storage, payment and node
+behavior are unchanged. Upload size limits are unchanged.
+
+Content-buffer memory is bounded, but root-map/index memory still grows with the
+number of chunks. Streaming also depends on destination capacity; in-memory
+output depends on the engine's typed-array limits. The JavaScript facade supports
+positions through `Number.MAX_SAFE_INTEGER`, just under 8 PiB, rather than
+claiming literally unlimited file sizes.
+
+Validation includes a complete 4,303,347,835-byte native-encrypted fixture streamed
+through generated WASM with a matching BLAKE3; public/private seeks beyond 4 GiB;
+disk output; fetching bounded behind a blocked write; `AbortSignal` cancellation
+during retries, stalled writes and the destination's close; invalid calls that
+leave the destination untouched; writer, allocation and output errors; memory
+budgets; manifest validation; and native index, range and retry tests. The
+generated WASM tests use mocked WebRTC hosts with real Rust protocol and crypto
+processing. They do not establish real-browser or live-network compatibility by
+themselves.

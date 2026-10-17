@@ -1,5 +1,5 @@
 //! Records the git commit the binary was built from, so `darwin --version`
-//! tells builds apart: the package version alone stays 0.3.9 across them.
+//! tells builds apart: the package version alone stays 0.3.11 across them.
 //! It names the commit only: uncommitted changes in the tree don't show.
 
 use std::process::Command;

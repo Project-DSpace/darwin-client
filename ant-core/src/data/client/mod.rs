@@ -30,6 +30,7 @@ pub mod quote;
 pub mod upload;
 pub mod upload_state;
 
+use crate::client_engine::single_flight::SingleFlight;
 use crate::data::client::adaptive::{AdaptiveConfig, AdaptiveController, ChannelStart, Outcome};
 use crate::data::client::cache::ChunkCache;
 use crate::data::error::{Error, Result};
@@ -307,6 +308,8 @@ mod settlement_refusal_tests {
 /// - `RemotePut` -> `ApplicationError` (the remote node responded with a
 ///   structured rejection — the transport succeeded, so the node declined
 ///   at the application layer; not a local capacity signal)
+/// - `PointerFinal`, `PointerForked` -> `ApplicationError` (a verdict about
+///   one pointer's state, read over a working link)
 /// - `ClientUpdateRequired` -> `ApplicationError` (the storer refused to quote
 ///   a client that settles under superseded rules — a terminal verdict about
 ///   this build, not about link capacity, and no retry rate clears it)
@@ -348,6 +351,11 @@ pub(crate) fn classify_error(err: &Error) -> Outcome {
         // run on the basis of a fault no retry can clear.
         | Error::ClientUpdateRequired(_)
         | Error::StorerUpdateRequired(_)
+        // A pointer that is final, or whose owner forked it, is a verdict
+        // about that pointer read over a working link. No retry rate changes
+        // it.
+        | Error::PointerFinal(_)
+        | Error::PointerForked(_)
         | Error::BadQuoteBinding { .. }
         | Error::BadQuoteCommitment { .. }
         // An external-signer merkle batch larger than one tree can hold —
@@ -651,6 +659,9 @@ pub struct Client {
     wallet: Option<Arc<Wallet>>,
     evm_network: Option<ant_protocol::evm::Network>,
     chunk_cache: ChunkCache,
+    /// Chunk GETs in flight, by address and peer count, so concurrent reads
+    /// of one chunk share a single network GET.
+    chunk_gets: SingleFlight<(XorName, usize), Result<Option<ant_protocol::DataChunk>>>,
     next_request_id: AtomicU64,
     /// Adaptive concurrency controller: replaces the static
     /// quote/store concurrency knobs. See `adaptive` module.
@@ -733,6 +744,7 @@ impl Client {
             wallet: None,
             evm_network: None,
             chunk_cache: ChunkCache::default(),
+            chunk_gets: SingleFlight::default(),
             next_request_id: AtomicU64::new(1),
             controller,
             #[cfg(feature = "native")]
@@ -779,6 +791,7 @@ impl Client {
             wallet: None,
             evm_network: None,
             chunk_cache: ChunkCache::default(),
+            chunk_gets: SingleFlight::default(),
             next_request_id: AtomicU64::new(1),
             unversioned_quote_peers: Arc::new(Mutex::new(HashSet::new())),
             versioned_capable_peers: Arc::new(Mutex::new(HashSet::new())),
@@ -836,6 +849,7 @@ impl Client {
             wallet: None,
             evm_network: None,
             chunk_cache: ChunkCache::default(),
+            chunk_gets: SingleFlight::default(),
             next_request_id: AtomicU64::new(1),
             unversioned_quote_peers: Arc::new(Mutex::new(HashSet::new())),
             versioned_capable_peers: Arc::new(Mutex::new(HashSet::new())),
@@ -1303,6 +1317,8 @@ mod tests {
             | Error::RemotePut { .. }
             | Error::ClientUpdateRequired(_)
             | Error::StorerUpdateRequired(_)
+            | Error::PointerFinal(_)
+            | Error::PointerForked(_)
             | Error::CloseGroupShortfall(_) => (),
         };
     }

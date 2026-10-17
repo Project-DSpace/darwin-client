@@ -5,6 +5,7 @@
 
 pub mod client;
 pub mod error;
+pub mod manifest;
 pub mod network;
 #[cfg(feature = "native")]
 pub mod peer_cache;
@@ -31,7 +32,9 @@ pub use ant_protocol::{compute_address, DataChunk, XorName};
 
 // The pointer record (ADR-0016) and the owner key that signs it, so a caller of
 // the pointer API needs no direct protocol dependency.
-pub use ant_protocol::pointer::{pointer_address, Pointer, PointerTarget, PointerTargetKind};
+pub use ant_protocol::pointer::{
+    pointer_address, Pointer, PointerTarget, PointerTargetKind, FINAL_COUNTER,
+};
 pub use ant_protocol::pqc::api::{ml_dsa_65, MlDsaPublicKey, MlDsaSecretKey};
 
 // Re-export client data types
@@ -63,10 +66,36 @@ pub use client::merkle::{
     DEFAULT_MERKLE_THRESHOLD,
 };
 pub use client::occupied::{OccupiedQuote, VaultRecord, MAX_OCCUPIED_REQUOTES, QUOTES_OCCUPIED};
+pub use client::pointer::{
+    FinalState, FinalityStatus, PointerController, PointerFinality, PointerTransfer,
+};
 pub use client::upload::{MerkleUploadPayment, UploadPayment};
 
 // Re-export self-encryption types
 pub use self_encryption::DataMap;
+
+// File manifests and `ant://` links (ADR-0006).
+#[cfg(feature = "native")]
+pub use manifest::{
+    build::{BuildEvent, BuildOptions, BuildResult, ManifestBuilder, ReferenceMode},
+    compact::{apply_compaction, plan_compaction, publish_data_maps, CompactPlan, EmbeddedEntry},
+    embed::embeddable_data_map,
+    extract::{
+        extract_manifest, select_entries, EntryOutcome, EntryStatus, ExtractEvent, ExtractOptions,
+        ExtractReport,
+    },
+    file::{manifest_filename_for, read_manifest_file, write_manifest_file},
+    history::{
+        default_history_dir, format_timestamp, list_uploads, load_upload, record_upload,
+        UploadListing, UploadRecord, UPLOAD_HISTORY_DIR,
+    },
+};
+pub use manifest::{
+    data_map_address, embedded_len, file_link, is_link, manifest_link, manifest_link_bytes,
+    manifest_link_from_bytes, parse_link, published_data_map, ContentRef, Link, Manifest,
+    ManifestEntry, ManifestError, TorrentReference, MANIFEST_EXTENSION,
+    MANIFEST_LINK_RECOMMENDED_MAX_BYTES, MAX_EMBEDDED_ROOT_MAP_BYTES,
+};
 
 // Datamap file persistence helpers. Canonical path is
 // `ant_core::datamap_file::*`; these convenience re-exports let existing

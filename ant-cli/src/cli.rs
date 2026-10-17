@@ -3,12 +3,12 @@ use clap::{ArgAction, Parser, Subcommand};
 use std::path::PathBuf;
 
 use crate::commands::data::{
-    ChunkAction, FileAction, ListingArgs, ListingsArgs, PointerAction, WalletAction,
+    ChunkAction, FileAction, ListingArgs, ListingsArgs, ManifestAction, PointerAction, WalletAction,
 };
 use crate::commands::node::NodeCommand;
 use crate::commands::update::UpdateArgs;
 
-/// `darwin 0.3.9` on line 1, the git commit on line 2 (see build.rs).
+/// `darwin 0.3.11` on line 1, the git commit on line 2 (see build.rs).
 const VERSION: &str = concat!(
     env!("CARGO_PKG_VERSION"),
     "\ncommit ",
@@ -145,6 +145,11 @@ pub enum Commands {
     /// One file's listing, in the index or not: from the nodes nearest its
     /// address, checked against the network and the payment chain
     Listing(ListingArgs),
+    /// Manifest operations (torrent-like file sets shared as .ant files or ant:// links)
+    Manifest {
+        #[command(subcommand)]
+        action: ManifestAction,
+    },
     /// Update the darwin binary (off in this build: there are no darwin releases yet)
     Update(UpdateArgs),
 }
