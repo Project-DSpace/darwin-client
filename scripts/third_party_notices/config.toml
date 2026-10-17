@@ -115,7 +115,7 @@ note = "its THIRD_PARTY file covers documentation adapted from Apple's Security 
 # once a copy moves to another version; update them when a copy changes.
 
 [remark.ant-protocol]
-version = "3.1.0"
+version = "5.0.0"
 note = "a modified copy of the crates.io release, kept in vendor/ant-protocol of the repository this build is made from; its Source above is that copy. The one change is PRICE_MULTIPLIER in src/payment/pricing.rs (see vendor/ant-protocol/VENDORED.md)."
 
 [remark.ant-listings]

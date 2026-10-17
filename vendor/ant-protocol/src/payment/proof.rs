@@ -203,7 +203,7 @@ mod tests {
         let (pop, hashes) = deserialize_proof(&bytes).unwrap();
 
         assert_eq!(pop.peer_quotes.len(), 1);
-        assert!(hashes.is_empty());
+        assert!(hashes.is_empty(), "expected no tx hashes, got {hashes:?}");
     }
 
     #[test]

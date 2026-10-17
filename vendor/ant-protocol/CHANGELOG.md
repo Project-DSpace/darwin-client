@@ -7,7 +7,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed
+
+- **A pointer state at `counter == u64::MAX` is final.** `PointerState::replaces`
+  gains a rule ahead of the other two: nothing replaces a final state, not even
+  another final state with smaller target bytes. Below the final counter the
+  order is unchanged. This is what makes ownership transferable by redirection:
+  the owner signs one last state pointing at a pointer the new owner holds the
+  key to, a reader of the address is redirected there by every node that holds
+  that state, and no node that holds it gives it up. Under the rule published
+  in 3.1.0, which `ant-node` 0.21.0 runs, a former owner could grind a smaller
+  target at the same counter and take the address back from every node.
+
+  The cost is that two *different* final states are unordered, so a node keeps
+  whichever it took first. That fork can only be made by the owner, by signing
+  a second final state and getting it to nodes the first has not reached, at
+  once or later. It cannot take the address back from a node that holds the
+  first. Clients decide between the two sides by how many of the close group
+  hold each, and nodes look for a rival before taking a final state (see
+  `ADR-0018` in `ant-node`).
+
+  Nodes and clients must agree on this rule; a node on the 3.1.0 rule still
+  lets a smaller-target final state displace the first one, so while a network
+  runs both, the same records can settle differently on different nodes.
+  Nothing on the wire tells the two rules apart: the pointer format version is
+  still 1.
+
 ### Added
+
+- `FINAL_COUNTER`, `Pointer::finalize`, `Pointer::transfer_to` and
+  `Pointer::transferred_to` / `PointerState::transferred_to`: sign and recognise
+  the final state that hands a pointer's address over to another pointer.
+  `finalize` refuses to sign past a record that is already final, since a second
+  final state is the one way to fork a pointer for good. That guards a caller against a
+  mistake, not the network against the owner, who can still finalize an
+  earlier record again. `PointerState::is_terminal` mirrors
+  `Pointer::is_terminal`.
 
 - **Pointers** (`pointer`): a paid, mutable, owner-signed reference. One
   5,303-byte record with the ML-DSA-65 owner key inlined, addressed at
@@ -22,10 +57,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
   A quote is paid against `state_id = BLAKE3::derive_key("autonomi.pointer.state.v1", body)`,
   not the address: the address is stable for the pointer's life, so paying
-  against it would make every update after the first free. The merge rule is a
-  larger counter first, then smaller target bytes. The counter orders states
-  rather than metering them: any paid state that beats the held one is taken,
-  so a counter may skip and a fork at one counter is healed by any later one.
+  against it would make every update after the first free. Below
+  `FINAL_COUNTER` the merge rule is a larger counter first, then smaller target
+  bytes. The counter orders states rather than metering them: any paid state
+  that beats the held one is taken, so a counter may skip and a fork at one
+  counter below the final one is healed by any later one. A state at
+  `FINAL_COUNTER` is the exception (see Changed above): nothing replaces it,
+  and two different ones are never healed.
 
 - `ChunkMessageBody::{PointerPutRequest, PointerPutResponse, PointerGetRequest,
   PointerGetResponse}`, appended after every existing variant so the

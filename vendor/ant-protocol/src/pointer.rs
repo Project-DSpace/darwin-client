@@ -6,16 +6,38 @@
 //! content hash: the address is fixed for the pointer's life while the bytes
 //! under it change with every update.
 //!
-//! Ownership is fixed at creation. There is no transfer, no lineage, no
-//! certificates and no key rotation: a former owner keeps its key forever, so
-//! transferable ownership cannot be made fork-proof by a local rule. An earlier
-//! draft of this module implemented transfer through a genesis object and a
-//! chain of transfer certificates; it was reviewed and withdrawn. See
-//! `ADR-0016` in `ant-node`.
+//! The owner *key* is fixed at creation. There is no lineage, no certificates
+//! and no key rotation: a former owner keeps its key forever, so ownership
+//! cannot be re-keyed by a local rule. An earlier draft of this module
+//! implemented transfer through a genesis object and a chain of transfer
+//! certificates; it was reviewed and withdrawn. See `ADR-0016` in `ant-node`.
 //!
 //! That choice is what lets the design be this small: the owner key is inlined
 //! in the record, so validating a pointer needs nothing but the pointer — no
 //! fetch, no cache, no second close group, nothing that can be missing.
+//!
+//! # Finality, and transfer by final redirection
+//!
+//! A record at `counter == u64::MAX` is **final**: no record replaces it, not
+//! even another one at `u64::MAX`. That is what makes ownership transferable
+//! without touching the record: the owner signs one last state, at the final
+//! counter, pointing at a pointer the new owner holds the key to
+//! ([`Pointer::transfer_to`]). A reader of the old address is redirected to the
+//! new owner's pointer by every node that holds that final state, the address
+//! never changes, and no node that holds the final state gives it up — a
+//! larger counter does not exist, and an equal one does not replace.
+//!
+//! Two different final states can still exist, because only the owner decides
+//! what it signs, and the rule only stops a node from changing its mind. A
+//! node that holds no final state takes whichever one reaches it first. So the
+//! former owner can fork the pointer by signing a second final state and
+//! getting it to nodes the first has not reached: racing both at once, or
+//! sending the second later. Nothing local can settle that. What the rule does
+//! settle is that no node ever gives up a final state it holds, so a fork
+//! cannot take a final state back from the nodes that hold it; it can only
+//! split the nodes that held none. Finding a fork, and reading the state most of the
+//! close group holds, is the client's job; not taking a rival of a final state
+//! the close group already holds is the node's. See `ADR-0018` in `ant-node`.
 //!
 //! # Encoding
 //!
@@ -81,6 +103,12 @@ pub const DATA_TYPE_POINTER: u32 = 1;
 /// body, so it reaches `state_id`: a record differing only in this byte is a
 /// different state and is paid for separately.
 pub const POINTER_FORMAT_VERSION: u8 = 1;
+
+/// The final counter. A record signed at it is never replaced.
+///
+/// See [`PointerState::replaces`] for why, and [`Pointer::transfer_to`] for
+/// what it is for.
+pub const FINAL_COUNTER: u64 = u64::MAX;
 
 /// Length of a raw ML-DSA-65 public key.
 pub const ML_DSA_65_PUBLIC_KEY_LEN: usize = 1952;
@@ -155,7 +183,8 @@ pub enum PointerError {
     SignatureInvalid,
     /// Signing failed.
     SigningFailed(String),
-    /// The counter is at its maximum and cannot be advanced.
+    /// The counter is at [`FINAL_COUNTER`]: the pointer is final and no
+    /// further state can replace it.
     CounterExhausted,
 }
 
@@ -178,8 +207,8 @@ impl std::fmt::Display for PointerError {
             Self::SigningFailed(reason) => write!(f, "pointer signing failed: {reason}"),
             Self::CounterExhausted => write!(
                 f,
-                "pointer counter is at u64::MAX and is terminal; migrate to a fresh \
-                 pointer with an earlier update"
+                "pointer is final: its counter is at u64::MAX, and no later state \
+                 can replace it"
             ),
         }
     }
@@ -430,15 +459,34 @@ impl PointerState {
         }
     }
 
+    /// Whether this state is final: signed at [`FINAL_COUNTER`], and so
+    /// replaced by nothing.
+    #[must_use]
+    pub const fn is_terminal(&self) -> bool {
+        self.counter == FINAL_COUNTER
+    }
+
+    /// The pointer this state hands the address over to, if it is a transfer:
+    /// a final state whose target is another pointer.
+    ///
+    /// A final state targeting anything else freezes the pointer rather than
+    /// handing it on, and a pointer target below the final counter is a
+    /// forwarding the owner can still take back. Neither is a transfer.
+    #[must_use]
+    pub const fn transferred_to(&self) -> Option<XorName> {
+        transfer_target(self.counter, self.target)
+    }
+
     /// Whether `self` replaces `other` under the merge rule.
     ///
     /// ```text
+    /// 0. a final state (counter == u64::MAX) is replaced by nothing
     /// 1. larger counter
     /// 2. smaller target bytes
     /// ```
     ///
-    /// A total order on the states of **one** pointer address. Records of
-    /// different owners are not comparable and neither replaces the other.
+    /// Records of different owners are not comparable and neither replaces the
+    /// other.
     ///
     /// Equal state never replaces, whatever the signature bytes: ML-DSA signing
     /// is randomized, so one authenticated state has unboundedly many valid
@@ -447,15 +495,43 @@ impl PointerState {
     /// win — unbounded storage, replication and audit work for a single
     /// payment.
     ///
-    /// At `counter == u64::MAX` the order still holds, and that has a
-    /// consequence worth stating plainly: the pointer is **not frozen**. The
-    /// counter can no longer advance, but equal counters are still resolved by
-    /// target bytes, and *smaller* bytes win. So a terminal pointer can still
-    /// be moved — but only ever toward smaller target bytes, and never back.
-    /// See [`Pointer::next_counter`] for what that means for migration.
+    /// Rule 0 is what makes a pointer's last state final, and so what makes
+    /// ownership transferable by redirection ([`Pointer::transfer_to`]). Under
+    /// rules 1 and 2 alone a state at the final counter could still be
+    /// displaced by another at the same counter with smaller target bytes, so
+    /// a former owner could grind a target and take the address back after
+    /// handing it on.
+    ///
+    /// The cost is that the order is total only below the final counter. Two
+    /// different final states are incomparable: neither replaces the other, so
+    /// whichever a node took first is the one it keeps. That is the only
+    /// conflict this rule leaves unordered, and so the only fork no later
+    /// state heals; a conflict at a lower counter is ordered by target bytes
+    /// and replaced by any later counter. Only the owner can make it — by
+    /// signing a second
+    /// final state and getting it to nodes the first has not reached, at once
+    /// or later. Once a node holds a final state no arrival can change it, so a
+    /// second final state can never displace an established one; it can only
+    /// land on a node that held no final state. A reader tells the two sides
+    /// apart by how many of the close group hold each.
+    ///
+    /// Every other pair of distinct states is ordered, and the order is a
+    /// strict partial order everywhere: never both ways round, and transitive.
     #[must_use]
     pub fn replaces(&self, other: &Self) -> bool {
-        self.address == other.address && self.rank() > other.rank()
+        self.address == other.address && !other.is_terminal() && self.rank() > other.rank()
+    }
+}
+
+/// The pointer a state at `counter` with `target` transfers to, if any.
+///
+/// One definition for [`PointerState::transferred_to`] and
+/// [`Pointer::transferred_to`], so a record and its parsed state cannot
+/// disagree about whether it is a transfer.
+const fn transfer_target(counter: u64, target: PointerTarget) -> Option<XorName> {
+    match target.kind() {
+        Some(PointerTargetKind::Pointer) if counter == FINAL_COUNTER => Some(target.address),
+        _ => None,
     }
 }
 
@@ -606,6 +682,69 @@ impl Pointer {
         Self::sign(secret_key, &self.owner, self.next_counter()?, target)
     }
 
+    /// Sign this pointer's final state, pointing at `target`.
+    ///
+    /// Signed at [`FINAL_COUNTER`], so once a node holds it nothing replaces
+    /// it — not a later update, which cannot exist, and not another final
+    /// state, which does not replace. Use [`Self::transfer_to`] to hand the
+    /// pointer to someone else; a final state pointing at a chunk freezes the
+    /// pointer on that chunk at every node that holds it.
+    ///
+    /// Signing a second final state is the one way to fork a pointer for
+    /// good: each node keeps whichever of the two it saw first, and no later
+    /// state heals it, where a fork at a lower counter is. So this refuses to sign
+    /// past a record that is already final, and a caller must read the
+    /// network's state before finalizing rather than after. That refusal guards
+    /// a caller against a mistake, not the network against the owner: an
+    /// earlier record can be finalized again, and [`Self::sign`] signs any
+    /// counter.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PointerError::CounterExhausted`] if this record is already
+    /// final, otherwise as [`Self::sign`].
+    pub fn finalize(
+        &self,
+        secret_key: &MlDsaSecretKey,
+        target: PointerTarget,
+    ) -> Result<Self, PointerError> {
+        if self.is_terminal() {
+            return Err(PointerError::CounterExhausted);
+        }
+        Self::sign(secret_key, &self.owner, FINAL_COUNTER, target)
+    }
+
+    /// Sign the final state that hands this pointer's address over to the
+    /// pointer at `recipient`.
+    ///
+    /// The owner key cannot change, but what the address resolves to can be
+    /// handed over: the final state points at a pointer the new owner holds
+    /// the key to, so a reader of this address is redirected there by every
+    /// node that holds this state, and from there only the new owner moves it
+    /// on. It is not exclusive: the former owner can still finalize an earlier
+    /// record towards someone else, and a node that holds neither takes
+    /// whichever reaches it first (see [`Self::finalize`]). The address readers
+    /// use does not change.
+    ///
+    /// `recipient` should be a pointer that exists, and one whose owner uses
+    /// it only for this address: a pointer's address derives from its owner
+    /// key, so every address handed to the same recipient pointer resolves to
+    /// the same place.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::finalize`].
+    pub fn transfer_to(
+        &self,
+        secret_key: &MlDsaSecretKey,
+        recipient: XorName,
+    ) -> Result<Self, PointerError> {
+        self.finalize(
+            secret_key,
+            PointerTarget::new(PointerTargetKind::Pointer, recipient),
+        )
+    }
+
     /// Parse and fully validate a record.
     ///
     /// Checks, cheapest first: length, format version, structure, then the
@@ -731,31 +870,32 @@ impl Pointer {
     ///
     /// # Errors
     ///
-    /// Returns [`PointerError::CounterExhausted`] at `u64::MAX`.
+    /// Returns [`PointerError::CounterExhausted`] at [`FINAL_COUNTER`].
     ///
-    /// A pointer that must outlive its counter has to be migrated by an
-    /// **earlier** update — one that retargets it at a fresh pointer while a
-    /// successor counter still exists. A migration written *at* `u64::MAX` is
-    /// not final: the counter is spent, so the only thing that still decides
-    /// the merge is the target, and any record with smaller target bytes
-    /// displaces it. A strictly larger counter is the one move nothing can
-    /// answer, so migration must spend a counter it still has.
+    /// A record at the final counter is replaced by nothing, so there is no
+    /// update to sign past it. Migrating a pointer to a fresh one is exactly
+    /// that final update: see [`Self::transfer_to`].
     pub fn next_counter(&self) -> Result<u64, PointerError> {
         self.counter
             .checked_add(1)
             .ok_or(PointerError::CounterExhausted)
     }
 
-    /// Whether this pointer's counter is spent.
+    /// Whether this record is final: signed at [`FINAL_COUNTER`].
     ///
-    /// `true` once the counter reaches `u64::MAX`. Note this does not mean the
-    /// stored value can no longer change: a record at the same counter with
-    /// smaller target bytes still wins. It means the *counter* can no longer
-    /// answer such a record, which is why clients migrate before reaching this
-    /// rather than on it.
+    /// A node that holds a final record keeps it: neither a lower counter nor
+    /// another final record replaces it. See [`PointerState::replaces`].
     #[must_use]
     pub const fn is_terminal(&self) -> bool {
-        self.counter == u64::MAX
+        self.counter == FINAL_COUNTER
+    }
+
+    /// The pointer this record hands its address over to, if it is a transfer.
+    ///
+    /// As [`PointerState::transferred_to`].
+    #[must_use]
+    pub const fn transferred_to(&self) -> Option<XorName> {
+        transfer_target(self.counter, self.target)
     }
 
     /// Whether `self` replaces `other` under the merge rule.
@@ -905,9 +1045,8 @@ mod tests {
 
     #[test]
     fn nothing_out_ranks_a_terminal_counter() {
-        // The migration rule: at u64::MAX no later record can win, so a pointer
-        // that must outlive its counter has to be retargeted *before* the
-        // terminal update, not on it.
+        // No lower counter replaces a final state, and a final state replaces
+        // every lower one.
         let terminal = signed(1, u64::MAX, 5);
         for counter in [0u64, 1, 42, u64::MAX - 1] {
             let earlier = signed(1, counter, 0);
@@ -920,14 +1059,166 @@ mod tests {
     }
 
     #[test]
-    fn a_terminal_counter_still_resolves_equal_counter_conflicts() {
-        // The order does not degenerate at the maximum: two records at
-        // u64::MAX with different targets still resolve deterministically, so
-        // replicas cannot split there.
-        let low_target = signed(1, u64::MAX, 1);
-        let high_target = signed(1, u64::MAX, 2);
-        assert!(low_target.replaces(&high_target), "smaller target wins");
-        assert!(!high_target.replaces(&low_target));
+    fn a_final_state_is_replaced_by_nothing_not_even_a_smaller_target() {
+        // Below the final counter, equal counters resolve by target bytes. At
+        // it they do not: a former owner who handed the address on could
+        // otherwise grind a smaller target and take it back. So two final
+        // states are incomparable, and a node keeps whichever it took first.
+        let first = signed(1, FINAL_COUNTER, 9);
+        let smaller_target = signed(1, FINAL_COUNTER, 1);
+        assert!(
+            !smaller_target.replaces(&first),
+            "a smaller target no longer wins"
+        );
+        assert!(!first.replaces(&smaller_target));
+
+        // Below the final counter nothing changed.
+        let low = signed(1, 7, 1);
+        let high = signed(1, 7, 9);
+        assert!(
+            low.replaces(&high),
+            "smaller target still wins below the end"
+        );
+    }
+
+    #[test]
+    fn a_state_at_the_final_counter_is_final_whatever_it_targets() {
+        let (pk, sk) = keypair(40);
+        let chunk = PointerTarget::new(PointerTargetKind::Chunk, [4; XORNAME_LEN]);
+        let pointer = PointerTarget::new(PointerTargetKind::Pointer, [5; XORNAME_LEN]);
+        let unknown = PointerTarget::from_raw_tag(200, [6; XORNAME_LEN]);
+        for target in [chunk, pointer, unknown] {
+            let held = Pointer::sign(&sk, &pk, FINAL_COUNTER, target).expect("sign");
+            assert!(held.is_terminal());
+            assert!(held.state().is_terminal());
+            for other in [chunk, pointer, unknown] {
+                for counter in [0, 1, FINAL_COUNTER - 1, FINAL_COUNTER] {
+                    let arrival = Pointer::sign(&sk, &pk, counter, other).expect("sign");
+                    assert!(
+                        !arrival.replaces(&held),
+                        "counter {counter} must not replace a final state"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_transfer_is_a_final_state_that_targets_the_recipient_pointer() {
+        let (pk, sk) = keypair(41);
+        let recipient = [0x42; XORNAME_LEN];
+        let current = Pointer::create(
+            &sk,
+            &pk,
+            PointerTarget::new(PointerTargetKind::Chunk, [1; XORNAME_LEN]),
+        )
+        .expect("create");
+        assert_eq!(current.transferred_to(), None);
+
+        let transfer = current.transfer_to(&sk, recipient).expect("transfer");
+        assert_eq!(transfer.counter(), FINAL_COUNTER);
+        assert_eq!(transfer.address(), current.address(), "the address stays");
+        assert_eq!(
+            transfer.target(),
+            PointerTarget::new(PointerTargetKind::Pointer, recipient)
+        );
+        assert_eq!(transfer.transferred_to(), Some(recipient));
+        assert_eq!(transfer.state().transferred_to(), Some(recipient));
+        assert!(transfer.replaces(&current));
+
+        // Nothing replaces the final state: no later counter exists, and a
+        // second final state, however its target sorts, does not replace it.
+        assert!(matches!(
+            transfer.update(&sk, current.target()),
+            Err(PointerError::CounterExhausted)
+        ));
+        assert!(
+            matches!(
+                transfer.transfer_to(&sk, [0; XORNAME_LEN]),
+                Err(PointerError::CounterExhausted)
+            ),
+            "finalizing twice is refused rather than signed into a fork"
+        );
+        let grinded = Pointer::sign(
+            &sk,
+            &pk,
+            FINAL_COUNTER,
+            PointerTarget::new(PointerTargetKind::Pointer, [0; XORNAME_LEN]),
+        )
+        .expect("sign");
+        assert!(!grinded.replaces(&transfer));
+    }
+
+    #[test]
+    fn an_earlier_record_can_be_finalized_twice_and_neither_replaces_the_other() {
+        // The refusal to finalize a final record is a guard for the caller
+        // that holds it. The owner still holds the earlier record and its key,
+        // so it can sign a second, different final state. The merge rule does
+        // not order the two: a node keeps whichever it took first.
+        let (pk, sk) = keypair(44);
+        let current = Pointer::create(
+            &sk,
+            &pk,
+            PointerTarget::new(PointerTargetKind::Chunk, [1; XORNAME_LEN]),
+        )
+        .expect("create");
+        let to_a = current.transfer_to(&sk, [0xA; XORNAME_LEN]).expect("first");
+        let to_b = current
+            .transfer_to(&sk, [0xB; XORNAME_LEN])
+            .expect("second");
+        assert_ne!(to_a.state().state_id, to_b.state().state_id);
+        assert!(to_a.replaces(&current) && to_b.replaces(&current));
+        assert!(
+            !to_a.replaces(&to_b),
+            "neither final state replaces the other"
+        );
+        assert!(!to_b.replaces(&to_a));
+    }
+
+    #[test]
+    fn only_a_final_pointer_target_is_a_transfer() {
+        let (pk, sk) = keypair(43);
+        let forward = PointerTarget::new(PointerTargetKind::Pointer, [7; XORNAME_LEN]);
+        let chunk = PointerTarget::new(PointerTargetKind::Chunk, [7; XORNAME_LEN]);
+
+        // A pointer target below the final counter is a forwarding the owner
+        // can still take back, not a transfer.
+        let forwarding = Pointer::sign(&sk, &pk, FINAL_COUNTER - 1, forward).expect("sign");
+        assert_eq!(forwarding.transferred_to(), None);
+
+        // A final chunk target freezes the pointer at the nodes that hold it;
+        // nobody receives it.
+        let frozen = Pointer::sign(&sk, &pk, FINAL_COUNTER, chunk).expect("sign");
+        assert_eq!(frozen.transferred_to(), None);
+
+        let handed_on = Pointer::sign(&sk, &pk, FINAL_COUNTER, forward).expect("sign");
+        assert_eq!(handed_on.transferred_to(), Some([7; XORNAME_LEN]));
+    }
+
+    #[test]
+    fn with_final_states_a_fold_keeps_the_first_final_it_meets() {
+        // A node folds `replaces` over arrivals in arrival order. Below the
+        // final counter the order is total, so the fold ends in one place
+        // whatever the order; two final states are the one pair it does not
+        // order, so the fold keeps whichever came first. That is the
+        // first-come rule, and the only place arrival order matters.
+        let fold = |arrivals: &[&Pointer]| -> XorName {
+            let mut held: Option<&Pointer> = None;
+            for arrival in arrivals {
+                if held.is_none_or(|h| arrival.replaces(h)) {
+                    held = Some(arrival);
+                }
+            }
+            held.expect("something arrived").state_id()
+        };
+        let early = signed(44, 3, 1);
+        let final_a = signed(44, FINAL_COUNTER, 9);
+        let final_b = signed(44, FINAL_COUNTER, 1);
+
+        assert_eq!(fold(&[&early, &final_a, &final_b]), final_a.state_id());
+        assert_eq!(fold(&[&final_b, &early, &final_a]), final_b.state_id());
+        assert_eq!(fold(&[&final_a, &final_b, &early]), final_a.state_id());
+        assert_eq!(fold(&[&early, &final_b]), final_b.state_id());
     }
 
     #[test]
@@ -1076,16 +1367,20 @@ mod tests {
     }
 
     #[test]
-    fn the_rule_is_a_strict_order_so_no_fold_depends_on_arrival_order() {
+    fn the_rule_is_a_strict_order_so_only_final_states_depend_on_arrival_order() {
         // Nodes and clients both pick a winner by folding `replaces` over
         // whatever arrives. That fold gives the same answer whatever the order
         // exactly when the rule is a strict total order on one address: never
         // both ways round, always one way for distinct states, and transitive.
+        // It is, for every pair but two different final states — the pair the
+        // first-come rule leaves unordered on purpose.
         let records = [
             signed(1, 0, 9),
             signed(1, 2, 1),
             signed(1, 5, 1),
             signed(1, 5, 2),
+            signed(1, FINAL_COUNTER, 3),
+            signed(1, FINAL_COUNTER, 4),
         ];
         for a in &records {
             assert!(!a.replaces(a), "an equal state never replaces");
@@ -1094,9 +1389,10 @@ mod tests {
                     !(a.replaces(b) && b.replaces(a)),
                     "two records cannot each replace the other"
                 );
+                let both_final = a.is_terminal() && b.is_terminal();
                 assert!(
-                    a.replaces(b) || b.replaces(a) || a.state_id() == b.state_id(),
-                    "distinct states are always ordered"
+                    a.replaces(b) || b.replaces(a) || a.state_id() == b.state_id() || both_final,
+                    "distinct states are always ordered unless both are final"
                 );
                 for c in &records {
                     assert!(

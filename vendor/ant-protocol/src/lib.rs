@@ -81,8 +81,8 @@ pub use payment::{
 };
 pub use pointer::{
     pointer_address, state_id_for_body, ParsedPointer, Pointer, PointerError, PointerState,
-    PointerTarget, PointerTargetKind, DATA_TYPE_POINTER, POINTER_BODY_LEN, POINTER_FORMAT_VERSION,
-    POINTER_WIRE_LEN, TARGET_WIRE_LEN,
+    PointerTarget, PointerTargetKind, DATA_TYPE_POINTER, FINAL_COUNTER, POINTER_BODY_LEN,
+    POINTER_FORMAT_VERSION, POINTER_WIRE_LEN, TARGET_WIRE_LEN,
 };
 
 // =============================================================================
