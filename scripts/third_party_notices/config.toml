@@ -83,10 +83,6 @@ note = "its only C file is a kernel-module test fixture that is not compiled int
 [native.windows_x86_64_msvc]
 note = "ships the Windows import library that windows-rs links against on Windows builds; it is covered by the crate's MIT OR Apache-2.0 licence (Microsoft Corporation)."
 
-[native.saorsa-transport]
-version = "0.37.0"
-note = "the published crate also contains a .minimax/ folder of AI-assistant files (Python tools and .NET DLLs) committed to its repository by mistake; nothing in it is compiled or linked into this build."
-
 [native.sysinfo]
 note = "its only C file is an example program that is not compiled into dependants."
 
@@ -97,11 +93,6 @@ note = "a build tool; its prebuilt .a files are test data, and nothing from it i
 # Each entry is for one reviewed version, names the licence it is
 # redistributed under (whose text must be among its files), and says why that
 # is acceptable.
-
-[exception.self_encryption]
-version = "0.36.0"
-licence = "GPL-3.0"
-reason = "GPL-3.0 with a linking exception, set out at the top of its LICENSE file, which is reproduced in full. The exception permits linking the unmodified library with independent modules into an executable distributed under other terms, provided each module's own licence terms are met; the library itself remains under GPL-3.0, and its exact source is the Source link above. This build links it because it is how files are stored on the network: ant-core uses it to encrypt files into chunks and a data map and to decrypt them, and ant-listings uses its data maps."
 
 # Explanations printed with a crate's entry, for licence or notice files that
 # could mislead without context.
