@@ -51,6 +51,10 @@ pub enum ManifestAction {
     ///
     /// One directory: its contents become the entries and its name the
     /// manifest name. Otherwise each path is added under its own name.
+    ///
+    /// Files are uploaded without an envelope, as
+    /// `darwin file upload --hide all` uploads them: they are not listed,
+    /// and no `.record` proves their payment.
     Create {
         /// Files or directories to upload.
         paths: Vec<PathBuf>,
@@ -65,9 +69,10 @@ pub enum ManifestAction {
         /// publishes anything itself.
         #[arg(long)]
         compact: bool,
-        /// Upload the files as public (stores each DataMap chunk). Anyone
-        /// with a file's address can then download it. The manifest still
-        /// embeds the DataMaps unless --compact is also given.
+        /// Upload the files as public: each file's address is its plain
+        /// DataMap chunk, with no envelope. Anyone with a file's address can
+        /// then download it. The manifest still embeds the DataMaps unless
+        /// --compact is also given.
         #[arg(long)]
         public: bool,
         /// Follow symlinks to regular files instead of skipping them.
@@ -121,7 +126,10 @@ pub enum ManifestAction {
     /// Compacting replaces embedded DataMaps with public addresses, which
     /// is only possible for DataMaps that are on the network. Any that are
     /// still private are listed and you are asked whether to publish them
-    /// first; publishing is paid and makes those files public.
+    /// first; publishing is paid and makes those files public. A readable
+    /// file that `darwin file upload` stored with an envelope counts as
+    /// still private here: its DataMap is in the envelope, not stored on its
+    /// own, so publishing it gives the file a second address.
     Export {
         /// A `.ant` file, an `ant://manifest/...` link, or an upload id
         /// from `darwin manifest list`.

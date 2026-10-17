@@ -366,6 +366,14 @@ Writes a proof of an upload from its record (`<filename>.record`) to `<filename>
 
 Checks a proof (or record) against the payment chain alone: the envelope hashes to its address, the quote names it and is signed, and the transaction paid it. Prints the payment (block, time, log index, transaction). With `--file`, also checks that a local file encrypts to the proof's data map. Needs no storage node. A proof shows the address was paid for by a block; it doesn't show who uploaded the file, since anyone who has the envelope can pay for the same address. Only a revealed data map and salt tie a private envelope to its file.
 
+### `darwin manifest` — Manifests and the Upload History
+
+A manifest is a `.ant` file, or an `ant://manifest/...` link, that names files and holds what reads each one: its data map, embedded, or the address of its public data map chunk ([ADR-0006](docs/adr/ADR-0006-file-manifests-and-links.md)). Whoever has a manifest with embedded data maps can read those files.
+
+- `darwin manifest create [PATH]...` uploads files, or one directory's contents, and writes a manifest of them (`<name>.ant`, or `-o <PATH>`). It pays per chunk and refuses `--merkle`, as `darwin file upload` does. Its uploads have no envelope: files are stored as `darwin file upload --hide all` stores them, so they aren't listed and get no `.record`, and with `--public` a file's address is its plain data map chunk. `--public-file ADDRESS[=PATH]` adds a file that is already public, without uploading anything.
+- `darwin manifest list` lists the upload history, newest first. Every `darwin file upload` and `darwin manifest create` is recorded there, as a manifest in `uploads/` under the client's data directory, holding each file's data map, a private upload's too.
+- `darwin manifest show`, `link`, `download` and `export` take a `.ant` file, an `ant://manifest/...` link, or an id from `darwin manifest list`. `export --compact` replaces embedded data maps with public addresses, and offers to publish (paid) those whose plain data map chunk isn't on the network. A readable file that `darwin file upload` stored with an envelope has no such chunk, so it counts as still private, and publishing it gives the file a second address, without an envelope.
+
 ### `darwin listings` — The Listings Index
 
 ```
