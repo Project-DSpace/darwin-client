@@ -834,6 +834,7 @@ dependencies = [
  "bytes",
  "clap",
  "colored",
+ "futures",
  "hex",
  "indicatif",
  "rand 0.8.6",
@@ -853,6 +854,7 @@ name = "ant-core"
 version = "0.13.0"
 dependencies = [
  "alloy",
+ "ant-listings",
  "ant-node",
  "ant-protocol",
  "anyhow",
@@ -910,6 +912,18 @@ dependencies = [
  "windows-sys 0.61.2",
  "xor_name",
  "zip",
+]
+
+[[package]]
+name = "ant-listings"
+version = "0.2.1"
+dependencies = [
+ "ant-protocol",
+ "postcard",
+ "rmp-serde",
+ "self_encryption",
+ "serde",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
@@ -978,8 +992,6 @@ dependencies = [
 [[package]]
 name = "ant-protocol"
 version = "5.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e4ad739acc497fb0f9bb49691e5874ecd68584569e730cc32f8a26d70f4b6725"
 dependencies = [
  "blake3",
  "bytes",
