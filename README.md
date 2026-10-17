@@ -265,6 +265,7 @@ Upload complete!
 
 Anyone can download this file with:
   darwin file download a1b2c3d4e5f6... -o <FILE>
+Recorded as 20261017T091502Z-my_data.bin (darwin manifest download 20261017T091502Z-my_data.bin)
 Prove this upload to anyone with:
   darwin file prove my_data.bin.record
 ```
@@ -288,6 +289,7 @@ Upload complete!
 
 Download this file with:
   darwin file download --datamap my_data.bin.datamap
+Recorded as 20261017T091734Z-my_data.bin (darwin manifest download 20261017T091734Z-my_data.bin)
 Prove this upload to anyone with:
   darwin file prove my_data.bin.record
 Keep the record as safe as the data map: it holds the data map and the salt, so it reads the file, and its salt is what proves which file this is. `darwin file prove --no-reveal` proves only the payment.
@@ -316,6 +318,7 @@ Mistakes in `--hide`, `--name` or `--content-type` are reported before `SECRET_K
 5. Unless the upload hides every payment field, is not in the index and has no name or content type, the client stores an **envelope**: a small chunk holding the data map (readable uploads) or a salted hash of it (private uploads), the name and content type, and flags saying which payment fields its listing shows and whether it is in the index. Its address is the file's address. Nodes that keep listings record the envelope's payment, so anyone with the address can check it against the chain. The envelope is paid in the same payment as the content (one payment for any upload under 64 chunks; from 64, with the chunks left after the merkle batches, or alone) and stored after every content chunk, so it never points at missing content.
 6. Without an envelope, a readable upload stores the DataMap itself as a chunk and returns its address; a private one stores nothing extra.
 7. The client saves the data map of a private upload to `<filename>.datamap`, and the envelope's record to `<filename>.record`: the envelope, its payment's transaction and paid quote, and for a private file the data map and the salt. Keep the record with the data map: it proves the upload from the chain alone (`darwin file prove`), even for fields you hid. **A private upload's record reads the file, like the `.datamap`**: whoever has it can download the file (`darwin file download --proof`), so keep it as safe as the data map, and hand over `darwin file prove --no-reveal` to prove only the payment. Until the record is saved, the client keeps a copy of it under its data directory (`payments/upload/records/<envelope address>.<payer>.record`, the same text as the `.record` file; for a private upload without a record, its salt as `.salt`), so a crash between paying and saving doesn't lose the paid quote and tx hash, which nothing else may hold once the quote is hidden. The upload removes its checkpoint only after that copy is written; a later upload of the same file with the same choices and wallet that finds the envelope already stored gets the kept record back. Saving the `.record` removes the copy.
+8. Every upload is also recorded in the upload history (`darwin manifest list`, below): a manifest in `uploads/` under the client's data directory that holds the file's data map, a private upload's too, so it reads the file as the `.datamap` does. It is owner-only on Unix (`0600`), and it stays when the `.datamap` and `.record` are deleted: delete it too to give up the means of reading the file.
 
 `darwin file cost <PATH>` takes the same `--readable`, `--index`, `--visibility`, `--public`, `--hide`, `--name` and `--content-type` flags, and counts the envelope or data map chunk the upload adds. When the sampled content is already stored, it prices that chunk alone, and says the content is only likely stored unless every content chunk was sampled.
 
@@ -349,10 +352,10 @@ Download complete!
 
 | Flag | Description |
 |------|-------------|
-| `ADDRESS` | Hex-encoded public DataMap or envelope address (64 hex chars). |
+| `ADDRESS` | A public DataMap or envelope address: 64 hex characters, or an `ant://ADDRESS` link. |
 | `--datamap <PATH>` | Path to a local `.datamap` file (for private downloads). With an address too (a private file's envelope), the data map is used, and checked against the envelope when the upload's `.record` is next to it. |
 | `--proof <PATH>` | Path to an upload record or proof (`darwin file prove`) whose envelope carries the data map, or reveals it. |
-| `-o, --output <PATH>` | Output file path (default: `downloaded_file`). |
+| `-o, --output <PATH>` | Output file path. Default, in the current directory: with `--datamap`, the data map's file name without `.datamap` (`my_data.bin.datamap` gives `my_data.bin`; other names need `-o`), also when an address comes with it; otherwise the address, in hex. Required with `--proof`. |
 
 A private file's envelope address can't be downloaded from: its envelope stores only a salted hash of the data map, and the download says so. Use `--datamap`, or `--proof` with a proof that reveals it.
 
