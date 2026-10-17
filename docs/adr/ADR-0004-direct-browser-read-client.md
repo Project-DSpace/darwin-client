@@ -129,13 +129,14 @@ occupying speculative GET slots for an entire ICE timeout.
 Bootstrap peers known by peer ID are the exception: every round reads the nine
 nearest the record (all of them when there are fewer) from the start, nearest
 first, one at a time and whether or not they are connected, in one of the two
-GET slots. Nine is the nodes' storage retention width, the close group of seven
-plus a margin of two: a node keeps and serves a record it admitted while it was
-among the nine nodes nearest the record, and a bootstrap peer among the nine
-nearest out of the whole network is also among the nine nearest out of the
-bootstrap peers. Hints and the ordinary path keep the other slot, and a stalled
-hint is raced only once those bootstrap peers have all been asked (see the
-README's bootstrap section).
+GET slots. Hints and the ordinary path keep the other slot, and a stalled hint
+is raced only once those bootstrap peers have all been asked (see the README's
+bootstrap section). Nine is the nodes' storage retention width, the close group
+of seven plus a margin of two: replication stores a record on the nodes among
+the nine nearest it, and a bootstrap peer among the nine nearest out of the
+whole network is also among the nine nearest out of the bootstrap peers. A chunk
+an upload left farther out, past close-group nodes that failed or were full, is
+not looked for on a bootstrap peer past the ninth.
 
 An immutable read begins with one speculative GET while ordinary XOR discovery
 continues. If it is still pending after one second, a second candidate may race

@@ -73,10 +73,13 @@ told apart by the commit `darwin --version` prints. Upstream's entries follow.
   start, nearest to the address first: the nodes that were nearest to a record when it was
   stored may still hold it after the nodes nearest to it have changed. A read asks the 9
   nearest the address, or all of them when fewer are configured: 9 is the nodes' storage
-  retention width, the close group (7) plus the storage admission margin (2). A node keeps and
-  serves a record it admitted while it was among the 9 nodes nearest the record, and a bootstrap
-  peer among the 9 nearest out of the whole network is also among the 9 nearest out of the
-  bootstrap peers, so asking these 9 asks every bootstrap peer that can hold the record.
+  retention width, the close group (7) plus the storage admission margin (2). A node is
+  responsible for a record, and replication stores it there, while the node is among the 9
+  nodes nearest the record by its own routing table, and a bootstrap peer among the 9 nearest
+  out of the whole network is also among the 9 nearest out of the bootstrap peers, so these 9
+  include every bootstrap peer responsible for the record. A chunk an upload left farther out,
+  past close-group nodes that failed or were full (up to the 20th nearest), stays there while
+  the node's disk has room, and is not looked for on a bootstrap peer past the 9th.
   `bootstrap_peers.toml` lists all 16 server nodes on QUIC (both nodes of each server, on 10000
   and 10001, every server's 10000 node first) with their peer IDs; the CLI and
   `Client::connect_multiaddrs` hand the selected seeds that carry one to reads

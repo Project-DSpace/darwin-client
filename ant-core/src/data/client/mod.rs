@@ -852,10 +852,12 @@ impl Client {
     /// (all of them when there are fewer), nearest first. The nodes that were
     /// nearest to a record when it was stored may still hold it after the
     /// nodes nearest to it have changed. Nine is the nodes' storage retention
-    /// width, the close group of seven plus a margin of two: a node keeps and
-    /// serves a record it admitted while it was among the nine nodes nearest
-    /// the record, and a bootstrap peer among the nine nodes nearest an
-    /// address is also among the nine bootstrap peers nearest it.
+    /// width, the close group of seven plus a margin of two: replication
+    /// stores a record on the nodes among the nine nearest it, and a bootstrap
+    /// peer among the nine nodes nearest an address is also among the nine
+    /// bootstrap peers nearest it. A chunk an upload left farther out, past
+    /// close-group nodes that failed or were full, is not looked for on a
+    /// bootstrap peer past the ninth.
     ///
     /// Pass the bootstrap addresses the client was configured with, such as
     /// those [`crate::config::resolve_bootstrap_multiaddrs`] returns. A client

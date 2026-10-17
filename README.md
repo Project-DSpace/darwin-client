@@ -1211,12 +1211,16 @@ knows (the selected QUIC seeds that carry `/p2p/<peer-id>`, or a browser
 client's seeds): the nine nearest the address read, or all of them when there
 are fewer. The nodes that were nearest to a record when it was stored may still
 hold it after the nodes nearest to it have changed. Nine is the nodes' storage
-retention width, the close group of seven plus a margin of two: a node keeps and
-serves a record it admitted while it was among the nine nodes nearest the
-record. A bootstrap peer that is among the nine nodes nearest an address out of
-the whole network is also among the nine nearest out of the bootstrap peers, so
-asking the nine bootstrap peers nearest the address asks every bootstrap peer
-that can hold the record.
+retention width, the close group of seven plus a margin of two: a node is
+responsible for a record, and replication stores it there, while the node is
+among the nine nodes nearest the record by its own routing table. A bootstrap
+peer that is among the nine nodes nearest an address out of the whole network is
+also among the nine nearest out of the bootstrap peers, so the nine bootstrap
+peers nearest the address include every bootstrap peer responsible for the
+record. An upload can also leave a chunk farther out: it moves past close-group
+nodes that fail or are full to the next nearest, up to the twentieth, and nodes
+keep what they hold while their disk has room. A copy left that way on a
+bootstrap peer past the ninth is not looked for there.
 
 A chunk read asks them from the start of each round, nearest to the chunk first
 and one at a time, in one of its two GET slots; discovery's hints, then the
@@ -1236,7 +1240,10 @@ So every read reaches the bootstrap peers: a chunk read sends its first GET to
 the one nearest the chunk, connected or not, and one to each of them in a round
 that finds nothing; a pointer read sends one to each of them that is not in the
 close group, all at once, dialling any it is not yet connected to. With the 16
-bundled seeds, a read asks at most 9 of them, not all 16.
+bundled seeds, a read asks nine of them as bootstrap peers, not all 16. A chunk
+read can still reach other seeds the way it reaches any node: as discovery's
+hints, or among the known peers (20 at most) a round falls back to before it
+reports a chunk missing.
 
 The config directory is `ant`'s: `~/.config/ant` on Linux,
 `~/Library/Application Support/ant` on macOS, `%APPDATA%\ant` on Windows. A

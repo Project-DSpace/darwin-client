@@ -102,12 +102,18 @@ pub type PeerAddresses = Vec<(PeerId, Vec<MultiAddr>)>;
 /// Nine is the nodes' storage retention width: the close group
 /// ([`ant_protocol::CLOSE_GROUP_SIZE`], seven) plus the storage admission
 /// margin of two (darwin-node's `storage_admission_width`, in
-/// `src/replication/config.rs`). A node keeps and serves a record it admitted
-/// while it was among the nine nodes nearest the record. A bootstrap peer that
-/// is among the nine nodes nearest an address out of the whole network is also
-/// among the nine nearest out of the bootstrap peers, so asking the nine
-/// bootstrap peers nearest the address asks every bootstrap peer that can hold
-/// the record.
+/// `src/replication/config.rs`). A node is responsible for a record, and
+/// replication stores it there, while the node is among the nine nodes nearest
+/// the record by its own routing table. A bootstrap peer that is among the nine
+/// nodes nearest an address out of the whole network is also among the nine
+/// nearest out of the bootstrap peers, so the nine bootstrap peers nearest the
+/// address include every bootstrap peer responsible for the record.
+///
+/// An upload can also leave a chunk farther out: it moves past close-group
+/// nodes that fail or are full to the next nearest, up to the twentieth
+/// ([`crate::data::client::PUT_TARGET_WIDTH`]), and nodes keep what they hold
+/// while their disk has room. A copy left that way on a bootstrap peer past the
+/// ninth is not looked for there.
 pub(crate) const MAX_BOOTSTRAP_READ_PEERS: usize = ant_protocol::CLOSE_GROUP_SIZE + 2;
 
 /// The bootstrap peers among `seeds` that a read of `target` asks: the
@@ -357,8 +363,8 @@ impl Network {
     }
 
     /// The bootstrap addresses chunk and pointer reads also ask, as the
-    /// network was given them. A read asks the nine nearest the address read
-    /// of those that carry a peer ID.
+    /// network was given them. Of those that carry a peer ID, a read asks the
+    /// nine nearest the address read.
     #[must_use]
     #[cfg(feature = "native")]
     pub fn bootstrap_peers(&self) -> &[MultiAddr] {
