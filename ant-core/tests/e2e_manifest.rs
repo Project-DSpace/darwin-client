@@ -462,6 +462,82 @@ async fn a_build_stores_each_file_in_an_envelope_with_its_record() {
     testnet.teardown().await;
 }
 
+/// A file uploaded in a readable envelope, unlisted or listed, is added to a
+/// manifest by the envelope's address, as `darwin manifest create
+/// --embed-public` adds it, and extracts to its bytes. Its plain data map's
+/// address, an embedded entry's identity, holds nothing.
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn readable_envelopes_added_by_their_address_extract() {
+    let (client, testnet) = setup().await;
+    let source = TempDir::new().unwrap();
+    let mut builder = ManifestBuilder::new(&client, BuildOptions::default());
+    let mut expected = Vec::new();
+    for (name, options, fill) in [
+        ("unlisted.bin", EnvelopeOptions::unlisted(), 0x61u8),
+        ("listed.bin", EnvelopeOptions::listed(), 0x62),
+    ] {
+        let path = source.path().join(name);
+        fs::write(&path, vec![fill; FILE_BYTES]).unwrap();
+        let result = client
+            .file_upload_with_visibility_and_progress(
+                &path,
+                PaymentMode::Single,
+                Visibility::Envelope(options.clone()),
+                None,
+            )
+            .await
+            .expect("upload");
+        let envelope = result.envelope.clone().expect("an envelope");
+        let address = envelope.address();
+        assert_eq!(result.data_map_address, Some(address));
+        // What `--embed-public` reads at the address: the readable envelope.
+        let chunk = client
+            .chunk_get(&address)
+            .await
+            .expect("fetch")
+            .expect("the envelope is stored");
+        let stored = Envelope::from_bytes(&chunk.content).expect("an envelope");
+        assert!(!stored.is_withheld());
+        assert_eq!(stored.flags(), options.flags());
+        assert!(client
+            .chunk_get(&data_map_address(&result.data_map).unwrap())
+            .await
+            .expect("fetch")
+            .is_none());
+        if envelope.proof.is_some() {
+            forget_upload_record(&address).expect("forget the kept record");
+        }
+        builder
+            .add_public(address, Some(name.into()), None)
+            .unwrap();
+        expected.push((name, vec![fill; FILE_BYTES]));
+    }
+    let built = builder.finish(None).await.expect("build");
+    assert_eq!(built.files_uploaded, 0);
+    assert!(built
+        .manifest
+        .entries
+        .iter()
+        .all(|entry| matches!(entry.source, ContentRef::Public { .. })));
+    let out = TempDir::new().unwrap();
+    let report = extract_manifest(
+        &client,
+        &built.manifest,
+        &extract_options(out.path(), vec![]),
+        None,
+    )
+    .await
+    .expect("extract");
+    assert_eq!(report.written(), 2, "{:?}", report.entries);
+    for (name, bytes) in expected {
+        assert_eq!(fs::read(out.path().join(name)).unwrap(), bytes, "{name}");
+    }
+
+    drop(client);
+    testnet.teardown().await;
+}
+
 #[tokio::test(flavor = "multi_thread")]
 #[serial]
 async fn compact_mode_uses_public_addresses_only_when_the_datamap_is_on_the_network() {

@@ -143,6 +143,9 @@ told apart by the commit `darwin --version` prints. Upstream's entries follow.
   to the manifest, also when the build fails or is cancelled. In the library,
   `Visibility::default()` (so `BuildOptions::default()`) is that private envelope, and
   `BuildResult::envelopes` carries each uploaded file's envelope and record.
+  `darwin manifest create --embed-public` adds a file stored with an envelope by the envelope's
+  address, which keeps its payment record, without embedding its data map, and refuses a
+  private file's envelope.
   `darwin manifest export --compact` looks for a file's plain data map chunk, so it counts a
   readable file stored with an envelope as still private, and offers to publish its data map
   again, at a second address without an envelope. The vendored ant-protocol is 5.0.0, still

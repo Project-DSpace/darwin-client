@@ -19,17 +19,17 @@ use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use ant_core::ant_listings::EnvelopeProof;
+use ant_core::ant_listings::{is_envelope, Envelope, EnvelopeProof};
 use ant_core::data::manifest::path::PATH_SEPARATOR;
 use ant_core::data::{
-    apply_compaction, data_map_address, default_history_dir, embeddable_data_map, extract_manifest,
-    forget_upload_record, format_timestamp, is_link, list_uploads, load_upload,
+    apply_compaction, compute_address, data_map_address, default_history_dir, embeddable_data_map,
+    extract_manifest, forget_upload_record, format_timestamp, is_link, list_uploads, load_upload,
     manifest_filename_for, manifest_link_bytes, manifest_link_from_bytes, parse_link,
     plan_compaction, publish_data_maps, read_manifest_file, record_upload, write_manifest_file,
-    BuildEvent, BuildOptions, BuildResult, Client, CollisionPolicy, ContentRef, DownloadEvent,
-    EntryStatus, EnvelopeOptions, ExtractEvent, ExtractOptions, Link, Manifest, ManifestBuilder,
-    ManifestError, PaymentMode, ReferenceMode, TorrentReference, UploadEvent, UploadRecord,
-    UploadedEnvelope, MANIFEST_LINK_RECOMMENDED_MAX_BYTES,
+    BuildEvent, BuildOptions, BuildResult, Client, CollisionPolicy, ContentRef, DataMap,
+    DownloadEvent, EntryStatus, EnvelopeOptions, ExtractEvent, ExtractOptions, Link, Manifest,
+    ManifestBuilder, ManifestError, PaymentMode, ReferenceMode, TorrentReference, UploadEvent,
+    UploadRecord, UploadedEnvelope, MANIFEST_LINK_RECOMMENDED_MAX_BYTES,
 };
 use ant_core::datamap_file::write_upload_files;
 use clap::Subcommand;
@@ -95,8 +95,11 @@ pub enum ManifestAction {
         /// Add an already-public file by address, optionally under PATH.
         #[arg(long = "public-file", value_name = "ADDRESS[=PATH]")]
         public_files: Vec<String>,
-        /// Add an already-public file by address but fetch its DataMap and
-        /// embed it, so recipients skip the DataMap fetch. Needs the network,
+        /// Add an already-public file by address, fetching its DataMap and
+        /// embedding it so recipients skip the DataMap fetch. A file stored
+        /// with an envelope (as `darwin file upload --public` stores it) is
+        /// added by its envelope address instead, which keeps its payment
+        /// record; a private file's envelope is refused. Needs the network,
         /// no wallet.
         #[arg(long = "embed-public", value_name = "ADDRESS[=PATH]")]
         embed_public: Vec<String>,
@@ -493,6 +496,43 @@ struct CreateArgs {
     link: bool,
 }
 
+/// What `--embed-public` does with the record stored at a file's address.
+#[derive(Debug)]
+enum EmbedChoice {
+    /// A plain data map: embed it, as upstream does.
+    Embed(DataMap),
+    /// A readable envelope, as `darwin file upload` stores one: the file is
+    /// added by the envelope's address, the file's address, which keeps its
+    /// payment record. Its data map is not embedded: an embedded entry is
+    /// known by its plain data map's address, where nothing is stored, and
+    /// compacting would then offer to store a second copy without an
+    /// envelope.
+    ByEnvelopeAddress,
+    /// A private file's envelope: it withholds the data map.
+    Withheld,
+    /// Neither a data map nor a valid envelope, and why.
+    Invalid(String),
+}
+
+/// How `--embed-public` adds the file whose record `bytes` was read from
+/// `address`.
+fn embed_choice(address: &[u8; 32], bytes: &[u8]) -> EmbedChoice {
+    if compute_address(bytes) != *address {
+        return EmbedChoice::Invalid("the record does not hash to its address".into());
+    }
+    if is_envelope(bytes) {
+        return match Envelope::from_bytes(bytes) {
+            Ok(envelope) if envelope.is_withheld() => EmbedChoice::Withheld,
+            Ok(_) => EmbedChoice::ByEnvelopeAddress,
+            Err(e) => EmbedChoice::Invalid(format!("not a valid envelope: {e}")),
+        };
+    }
+    match rmp_serde::from_slice::<DataMap>(bytes) {
+        Ok(map) => EmbedChoice::Embed(map),
+        Err(e) => EmbedChoice::Invalid(format!("not a data map: {e}")),
+    }
+}
+
 /// The upload options `create`'s flags ask for: those `darwin file upload`
 /// takes, with no envelope metadata (`--name` names the manifest).
 fn create_upload_options(choices: &EnvelopeChoices) -> anyhow::Result<EnvelopeOptions> {
@@ -545,24 +585,54 @@ async fn create(client: &Client, args: CreateArgs, json: bool) -> anyhow::Result
     }
     for spec in &args.embed_public {
         let (address, path) = parse_public_file(spec)?;
-        info!("Fetching public DataMap {}", hex::encode(address));
-        let data_map = client.data_map_fetch(&address).await.map_err(|e| {
-            anyhow::anyhow!("Failed to fetch DataMap {}: {e}", hex::encode(address))
-        })?;
-        // Embed the root map when it is small enough: recipients then start
-        // on data chunks with no wrapper-record fetches.
-        let data_map = embeddable_data_map(client, &data_map).await?;
-        // An entry's identity is derived from its DataMap. A map stored in
-        // some other form than an upload publishes would derive a different
-        // address, so such a file is referenced by its address instead.
-        if data_map_address(&data_map)? == address {
-            builder.add_embedded(data_map, path, None)?;
-        } else {
-            eprintln!(
-                "warning: the DataMap at {} is not in published form; adding it by address",
-                hex::encode(address)
-            );
-            builder.add_public(address, path, None)?;
+        let hex_address = hex::encode(address);
+        info!("Fetching public DataMap {hex_address}");
+        // The record at the address, fetched once: a plain data map, or an
+        // envelope as `darwin file upload` stores one.
+        let record = client
+            .chunk_get(&address)
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to fetch DataMap {hex_address}: {e}"))?
+            .ok_or_else(|| {
+                anyhow::anyhow!("Failed to fetch DataMap {hex_address}: nothing is stored there")
+            })?;
+        match embed_choice(&address, &record.content) {
+            EmbedChoice::Embed(data_map) => {
+                // Embed the root map when it is small enough: recipients then
+                // start on data chunks with no wrapper-record fetches.
+                let data_map = embeddable_data_map(client, &data_map).await?;
+                // An entry's identity is derived from its DataMap. A map
+                // stored in some other form than an upload publishes would
+                // derive a different address, so such a file is referenced by
+                // its address instead.
+                if data_map_address(&data_map)? == address {
+                    builder.add_embedded(data_map, path, None)?;
+                } else {
+                    eprintln!(
+                        "warning: the DataMap at {hex_address} is not in published form; \
+                         adding it by address"
+                    );
+                    builder.add_public(address, path, None)?;
+                }
+            }
+            EmbedChoice::ByEnvelopeAddress => {
+                // Never the envelope's data map: an embedded entry is known
+                // by its plain data map's address, where nothing is stored.
+                eprintln!(
+                    "note: {hex_address} is added by its envelope address, which keeps its \
+                     payment record; its data map is not embedded"
+                );
+                builder.add_public(address, path, None)?;
+            }
+            EmbedChoice::Withheld => anyhow::bail!(
+                "--embed-public {hex_address}: this address holds a private file's envelope: its \
+                 data map is withheld (the envelope stores only a salted hash of it), so the file \
+                 can be read only with the uploader's data map, and can't be added to a manifest \
+                 by its address. Nothing was uploaded or paid."
+            ),
+            EmbedChoice::Invalid(why) => {
+                anyhow::bail!("Failed to fetch DataMap {hex_address}: {why}")
+            }
         }
     }
     if builder.pending_count() == 0 && args.public_files.is_empty() && args.embed_public.is_empty()
@@ -2102,5 +2172,85 @@ mod tests {
         .is_err());
         assert!(action(&["test", "list"]).validate().is_ok());
         assert!(action(&["test", "show", "x.darwin"]).validate().is_ok());
+    }
+
+    /// `--embed-public` embeds a plain data map, adds a readable envelope by
+    /// its address without embedding its data map, and refuses a private
+    /// file's envelope, before anything is uploaded or paid.
+    #[test]
+    fn embed_public_embeds_plain_maps_and_adds_envelopes_by_address() {
+        use ant_core::ant_listings::{self_encryption, Metadata, ShownFields};
+        let (map, _) = self_encryption::encrypt(bytes::Bytes::from(vec![6u8; 4_000])).unwrap();
+        let record = |bytes: Vec<u8>| (compute_address(&bytes), bytes);
+
+        // A plain data map, as a readable upload with no envelope stores it.
+        let (address, bytes) = record(rmp_serde::to_vec(&map).unwrap());
+        match embed_choice(&address, &bytes) {
+            EmbedChoice::Embed(embedded) => assert!(embedded == map),
+            other => panic!("expected the data map to embed, got {other:?}"),
+        }
+
+        // Readable envelopes, in the index or not, whatever they show and
+        // whatever their metadata.
+        for in_index in [false, true] {
+            for shown in [ShownFields::ALL, ShownFields::NONE] {
+                for metadata in [
+                    Metadata::default(),
+                    Metadata {
+                        content_type: Some("text/plain".into()),
+                        name: Some("notes.txt".into()),
+                    },
+                ] {
+                    let envelope = Envelope::readable(&map, metadata, shown, in_index).unwrap();
+                    let (address, bytes) = record(envelope.to_bytes());
+                    assert_eq!(address, envelope.address());
+                    assert!(
+                        matches!(
+                            embed_choice(&address, &bytes),
+                            EmbedChoice::ByEnvelopeAddress
+                        ),
+                        "in_index {in_index}, shown {shown:?}"
+                    );
+                }
+            }
+        }
+
+        // A private file's envelope withholds its data map, listed or not.
+        for in_index in [false, true] {
+            let envelope = Envelope::withheld(
+                &map,
+                &[3; 32],
+                Metadata::default(),
+                ShownFields::ALL,
+                in_index,
+            )
+            .unwrap();
+            let (address, bytes) = record(envelope.to_bytes());
+            assert!(matches!(
+                embed_choice(&address, &bytes),
+                EmbedChoice::Withheld
+            ));
+        }
+
+        // Bytes that don't hash to the address, that are no data map, or a
+        // damaged envelope.
+        let envelope = Envelope::readable(&map, Metadata::default(), ShownFields::ALL, false)
+            .unwrap()
+            .to_bytes();
+        assert!(matches!(
+            embed_choice(&[0; 32], &envelope),
+            EmbedChoice::Invalid(_)
+        ));
+        let (address, bytes) = record(b"not a data map".to_vec());
+        assert!(matches!(
+            embed_choice(&address, &bytes),
+            EmbedChoice::Invalid(_)
+        ));
+        let (address, bytes) = record(envelope[..8].to_vec());
+        assert!(is_envelope(&bytes));
+        assert!(matches!(
+            embed_choice(&address, &bytes),
+            EmbedChoice::Invalid(_)
+        ));
     }
 }
