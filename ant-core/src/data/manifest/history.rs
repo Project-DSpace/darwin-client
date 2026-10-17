@@ -1,5 +1,11 @@
 //! Upload history: one manifest file per upload, kept under the data
-//! directory so every upload can be listed and downloaded again later.
+//! directory so an upload can be listed and downloaded again later.
+//!
+//! The history is this client's own folder, `darwin-uploads`, in the data
+//! directory it shares with Autonomi's `ant`, which keeps its history in
+//! `uploads`: neither lists or loads the other's records. A record holds
+//! what its caller recorded; the `darwin` CLI records readable uploads only,
+//! by the address each one stored, so no private data map is kept here.
 //!
 //! A record is an ordinary manifest file named `<timestamp>-<label>.darwin`,
 //! for example `20261006T140311Z-holiday-photos.darwin`. The filename stem is the
@@ -23,8 +29,10 @@ use super::{Manifest, ManifestError, MANIFEST_EXTENSION};
 #[cfg(test)]
 use super::{ContentRef, ManifestEntry};
 
-/// Directory under the data directory that holds upload records.
-pub const UPLOAD_HISTORY_DIR: &str = "uploads";
+/// Directory under the data directory that holds upload records. It is this
+/// client's own: Autonomi's `ant`, which shares the data directory, writes
+/// its upload history to `uploads`.
+pub const UPLOAD_HISTORY_DIR: &str = "darwin-uploads";
 /// Label used when an upload has no name.
 const DEFAULT_LABEL: &str = "upload";
 /// Longest label kept in an id.
@@ -98,10 +106,15 @@ pub struct UploadListing {
     pub unreadable: Vec<(PathBuf, String)>,
 }
 
-/// The default history directory: `<data dir>/uploads`.
+/// The default history directory: `<data dir>/darwin-uploads`.
 pub fn default_history_dir() -> Result<PathBuf, ManifestError> {
     let data_dir = crate::config::data_dir().map_err(|e| ManifestError::Build(e.to_string()))?;
-    Ok(data_dir.join(UPLOAD_HISTORY_DIR))
+    Ok(history_dir_in(&data_dir))
+}
+
+/// The history directory under the data directory `data_dir`.
+fn history_dir_in(data_dir: &Path) -> PathBuf {
+    data_dir.join(UPLOAD_HISTORY_DIR)
 }
 
 /// Write `manifest` into `dir` as a new record and return it.
@@ -451,5 +464,81 @@ mod tests {
         assert_eq!(listing.records.len(), 3);
         assert_eq!(listing.unreadable.len(), 1);
         assert!(first.path.to_string_lossy().ends_with(".darwin"));
+    }
+
+    /// The history is darwin's own folder in the shared data directory, not
+    /// the `uploads` folder Autonomi's `ant` writes.
+    #[test]
+    fn the_history_is_darwins_own_folder() {
+        assert_eq!(UPLOAD_HISTORY_DIR, "darwin-uploads");
+        let dir = default_history_dir().unwrap();
+        assert!(dir.ends_with("darwin-uploads"), "{}", dir.display());
+        assert!(!dir.ends_with("uploads"), "{}", dir.display());
+        assert_eq!(
+            dir.parent(),
+            Some(crate::config::data_dir().unwrap().as_path())
+        );
+    }
+
+    /// A record Autonomi's `ant` left in `<data dir>/uploads` is neither
+    /// listed nor loaded by id: it may hold a private file's data map, and it
+    /// is not this client's upload.
+    #[test]
+    fn records_in_upstreams_uploads_folder_are_not_read() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let upstream = data_dir.path().join("uploads");
+        let theirs = record_upload(&upstream, &manifest(Some("theirs"), 4), None).unwrap();
+        // As upstream names its records.
+        fs::copy(&theirs.path, upstream.join(format!("{}.ant", theirs.id))).unwrap();
+        let ours = history_dir_in(data_dir.path());
+        assert_ne!(ours, upstream);
+        assert!(list_uploads(&ours).unwrap().records.is_empty());
+        assert!(load_upload(&ours, &theirs.id).unwrap().is_none());
+        // This client's own records are found.
+        let mine = record_upload(&ours, &manifest(Some("mine"), 5), None).unwrap();
+        let listing = list_uploads(&ours).unwrap();
+        assert_eq!(listing.records.len(), 1);
+        assert_eq!(listing.records[0].id, mine.id);
+        assert!(load_upload(&ours, &mine.id).unwrap().is_some());
+    }
+
+    /// A record, or any manifest file, can hold a data map that reads a
+    /// file: each is written through tempfile, which creates files
+    /// owner-only (0600) on Unix, also when one replaces an older file.
+    /// This pins that, with no chmod that could fail a write made after an
+    /// upload was paid.
+    #[cfg(unix)]
+    #[test]
+    fn records_and_manifests_are_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let owner_only = |path: &Path| {
+            let mode = fs::metadata(path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o077, 0, "{} is {mode:o}", path.display());
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let history = dir.path().join(UPLOAD_HISTORY_DIR);
+        // Records with one label, until two land in the same second and the
+        // later one takes a collision suffix.
+        let mut suffixed = false;
+        for seed in 0..1_000u32 {
+            let record =
+                record_upload(&history, &manifest(Some("same"), seed as u8), None).unwrap();
+            owner_only(&record.path);
+            if id_sort_key(&record.id).1 > FIRST_ID_SEQUENCE {
+                suffixed = true;
+                break;
+            }
+        }
+        assert!(suffixed, "no record took a collision suffix");
+        // A new manifest file (persist_noclobber).
+        let fresh = dir.path().join("fresh.darwin");
+        write_manifest_file(&fresh, &manifest(None, 3), false).unwrap();
+        owner_only(&fresh);
+        // One that replaces a world-readable file (persist).
+        let replaced = dir.path().join("replaced.darwin");
+        fs::write(&replaced, b"old").unwrap();
+        fs::set_permissions(&replaced, fs::Permissions::from_mode(0o644)).unwrap();
+        write_manifest_file(&replaced, &manifest(None, 4), true).unwrap();
+        owner_only(&replaced);
     }
 }

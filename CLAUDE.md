@@ -80,7 +80,7 @@ ant-core/src/
 │       ├── path.rs           # Portable path rules (cross-platform, enforced everywhere)
 │       ├── link.rs           # darwin://<address> and darwin://manifest/<base64url> links (ant:// read too)
 │       ├── file.rs           # .darwin file read/write (.ant files read too)
-│       ├── history.rs        # Upload history: one .darwin per upload under <data dir>/uploads
+│       ├── history.rs        # Upload history: one .darwin per readable upload under <data dir>/darwin-uploads
 │       ├── wire.rs           # Manifest-owned DataMap layout; pre-decode structure check
 │       ├── build.rs          # ManifestBuilder (uploads files, embedded or compact refs)
 │       ├── embed.rs          # Root-vs-shrunk DataMap choice for embedding
@@ -161,9 +161,10 @@ cargo run --bin darwin -- --help  # Run the CLI
   is shared off-network; only the files it references live on the network. `darwin://<hex>` is always
   a plain file link. `darwin://` links and `.darwin` files are what the client writes; upstream's
   `ant://` and `.ant` are also read, and the format's magic (`\xC1ANT`) and version stay upstream's.
-  Every upload (`darwin file upload`, `darwin manifest create`) is also recorded as
-  a manifest under `<data dir>/uploads/`; `darwin manifest list` shows them and `show`/`link`/`export`/`download`
-  accept a record id. Entry paths obey the portable rules in `data/manifest/path.rs` at build,
+  Every readable upload (`darwin file upload` by its address, `darwin manifest create` as written) is
+  also recorded as a manifest under `<data dir>/darwin-uploads/` (Autonomi's `ant` uses `uploads/`);
+  private uploads are not recorded, so no private data map is kept in the data directory.
+  `darwin manifest list` shows them and `show`/`link`/`export`/`download` accept a record id. Entry paths obey the portable rules in `data/manifest/path.rs` at build,
   decode and extract time, and extraction never follows symlinks inside the output directory.
   See `docs/adr/ADR-0006-file-manifests-and-links.md`.
 - **Log forwarding is opt-in and node-logging-dependent**: `darwin node logs forward enable` is the

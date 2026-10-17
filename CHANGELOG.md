@@ -129,9 +129,13 @@ told apart by the commit `darwin --version` prints. Upstream's entries follow.
   (`darwin manifest`), large-file downloads in the browser, and concurrent reads that share their
   chunk fetches. Here links are `darwin://` links and manifest files `.darwin` files; upstream's
   `ant://` links and `.ant` files are also read, and the manifest format's magic bytes and
-  version stay upstream's. Uploads are recorded in the upload history, as manifests under
-  `<data dir>/uploads/` that `darwin manifest list` lists and `darwin manifest download` fetches
-  again; the record of a `darwin file upload` holds the file's data map, a private upload's too.
+  version stay upstream's. Readable uploads are recorded in the upload history, as manifests
+  that `darwin manifest list` lists and `darwin manifest download` fetches again, under
+  `<data dir>/darwin-uploads/`: darwin's own folder, since Autonomi's `ant` keeps its history in
+  `uploads/` in the same data directory. A `darwin file upload` is recorded by the address it
+  stored (its envelope's), whatever its metadata or hidden fields. Private uploads are not
+  recorded, so no private data map is kept under the data directory: it stays in the upload's
+  `.datamap` and `.record`, or in the manifest file written.
   Here `darwin manifest create` uploads each file as `darwin file upload` uploads it, with the
   same `--visibility`, `--public`, `--readable`, `--index` and `--hide` choices: private by
   default, in an envelope that shows every payment field, with the same warnings first, paid

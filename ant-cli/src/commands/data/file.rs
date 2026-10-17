@@ -11,11 +11,11 @@ use tracing::info;
 use ant_core::ant_listings::{EnvelopeProof, Metadata, PaymentField, ShownFields};
 use ant_core::data::manifest::path::portable_component;
 use ant_core::data::{
-    embeddable_data_map, file_data_map, forget_upload_record, parse_link, proof_data_map,
-    shown_after_hiding, spawn_download_diagnostics_writer, Client, CollisionPolicy, ContentRef,
-    CostEstimateConfidence, DownloadEvent, EnvelopeOptions, Error as DataError, EvmNetwork,
-    FileChunkPeerReport, FileChunkPeerReportPeer, FileChunkPeerStatus, FileChunkPeerSweepReport,
-    Link, ListingChain, Manifest, ManifestEntry, PaymentMode, UploadEvent,
+    file_data_map, forget_upload_record, parse_link, proof_data_map, shown_after_hiding,
+    spawn_download_diagnostics_writer, Client, CollisionPolicy, ContentRef, CostEstimateConfidence,
+    DownloadEvent, EnvelopeOptions, Error as DataError, EvmNetwork, FileChunkPeerReport,
+    FileChunkPeerReportPeer, FileChunkPeerStatus, FileChunkPeerSweepReport, Link, ListingChain,
+    Manifest, ManifestEntry, PaymentMode, UploadEvent,
 };
 use ant_core::datamap_file::{
     original_name_from_datamap, read_datamap, read_record, record_path_for, write_record,
@@ -639,33 +639,13 @@ async fn handle_file_upload(
         }
     }
 
-    // Every upload is remembered as a one-entry manifest in the upload
-    // history (ADR-0006), so it can be listed and downloaded again. The
-    // DataMap is embedded whether or not the upload was public, as the root
-    // map when that is small enough so a later download starts on data
-    // chunks at once; if resolving the root fails the shrunk map is kept.
-    // A file name that breaks the portable path rules is repaired, or
-    // dropped so the entry extracts under its content address, rather than
-    // losing the record.
-    let recorded_map = match embeddable_data_map(client, &result.data_map).await {
-        Ok(map) => map,
-        Err(e) => {
-            eprintln!("warning: could not resolve the root DataMap for the upload history: {e}");
-            result.data_map.clone()
-        }
-    };
-    let history_entry = Manifest {
-        name: None,
-        torrent: None,
-        entries: vec![ManifestEntry {
-            path: portable_component(&original_name),
-            size: Some(file_size),
-            source: ContentRef::Embedded {
-                data_map: recorded_map,
-            },
-        }],
-    };
-    let manifest_id = record_upload_manifest(&history_entry, Some(&original_name));
+    // A readable upload is remembered as a one-entry manifest in the upload
+    // history (ADR-0006), naming the file by the address the upload stored,
+    // so it can be listed and downloaded again. A private upload is not: its
+    // data map stays only in its .datamap and .record.
+    let manifest_id =
+        history_entry_for(&options, result.data_map_address, &original_name, file_size)
+            .and_then(|entry| record_upload_manifest(&entry, Some(&original_name)));
 
     let address = result.data_map_address.map(hex::encode);
     if options.readable && address.is_none() {
@@ -758,6 +738,9 @@ async fn handle_file_upload(
         println!("Download this file with:");
         println!("  darwin file download --datamap {}", datamap.display());
     }
+    if manifest_id.is_none() && !options.readable {
+        println!("{NOT_RECORDED_PRIVATE_UPLOAD}");
+    }
     print_recorded(manifest_id.as_deref());
     if let Some(record) = &files.record {
         println!("Prove this upload to anyone with:");
@@ -776,6 +759,39 @@ async fn handle_file_upload(
         result.total_chunks
     );
     Ok(())
+}
+
+/// What a private upload says in place of its upload history id.
+const NOT_RECORDED_PRIVATE_UPLOAD: &str = "Not recorded in the upload history: a private \
+     upload's data map stays only in its .datamap and .record.";
+
+/// The upload history's entry for an upload with `options` that stored its
+/// file at `address` (`FileUploadResult::data_map_address`): a one-entry
+/// manifest naming the file by that address, the envelope's or, without an
+/// envelope, the plain data map chunk's, so the file is fetched as the
+/// upload stored it, whatever its metadata or hidden fields. `None` for a
+/// private upload: its data map is kept only in its `.datamap` and
+/// `.record`, never under the client's data directory. A file name that
+/// breaks the portable path rules is repaired, or dropped so the entry
+/// extracts under its address.
+fn history_entry_for(
+    options: &EnvelopeOptions,
+    address: Option<[u8; 32]>,
+    original_name: &str,
+    size: u64,
+) -> Option<Manifest> {
+    if !options.readable {
+        return None;
+    }
+    Some(Manifest {
+        name: None,
+        torrent: None,
+        entries: vec![ManifestEntry {
+            path: portable_component(original_name),
+            size: Some(size),
+            source: ContentRef::Public { address: address? },
+        }],
+    })
 }
 
 /// The `mode` an upload's JSON reports, as before envelopes: `listed`,
@@ -2342,6 +2358,65 @@ mod tests {
         }
         assert!(upload(&["--name", "a/b"]).is_err());
         assert!(upload(&["--content-type", "not a type"]).is_err());
+    }
+
+    /// Only a readable upload is recorded in the upload history, as a
+    /// manifest naming the file by the address the upload stored, never by
+    /// an embedded data map. A private upload's data map stays only in its
+    /// .datamap and .record.
+    #[test]
+    fn only_readable_uploads_are_recorded_and_by_their_address() {
+        let address = [0x42; 32];
+        let dated = EnvelopeOptions {
+            in_index: true,
+            ..EnvelopeOptions::private()
+        };
+        for private in [
+            EnvelopeOptions::private(),
+            EnvelopeOptions::private().hiding(PaymentField::ALL),
+            dated,
+            upload(&["--name", "notes.txt"]).unwrap(),
+        ] {
+            assert!(!private.readable);
+            assert_eq!(history_entry_for(&private, None, "notes.txt", 10), None);
+            assert_eq!(
+                history_entry_for(&private, Some(address), "notes.txt", 10),
+                None
+            );
+        }
+        for readable in [
+            upload(&["--public"]).unwrap(),
+            upload(&["--visibility", "listed"]).unwrap(),
+            upload(&["--public", "--hide", "all"]).unwrap(),
+            upload(&["--public", "--name", "notes.txt", "--hide", "quote"]).unwrap(),
+        ] {
+            let entry = history_entry_for(&readable, Some(address), "notes.txt", 10)
+                .expect("a readable upload is recorded");
+            assert_eq!(
+                entry,
+                Manifest {
+                    name: None,
+                    torrent: None,
+                    entries: vec![ManifestEntry {
+                        path: Some("notes.txt".into()),
+                        size: Some(10),
+                        source: ContentRef::Public { address },
+                    }],
+                }
+            );
+            // A readable upload always has an address; without one there is
+            // nothing to record.
+            assert_eq!(history_entry_for(&readable, None, "notes.txt", 10), None);
+        }
+        // A name the portable path rules refuse is dropped: the entry is
+        // then named by its address.
+        let entry = history_entry_for(&EnvelopeOptions::unlisted(), Some(address), "..", 10)
+            .expect("recorded");
+        assert_eq!(entry.entries[0].path, None);
+        assert_eq!(
+            entry.entries[0].effective_name().unwrap(),
+            hex::encode(address)
+        );
     }
 
     #[test]

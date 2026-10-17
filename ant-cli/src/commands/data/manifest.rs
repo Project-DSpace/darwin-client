@@ -5,9 +5,13 @@
 //! never stored on the network. Upstream's `.ant` files and `ant://` links
 //! are read too.
 //!
-//! Every upload the CLI performs is also recorded as a manifest in the upload
-//! history under the data directory, so `darwin manifest list` can show it
-//! and `darwin manifest download <ID>` can fetch it again.
+//! Every readable upload the CLI performs is also recorded as a manifest in
+//! the upload history, `darwin-uploads` under the data directory, so
+//! `darwin manifest list` can show it and `darwin manifest download <ID>`
+//! can fetch it again: a `darwin file upload` by the address it stored, a
+//! `darwin manifest create` as the manifest written. A private upload is not
+//! recorded: its data map stays only in its `.datamap` and `.record`, or in
+//! the manifest file written.
 
 use std::ffi::OsString;
 use std::io::{self, BufRead, IsTerminal, Write};
@@ -580,6 +584,9 @@ async fn create(client: &Client, args: CreateArgs, json: bool) -> anyhow::Result
     for warning in &warnings {
         eprintln!("warning: {warning}");
     }
+    // A manifest of private uploads is not recorded in the upload history:
+    // their data maps stay only in their records and the manifest file.
+    let private = uploads_are_private(&args.upload, builder.pending_count() > 0);
 
     info!("Building manifest from {} file(s)", builder.pending_count());
     let start = Instant::now();
@@ -595,7 +602,7 @@ async fn create(client: &Client, args: CreateArgs, json: bool) -> anyhow::Result
 
     let (result, history_id, records) = record_build_result(
         built,
-        |manifest| record_upload_manifest(manifest, None),
+        |manifest| history_record(private, manifest),
         |envelopes| save_records(&out, envelopes),
         &records_root_for(&out),
     )?;
@@ -619,6 +626,7 @@ async fn create(client: &Client, args: CreateArgs, json: bool) -> anyhow::Result
             options: &args.upload,
             records: &records,
             warnings,
+            private,
         }),
         history_id,
         args.link,
@@ -823,6 +831,28 @@ fn saved_records_message(records: &[SavedRecord], records_root: &Path) -> String
     }
 }
 
+/// What a manifest of private uploads says in place of its upload history id.
+const NOT_RECORDED_PRIVATE_MANIFEST: &str = "Not recorded in the upload history: a private \
+     upload's data map stays only in its .record and in the manifest file written.";
+
+/// Whether a build that uploads files (`uploading`) with `options` makes a
+/// manifest of private uploads, whose data maps it embeds.
+fn uploads_are_private(options: &EnvelopeOptions, uploading: bool) -> bool {
+    uploading && !options.readable
+}
+
+/// Record a built manifest in the upload history, unless it holds private
+/// uploads (`private`): their data maps are kept only in their records and
+/// the manifest file the user chose, never under the client's data
+/// directory.
+fn history_record(private: bool, manifest: &Manifest) -> Option<String> {
+    if private {
+        None
+    } else {
+        record_upload_manifest(manifest, None)
+    }
+}
+
 /// What `create` reports about the files it uploaded.
 struct UploadReport<'a> {
     result: &'a BuildResult,
@@ -832,6 +862,9 @@ struct UploadReport<'a> {
     records: &'a [SavedRecord],
     /// What the choices give away, as said before uploading.
     warnings: Vec<String>,
+    /// Whether the files were uploaded private, so the manifest was not
+    /// recorded in the upload history.
+    private: bool,
 }
 
 /// One uploaded file's envelope and record in `create`'s JSON: its path and
@@ -1033,6 +1066,8 @@ fn report_created(
     }
     if let Some(id) = history_id {
         println!("Recorded as {id} (darwin manifest download {id})");
+    } else if uploads.is_some_and(|uploads| uploads.private) {
+        println!("{NOT_RECORDED_PRIVATE_MANIFEST}");
     }
     if let Some((link, len)) = link_text {
         warn_if_long_link(len);
@@ -1979,6 +2014,37 @@ mod tests {
             assert!(create_options(flags).is_err(), "{flags:?}");
             assert!(file_upload_options(flags).is_err(), "{flags:?}");
         }
+    }
+
+    /// A manifest of private uploads is not recorded in the upload history:
+    /// their data maps stay in their records and the manifest file. One of
+    /// readable uploads, or one that uploads nothing, is recorded.
+    #[test]
+    fn a_manifest_of_private_uploads_is_not_recorded() {
+        for flags in [
+            &[][..],
+            &["--hide", "all"],
+            &["--index", "yes"],
+            &["--visibility", "private"],
+        ] {
+            assert!(
+                uploads_are_private(&create_options(flags).unwrap(), true),
+                "{flags:?}"
+            );
+            assert!(!uploads_are_private(&create_options(flags).unwrap(), false));
+        }
+        for flags in [
+            &["--public"][..],
+            &["--visibility", "listed"],
+            &["--readable", "yes"],
+            &["--public", "--hide", "all"],
+        ] {
+            assert!(
+                !uploads_are_private(&create_options(flags).unwrap(), true),
+                "{flags:?}"
+            );
+        }
+        assert_eq!(history_record(true, &one_entry_manifest()), None);
     }
 
     /// `--name` names the manifest; a manifest's files get no envelope
