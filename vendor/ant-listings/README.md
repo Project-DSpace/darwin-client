@@ -22,7 +22,7 @@ The usual names cover three of the read and index combinations:
 The fourth, in the index with the data map withheld, is a public, dated record
 of a file nobody can read until the uploader reveals it. An upload that hides
 all five payment fields, stays out of the index and has no metadata needs no
-envelope, and is stored as plain Autonomi data.
+envelope, and is stored as plain Darwin data.
 
 Nodes that support envelopes recognise them as they store chunks, find the
 on-chain payment for each one, record a listing with the fields the envelope
