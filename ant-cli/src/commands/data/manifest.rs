@@ -1315,4 +1315,46 @@ mod tests {
         assert!(download.needs_network());
         assert!(!download.needs_wallet());
     }
+
+    #[derive(Debug, clap::Parser)]
+    struct TestManifestCli {
+        #[command(subcommand)]
+        action: ManifestAction,
+    }
+
+    /// `create` takes the merkle flags as `darwin file upload` does:
+    /// `--no-merkle` parses, hidden from the help; `--merkle` parses, to be
+    /// refused when the command runs (file.rs's `payment_mode`), so every
+    /// file is paid per chunk; and the two together are a mistake.
+    #[test]
+    fn create_takes_the_merkle_flags_as_file_upload_does() {
+        use clap::Parser;
+        let merkle_flags = |flags: &[&str]| {
+            let mut argv = vec!["test", "create", "photos"];
+            argv.extend_from_slice(flags);
+            match TestManifestCli::try_parse_from(argv).map(|cli| cli.action) {
+                Ok(ManifestAction::Create {
+                    merkle, no_merkle, ..
+                }) => Ok((merkle, no_merkle)),
+                Ok(_) => panic!("expected create"),
+                Err(e) => Err(e.kind()),
+            }
+        };
+        assert_eq!(merkle_flags(&[]), Ok((false, false)));
+        assert_eq!(merkle_flags(&["--no-merkle"]), Ok((false, true)));
+        assert_eq!(merkle_flags(&["--merkle"]), Ok((true, false)));
+        assert_eq!(
+            merkle_flags(&["--merkle", "--no-merkle"]),
+            Err(clap::error::ErrorKind::ArgumentConflict)
+        );
+        assert!(payment_mode(true).is_err());
+        assert!(matches!(payment_mode(false), Ok(PaymentMode::Single)));
+        let help = TestManifestCli::try_parse_from(["test", "create", "--help"])
+            .expect_err("--help")
+            .to_string();
+        assert!(
+            help.contains("--merkle") && !help.contains("--no-merkle"),
+            "{help}"
+        );
+    }
 }

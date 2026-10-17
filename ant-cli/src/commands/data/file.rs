@@ -2503,6 +2503,57 @@ mod tests {
         );
     }
 
+    /// Batch (merkle) payments are refused with the reason, and every
+    /// upload pays per chunk.
+    #[test]
+    fn merkle_is_refused_and_uploads_pay_per_chunk() {
+        let refused = payment_mode(true).expect_err("--merkle is refused");
+        assert!(
+            refused.to_string().contains("Leave out --merkle"),
+            "{refused}"
+        );
+        assert!(matches!(payment_mode(false), Ok(PaymentMode::Single)));
+    }
+
+    /// `upload` and `cost` still take `--no-merkle`, hidden from the help,
+    /// so scripts that pass it run. `--merkle` parses, to be refused when
+    /// the command runs, and the two together are a mistake.
+    #[test]
+    fn upload_and_cost_take_the_merkle_flags_scripts_pass() {
+        for command in ["upload", "cost"] {
+            let merkle_flags = |flags: &[&str]| {
+                let mut argv = vec!["test", command, "notes.txt"];
+                argv.extend_from_slice(flags);
+                match TestFileCli::try_parse_from(argv).map(|cli| cli.action) {
+                    Ok(
+                        FileAction::Upload {
+                            merkle, no_merkle, ..
+                        }
+                        | FileAction::Cost {
+                            merkle, no_merkle, ..
+                        },
+                    ) => Ok((merkle, no_merkle)),
+                    Ok(_) => panic!("expected {command}"),
+                    Err(e) => Err(e.kind()),
+                }
+            };
+            assert_eq!(merkle_flags(&[]), Ok((false, false)));
+            assert_eq!(merkle_flags(&["--no-merkle"]), Ok((false, true)));
+            assert_eq!(merkle_flags(&["--merkle"]), Ok((true, false)));
+            assert_eq!(
+                merkle_flags(&["--merkle", "--no-merkle"]),
+                Err(clap::error::ErrorKind::ArgumentConflict)
+            );
+            let help = TestFileCli::try_parse_from(["test", command, "--help"])
+                .expect_err("--help")
+                .to_string();
+            assert!(
+                help.contains("--merkle") && !help.contains("--no-merkle"),
+                "{help}"
+            );
+        }
+    }
+
     #[test]
     fn the_summary_counts_the_envelope_or_data_map_once() {
         // A 3-chunk private file and its envelope: 4 stored.
