@@ -3079,6 +3079,31 @@ mod tests {
         assert_eq!(asked.len(), 7);
     }
 
+    /// A lookup that returns fewer peers than the close group does not shrink
+    /// a read's quorum: one to three peers naming the same state are fewer
+    /// than the four of seven a read needs, so the read fails with the close
+    /// group's shortfall rather than return what they name, with or without
+    /// bootstrap peers (here holding none).
+    #[tokio::test(start_paused = true)]
+    async fn a_read_of_a_short_lookup_is_a_shortfall_however_its_peers_agree() {
+        let (pk, sk) = keypair(27);
+        let held = Pointer::create(&sk, &pk, chunk_target(1)).expect("create");
+        for found in 1..=3u8 {
+            for bootstrap in [Vec::new(), (101..=109).collect::<Vec<u8>>()] {
+                let mut answers = answering(1..=found, 50, || Ok(Some(held.clone())));
+                answers.extend(answering(bootstrap.clone(), 50, || Ok(None)));
+                let (read, _, _) =
+                    simulated_read(held.address(), 0, 1..=found, bootstrap.clone(), answers).await;
+                assert!(
+                    matches!(&read, Err(Error::CloseGroupShortfall(message))
+                        if message.starts_with(&format!("only {found} of the close group answered"))),
+                    "a lookup of {found} peers, with {} bootstrap peers: {read:?}",
+                    bootstrap.len()
+                );
+            }
+        }
+    }
+
     /// Refusals are counted as they arrive through the group, not only the
     /// first kept. One refusal among six silent peers is retried with the
     /// proof already paid for; a second makes it the answer.
