@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Darwin fork
 
-Our changes on top of upstream 0.3.9 (ant-core 0.11.0). There are no tagged releases; builds are
+Our changes on top of upstream 0.3.11 (ant-core 0.13.0). There are no tagged releases; builds are
 told apart by the commit `darwin --version` prints. Upstream's entries follow.
 
 - The default network is ours: Robinhood Chain (chain ID 4663), with the seeds, token, vault and
@@ -105,7 +105,13 @@ told apart by the commit `darwin --version` prints. Upstream's entries follow.
   answered or failed, so a pointer is reported absent only then. A read takes as long as the
   slower set, up to the GET timeout when bootstrap peers don't answer, and sends one GET to each
   bootstrap peer it asks that is outside the close group (9 at most, of the 16 bundled seeds; a
-  pointer is at most 5.3 KB). Writes read first, so they wait the same way.
+  pointer is at most 5.3 KB). Each set settles as upstream's read does: once a final state is
+  named, a set's answer is the final state a majority of it holds, and two final states that no
+  majority holds are a fork, which fails the read unless only the bootstrap peers report it and
+  the close group holds a final state. Creating, updating and transferring a pointer read it
+  this way first, so they wait the same way; the check an update or a transfer makes before
+  paying, whether any peer holds a final state, asks every peer of the close group and none of
+  the bootstrap peers.
 - `PaymentMode::Single` is the default of the library (`PaymentMode::default()`,
   `Client::file_upload`, `file_prepare_upload`) and of the browser API, so programs built on
   ant-core pay per chunk unless they ask for batches.
@@ -115,6 +121,15 @@ told apart by the commit `darwin --version` prints. Upstream's entries follow.
 - The CLI is `darwin`, shows costs in the payment token, and has self-update turned off.
 - `darwin-linux-x64.tar.gz` from CI carries license notices: `LICENSE-MIT`, `LICENSE-APACHE`,
   `THIRD-PARTY-NOTICES.txt` and `RUST-STD-COPYRIGHT.html` next to `darwin`, like upstream's archives.
+- The merge of upstream 0.3.11 (ant-core 0.13.0) brings pointer transfer, finality and controller
+  (`darwin pointer transfer`, `finality`, `controller`), file manifests and `ant://` links
+  (`darwin manifest`), large-file downloads in the browser, and concurrent reads that share their
+  chunk fetches. Uploads are recorded in the upload history, as manifests under
+  `<data dir>/uploads/` that `darwin manifest list` lists and `darwin manifest download` fetches
+  again; the record of a `darwin file upload` holds the file's data map, a private upload's too.
+  Here `darwin manifest create` pays per chunk, as `darwin file upload` does, and refuses
+  `--merkle`. The vendored ant-protocol is 5.0.0, still with the price multiplier, darwin-listings
+  is vendored at 0.2.1 to match, and rustls is 0.23.46, as on upstream's main.
 
 ## [Unreleased]
 

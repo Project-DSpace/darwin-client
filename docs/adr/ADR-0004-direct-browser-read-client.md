@@ -136,7 +136,10 @@ of seven plus a margin of two: replication stores a record on the nodes among
 the nine nearest it, and a bootstrap peer among the nine nearest out of the
 whole network is also among the nine nearest out of the bootstrap peers. A chunk
 an upload left farther out, past close-group nodes that failed or were full, is
-not looked for on a bootstrap peer past the ninth.
+not looked for on a bootstrap peer past the ninth. The complete downloads,
+`pipeTo` streams and read-ahead described under "Large-file download
+destinations" fetch their chunks through this same read, and concurrent reads
+of one chunk share one fetch, its bootstrap lane included.
 
 An immutable read begins with one speculative GET while ordinary XOR discovery
 continues. If it is still pending after one second, a second candidate may race
