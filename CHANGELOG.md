@@ -99,19 +99,22 @@ told apart by the commit `darwin --version` prints. Upstream's entries follow.
   the state), a peer in both once, and returns the newer of the two states. A state the
   bootstrap peers agree on is returned even when the close group holds none or does not answer.
   When too few of a set answer, the state those that did agree on still holds the read back: it
-  fails with that shortfall rather than return an older state, or none. When the close group
-  has a state, the bootstrap peers are waited for until a quorum of them has answered, and until
-  a second confirms a newer state one of them names; when it has none, until every one has
-  answered or failed, so a pointer is reported absent only then. A read takes as long as the
-  slower set, up to the GET timeout when bootstrap peers don't answer, and sends one GET to each
-  bootstrap peer it asks that is outside the close group (9 at most, of the 16 bundled seeds; a
-  pointer is at most 5.3 KB). Each set settles as upstream's read does: once a final state is
-  named, a set's answer is the final state a majority of it holds, and two final states that no
-  majority holds are a fork, which fails the read unless only the bootstrap peers report it and
-  the close group holds a final state. Creating, updating and transferring a pointer read it
-  this way first, so they wait the same way; the check an update or a transfer makes before
-  paying, whether any peer holds a final state, asks every peer of the close group and none of
-  the bootstrap peers.
+  fails with that shortfall rather than return an older state, or none. The close group is read
+  as upstream reads it: it is asked further while only one of its peers names a state newer than
+  the one it would return, or while a final state is named that no majority of it holds. The
+  bootstrap peers are waited for until a quorum of them has answered and two of them agree on a
+  state (not one side of a fork), or, once the close group has a state, none of them names a
+  newer one; otherwise until every one has answered or failed, so a pointer is reported absent
+  only then. So when two bootstrap peers agree on a state, the read does not wait for a newer one
+  that a single bootstrap peer names. A read takes as long as the slower set, up to the GET
+  timeout when bootstrap peers don't answer, and sends one GET to each bootstrap peer it asks
+  that is outside the close group (9 at most, of the 16 bundled seeds; a pointer is at most
+  5.3 KB). In either set, a final state a majority of it holds is its answer, and two final
+  states that no majority holds are a fork, which fails the read unless only the bootstrap peers
+  report it and the close group holds a final state. Creating, updating and transferring a
+  pointer read it this way first, so they wait the same way; the check an update or a transfer
+  makes before paying, whether any peer holds a final state, asks every peer of the close group
+  and none of the bootstrap peers.
 - `PaymentMode::Single` is the default of the library (`PaymentMode::default()`,
   `Client::file_upload`, `file_prepare_upload`) and of the browser API, so programs built on
   ant-core pay per chunk unless they ask for batches.
