@@ -1838,6 +1838,74 @@ mod tests {
         assert!(found.expect("a read").is_none());
     }
 
+    /// A read given the bootstrap peers `bootstrap_read_peers` chooses from
+    /// sixteen seeds, as `pointer_get` is, asks the nine nearest the pointer
+    /// and never the seven farther ones: two of the nine naming the state are
+    /// enough on five answers, and a state only the farther seeds hold is not
+    /// looked for there.
+    #[tokio::test(start_paused = true)]
+    async fn a_pointer_read_asks_the_nine_bootstrap_peers_nearest_the_pointer() {
+        let (pk, sk) = keypair(25);
+        let held = Pointer::create(&sk, &pk, chunk_target(1)).expect("create");
+        let address = held.address();
+        // Sixteen seeds, 101 to 116, the highest listed first.
+        let seeds: Vec<MultiAddr> = (101..=116u8)
+            .rev()
+            .map(|n| {
+                format!(
+                    "/ip4/127.0.0.1/udp/{}/quic/p2p/{}",
+                    10_000 + u16::from(n),
+                    hex::encode([n; 32])
+                )
+                .parse()
+                .expect("a seed address")
+            })
+            .collect();
+        let bootstrap: Vec<u8> = crate::data::network::bootstrap_read_peers(
+            &seeds,
+            &address,
+            &PeerId::from_bytes([0xff; 32]),
+        )
+        .into_iter()
+        .map(|(peer, _)| peer.as_bytes()[0])
+        .collect();
+        let mut nearest: Vec<u8> = (101..=116).collect();
+        nearest.sort_by_key(|&n| ant_protocol::transport::xor_distance(&[n; 32], &address));
+        assert_eq!(bootstrap, nearest[..9]);
+        let (near, far) = nearest.split_at(9);
+        let none = |peers: &[u8]| answering(peers.to_vec(), 50, || Ok(None));
+        let holding = |peers: &[u8]| answering(peers.to_vec(), 100, || Ok(Some(held.clone())));
+        let read = |answers| simulated_read(address, 0, 1..=7, bootstrap.clone(), answers);
+
+        // The close group holds none. The eighth and ninth nearest seeds name
+        // the state, three more of the nine hold none and the rest do not
+        // answer: five answers, two naming it, and the state is the read's.
+        // The seven farther seeds hold it too, and are never asked.
+        let close_group = || answering(1..=7, 50, || Ok(None));
+        let answers = joined([
+            close_group(),
+            none(&near[..3]),
+            holding(&near[7..]),
+            holding(far),
+        ]);
+        let (found, took, asked) = read(answers).await;
+        assert_eq!(state_of(found), held.state_id());
+        assert_eq!(took, Duration::from_millis(100));
+        assert!(far.iter().all(|n| !asked.contains_key(n)), "{asked:?}");
+        // Only the farther seeds hold it: the pointer is absent once the close
+        // group and the nine have answered, each asked once.
+        let (found, _, asked) = read(joined([close_group(), none(near), holding(far)])).await;
+        assert!(found.expect("a read").is_none());
+        let mut asked: Vec<(u8, usize)> = asked.into_iter().collect();
+        asked.sort_unstable();
+        let mut expected: Vec<(u8, usize)> = (1..=7)
+            .chain(near.iter().copied())
+            .map(|n| (n, 1))
+            .collect();
+        expected.sort_unstable();
+        assert_eq!(asked, expected);
+    }
+
     /// Once the close group has returned a state, the bootstrap peers stop at
     /// their quorum unless one names a newer state: an older copy one of them
     /// still holds does not keep the read open for a peer that never answers,
