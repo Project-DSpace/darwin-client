@@ -74,7 +74,7 @@ pub use client::upload::{MerkleUploadPayment, UploadPayment};
 // Re-export self-encryption types
 pub use self_encryption::DataMap;
 
-// File manifests and `ant://` links (ADR-0006).
+// File manifests and `darwin://` links (ADR-0006).
 #[cfg(feature = "native")]
 pub use manifest::{
     build::{BuildEvent, BuildOptions, BuildResult, ManifestBuilder, ReferenceMode},

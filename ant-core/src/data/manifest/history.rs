@@ -1,8 +1,8 @@
 //! Upload history: one manifest file per upload, kept under the data
 //! directory so every upload can be listed and downloaded again later.
 //!
-//! A record is an ordinary `.ant` file named `<timestamp>-<label>.ant`, for
-//! example `20261006T140311Z-holiday-photos.ant`. The filename stem is the
+//! A record is an ordinary manifest file named `<timestamp>-<label>.darwin`,
+//! for example `20261006T140311Z-holiday-photos.darwin`. The filename stem is the
 //! record's id. The timestamp is UTC in a compact form that is safe on every
 //! filesystem, and the label is the upload's name reduced to safe characters.
 //! When an id is already taken, which happens when uploads with the same label
@@ -93,7 +93,8 @@ pub struct UploadRecord {
 pub struct UploadListing {
     /// Readable records, newest first.
     pub records: Vec<UploadRecord>,
-    /// `.ant` files in the directory that could not be read, with the reason.
+    /// `.darwin` files in the directory that could not be read, with the
+    /// reason.
     pub unreadable: Vec<(PathBuf, String)>,
 }
 
@@ -444,10 +445,11 @@ mod tests {
         assert!(load_upload(&history, "missing").unwrap().is_none());
         assert!(load_upload(&history, "../escape").unwrap().is_none());
 
-        fs::write(history.join("junk.ant"), b"nope").unwrap();
+        fs::write(history.join("junk.darwin"), b"nope").unwrap();
         fs::write(history.join("ignored.txt"), b"nope").unwrap();
         let listing = list_uploads(&history).unwrap();
         assert_eq!(listing.records.len(), 3);
         assert_eq!(listing.unreadable.len(), 1);
+        assert!(first.path.to_string_lossy().ends_with(".darwin"));
     }
 }

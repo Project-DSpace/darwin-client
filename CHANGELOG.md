@@ -125,9 +125,11 @@ told apart by the commit `darwin --version` prints. Upstream's entries follow.
 - `darwin-linux-x64.tar.gz` from CI carries license notices: `LICENSE-MIT`, `LICENSE-APACHE`,
   `THIRD-PARTY-NOTICES.txt` and `RUST-STD-COPYRIGHT.html` next to `darwin`, like upstream's archives.
 - The merge of upstream 0.3.11 (ant-core 0.13.0) brings pointer transfer, finality and controller
-  (`darwin pointer transfer`, `finality`, `controller`), file manifests and `ant://` links
+  (`darwin pointer transfer`, `finality`, `controller`), file manifests and links
   (`darwin manifest`), large-file downloads in the browser, and concurrent reads that share their
-  chunk fetches. Uploads are recorded in the upload history, as manifests under
+  chunk fetches. Here links are `darwin://` links and manifest files `.darwin` files; upstream's
+  `ant://` links and `.ant` files are also read, and the manifest format's magic bytes and
+  version stay upstream's. Uploads are recorded in the upload history, as manifests under
   `<data dir>/uploads/` that `darwin manifest list` lists and `darwin manifest download` fetches
   again; the record of a `darwin file upload` holds the file's data map, a private upload's too.
   Here `darwin manifest create` pays per chunk, as `darwin file upload` does, and refuses

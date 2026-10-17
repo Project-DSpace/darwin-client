@@ -1,4 +1,5 @@
-//! Reading and writing `.ant` manifest files.
+//! Reading and writing manifest files: `.darwin` files, and upstream's
+//! `.ant` files, which hold the same bytes.
 
 use std::fs;
 use std::io::Write;
@@ -14,12 +15,15 @@ use super::{ContentRef, ManifestEntry};
 /// Default basename when a manifest has no name.
 const DEFAULT_BASENAME: &str = "manifest";
 
-/// The filename a manifest with `name` is written to: `<name>.ant`.
+/// The filename a manifest with `name` is written to: `<name>.darwin`, or
+/// `manifest.darwin` without a name.
 pub fn manifest_filename_for(name: Option<&str>) -> String {
     format!("{}.{MANIFEST_EXTENSION}", name.unwrap_or(DEFAULT_BASENAME))
 }
 
-/// Read and decode a `.ant` file, refusing oversized files before reading.
+/// Read and decode a manifest file, refusing oversized files before
+/// reading. The file is known by its content, whatever its name: a `.darwin`
+/// file, or upstream's `.ant` file.
 pub fn read_manifest_file(path: &Path) -> Result<Manifest, ManifestError> {
     let len = fs::metadata(path)?.len();
     if len > MAX_MANIFEST_BYTES as u64 {
@@ -77,7 +81,7 @@ mod tests {
     fn write_then_read_round_trips_and_respects_noclobber() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(manifest_filename_for(Some("pack")));
-        assert_eq!(path.file_name().unwrap(), "pack.ant");
+        assert_eq!(path.file_name().unwrap(), "pack.darwin");
         write_manifest_file(&path, &sample(), false).unwrap();
         assert_eq!(read_manifest_file(&path).unwrap(), sample());
         assert!(matches!(
@@ -85,7 +89,20 @@ mod tests {
             Err(ManifestError::Io(_))
         ));
         write_manifest_file(&path, &sample(), true).unwrap();
-        assert_eq!(manifest_filename_for(None), "manifest.ant");
+        assert_eq!(manifest_filename_for(None), "manifest.darwin");
+    }
+
+    /// Upstream's `.ant` files hold the same bytes and still open: a
+    /// manifest is read by its content.
+    #[test]
+    fn an_upstream_ant_file_still_reads() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pack.ant");
+        fs::write(&path, sample().encode().unwrap()).unwrap();
+        assert_eq!(read_manifest_file(&path).unwrap(), sample());
+        let unnamed = dir.path().join("pack");
+        fs::write(&unnamed, sample().encode().unwrap()).unwrap();
+        assert_eq!(read_manifest_file(&unnamed).unwrap(), sample());
     }
 
     #[test]

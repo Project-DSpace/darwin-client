@@ -5,9 +5,11 @@
 //! manifest or from the address of a public DataMap chunk. It is Autonomi's
 //! equivalent of a `.torrent` file, minus trackers and peers.
 //!
-//! A manifest is shared off the network, as a `.ant` file or as an
-//! `ant://manifest/<base64url>` link carrying the same bytes. It is never
-//! stored on the network.
+//! A manifest is shared off the network, as a `.darwin` file or as a
+//! `darwin://manifest/<base64url>` link carrying the same bytes. It is never
+//! stored on the network. Upstream names the same bytes a `.ant` file and an
+//! `ant://manifest/...` link; both are read, since a manifest file is read by
+//! its content, not its name.
 //!
 //! # Byte form
 //!
@@ -17,9 +19,12 @@
 //! ...           named msgpack encoding of `Manifest`
 //! ```
 //!
+//! The magic and the version are the format's identifiers and stay
+//! upstream's, so manifests pass between this client and upstream's.
+//!
 //! `0xC1` is unused by the msgpack specification, so no DataMap can begin
-//! with it; the first byte alone tells a `.ant` file from a `.datamap` file,
-//! but a decoder requires the whole five-byte header.
+//! with it; the first byte alone tells a manifest file from a `.datamap`
+//! file, but a decoder requires the whole five-byte header.
 //!
 //! # Forward compatibility
 //!
@@ -78,18 +83,19 @@ pub const MANIFEST_MAGIC: [u8; 4] = [0xC1, b'A', b'N', b'T'];
 pub const MANIFEST_FORMAT_VERSION: u8 = 1;
 /// Magic plus version byte.
 pub const MANIFEST_HEADER_LEN: usize = MANIFEST_MAGIC.len() + 1;
-/// File extension for a manifest on disk.
-pub const MANIFEST_EXTENSION: &str = "ant";
+/// File extension for a manifest this client writes. A manifest is read by
+/// its content, so upstream's `.ant` files open too.
+pub const MANIFEST_EXTENSION: &str = "darwin";
 /// Largest manifest a decoder will accept.
 pub const MAX_MANIFEST_BYTES: usize = 64 * 1024 * 1024;
 /// Most entries a manifest may hold.
 pub const MAX_MANIFEST_ENTRIES: usize = 100_000;
 /// Encoded size above which tools warn that a manifest link is getting
-/// long for a chat message and suggest a `.ant` file instead.
+/// long for a chat message and suggest a manifest file instead.
 pub const MANIFEST_LINK_RECOMMENDED_MAX_BYTES: usize = 1_500;
 /// Length of a content address in bytes.
 pub const ADDRESS_LEN: usize = 32;
-/// Largest root DataMap, as written in a manifest, that a `.ant` file embeds
+/// Largest root DataMap, as written in a manifest, that a manifest file embeds
 /// in place of the shrunk map a large upload produces. A root map lets a
 /// reader start fetching data chunks with no wrapper-record fetches; at
 /// [`CHUNK_RECORD_LEN`] bytes per chunk of up to about 4 MiB this covers
@@ -445,7 +451,7 @@ impl Manifest {
     /// its published (shrunk) form, at most three chunks. Lossless: each
     /// entry keeps its content address, and a reader resolves the root
     /// from the wrapper records the upload stored. Keeps links short; a
-    /// `.ant` file keeps the root maps.
+    /// manifest file keeps the root maps.
     pub fn link_form(&self) -> Result<Self, ManifestError> {
         let mut link = self.clone();
         for entry in &mut link.entries {
@@ -946,6 +952,18 @@ mod tests {
                 expected
             }
         );
+    }
+
+    /// Files are named `.darwin`; the format's identifiers, the magic and
+    /// the version byte, stay upstream's so manifests pass between clients.
+    #[test]
+    fn files_are_named_darwin_and_the_format_identifiers_are_kept() {
+        assert_eq!(MANIFEST_EXTENSION, "darwin");
+        assert_eq!(MANIFEST_MAGIC, *b"\xC1ANT");
+        assert_eq!(MANIFEST_FORMAT_VERSION, 1);
+        assert!(hex::decode(GOLDEN_V1_HEX)
+            .unwrap()
+            .starts_with(&[0xC1, b'A', b'N', b'T', 1]));
     }
 
     #[test]

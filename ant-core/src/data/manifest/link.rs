@@ -1,14 +1,16 @@
-//! `ant://` links (ADR-0006).
+//! `darwin://` links (ADR-0006).
 //!
 //! Two forms, told apart by the authority:
 //!
 //! ```text
-//! ant://<64 hex characters>                       a public file's DataMap address
-//! ant://manifest/<unpadded base64url .ant bytes>  a manifest, bytes included
+//! darwin://<64 hex characters>                          a public file's address
+//! darwin://manifest/<unpadded base64url manifest bytes> a manifest, bytes included
 //! ```
 //!
-//! A bare 64-character hex address is accepted wherever a link is. A file
-//! link carries nothing but the address: any query string or path on it is
+//! Links are written with the `darwin://` scheme. Upstream's `ant://` links,
+//! the same two forms under another scheme, are read too. A bare
+//! 64-character hex address is accepted wherever a link is. A file link
+//! carries nothing but the address: any query string or path on it is
 //! rejected so that grammar stays reserved.
 
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -23,12 +25,17 @@ use self_encryption::{ChunkInfo, DataMap};
 #[cfg(test)]
 use xor_name::XorName;
 
-/// Scheme prefix of every link.
-pub const LINK_SCHEME: &str = "ant://";
+/// Scheme prefix of every link written.
+pub const LINK_SCHEME: &str = "darwin://";
+/// Upstream's scheme prefix, still read: an `ant://` link parses as the same
+/// link with [`LINK_SCHEME`].
+pub const UPSTREAM_LINK_SCHEME: &str = "ant://";
 /// Authority that marks a manifest link.
 pub const MANIFEST_AUTHORITY: &str = "manifest";
 /// Prefix of a manifest link.
-pub const MANIFEST_LINK_PREFIX: &str = "ant://manifest/";
+pub const MANIFEST_LINK_PREFIX: &str = "darwin://manifest/";
+/// The schemes a link is read with, ignoring case.
+const READ_SCHEMES: [&str; 2] = [LINK_SCHEME, UPSTREAM_LINK_SCHEME];
 /// Characters that would start a path, query or fragment on a file link.
 const FILE_LINK_TERMINATORS: &[char] = &['/', '?', '#'];
 /// Hex characters in an address.
@@ -43,20 +50,32 @@ pub enum Link {
     Manifest(Manifest),
 }
 
-/// Whether `input` starts with the `ant://` scheme, ignoring case.
-pub fn is_link(input: &str) -> bool {
-    input
-        .get(..LINK_SCHEME.len())
-        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(LINK_SCHEME))
+/// Length of the scheme `input` starts with, `darwin://` or `ant://`
+/// ignoring case, or `None` when it starts with neither.
+fn scheme_len(input: &str) -> Option<usize> {
+    READ_SCHEMES
+        .iter()
+        .find(|scheme| {
+            input
+                .get(..scheme.len())
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case(scheme))
+        })
+        .map(|scheme| scheme.len())
 }
 
-/// Parse a link or a bare hex address.
+/// Whether `input` starts with the `darwin://` scheme, or upstream's
+/// `ant://`, ignoring case.
+pub fn is_link(input: &str) -> bool {
+    scheme_len(input).is_some()
+}
+
+/// Parse a link (`darwin://` or `ant://`) or a bare hex address.
 pub fn parse_link(input: &str) -> Result<Link, ManifestError> {
     let input = input.trim();
-    if !is_link(input) {
+    let Some(scheme_len) = scheme_len(input) else {
         return parse_address(input).map(Link::File);
-    }
-    let rest = &input[LINK_SCHEME.len()..];
+    };
+    let rest = &input[scheme_len..];
 
     let authority_end = rest.find(FILE_LINK_TERMINATORS).unwrap_or(rest.len());
     let authority = &rest[..authority_end];
@@ -109,24 +128,25 @@ fn decode_manifest_payload(payload: &str, max: usize) -> Result<Vec<u8>, Manifes
     Ok(bytes)
 }
 
-/// Format a file link.
+/// Format a file link: `darwin://<hex>`.
 pub fn file_link(address: &[u8; ADDRESS_LEN]) -> String {
     format!("{LINK_SCHEME}{}", hex::encode(address))
 }
 
-/// Format a manifest link, encoding the manifest's link form.
+/// Format a manifest link, `darwin://manifest/...`, encoding the manifest's
+/// link form.
 pub fn manifest_link(manifest: &Manifest) -> Result<String, ManifestError> {
     Ok(manifest_link_from_bytes(&manifest_link_bytes(manifest)?))
 }
 
-/// The `.ant` bytes a manifest link carries: the encoding of
-/// [`Manifest::link_form`], with every embedded DataMap in its published
-/// (shrunk) form.
+/// The manifest bytes a manifest link carries, as a manifest file holds
+/// them: the encoding of [`Manifest::link_form`], with every embedded
+/// DataMap in its published (shrunk) form.
 pub fn manifest_link_bytes(manifest: &Manifest) -> Result<Vec<u8>, ManifestError> {
     manifest.link_form()?.encode()
 }
 
-/// Format a manifest link from already-encoded `.ant` bytes, as given.
+/// Format a manifest link from already-encoded manifest bytes, as given.
 pub fn manifest_link_from_bytes(bytes: &[u8]) -> String {
     format!("{MANIFEST_LINK_PREFIX}{}", URL_SAFE_NO_PAD.encode(bytes))
 }
@@ -166,6 +186,7 @@ mod tests {
     fn file_link_round_trips_and_accepts_bare_hex() {
         let addr = [0xabu8; 32];
         let link = file_link(&addr);
+        assert_eq!(link, format!("darwin://{}", hex::encode(addr)));
         assert_eq!(parse_link(&link).unwrap(), Link::File(addr));
         assert_eq!(parse_link(&hex::encode(addr)).unwrap(), Link::File(addr));
         assert_eq!(
@@ -178,19 +199,63 @@ mod tests {
     #[test]
     fn file_link_rejects_paths_queries_and_bad_addresses() {
         let hex64 = "ab".repeat(32);
-        for bad in [
-            format!("ant://{hex64}/x"),
-            format!("ant://{hex64}?dn=x"),
-            format!("ant://{hex64}#frag"),
-            "ant://abc".to_string(),
-            "ant://".to_string(),
-            "zz".repeat(32),
-            format!("ant://{}", "zz".repeat(32)),
+        for scheme in ["darwin://", "ant://"] {
+            for bad in [
+                format!("{scheme}{hex64}/x"),
+                format!("{scheme}{hex64}?dn=x"),
+                format!("{scheme}{hex64}#frag"),
+                format!("{scheme}abc"),
+                scheme.to_string(),
+                format!("{scheme}{}", "zz".repeat(32)),
+            ] {
+                assert!(
+                    matches!(parse_link(&bad), Err(ManifestError::Link(_))),
+                    "{bad}"
+                );
+            }
+        }
+        assert!(matches!(
+            parse_link(&"zz".repeat(32)),
+            Err(ManifestError::Link(_))
+        ));
+        // Another scheme is not a link: it is read as an address and fails.
+        assert!(matches!(
+            parse_link(&format!("ftp://{hex64}")),
+            Err(ManifestError::Link(_))
+        ));
+    }
+
+    /// Links are written as `darwin://`; upstream's `ant://` links, file and
+    /// manifest, are read as the same links, in any case.
+    #[test]
+    fn upstream_ant_links_are_still_read() {
+        let addr = [0xcdu8; 32];
+        let hex64 = hex::encode(addr);
+        for link in [
+            format!("ant://{hex64}"),
+            format!("ANT://{hex64}"),
+            format!("Darwin://{hex64}"),
+            format!("  darwin://{hex64}  "),
         ] {
-            assert!(
-                matches!(parse_link(&bad), Err(ManifestError::Link(_))),
-                "{bad}"
-            );
+            assert!(is_link(link.trim()), "{link}");
+            assert_eq!(parse_link(&link).unwrap(), Link::File(addr), "{link}");
+        }
+        for not_a_link in ["", "ant:/", "darwin:", "ftp://x", "antx://", hex64.as_str()] {
+            assert!(!is_link(not_a_link), "{not_a_link}");
+        }
+
+        let link = manifest_link(&sample()).unwrap();
+        let payload = link
+            .strip_prefix("darwin://manifest/")
+            .expect("a darwin manifest link");
+        for upstream in [
+            format!("ant://manifest/{payload}"),
+            format!("ANT://MANIFEST/{payload}"),
+        ] {
+            match parse_link(&upstream).unwrap() {
+                Link::Manifest(m) => assert_eq!(m, sample()),
+                Link::File(_) => panic!("expected manifest"),
+            }
         }
     }
 
@@ -229,6 +294,7 @@ mod tests {
     #[test]
     fn manifest_link_round_trips() {
         let link = manifest_link(&sample()).unwrap();
+        assert!(link.starts_with("darwin://manifest/"), "{link}");
         assert!(link.starts_with(MANIFEST_LINK_PREFIX));
         match parse_link(&link).unwrap() {
             Link::Manifest(m) => assert_eq!(m, sample()),
@@ -287,13 +353,15 @@ mod tests {
             parse_link(&format!("{MANIFEST_LINK_PREFIX}{payload}")),
             Err(ManifestError::BadHeader)
         ));
-        assert!(matches!(
-            parse_link("ant://manifest/!!!"),
-            Err(ManifestError::Link(_))
-        ));
-        assert!(matches!(
-            parse_link("ant://manifest"),
-            Err(ManifestError::Link(_))
-        ));
+        for scheme in ["darwin://", "ant://"] {
+            assert!(matches!(
+                parse_link(&format!("{scheme}manifest/!!!")),
+                Err(ManifestError::Link(_))
+            ));
+            assert!(matches!(
+                parse_link(&format!("{scheme}manifest")),
+                Err(ManifestError::Link(_))
+            ));
+        }
     }
 }

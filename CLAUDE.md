@@ -75,12 +75,12 @@ ant-core/src/
 │       ├── merkle.rs         # Merkle batch payment (PaymentMode enum)
 │       ├── pointer.rs        # pointer_create/update/get/resolve (ADR-0016), transfer/finality (ADR-0018)
 │       └── cache.rs          # In-memory LRU chunk cache
-│   └── manifest/             # File manifests and ant:// links (ADR-0006)
+│   └── manifest/             # File manifests and darwin:// links (ADR-0006)
 │       ├── mod.rs            # Manifest, ManifestEntry, ContentRef, encode/decode, limits
 │       ├── path.rs           # Portable path rules (cross-platform, enforced everywhere)
-│       ├── link.rs           # ant://<address> and ant://manifest/<base64url> links
-│       ├── file.rs           # .ant file read/write
-│       ├── history.rs        # Upload history: one .ant per upload under <data dir>/uploads
+│       ├── link.rs           # darwin://<address> and darwin://manifest/<base64url> links (ant:// read too)
+│       ├── file.rs           # .darwin file read/write (.ant files read too)
+│       ├── history.rs        # Upload history: one .darwin per upload under <data dir>/uploads
 │       ├── wire.rs           # Manifest-owned DataMap layout; pre-decode structure check
 │       ├── build.rs          # ManifestBuilder (uploads files, embedded or compact refs)
 │       ├── embed.rs          # Root-vs-shrunk DataMap choice for embedding
@@ -157,9 +157,11 @@ cargo run --bin darwin -- --help  # Run the CLI
 - **Registry file locking**: Use `NodeRegistry::load_locked()` for read-modify-write operations to prevent concurrent CLI invocations from corrupting the registry. The returned `File` handle holds the lock until dropped.
 - **Dual-path CLI commands**: Commands that modify the registry (like `darwin node add`) check if the daemon is running. If so, they route through the REST API; otherwise, they operate directly on the registry file.
 - **Binary source resolution**: Node binary sources are represented by the `BinarySource` enum (Latest, Version, Url, LocalPath). Download variants are stubbed until release infrastructure is available.
-- **Manifests never touch the network**: a manifest (`.ant` file or `ant://manifest/...` link)
-  is shared off-network; only the files it references live on the network. `ant://<hex>` is always
-  a plain file link. Every upload (`darwin file upload`, `darwin manifest create`) is also recorded as
+- **Manifests never touch the network**: a manifest (`.darwin` file or `darwin://manifest/...` link)
+  is shared off-network; only the files it references live on the network. `darwin://<hex>` is always
+  a plain file link. `darwin://` links and `.darwin` files are what the client writes; upstream's
+  `ant://` and `.ant` are also read, and the format's magic (`\xC1ANT`) and version stay upstream's.
+  Every upload (`darwin file upload`, `darwin manifest create`) is also recorded as
   a manifest under `<data dir>/uploads/`; `darwin manifest list` shows them and `show`/`link`/`export`/`download`
   accept a record id. Entry paths obey the portable rules in `data/manifest/path.rs` at build,
   decode and extract time, and extraction never follows symlinks inside the output directory.

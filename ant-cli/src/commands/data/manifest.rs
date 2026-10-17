@@ -1,8 +1,9 @@
 //! Manifest commands (ADR-0006).
 //!
 //! A manifest is a torrent-like description of a set of files. It is shared
-//! off the network as a `.ant` file or an `ant://manifest/...` link, never
-//! stored on the network.
+//! off the network as a `.darwin` file or a `darwin://manifest/...` link,
+//! never stored on the network. Upstream's `.ant` files and `ant://` links
+//! are read too.
 //!
 //! Every upload the CLI performs is also recorded as a manifest in the upload
 //! history under the data directory, so `darwin manifest list` can show it
@@ -58,7 +59,7 @@ pub enum ManifestAction {
     Create {
         /// Files or directories to upload.
         paths: Vec<PathBuf>,
-        /// Where to write the manifest. Defaults to `<name>.ant` here.
+        /// Where to write the manifest. Defaults to `<name>.darwin` here.
         #[arg(short, long)]
         output: Option<PathBuf>,
         /// Manifest name, used as the default extraction directory.
@@ -102,7 +103,7 @@ pub enum ManifestAction {
         /// Replace an existing manifest file at the output path.
         #[arg(long)]
         overwrite: bool,
-        /// Also print the manifest as an `ant://manifest/...` link.
+        /// Also print the manifest as a `darwin://manifest/...` link.
         #[arg(long)]
         link: bool,
     },
@@ -110,18 +111,18 @@ pub enum ManifestAction {
     List,
     /// List the entries of a manifest.
     Show {
-        /// A `.ant` file, an `ant://manifest/...` link, or an upload id
+        /// A `.darwin` file, a `darwin://manifest/...` link, or an upload id
         /// from `darwin manifest list`.
         source: String,
     },
-    /// Print a manifest as an `ant://manifest/...` link. The link carries
+    /// Print a manifest as a `darwin://manifest/...` link. The link carries
     /// each embedded DataMap in its short published form.
     Link {
-        /// A `.ant` file, an `ant://manifest/...` link, or an upload id
+        /// A `.darwin` file, a `darwin://manifest/...` link, or an upload id
         /// from `darwin manifest list`.
         source: String,
     },
-    /// Write a manifest out as a `.ant` file, optionally compacted.
+    /// Write a manifest out as a `.darwin` file, optionally compacted.
     ///
     /// Compacting replaces embedded DataMaps with public addresses, which
     /// is only possible for DataMaps that are on the network. Any that are
@@ -131,10 +132,10 @@ pub enum ManifestAction {
     /// still private here: its DataMap is in the envelope, not stored on its
     /// own, so publishing it gives the file a second address.
     Export {
-        /// A `.ant` file, an `ant://manifest/...` link, or an upload id
+        /// A `.darwin` file, a `darwin://manifest/...` link, or an upload id
         /// from `darwin manifest list`.
         source: String,
-        /// Where to write the manifest. Defaults to `<name>.ant` here.
+        /// Where to write the manifest. Defaults to `<name>.darwin` here.
         #[arg(short, long)]
         output: Option<PathBuf>,
         /// Replace embedded DataMaps with public addresses.
@@ -146,13 +147,13 @@ pub enum ManifestAction {
         /// Replace an existing file at the output path.
         #[arg(long)]
         overwrite: bool,
-        /// Also print the exported manifest as an `ant://manifest/...` link.
+        /// Also print the exported manifest as a `darwin://manifest/...` link.
         #[arg(long)]
         link: bool,
     },
     /// Download the files a manifest describes.
     Download {
-        /// A `.ant` file, an `ant://manifest/...` link, or an upload id
+        /// A `.darwin` file, a `darwin://manifest/...` link, or an upload id
         /// from `darwin manifest list`.
         source: String,
         /// Directory to extract into. Defaults to the manifest name, or
@@ -606,7 +607,8 @@ fn record_build_result(
     Ok((result, history_id))
 }
 
-/// The output path: the one given, or `<name>.ant` in the current directory.
+/// The output path: the one given, or `<name>.darwin` in the current
+/// directory.
 fn resolve_output(name: Option<&str>, output: Option<PathBuf>) -> anyhow::Result<PathBuf> {
     if let Some(name) = name {
         ant_core::data::manifest::path::validate_component(name)
@@ -888,7 +890,7 @@ fn link(manifest: &Manifest, json: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// A manifest link and the length of the `.ant` bytes it carries, encoded
+/// A manifest link and the length of the manifest bytes it carries, encoded
 /// once.
 fn make_link(manifest: &Manifest) -> anyhow::Result<(String, usize)> {
     let bytes = manifest_link_bytes(manifest)?;
@@ -900,7 +902,7 @@ fn warn_if_long_link(len: usize) {
         eprintln!(
             "warning: this manifest is {len} bytes; links above \
              {MANIFEST_LINK_RECOMMENDED_MAX_BYTES} bytes are long for a chat message. \
-             Consider sharing the .ant file instead."
+             Consider sharing the .darwin file instead."
         );
     }
 }
@@ -975,8 +977,10 @@ async fn download(
     Ok(())
 }
 
-/// Load a manifest from an `ant://manifest/...` link, a `.ant` path, or an
-/// upload id from the history, tried in that order.
+/// Load a manifest from a `darwin://manifest/...` link (or upstream's
+/// `ant://manifest/...`), a manifest file (read by its content, so `.darwin`
+/// and `.ant` files both open), or an upload id from the history, tried in
+/// that order.
 fn load_manifest(source: &str) -> anyhow::Result<Manifest> {
     if is_link(source) {
         return match parse_link(source)? {
@@ -1177,12 +1181,17 @@ mod tests {
             assert!(resolve_output(Some(name), None).is_err());
             assert!(resolve_download_root(&manifest, None).is_err());
         }
+        assert!(!outside.with_extension("darwin").exists());
         assert!(!outside.with_extension("ant").exists());
 
         let valid = Manifest::new(Some("pack".into()));
         assert_eq!(
             resolve_output(Some("pack"), None).unwrap(),
-            PathBuf::from("pack.ant")
+            PathBuf::from("pack.darwin")
+        );
+        assert_eq!(
+            resolve_output(None, None).unwrap(),
+            PathBuf::from("manifest.darwin")
         );
         assert_eq!(
             resolve_download_root(&valid, None).unwrap(),
@@ -1284,10 +1293,58 @@ mod tests {
         let (addr, path) = parse_public_file(&hex64).unwrap();
         assert_eq!(addr, [0xab; 32]);
         assert_eq!(path, None);
-        let (addr, path) = parse_public_file(&format!("ant://{hex64}=docs/a.pdf")).unwrap();
-        assert_eq!(addr, [0xab; 32]);
-        assert_eq!(path.as_deref(), Some("docs/a.pdf"));
+        for scheme in ["darwin://", "ant://"] {
+            let (addr, path) = parse_public_file(&format!("{scheme}{hex64}=docs/a.pdf")).unwrap();
+            assert_eq!(addr, [0xab; 32]);
+            assert_eq!(path.as_deref(), Some("docs/a.pdf"));
+        }
         assert!(parse_public_file("nope").is_err());
+    }
+
+    fn one_entry_manifest() -> Manifest {
+        Manifest {
+            name: Some("pack".into()),
+            torrent: None,
+            entries: vec![ant_core::data::ManifestEntry {
+                path: Some("a.bin".into()),
+                size: Some(10),
+                source: ContentRef::Public { address: [3; 32] },
+            }],
+        }
+    }
+
+    /// Links are printed as `darwin://manifest/...` and files written as
+    /// `.darwin`; upstream's `ant://manifest/...` links and `.ant` files
+    /// still load.
+    #[test]
+    fn links_and_files_are_named_darwin_and_upstreams_still_load() {
+        let manifest = one_entry_manifest();
+        let (link, _) = make_link(&manifest).unwrap();
+        assert!(link.starts_with("darwin://manifest/"), "{link}");
+        assert_eq!(load_manifest(&link).unwrap(), manifest);
+        let payload = link.strip_prefix("darwin://manifest/").unwrap();
+        assert_eq!(
+            load_manifest(&format!("ant://manifest/{payload}")).unwrap(),
+            manifest
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let written = dir.path().join(manifest_filename_for(Some("pack")));
+        assert_eq!(written.file_name().unwrap(), "pack.darwin");
+        write_manifest(&manifest, &written, false).unwrap();
+        assert_eq!(load_manifest(written.to_str().unwrap()).unwrap(), manifest);
+        let upstream = dir.path().join("pack.ant");
+        std::fs::copy(&written, &upstream).unwrap();
+        assert_eq!(load_manifest(upstream.to_str().unwrap()).unwrap(), manifest);
+
+        // A file link is not a manifest link, in either scheme.
+        for file_link in [
+            format!("darwin://{}", "ab".repeat(32)),
+            format!("ant://{}", "ab".repeat(32)),
+        ] {
+            let error = load_manifest(&file_link).unwrap_err().to_string();
+            assert!(error.contains("darwin file download"), "{error}");
+        }
     }
 
     #[test]

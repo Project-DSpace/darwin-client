@@ -143,13 +143,13 @@ pub enum FileAction {
     /// Download a file from the network.
     ///
     /// Public:  `darwin file download ADDRESS -o output.pdf`
-    /// Public (link): `darwin file download ant://ADDRESS`
+    /// Public (link): `darwin file download darwin://ADDRESS`
     /// Private: `darwin file download --datamap photo.jpg.datamap`
     /// Private (custom output): `darwin file download --datamap photo.jpg.datamap -o keep.jpg`
     /// Revealed: `darwin file download --proof photo.jpg.proof -o photo.jpg`
     Download {
         /// Address (public data map or envelope address): 64 hex characters
-        /// or an `ant://ADDRESS` link. Required unless --datamap or --proof
+        /// or a `darwin://ADDRESS` link. Required unless --datamap or --proof
         /// is provided.
         #[arg(required_unless_present_any = ["datamap", "proof"])]
         address: Option<String>,
@@ -286,7 +286,8 @@ impl FileAction {
     }
 }
 
-/// Parse a public file address: bare hex or an `ant://ADDRESS` link.
+/// Parse a public file address: bare hex or a `darwin://ADDRESS` link
+/// (upstream's `ant://ADDRESS` too).
 fn parse_file_address(input: &str) -> anyhow::Result<[u8; 32]> {
     match parse_link(input)? {
         Link::File(address) => Ok(address),
@@ -2028,10 +2029,48 @@ mod tests {
         let hex64 = "ab".repeat(32);
         let resolved = resolve_download_output(None, None, Some(&hex64)).unwrap();
         assert_eq!(resolved, PathBuf::from(&hex64));
-        let link = format!("ant://{hex64}");
-        let resolved = resolve_download_output(None, None, Some(&link)).unwrap();
-        assert_eq!(resolved, PathBuf::from(&hex64));
-        assert!(resolve_download_output(None, None, Some("ant://manifest/AAAA")).is_err());
+        // A darwin:// link, and upstream's ant:// link, name the same file.
+        for link in [format!("darwin://{hex64}"), format!("ant://{hex64}")] {
+            let resolved = resolve_download_output(None, None, Some(&link)).unwrap();
+            assert_eq!(resolved, PathBuf::from(&hex64));
+        }
+        for manifest_link in ["darwin://manifest/AAAA", "ant://manifest/AAAA"] {
+            assert!(resolve_download_output(None, None, Some(manifest_link)).is_err());
+        }
+    }
+
+    /// `file download` takes a `darwin://` link, as its help shows, and still
+    /// reads upstream's `ant://` links.
+    #[test]
+    fn download_takes_a_darwin_link() {
+        let hex64 = "cd".repeat(32);
+        for link in [format!("darwin://{hex64}"), format!("ant://{hex64}")] {
+            let cli = TestFileCli::try_parse_from(["test", "download", link.as_str()])
+                .expect("a link parses as the address");
+            match cli.action {
+                FileAction::Download { address, .. } => {
+                    assert_eq!(
+                        parse_file_address(address.as_deref().unwrap()).unwrap(),
+                        [0xcd; 32]
+                    );
+                }
+                _ => panic!("expected file download action"),
+            }
+        }
+        // A manifest link is not a file address.
+        let manifest = Manifest {
+            name: None,
+            torrent: None,
+            entries: vec![ManifestEntry {
+                path: Some("a.bin".into()),
+                size: None,
+                source: ContentRef::Public { address: [1; 32] },
+            }],
+        };
+        let link = ant_core::data::manifest_link(&manifest).unwrap();
+        assert!(link.starts_with("darwin://manifest/"), "{link}");
+        let error = parse_file_address(&link).unwrap_err().to_string();
+        assert!(error.contains("darwin manifest download"), "{error}");
     }
 
     #[test]

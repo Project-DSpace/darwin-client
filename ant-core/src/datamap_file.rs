@@ -19,8 +19,8 @@
 //!
 //! The byte `0xC1`, unused in the msgpack spec and therefore never the first
 //! byte of a `.datamap`, opens the manifest format defined by ADR-0006
-//! (`crate::data::manifest`). A `.ant` file can thus be told from a
-//! `.datamap` by its first byte.
+//! (`crate::data::manifest`). A manifest file (`.darwin`, or upstream's
+//! `.ant`) can thus be told from a `.datamap` by its first byte.
 //!
 //! # Naming convention
 //!

@@ -145,7 +145,7 @@ pub enum Commands {
     /// One file's listing, in the index or not: from the nodes nearest its
     /// address, checked against the network and the payment chain
     Listing(ListingArgs),
-    /// Manifest operations (torrent-like file sets shared as .ant files or ant:// links)
+    /// Manifest operations (torrent-like file sets shared as .darwin files or darwin:// links)
     Manifest {
         #[command(subcommand)]
         action: ManifestAction,
@@ -175,6 +175,64 @@ fn parse_positive_usize(s: &str) -> Result<usize, String> {
         return Err("must be > 0".to_string());
     }
     Ok(n)
+}
+
+#[cfg(test)]
+mod naming_tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    /// The help a command line asks for with `--help`.
+    fn help(args: &[&str]) -> String {
+        let mut argv = vec!["darwin"];
+        argv.extend_from_slice(args);
+        argv.push("--help");
+        match Cli::try_parse_from(argv) {
+            Err(e) if e.kind() == clap::error::ErrorKind::DisplayHelp => e.to_string(),
+            Err(e) => panic!("{args:?}: {e}"),
+            Ok(_) => panic!("{args:?}: --help did not print help"),
+        }
+    }
+
+    /// Links and manifest files are shown as `darwin://` and `.darwin`:
+    /// no help of `darwin`, its manifest commands or `darwin file download`
+    /// gives an `ant://` example.
+    #[test]
+    fn the_help_names_darwin_links_and_files() {
+        let manifest_commands: Vec<String> = Cli::command()
+            .find_subcommand("manifest")
+            .expect("darwin manifest")
+            .get_subcommands()
+            .map(|command| command.get_name().to_string())
+            .collect();
+        assert!(manifest_commands.len() >= 6, "{manifest_commands:?}");
+        let mut pages = vec![
+            (vec![], help(&[])),
+            (vec!["manifest"], help(&["manifest"])),
+            (vec!["file", "download"], help(&["file", "download"])),
+        ];
+        for name in &manifest_commands {
+            let command = vec!["manifest", name.as_str()];
+            let page = help(&command);
+            pages.push((command, page));
+        }
+        for (command, page) in &pages {
+            assert!(!page.contains("ant://"), "{command:?}:\n{page}");
+            assert!(!page.contains(".ant "), "{command:?}:\n{page}");
+            assert!(!page.contains(".ant`"), "{command:?}:\n{page}");
+        }
+        for command in [
+            &["manifest", "show"][..],
+            &["manifest", "link"],
+            &["manifest", "export"],
+            &["manifest", "download"],
+            &["file", "download"],
+        ] {
+            assert!(help(command).contains("darwin://"), "{command:?}");
+        }
+        assert!(help(&[]).contains(".darwin files or darwin:// links"));
+        assert!(help(&["manifest", "create"]).contains("<name>.darwin"));
+    }
 }
 
 #[cfg(test)]

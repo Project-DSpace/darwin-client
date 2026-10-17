@@ -352,7 +352,7 @@ Download complete!
 
 | Flag | Description |
 |------|-------------|
-| `ADDRESS` | A public DataMap or envelope address: 64 hex characters, or an `ant://ADDRESS` link. |
+| `ADDRESS` | A public DataMap or envelope address: 64 hex characters, or a `darwin://ADDRESS` link (upstream's `ant://ADDRESS` is read too). |
 | `--datamap <PATH>` | Path to a local `.datamap` file (for private downloads). With an address too (a private file's envelope), the data map is used, and checked against the envelope when the upload's `.record` is next to it. |
 | `--proof <PATH>` | Path to an upload record or proof (`darwin file prove`) whose envelope carries the data map, or reveals it. |
 | `-o, --output <PATH>` | Output file path. Default, in the current directory: with `--datamap`, the data map's file name without `.datamap` (`my_data.bin.datamap` gives `my_data.bin`; other names need `-o`), also when an address comes with it; otherwise the address, in hex. Required with `--proof`. |
@@ -371,11 +371,11 @@ Checks a proof (or record) against the payment chain alone: the envelope hashes 
 
 ### `darwin manifest` — Manifests and the Upload History
 
-A manifest is a `.ant` file, or an `ant://manifest/...` link, that names files and holds what reads each one: its data map, embedded, or the address of its public data map chunk ([ADR-0006](docs/adr/ADR-0006-file-manifests-and-links.md)). Whoever has a manifest with embedded data maps can read those files.
+A manifest is a `.darwin` file, or a `darwin://manifest/...` link, that names files and holds what reads each one: its data map, embedded, or the address of its public data map chunk ([ADR-0006](docs/adr/ADR-0006-file-manifests-and-links.md)). Whoever has a manifest with embedded data maps can read those files. `darwin://` links and `.darwin` files are what `darwin` writes; upstream's `ant://` links and `.ant` files, the same bytes under upstream's names, are also read. A manifest file is read by its content, whatever its name.
 
-- `darwin manifest create [PATH]...` uploads files, or one directory's contents, and writes a manifest of them (`<name>.ant`, or `-o <PATH>`). It pays per chunk and refuses `--merkle`, as `darwin file upload` does. Its uploads have no envelope: files are stored as `darwin file upload --hide all` stores them, so they aren't listed and get no `.record`, and with `--public` a file's address is its plain data map chunk. `--public-file ADDRESS[=PATH]` adds a file that is already public, without uploading anything.
+- `darwin manifest create [PATH]...` uploads files, or one directory's contents, and writes a manifest of them (`<name>.darwin`, or `-o <PATH>`). It pays per chunk and refuses `--merkle`, as `darwin file upload` does. Its uploads have no envelope: files are stored as `darwin file upload --hide all` stores them, so they aren't listed and get no `.record`, and with `--public` a file's address is its plain data map chunk. `--public-file ADDRESS[=PATH]` adds a file that is already public, without uploading anything.
 - `darwin manifest list` lists the upload history, newest first. Every `darwin file upload` and `darwin manifest create` is recorded there, as a manifest in `uploads/` under the client's data directory, holding each file's data map, a private upload's too.
-- `darwin manifest show`, `link`, `download` and `export` take a `.ant` file, an `ant://manifest/...` link, or an id from `darwin manifest list`. `export --compact` replaces embedded data maps with public addresses, and offers to publish (paid) those whose plain data map chunk isn't on the network. A readable file that `darwin file upload` stored with an envelope has no such chunk, so it counts as still private, and publishing it gives the file a second address, without an envelope.
+- `darwin manifest show`, `link`, `download` and `export` take a `.darwin` file, a `darwin://manifest/...` link, or an id from `darwin manifest list`. `export --compact` replaces embedded data maps with public addresses, and offers to publish (paid) those whose plain data map chunk isn't on the network. A readable file that `darwin file upload` stored with an envelope has no such chunk, so it counts as still private, and publishing it gives the file a second address, without an envelope.
 
 ### `darwin listings` — The Listings Index
 

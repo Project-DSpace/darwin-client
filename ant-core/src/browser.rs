@@ -646,10 +646,11 @@ mod wasm {
             .map_err(|error| JsValue::from_str(&error.to_string()))
     }
 
-    /// Decode an `ant://manifest/...` link, an `ant://<address>` file link
-    /// or a bare address (ADR-0006). A manifest comes back with its entries,
-    /// embedded DataMaps included as bytes ready for `downloadPrivateFile`;
-    /// a file link comes back as `{ kind: "file", address }`.
+    /// Decode a `darwin://manifest/...` link, a `darwin://<address>` file
+    /// link or a bare address (ADR-0006); upstream's `ant://` links are read
+    /// too. A manifest comes back with its entries, embedded DataMaps
+    /// included as bytes ready for `downloadPrivateFile`; a file link comes
+    /// back as `{ kind: "file", address }`.
     #[wasm_bindgen(js_name = parseManifestLink)]
     pub fn parse_manifest_link_wasm(link: &str) -> Result<JsValue, JsValue> {
         let parsed = crate::data::manifest::parse_link(link)
@@ -666,7 +667,8 @@ mod wasm {
         serde_wasm_bindgen::to_value(&view).map_err(|error| JsValue::from_str(&error.to_string()))
     }
 
-    /// Decode the bytes of a `.ant` manifest file (ADR-0006).
+    /// Decode the bytes of a manifest file, `.darwin` or upstream's `.ant`
+    /// (ADR-0006).
     #[wasm_bindgen(js_name = decodeManifest)]
     pub fn decode_manifest_wasm(bytes: &[u8]) -> Result<JsValue, JsValue> {
         let manifest = crate::data::manifest::Manifest::decode(bytes)
@@ -1130,7 +1132,8 @@ mod tests {
     }
 }
 
-/// What a parsed `ant://` link points at, shaped for JavaScript.
+/// What a parsed `darwin://` (or `ant://`) link points at, shaped for
+/// JavaScript.
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "kind", rename_all = "camelCase")]
 pub enum BrowserLinkView {
