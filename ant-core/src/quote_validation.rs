@@ -204,4 +204,29 @@ mod tests {
         let error = validate_price_ceiling(price, Some(Amount::from(999u64))).unwrap_err();
         assert_eq!(error, "price 1000 is above the price ceiling 999");
     }
+
+    /// Upstream's price for a node storing nothing, in wei (0.00390625 ANT).
+    const UPSTREAM_BASELINE_WEI: u128 = 3_906_250_000_000_000;
+
+    /// Upstream's quadratic coefficient, in wei (0.03515625 ANT): what the
+    /// price adds to the baseline at the curve's divisor of 6,000 records.
+    const UPSTREAM_COEFFICIENT_WEI: u128 = 35_156_250_000_000_000;
+
+    /// This network's multiplier over upstream's prices, set in
+    /// `vendor/ant-protocol/src/payment/pricing.rs`, which `[patch.crates-io]`
+    /// puts in place of the crates.io release. Clients and nodes must carry
+    /// the same multiplier, or the forced-price check drops the nodes' quotes.
+    const PRICE_MULTIPLIER: u128 = 32;
+
+    #[test]
+    fn forced_prices_carry_the_networks_multiplier() {
+        let baseline = Amount::from(UPSTREAM_BASELINE_WEI * PRICE_MULTIPLIER);
+        assert_eq!(ant_protocol::payment::calculate_price(0), baseline);
+        // The price `validate_commitment_binding` holds a quote to.
+        assert_eq!(Amount::for_key_count(0), baseline);
+        assert_eq!(
+            Amount::for_key_count(6_000),
+            Amount::from((UPSTREAM_BASELINE_WEI + UPSTREAM_COEFFICIENT_WEI) * PRICE_MULTIPLIER)
+        );
+    }
 }
