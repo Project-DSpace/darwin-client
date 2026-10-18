@@ -20,9 +20,10 @@ told apart by the commit `darwin --version` prints. Upstream's entries follow.
 - Envelopes are darwin's default: `darwin file upload`, `darwin manifest create` and the
   library's file upload shortcuts store each upload in an envelope, with its payment record, a
   listing when listed, and a `.record`. The other ways of using the network remain, with no
-  envelope: raw chunks (`darwin chunk put`), plain data maps (`Visibility::Public`,
-  `data_upload`, `darwin manifest export --compact --yes`), the browser core's uploads and pointer
-  writes, and other clients.
+  envelope: raw chunks (`darwin chunk put`), a file's encrypted chunks whose data map the caller
+  keeps (`data_upload`), plain data maps (`Visibility::Public`,
+  `darwin manifest export --compact --yes`), the browser core's uploads and pointer writes, and
+  other clients.
 - Uploads paid by an outside payer; merkle batches paid in exact powers of two.
 - Uploads pay per chunk: `darwin file upload` and `darwin file cost` no longer use batch (merkle)
   payments, which the vault lets a payer steer and can charge twice when re-sent, and refuse
@@ -82,10 +83,10 @@ told apart by the commit `darwin --version` prints. Upstream's entries follow.
   named by the payer's `checkpoint_scope()`, with an envelope or without. Before, uploads of the
   same file without an envelope shared one checkpoint whoever paid: one payer's upload could
   resume another's payment state, and since an upload holds its checkpoint's lock while it
-  waits for its payment, a second payer's upload of the same file waited for the first (through
-  dspace-gateway, until the first payer paid or gave up). Wallet uploads without an envelope
-  keep their shared checkpoint. A payer's upload interrupted under an earlier build, without an
-  envelope, isn't resumed by this one: finish or drain such uploads before upgrading.
+  waits for its payment, a second payer's upload of the same file waited for the first (on a
+  gateway serving several payers, until the first payer paid or gave up). Wallet uploads without
+  an envelope keep their shared checkpoint. A payer's upload interrupted under an earlier build,
+  without an envelope, isn't resumed by this one: finish or drain such uploads before upgrading.
 - An optional price ceiling: `--max-chunk-price <BASE_UNITS>`, or `ClientConfig::max_chunk_price`
   in the library, the most a node's quote may ask to store one chunk, in the token's base units.
   A quote or merkle candidate asking more is dropped as if its node hadn't answered, and the

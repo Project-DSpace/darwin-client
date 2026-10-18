@@ -13,7 +13,7 @@ This project provides two Rust crates:
 
 Data on Darwin is **content-addressed**. Files are split into encrypted chunks (via [self-encryption](https://en.wikipedia.org/wiki/Convergent_encryption)), each stored at an XOR address derived from its content. A `DataMap` tracks which chunks belong to a file. Storage is paid in DARWIN on Robinhood Chain (chain ID 4663), through the payment vault `0xE0f627986c0438De0E314B644f3C8aA21D3f4f6B`. The token, the vault and the RPCs are bundled in `ant-core/resources/payment_network.toml`; `--evm-network robinhood`, the default, selects them.
 
-Envelopes are darwin's default. `darwin file upload`, `darwin manifest create` and the library's file upload shortcuts store each upload in an envelope: its payment record, with every payment field shown unless you hide some, a listing when it is listed, and a `.record` proof of the payment. The other ways of using the network remain, and store no envelope, so no payment record, listing or `.record`: raw chunks (`darwin chunk put`), plain data maps (`Visibility::Public`, `data_upload`, `darwin manifest export --compact --yes`), the browser core's uploads, and other clients.
+Envelopes are darwin's default. `darwin file upload`, `darwin manifest create` and the library's file upload shortcuts store each upload in an envelope: its payment record, with every payment field shown unless you hide some, a listing when it is listed, and a `.record` proof of the payment. The other ways of using the network remain, and store no envelope, so no payment record, listing or `.record`: raw chunks (`darwin chunk put`), a file's encrypted chunks whose data map the caller keeps (`data_upload`), plain data maps (`Visibility::Public`, `darwin manifest export --compact --yes`), the browser core's uploads, and other clients.
 
 ### Browser WebAssembly client
 
@@ -942,7 +942,7 @@ Data operations (upload/download) go directly to the P2P network — they do not
 │       └── commands/
 │           ├── data/
 │           │   ├── file.rs      # darwin file upload/download
-│           │   ├── chunk.rs     # darwin chunk get (put is off in this build)
+│           │   ├── chunk.rs     # darwin chunk put/get
 │           │   └── wallet.rs    # darwin wallet address/balance
 │           └── node/            # darwin node: off in this build
 │               ├── add.rs       # darwin node add

@@ -176,12 +176,13 @@ cargo run --bin darwin -- --help  # Run the CLI
 
 ## Commands that are off in this build
 
-`darwin chunk put` (`RAW_CHUNK_PUT` in `commands/data/chunk.rs`) and every `darwin node` command
-(`NODE_MANAGER` in `commands/node/mod.rs`) are refused before they read a key, touch the data
-directories or reach a network; so is `darwin update` (`SELF_UPDATE` in `commands/update.rs`).
-`ant-cli/tests/darwin_cli.rs` runs the binary to check the first two. A `darwin node` command a
-merge adds is refused too, and fails `the_node_commands_are_the_ones_checked_off` (cli.rs) until
-it is added to that test's list and to `NODE_COMMANDS` in `darwin_cli.rs`.
+Every `darwin node` command (`NODE_MANAGER` in `commands/node/mod.rs`) is refused before it reads
+a key, touches the data directories or reaches a network; so is `darwin update` (`SELF_UPDATE` in
+`commands/update.rs`). `ant-cli/tests/darwin_cli.rs` runs the binary to check that every
+`darwin node` command is refused, and that `darwin chunk put`, which stores a raw chunk with no
+envelope, is not: it goes on to ask for `SECRET_KEY`. A `darwin node` command a merge adds is
+refused too, and fails `the_node_commands_are_the_ones_checked_off` (cli.rs) until it is added to
+that test's list and to `NODE_COMMANDS` in `darwin_cli.rs`.
 
 ## Linear Project
 
