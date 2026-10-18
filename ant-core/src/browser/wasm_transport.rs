@@ -2351,6 +2351,35 @@ pub struct BrowserNetworkClient {
     shared: Rc<crate::data::Client>,
     adapter: Rc<SharedNetworkAdapter>,
     read_ahead: Rc<read_ahead::ReadAheadPool>,
+    /// Test builds only: whether a test let this client upload and write
+    /// pointers, which are off in this build (`browser::paid_writes`).
+    #[cfg(feature = "test-utils")]
+    test_paid_writes: Cell<bool>,
+}
+
+impl BrowserNetworkClient {
+    /// Refuse an upload or a pointer write while they are off in this build
+    /// (`browser::paid_writes`): called first by every export that pays or
+    /// stores, before any quote, wallet callback or PUT.
+    fn check_paid_writes(&self) -> Result<(), JsValue> {
+        if self.paid_writes_allowed() {
+            return Ok(());
+        }
+        super::paid_writes::check_browser_payments().map_err(JsValue::from_str)
+    }
+
+    /// Whether a test let this client through (`test_allow_paid_writes`),
+    /// to test the upload and pointer-write code underneath the exports.
+    #[cfg(feature = "test-utils")]
+    fn paid_writes_allowed(&self) -> bool {
+        self.test_paid_writes.get()
+    }
+
+    /// Never, outside test builds.
+    #[cfg(not(feature = "test-utils"))]
+    fn paid_writes_allowed(&self) -> bool {
+        false
+    }
 }
 
 #[wasm_bindgen(js_class = BrowserNetworkClient)]
@@ -2384,6 +2413,8 @@ impl BrowserNetworkClient {
             shared,
             adapter,
             read_ahead,
+            #[cfg(feature = "test-utils")]
+            test_paid_writes: Cell::new(false),
         })
     }
 
@@ -2500,6 +2531,9 @@ impl BrowserNetworkClient {
     }
 
     /// Self-encrypt, quote, pay through a wallet callback, and store a public file.
+    ///
+    /// Off in this build: refused before anything is quoted, paid or sent
+    /// (`browser::paid_writes`).
     #[wasm_bindgen(js_name = uploadPublicFile)]
     #[allow(clippy::too_many_arguments)] // Preserve the existing JS argument order; recovery is additive.
     pub async fn upload_public_file(
@@ -2515,6 +2549,7 @@ impl BrowserNetworkClient {
         payment_mode: Option<String>,
         pay_for_merkle: Option<js_sys::Function>,
     ) -> Result<JsValue, JsValue> {
+        self.check_paid_writes()?;
         let payment_network = parse_payment_network(payment_network)?;
         let progress = ProgressReporter::from_js(on_progress);
         let checkpoint =
@@ -2538,6 +2573,9 @@ impl BrowserNetworkClient {
     ///
     /// Record bytes are requested lazily from the asynchronous JavaScript
     /// callback, allowing the page to keep them in IndexedDB rather than WASM.
+    ///
+    /// Off in this build: refused before anything is quoted, paid or sent
+    /// (`browser::paid_writes`).
     #[wasm_bindgen(js_name = uploadStagedPublicFile)]
     #[allow(clippy::too_many_arguments)] // Preserve the existing JS argument order; recovery is additive.
     pub async fn upload_staged_public_file(
@@ -2552,6 +2590,7 @@ impl BrowserNetworkClient {
         payment_mode: Option<String>,
         pay_for_merkle: Option<js_sys::Function>,
     ) -> Result<JsValue, JsValue> {
+        self.check_paid_writes()?;
         let staged: BrowserStagedFile = serde_wasm_bindgen::from_value(staged)
             .map_err(|error| JsValue::from_str(&error.to_string()))?;
         let payment_network = parse_payment_network(payment_network)?;
@@ -2579,6 +2618,9 @@ impl BrowserNetworkClient {
     /// checkpoint scope; the shared coordinator selects single-node or Merkle
     /// payment for it exactly as for a complete file. Records are loaded
     /// lazily and verified against their addresses on every load.
+    ///
+    /// Off in this build: refused before anything is quoted, paid or sent
+    /// (`browser::paid_writes`).
     #[wasm_bindgen(js_name = uploadRecords)]
     #[allow(clippy::too_many_arguments)] // Mirrors the staged upload argument order.
     pub async fn upload_records(
@@ -2593,6 +2635,7 @@ impl BrowserNetworkClient {
         payment_mode: Option<String>,
         pay_for_merkle: Option<js_sys::Function>,
     ) -> Result<JsValue, JsValue> {
+        self.check_paid_writes()?;
         let mut batch: BrowserRecordBatch = serde_wasm_bindgen::from_value(batch)
             .map_err(|error| JsValue::from_str(&error.to_string()))?;
         validate_record_batch(&mut batch).map_err(|error| JsValue::from_str(&error))?;
@@ -2638,13 +2681,8 @@ fn parse_payment_network(value: JsValue) -> Result<BrowserPaymentNetwork, JsValu
 }
 
 fn parse_payment_mode(value: Option<&str>) -> Result<PaymentMode, JsValue> {
-    match value {
-        // Per chunk unless asked: see `PaymentMode`'s default.
-        None | Some("single") => Ok(PaymentMode::Single),
-        Some("auto") => Ok(PaymentMode::Auto),
-        Some("merkle") => Ok(PaymentMode::Merkle),
-        Some(_) => Err(JsValue::from_str("unknown payment mode")),
-    }
+    // Per chunk unless asked: see `PaymentMode`'s default.
+    super::paid_writes::payment_mode_named(value).map_err(JsValue::from_str)
 }
 
 impl BrowserNetworkClient {

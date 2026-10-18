@@ -14,6 +14,17 @@ node --import ./wasm-tests/setup-wasm.mjs \
 The generated `pkg/` directory is ignored. Browser-native integration,
 examples, and end-to-end browser tests belong to `ant-client-browser-sdk`.
 
+Uploads and pointer writes are off in this build (`src/browser/paid_writes.rs`):
+a page's `BrowserNetworkClient` refuses `uploadPublicFile`,
+`uploadStagedPublicFile`, `uploadRecords`, `createPointer`, `updatePointer`,
+`transferPointer` and `storePaidPointer` before any quote, wallet callback or
+send. `paid-writes-off.test.mjs` checks that for each of them, whatever the
+arguments, and that downloads and pointer reads still work. The upload and
+pointer-write tests below exercise the code underneath on the client
+`client-fixture.mjs` makes, which a `test-utils` build lets through
+(`test_allow_paid_writes`); the Merkle, Auto, transfer and stored-paid-state
+tests expect the refusal a page gets.
+
 The test build enables `test-utils` for a deterministic mock node. Transport
 regressions use a mock `RTCPeerConnection` while running the real PQ handshake,
 record encryption, lookup, quote verification, and upload implementation.
@@ -39,16 +50,17 @@ remote errors are tested separately from an actual PUT-response deadline.
 
 Record-batch tests upload one file as consecutive caller-staged batches with
 separate payments, check that progress keeps file-level record positions, and
-confirm each result reports the payment mode the shared coordinator used.
+confirm a page's client refuses batches in every payment mode.
 Private-file tests keep the DataMap record local, then download and range-read
 through the caller-held DataMap, including one with nested DataMap records.
 
 Pointer tests create, update, read and resolve pointers through the real
 client, quorum and payment code against mock nodes that keep pointers with the
 node's merge rule, and check that a node which does not advertise
-`pointer_protocol` is never asked. The mock serves every channel of one node
-from one store, as a real node does, since pointer reads and writes take
-different channels.
+`pointer_protocol` is never asked. A page's transfers and stored paid states are
+refused, and its reads follow a transfer the test client made. The mock serves
+every channel of one node from one store, as a real node does, since pointer
+reads and writes take different channels.
 
 Download regressions cover known holders omitted by failed discovery, complete
 discovery failure, bounded fallback, and unchanged BLAKE3 verification. The mock
@@ -111,10 +123,11 @@ monotonic frame deadlines, operation-specific response timeouts, and pool
 capacity wakeups after cancellation. See `../browser-tests/README.md` for the
 Chromium integration against real nodes and Anvil.
 
-`payment-recovery.test.mjs` covers storing earlier paid Merkle batches after a
-later payment/recovery failure, explicit reconciliation of rejected and reverted
-payments, preservation of paid proofs, failed verification/persistence, and client
-closure during asynchronous prepayment checkpoints for both payment modes.
+`payment-recovery.test.mjs` checks that a page's client refuses Merkle and
+single uploads before any payment, checkpoint or staged-record load, so it never
+has a payment to recover, and covers reconciliation of reverted payments,
+preservation of paid proofs and failed verification/persistence on the test
+client.
 
 `rpc-deadlines.test.mjs` covers independent queue/send/response budgets, a final
 buffer drain with early responses, one HELLO for concurrent cold operations,

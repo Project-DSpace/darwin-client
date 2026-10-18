@@ -7,6 +7,7 @@
 //! `ant-client-browser-sdk` project.
 
 pub mod manifest;
+mod paid_writes;
 pub mod payment;
 #[cfg(any(all(target_arch = "wasm32", feature = "browser-wasm"), test))]
 mod peer_records;

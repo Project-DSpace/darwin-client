@@ -31,7 +31,10 @@ for (const malformed of ["amount", "hash"]) test(`invalid wallet ${malformed} pr
 
 test("paid low-level uploads require checkpoint persistence before invoking the wallet", async () => {
   const rtc = mockWebRtc(Array.from({ length: 7 }, () => ({})));
+  // The unwrapped bindings, let through to the upload code underneath, which
+  // is off in this build (paid-writes-off.test.mjs).
   const client = new RawNetwork(rtc.endpoints); let calls = 0;
+  client.test_allow_paid_writes();
   try {
     await assert.rejects(client.uploadPublicFile(content, "a", "text/plain", paymentNetwork, async (_, quotes) => { calls++; return receipt(quotes); }), /checkpoint persistence/);
     assert.equal(calls, 0);

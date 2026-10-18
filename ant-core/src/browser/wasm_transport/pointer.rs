@@ -246,6 +246,9 @@ impl BrowserNetworkClient {
     /// is paid for and before it is stored. Keep both: if storing fails, or the
     /// page is lost, [`Self::store_paid_pointer`] stores the same state without
     /// paying again.
+    ///
+    /// Off in this build: refused before anything is quoted, paid or sent
+    /// (`browser::paid_writes`).
     #[wasm_bindgen(js_name = createPointer)]
     pub async fn create_pointer(
         &self,
@@ -256,6 +259,7 @@ impl BrowserNetworkClient {
         pay_for_quotes: js_sys::Function,
         on_paid: Option<js_sys::Function>,
     ) -> Result<JsValue, JsValue> {
+        self.check_paid_writes()?;
         let payment_network = parse_payment_network(payment_network)?;
         let written = self
             .write_pointer(
@@ -275,6 +279,8 @@ impl BrowserNetworkClient {
     /// Point the pointer `owner_seed` controls at `target`, one past the
     /// counter the network serves (or create it), and pay for the new state.
     /// `on_paid` is as for [`Self::create_pointer`].
+    ///
+    /// Off in this build, as [`Self::create_pointer`] is.
     #[wasm_bindgen(js_name = updatePointer)]
     pub async fn update_pointer(
         &self,
@@ -285,6 +291,7 @@ impl BrowserNetworkClient {
         pay_for_quotes: js_sys::Function,
         on_paid: Option<js_sys::Function>,
     ) -> Result<JsValue, JsValue> {
+        self.check_paid_writes()?;
         let payment_network = parse_payment_network(payment_network)?;
         let written = self
             .write_pointer(
@@ -310,6 +317,8 @@ impl BrowserNetworkClient {
     /// Refused before anything is paid if the pointer is already final, or if
     /// `recipient` does not exist or leads back to this pointer. Check the
     /// result with [`Self::pointer_finality`] before relying on it.
+    ///
+    /// Off in this build, as [`Self::create_pointer`] is.
     #[wasm_bindgen(js_name = transferPointer)]
     pub async fn transfer_pointer(
         &self,
@@ -319,6 +328,7 @@ impl BrowserNetworkClient {
         pay_for_quotes: js_sys::Function,
         on_paid: Option<js_sys::Function>,
     ) -> Result<JsValue, JsValue> {
+        self.check_paid_writes()?;
         let payment_network = parse_payment_network(payment_network)?;
         let written = self
             .write_pointer(
@@ -351,6 +361,9 @@ impl BrowserNetworkClient {
 
     /// Store a pointer state already paid for, from the `record` and `proof`
     /// an earlier write handed to its `on_paid` callback. Pays nothing.
+    ///
+    /// Off in this build, as [`Self::create_pointer`] is: refused before
+    /// anything is sent.
     #[wasm_bindgen(js_name = storePaidPointer)]
     pub async fn store_paid_pointer(
         &self,
@@ -358,6 +371,7 @@ impl BrowserNetworkClient {
         proof: &[u8],
         payment_network: JsValue,
     ) -> Result<JsValue, JsValue> {
+        self.check_paid_writes()?;
         let payment_network = parse_payment_network(payment_network)?;
         let record = Pointer::from_bytes(record)
             .map_err(|error| JsValue::from_str(&format!("invalid pointer record: {error}")))?;

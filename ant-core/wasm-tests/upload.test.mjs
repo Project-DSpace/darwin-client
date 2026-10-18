@@ -1,4 +1,4 @@
-import { BrowserNetworkClient } from "./client-fixture.mjs";
+import { BrowserNetworkClient, PageClient, PAID_WRITES_OFF } from "./client-fixture.mjs";
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
@@ -520,82 +520,62 @@ const merkleReceipt = request => ({
   totalAmount: request.maximumAmount,
 });
 
-test("forced Merkle uses native candidate quotes and tagged record proofs", async () => {
-  const rtc = mockWebRtc(Array.from({ length: 16 }, () => ({})));
-  const client = new BrowserNetworkClient(rtc.endpoints);
-  let request;
-  try {
-    const result = await client.uploadPublicFile(content, "merkle.txt", "text/plain", paymentNetwork,
-      async () => { throw new Error("single payment must not run"); }, undefined, undefined, undefined, "merkle",
-      async (_, value) => { request = value; return merkleReceipt(value); });
-    assert.match(request.calldata, /^0x[0-9a-f]+$/);
-    assert(rtc.requests.some(request => request.method === "merkle_quote"));
-    assert.equal(result.storageCostAtto, request.maximumAmount);
-    for (const put of rtc.requests.filter(request => request.method === "put_chunk")) {
-      assert.equal(put.quoteHash, request.poolHashes[0]);
-    }
-  } finally { client.close(); }
+// Uploads are off in this build, so a page's client refuses a Merkle or Auto
+// upload as it refuses every other: before any candidate quote, payment,
+// checkpoint or staged-record load, and before anything is sent.
+const refusedAsOff = error => error === PAID_WRITES_OFF;
+
+test("forced Merkle uploads are refused before any candidate quote or payment", async () => {
+  for (const nodes of [16, 7]) {
+    const rtc = mockWebRtc(Array.from({ length: nodes }, () => ({})));
+    const client = new PageClient(rtc.endpoints);
+    const calls = [];
+    try {
+      await assert.rejects(client.uploadPublicFile(content, "merkle.txt", "text/plain", paymentNetwork,
+        async () => { calls.push("single"); }, undefined, undefined, () => { calls.push("checkpoint"); },
+        "merkle", async (_, value) => { calls.push("merkle"); return merkleReceipt(value); }), refusedAsOff);
+      assert.deepEqual(calls, [], `${nodes} nodes`);
+      assert.equal(rtc.requests.length, 0, `${nodes} nodes`);
+    } finally { client.close(); }
+  }
 });
 
-test("forced Merkle fails before payment when candidate pools cannot be filled", async () => {
-  const rtc = mockWebRtc(Array.from({ length: 7 }, () => ({})));
-  const client = new BrowserNetworkClient(rtc.endpoints);
-  let payments = 0;
-  try {
-    await assert.rejects(client.uploadPublicFile(content, "merkle.txt", "text/plain", paymentNetwork,
-      async () => { payments++; }, undefined, undefined, undefined, "merkle", async () => { payments++; }));
-    assert.equal(payments, 0);
-  } finally { client.close(); }
-});
-
-test("prepared Merkle checkpoint preserves the exact salted tree and wallet request", async () => {
+test("a Merkle checkpoint from an interrupted upload is not resumed by a page", async () => {
   const rtc = mockWebRtc(Array.from({ length: 16 }, () => ({})));
-  let client = new BrowserNetworkClient(rtc.endpoints);
-  let checkpoint, original;
+  // The code underneath, as a test build lets it run, leaves a prepared
+  // checkpoint when the wallet is interrupted.
+  const writer = new BrowserNetworkClient(rtc.endpoints);
+  let checkpoint;
   try {
-    await assert.rejects(client.uploadPublicFile(content, "merkle.txt", "text/plain", paymentNetwork,
+    await assert.rejects(writer.uploadPublicFile(content, "merkle.txt", "text/plain", paymentNetwork,
       async () => { throw new Error("unexpected single payment"); }, undefined, undefined,
-      value => { checkpoint = value; }, "merkle", async (_, request) => {
-        original = request; throw new Error("wallet interrupted");
-      }), /wallet interrupted/);
-    client.close();
-    await new Promise(resolve => setTimeout(resolve, 1100));
-    client = new BrowserNetworkClient(rtc.endpoints);
-    await client.uploadPublicFile(content, "merkle.txt", "text/plain", paymentNetwork,
-      async () => { throw new Error("unexpected single payment"); }, undefined, checkpoint, undefined, "merkle",
-      Object.assign(async () => { throw new Error("must not submit again"); }, {
-        recover: async (_, request) => { assert.deepEqual(request, original); return merkleReceipt(request); },
-      }));
-  } finally { client.close(); }
-});
-
-test("paid Merkle checkpoint survives byte-loader failure without repaying", async () => {
-  const rtc = mockWebRtc(Array.from({ length: 16 }, () => ({})));
+      value => { checkpoint = value; }, "merkle", async () => { throw new Error("wallet interrupted"); }),
+      /wallet interrupted/);
+  } finally { writer.close(); }
+  assert.equal(typeof checkpoint, "string");
+  const sent = rtc.requests.length;
+  const client = new PageClient(rtc.endpoints);
   const {encrypted, staged} = stagedFixture();
-  let client = new BrowserNetworkClient(rtc.endpoints);
-  let checkpoint, payments = 0;
-  const noSingle = async () => { throw new Error("unexpected single payment"); };
+  const calls = [];
+  const recovering = Object.assign(async () => { calls.push("merkle"); }, {
+    recover: async (_, request) => { calls.push("recover"); return merkleReceipt(request); },
+  });
   try {
+    await assert.rejects(client.uploadPublicFile(content, "merkle.txt", "text/plain", paymentNetwork,
+      async () => { calls.push("single"); }, undefined, checkpoint, undefined, "merkle", recovering),
+      refusedAsOff);
     await assert.rejects(client.uploadStagedPublicFile(staged, paymentNetwork,
-      async index => { if (payments) throw new Error("loader unavailable"); return encrypted.records[index].content; }, noSingle, undefined, undefined,
-      value => { checkpoint = value; }, "merkle", async (_, request) => {
-        payments++; return merkleReceipt(request);
-      }), /loader unavailable/);
-    assert.equal(payments, 1);
-    client.close();
-    client = new BrowserNetworkClient(rtc.endpoints);
-    const result = await client.uploadStagedPublicFile(staged, paymentNetwork,
-      async index => encrypted.records[index].content, noSingle, undefined, checkpoint, undefined, "merkle",
-      async () => { throw new Error("Merkle payment must be reused"); });
-    assert.equal(result.storageCostAtto, "0");
-    assert.equal(result.records, staged.records.length);
+      async index => { calls.push("load"); return encrypted.records[index].content; },
+      async () => { calls.push("single"); }, undefined, checkpoint, undefined, "merkle", recovering),
+      refusedAsOff);
+    assert.deepEqual(calls, []);
+    assert.equal(rtc.requests.length, sent, "the page sent nothing");
   } finally { client.close(); }
 });
 
-
-test("Auto fallback shares single-node payment waves and deduplicates records", async () => {
+test("Auto uploads are refused before any quote or payment", async () => {
   const rtc = mockWebRtc(Array.from({ length: 7 }, () => ({})));
-  const client = new BrowserNetworkClient(rtc.endpoints);
+  const client = new PageClient(rtc.endpoints);
   const {encrypted, staged} = stagedFixture();
   const records = encrypted.records.slice(0, -1);
   while (records.length < 64) {
@@ -605,12 +585,14 @@ test("Auto fallback shares single-node payment waves and deduplicates records", 
   records.push(records[0], encrypted.records.at(-1));
   staged.records = records.map(record => ({address: record.address, size: record.content.length}));
   const signer = wallet();
+  let loads = 0;
   try {
-    const result = await client.uploadStagedPublicFile(staged, paymentNetwork,
-      async index => records[index].content, signer.pay, undefined, undefined, undefined, "auto");
-    assert.equal(result.records, 66);
-    assert.deepEqual(signer.calls.map(call => call.quotes.length), [64, 1]);
-    assert.equal(rtc.requests.filter(request => request.method === "put_chunk").length, 65 * 7);
+    await assert.rejects(client.uploadStagedPublicFile(staged, paymentNetwork,
+      async index => { loads++; return records[index].content; }, signer.pay, undefined, undefined,
+      undefined, "auto"), refusedAsOff);
+    assert.equal(signer.calls.length, 0);
+    assert.equal(loads, 0);
+    assert.equal(rtc.requests.length, 0);
   } finally { client.close(); }
 });
 
