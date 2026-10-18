@@ -38,12 +38,12 @@ told apart by the commit `darwin --version` prints. Upstream's entries follow.
   which fails with the same error (a finalize can't quote it again, so the upload has to be
   prepared again), hold the envelope back, report the cost without the skipped payment, and leave
   the chunk out of the resume handle, which lists it (`WaveFinalizeResume::occupied`);
-  `finalize_chunk` and `pointer_put_paid` refuse it before sending. `batch_pay`, which paid with
-  no read-back and had no callers, is off: it returns an error naming `batch_upload_chunks`. The
-  merkle finalize paths and the raw building blocks (`chunk_put_with_proof`,
-  `finalize_batch_payment`, `SingleNodeQuotePayment::pay`) read nothing back. The records are read
-  through the payment network's RPC and then, on the bundled network, the RPCs reads of payments
-  fall back to, each call within 15 seconds; before, through its RPC alone, with no time limit.
+  `finalize_chunk` and `pointer_put_paid` refuse it before sending. The merkle finalize paths and
+  the raw building blocks (`batch_pay`, `chunk_put_with_proof`, `finalize_batch_payment`,
+  `SingleNodeQuotePayment::pay`) read nothing back; `batch_upload_chunks` is the batch path that
+  does. The records are read through the payment network's RPC and then, on the bundled network,
+  the RPCs reads of payments fall back to, each call within 15 seconds; before, through its RPC
+  alone, with no time limit.
   Browser builds don't read records back.
 - The browser core's uploads and pointer writes (`uploadPublicFile`, `uploadStagedPublicFile`,
   `uploadRecords`, `createPointer`, `updatePointer`, `transferPointer` and `storePaidPointer`)
