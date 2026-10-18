@@ -2,7 +2,7 @@
 name = "ant-cli"
 version = "0.3.11"
 edition = "2021"
-description = "Unified CLI (`darwin`) for the Darwin storage network: store and retrieve data, and manage local nodes."
+description = "CLI (`darwin`) for the Darwin storage network: store and retrieve data."
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/WithAutonomi/ant-client"
 readme = "../README.md"

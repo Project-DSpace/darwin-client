@@ -1,5 +1,9 @@
 # Architecture: Node Management
 
+> In this repository's `darwin`, `darwin node` is off: this is upstream's node manager, kept in
+> `ant-core`. It installs Autonomi's `ant-node`, which joins Autonomi's network, not Darwin's;
+> Darwin storage nodes run from the storage-node image.
+
 ## Overview
 
 Node management uses a daemon-based architecture. A single long-running daemon process manages all

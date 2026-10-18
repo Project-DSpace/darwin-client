@@ -106,6 +106,9 @@ async fn run() -> anyhow::Result<()> {
 
     match command {
         Commands::Node { command } => {
+            // Off in this build: every node command is refused here, before
+            // any download, registry write, daemon or network call.
+            commands::node::ensure_node_manager()?;
             // Delegate to existing node management commands
             match command {
                 commands::node::NodeCommand::Add(args) => {

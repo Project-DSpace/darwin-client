@@ -143,6 +143,13 @@ told apart by the commit `darwin --version` prints. Upstream's entries follow.
   an envelope, with no payment record, listing or `.record`. It fails before reading its input
   or `SECRET_KEY`, or joining the network, and names `darwin file upload`. `darwin chunk get`
   and the library's `Client::chunk_put` are unchanged.
+- `darwin node`, upstream's node manager, is off: it installed Autonomi's `ant-node` from
+  WithAutonomi's releases, which joins Autonomi's network and is paid on Arbitrum, and its log
+  forwarding shipped node logs to Autonomi's endpoint. Every `darwin node` command, the hidden
+  `daemon run` and its REST API included, fails before it downloads, writes or starts anything.
+  Darwin storage nodes run from the storage-node image (the darwin-node repository's
+  `docker/README.md`); nodes an earlier build added are managed with Autonomi's `ant`. The
+  library's `ant_core::node` is unchanged.
 - `darwin-linux-x64.tar.gz` from CI carries license notices: `LICENSE-MIT`, `LICENSE-APACHE`,
   `THIRD-PARTY-NOTICES.txt` and `RUST-STD-COPYRIGHT.html` next to `darwin`, like upstream's archives.
 - In the library, the upload calls that take no visibility (`file_upload`, `file_upload_with_mode`,

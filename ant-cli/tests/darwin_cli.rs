@@ -30,6 +30,41 @@ const CHUNK_PUT_OFF: &str = "`darwin chunk put` is off in this build: a raw chun
      envelope, so it would be stored without the payment record, listing and .record every upload \
      carries. Use `darwin file upload <FILE>`: private by default, every payment field shown.";
 
+/// What every `darwin node` command says while the node manager is off.
+const NODE_OFF: &str = "`darwin node` is off in this build: it would install Autonomi's ant-node, \
+     which joins Autonomi's network and is paid on Arbitrum, not Darwin. Darwin storage nodes run \
+     from the storage-node image (see the darwin-node repository's docker/README.md). Nodes added \
+     by an earlier build are managed with Autonomi's `ant`.";
+
+/// Every `darwin node` command, the hidden `daemon run` included, with
+/// arguments it parses. ant-cli's `the_node_commands_are_the_ones_checked_off`
+/// keeps the list complete.
+const NODE_COMMANDS: &[&[&str]] = &[
+    &[
+        "node",
+        "add",
+        "--rewards-address",
+        "0x1111111111111111111111111111111111111111",
+        "--count",
+        "2",
+        "--node-port",
+        "12000-12001",
+    ],
+    &["node", "daemon", "start", "--listen-addr", "127.0.0.1"],
+    &["node", "daemon", "stop"],
+    &["node", "daemon", "status"],
+    &["node", "daemon", "info"],
+    &["node", "daemon", "run", "--port", "0"],
+    &["node", "dismiss", "1"],
+    &["node", "logs", "forward", "enable", "--token", "token"],
+    &["node", "logs", "forward", "disable"],
+    &["node", "logs", "forward", "status"],
+    &["node", "reset", "--force"],
+    &["node", "start"],
+    &["node", "status"],
+    &["node", "stop"],
+];
+
 /// How a run of `darwin` ended and what it printed and left behind.
 #[derive(Debug)]
 struct Run {
@@ -163,6 +198,23 @@ fn chunk_put_is_refused() {
     ] {
         let run = darwin(args, b"hello darwin");
         assert_refused(args, &run, CHUNK_PUT_OFF);
+    }
+}
+
+/// `darwin node` is off: every command, with or without `--json`, is
+/// refused before it downloads, writes, starts or asks anything.
+#[test]
+fn every_node_command_is_refused() {
+    for command in NODE_COMMANDS {
+        for json in [false, true] {
+            let args: Vec<&str> = json
+                .then_some("--json")
+                .into_iter()
+                .chain(command.iter().copied())
+                .collect();
+            let run = darwin(&args, b"");
+            assert_refused(&args, &run, NODE_OFF);
+        }
     }
 }
 

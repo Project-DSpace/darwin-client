@@ -1,6 +1,6 @@
 # darwin — Darwin Storage Network Client
 
-A unified CLI and Rust library for storing data on the Darwin storage network and managing its nodes.
+A CLI and Rust library for storing data on the Darwin storage network.
 
 Based on Autonomi's [ant-client](https://github.com/WithAutonomi/ant-client), licensed MIT or Apache-2.0.
 
@@ -602,195 +602,15 @@ $ SECRET_KEY=0x... darwin wallet balance
 1000000000000000000
 ```
 
-### `darwin node` — Node Management (Autonomi only)
+### `darwin node` — Node Management
 
-> **This does not run Darwin nodes.** `darwin node` is upstream's node manager, unchanged:
-> `darwin node add` downloads Autonomi's `ant-node` from WithAutonomi's GitHub releases, and
-> those nodes join Autonomi's network and take payment on Arbitrum (`--evm-network` offers only
-> `arbitrum-one` and `arbitrum-sepolia`). Darwin storage nodes run from the storage-node Docker
-> image built from Project-DSpace/darwin-node. The rest of this section describes upstream's tool.
-
-Manage Autonomi `ant-node` processes via a local daemon process. The daemon runs in the background, exposes a REST API on `127.0.0.1`, and supervises all node processes.
-
-#### `darwin node daemon start`
-
-Launch the daemon as a detached background process. By default it binds to a random free port on `127.0.0.1` and writes the chosen port to `daemon.port` for discovery.
-
-```
-$ darwin node daemon start
-Daemon started (pid: 12345, port: 48532)
-```
-
-**Options:**
-
-| Flag | Description |
-|------|-------------|
-| `--port <PORT>` | Pin the HTTP port. `0` means OS-assigned (the default behavior). |
-| `--listen-addr <IP>` | Bind address. Defaults to `127.0.0.1`. |
-
-Pin the port and bind on all interfaces — useful when the daemon runs inside a container and the API needs to be reachable through a port mapping:
-
-```
-$ darwin node daemon start --listen-addr 0.0.0.0 --port 8765
-```
-
-```
-$ docker run -d -p 8765:8765 my/darwin-image \
-    darwin node daemon start --listen-addr 0.0.0.0 --port 8765
-```
-
-> **Warning:** the daemon has no authentication. Binding to a non-loopback address exposes node management — start, stop, reset, registry mutation — to anyone who can reach the port. Only do this when the network path is controlled (e.g. a container with an explicit port mapping or a trusted private network).
-
-#### `darwin node daemon stop`
-
-Shut down the running daemon. Sends SIGTERM and waits for exit.
-
-```
-$ darwin node daemon stop
-Daemon stopped (pid: 12345)
-```
-
-#### `darwin node daemon status`
-
-Show daemon status and node count summary.
-
-```
-$ darwin node daemon status
-Daemon is running
-  PID:           12345
-  Port:          48532
-  Uptime:        3600s
-  Nodes total:   3
-  Nodes running: 2
-  Nodes stopped: 1
-  Nodes errored: 0
-```
-
-#### `darwin node daemon info`
-
-Output connection details as JSON (always JSON, regardless of `--json` flag). AI agents use this to discover the daemon's REST API.
-
-```json
-{
-  "running": true,
-  "pid": 12345,
-  "port": 48532,
-  "api_base": "http://127.0.0.1:48532/api/v1"
-}
-```
-
-#### `darwin node add`
-
-Register one or more nodes in the registry. Does **not** start them. Does **not** require the daemon.
-
-```
-$ darwin node add --rewards-address 0xYourWallet --count 3 --node-port 12000-12002 --path /path/to/antnode
-Added 3 node(s):
-  Node 1: port 12000
-  Node 2: port 12001
-  Node 3: port 12002
-```
-
-If the daemon is running, the command routes through its REST API. Otherwise, it operates directly on the registry file.
-
-**Options:**
-
-| Flag | Description |
-|------|-------------|
-| `--rewards-address <ADDR>` | Required. EVM wallet address for node earnings. |
-| `--count <N>` | Number of nodes to add (default: 1). |
-| `--node-port <PORT\|RANGE>` | Port or range (e.g., `12000` or `12000-12004`). |
-| `--data-dir-path <PATH>` | Custom data directory prefix. |
-| `--log-dir-path <PATH>` | Custom log directory prefix. |
-| `--path <PATH>` | Path to a local `antnode` binary. |
-| `--version <X.Y.Z>` | Download a specific version (accepts pre-releases, e.g. `0.17.0-beta.1`). |
-| `--url <URL>` | Download binary from a URL archive. |
-| `--bootstrap <IP:PORT>` | Bootstrap peer(s), comma-separated. |
-| `--evm-network <NET>` | EVM network for storage payments: `arbitrum-one` (default) or `arbitrum-sepolia`. |
-| `--upgrade-channel <CHAN>` | Release channel the node tracks for automatic upgrades: `stable` (default) or `beta`. Also selects which release the binary is downloaded from when no `--path`/`--version`/`--url` is given. |
-| `--env <K=V>` | Environment variables, comma-separated. |
-
-With none of `--path`, `--version` or `--url`, the binary is downloaded from the newest release
-eligible for the chosen channel: the latest stable release on `stable`, and the highest of the
-`-beta.N` and stable releases on `beta`. Release candidates (`-rc.N`) are never installed on
-either channel — they are cut before the release gates have given a verdict.
-
-#### `darwin node start`
-
-Start registered node(s). Requires the daemon to be running.
-
-```
-$ darwin node start                          # Start all
-$ darwin node start --service-name node1     # Start specific node
-```
-
-#### `darwin node stop`
-
-Stop running node(s). Requires the daemon.
-
-```
-$ darwin node stop                           # Stop all
-$ darwin node stop --service-name node1      # Stop specific node
-```
-
-#### `darwin node status`
-
-Display all nodes and their current status.
-
-#### `darwin node reset`
-
-Remove all node data, log directories, and clear the registry. All nodes must be stopped first.
-
-```
-$ darwin node reset --force
-```
-
-#### `darwin node logs forward`
-
-Autonomi only: the endpoint and the beta programme are Autonomi's. Optionally ship this machine's node logs to the Autonomi beta log endpoint, to help judge a beta
-build. Off by default and never enabled for you — running `enable` yourself is the whole of the
-consent, and `disable` stops it. See
-[Forwarding your node logs](#forwarding-your-node-logs-optional) for the walkthrough.
-
-```
-$ darwin node logs forward enable --token <token>
-$ darwin node logs forward status
-$ darwin node logs forward disable
-```
-
-**`enable` options:**
-
-| Flag | Description |
-|------|-------------|
-| `--token <TOKEN>` | The write-only token issued with your beta enrolment. Only needed the first time; re-enabling after a `disable` reuses the stored one. |
-| `--endpoint <URL>` | Send somewhere other than the default endpoint. Intended for testing against a local sink. |
-| `--level <LEVEL>` | Lowest level to forward: `trace`, `debug`, `info`, `warn`, `error`. Defaults to `info`. |
-
-`status` reports whether forwarding is on, which nodes are being tailed, which are being skipped and
-why, and how many events have been delivered:
-
-```
-$ darwin node logs forward status
-Log forwarding: on
-  Endpoint: https://logs.autonomi.com   Level: INFO and above
-  Token:    75f57160d2c2
-
-  Forwarding (1)
-    ● node1 (1)
-
-  Not forwarding (2)
-    ○ node2 (2) — logging is not enabled for this node — re-add it with --log-dir-path to forward its logs
-    ○ node3 (3) — logging is not enabled for this node — re-add it with --log-dir-path to forward its logs
-
-  Node logging is off unless a node was added with --log-dir-path.
-
-  Delivery
-    Forwarded: 1284   Batches: 7 sent, 0 failed
-```
-
-The token is stored at `~/.config/ant/log_forward.json` with owner-only permissions and is never
-printed back or returned by the API — `status` shows a short fingerprint of it instead, enough to
-tell which token is in use.
+Off in this build: every `darwin node` command exits with an error, before it downloads, writes
+or starts anything, or reaches the network. Upstream's node manager would install Autonomi's
+`ant-node` from WithAutonomi's GitHub releases, and those nodes join Autonomi's network and take
+payment on Arbitrum; its log forwarding (`darwin node logs forward`) ships node logs to
+Autonomi's endpoint, and its daemon serves both through a REST API. Darwin storage nodes run from
+the storage-node image (see the darwin-node repository's `docker/README.md`). Nodes added by an
+earlier build are managed with Autonomi's `ant`.
 
 ### `darwin update` — Self-Update
 
@@ -803,203 +623,19 @@ publishes no releases yet. Update by building a new `darwin` or taking the lates
 
 ## Beta Programme
 
-> **Autonomi only.** This is Autonomi's beta programme for `ant` and `ant-node`. Darwin has no
-> beta channel, `darwin update` is off, and the log endpoint below is Autonomi's.
-
-The beta channel carries the week's build ahead of the stable train, for people who want to soak it
-and report back.
-
-Taking part means [running beta builds](#running-beta-builds). That is the whole requirement.
-
-Separately, and entirely optionally, you can [forward your node logs](#forwarding-your-node-logs-optional)
-to Autonomi's beta log endpoint. It is off by default, it is not a condition of being on the beta channel, and choosing not to
-turn it on costs you nothing.
-
-### Running beta builds
-
-The client and the nodes have separate beta channels, opted into separately.
-
-```bash
-# 1. Run a beta build of the client (a version with a -beta.N suffix).
-
-# 2. From then on, self-update stays on beta with no flag needed.
-$ darwin update
-
-# 3. Add nodes that track the beta channel. The binary is downloaded from the newest
-#    beta-eligible ant-node release.
-$ darwin node add --rewards-address 0xYourWallet --count 3 --upgrade-channel beta
-```
-
-Existing nodes are not switched to the beta channel by any of this — `--upgrade-channel` applies
-to nodes at the point they are added, so opting in means adding new nodes.
-
-### Forwarding your node logs (optional)
-
-**This is opt-in and stays off until you ask for it.** Nothing leaves your machine unless you run
-`darwin node logs forward enable` yourself, and running it is the whole of the consent. You can skip
-this section entirely and still run beta builds.
-
-If you do want to help: beta enrolment comes with a write-only token, and handing it to that command
-makes the daemon tail your nodes' log files and ship them to the Autonomi beta log endpoint. It is
-the difference between Autonomi judging a build on a handful of self-reported problems and judging it on
-what the nodes actually did, so it is genuinely useful — but it is your call, and `disable` stops it
-at any point.
-
-**If you do turn it on, the order of these three steps matters:**
-
-```bash
-# 1. Add nodes WITH LOGGING ENABLED. Node file logging is off by default; without
-#    --log-dir-path a node writes no log files at all and there is nothing to forward.
-$ darwin node add --rewards-address 0xYourWallet --count 3 \
-      --upgrade-channel beta --log-dir-path ~/.local/share/ant
-
-# 2. Enable forwarding BEFORE starting the nodes.
-$ darwin node logs forward enable --token <your-token>
-
-# 3. Now start them.
-$ darwin node start
-```
-
-#### Why the order matters
-
-**`--log-dir-path` has to be set when the node is added.** The value is a prefix — each node gets
-`<prefix>/node-<id>/logs` — and there is no way to turn logging on for an existing node short of
-removing it and adding it again. If you forget, `enable` will tell you —
-those nodes appear under "Not forwarding" in `darwin node logs forward status` — but the node has to be
-re-added to fix it.
-
-**Enable before you start, not after.** Enabling forwarding is forward-looking consent: for any log
-file that *already exists*, the daemon starts reading from the end of it, so nothing written before
-you opted in is ever uploaded. A node that has not run yet has no log file, so the one it creates
-when it starts is read from its first line.
-
-The practical difference is the node's startup line, which is where its version, commit and peer ID
-are recorded, along with the bootstrap and listen-address lines that show whether it actually joined
-the network. Enable first and those are captured. Enable afterwards and they are skipped, so every
-event forwarded from that run is missing the fields that identify which build produced it — which is
-most of what makes the logs useful.
-
-If you have already started a node, restarting it does not necessarily help: the node appends to the
-same daily file, so a restart on the same day resumes from where the daemon had got to rather than
-from the new run's first line.
-
-#### What gets sent
-
-Worth knowing before you decide. Only events at `INFO` and above, from nodes with logging enabled.
-Every event is tagged with the node ID, service name, binary version, release channel, and the OS
-and architecture of the machine.
-
-Each event also carries a random identifier generated when you first enable forwarding, stored in
-`~/.config/ant/log_forward.json`. Because every participant writes into the same daily index, it is
-there to stop two machines' events colliding and overwriting one another. It is generated from
-random bytes — not from your hostname, MAC address or username — so it distinguishes your
-installation from others without describing it.
-
-Your machine's hostname is **not** sent. Your wallet and rewards address are not part of what the
-daemon adds. Beyond those tags, the content is whatever `ant-node` itself wrote to its log at `INFO`
-or above — the same lines you can read yourself in the node's log directory.
-
-#### If something looks wrong
-
-`darwin node logs forward status` is the place to look. `Batches: N sent, M failed` with an error line
-underneath means the endpoint is unreachable or rejecting the token. Delivery is best-effort by
-design: it is bounded in memory, it retries a few times and then gives up on a batch, and it never
-blocks or slows a node. Losing some log lines is an acceptable outcome; a stalled node is not.
-
-`disable` takes effect immediately: it waits for any request already in flight to be abandoned
-before reporting that forwarding has stopped, so nothing is still being uploaded once the command
-returns.
-
-Forwarding survives a daemon restart, picking up where it left off without re-sending what it had
-already delivered. If you want a genuinely clean slate, `disable` first, then delete
-`~/.local/share/ant/log_forward_offsets.json`.
-
-### Turning forwarding off
-
-You can stop forwarding at any time, without leaving the beta channel and without giving a reason:
-
-```bash
-$ darwin node logs forward disable
-```
-
-Nothing else about your nodes changes — no restart, no change to how they run, no data touched. They
-keep writing their own logs to disk exactly as before; the daemon just stops reading them.
-
-### Leaving the beta channel
-
-Separate from the above, and manual. Because a beta version outranks the stable release it was cut
-from, `darwin update --channel stable` cannot walk a beta build backwards — installing a stable build
-means downloading it yourself. Nodes already on `--upgrade-channel beta` stay on it.
+Off in this build. Upstream's beta programme is Autonomi's, for `ant` and `ant-node`: beta builds
+of the client through `darwin update`, nodes on the beta channel through
+`darwin node add --upgrade-channel beta`, and the optional forwarding of node logs to Autonomi's
+beta log endpoint through `darwin node logs forward`. Darwin has no beta channel, and
+`darwin update` and `darwin node` are off.
 
 ---
 
 ## REST API
 
-When the daemon is running, it exposes a REST API on `127.0.0.1:<port>`. Discover the port via `darwin node daemon info` or by reading `~/.local/share/ant/daemon.port`.
-
-| Method | Path | Description |
-|--------|------|-------------|
-| GET | `/api/v1/status` | Daemon health, uptime, node count summary |
-| GET | `/api/v1/events` | SSE stream of real-time node events |
-| GET | `/api/v1/nodes/status` | Node status summary |
-| POST | `/api/v1/nodes` | Add nodes to the registry |
-| DELETE | `/api/v1/nodes/{id}` | Remove a node |
-| POST | `/api/v1/nodes/{id}/start` | Start a specific node |
-| POST | `/api/v1/nodes/start-all` | Start all registered nodes |
-| POST | `/api/v1/nodes/{id}/stop` | Stop a specific node |
-| POST | `/api/v1/nodes/stop-all` | Stop all running nodes |
-| POST | `/api/v1/reset` | Reset all node state (fails if nodes running) |
-| GET | `/api/v1/logs/forward` | Beta log-forwarding status, tailed nodes, delivery counters |
-| POST | `/api/v1/logs/forward/enable` | Enable beta log forwarding |
-| POST | `/api/v1/logs/forward/disable` | Disable beta log forwarding |
-| GET | `/api/v1/openapi.json` | OpenAPI 3.1 specification |
-| GET | `/console` | Web status console (HTML) |
-
-### Error Envelope
-
-All error responses use a consistent envelope:
-
-```json
-{
-  "error": {
-    "code": "NODE_NOT_FOUND",
-    "message": "No node with id 42"
-  }
-}
-```
-
-### Idempotency
-
-409 Conflict responses include `current_state` so retrying clients can confirm the desired state already exists:
-
-```json
-{
-  "error": {
-    "code": "NODE_ALREADY_RUNNING",
-    "message": "Node 3 is already running"
-  },
-  "current_state": {
-    "node_id": 3,
-    "status": "running",
-    "pid": 12345,
-    "uptime_secs": 3600
-  }
-}
-```
-
-### SSE Events
-
-`GET /api/v1/events` streams real-time node lifecycle events:
-
-```
-event: node_started
-data: {"node_id": 1, "pid": 12345}
-
-event: node_crashed
-data: {"node_id": 2, "exit_code": 1}
-```
-
-Event types: `node_starting`, `node_started`, `node_stopping`, `node_stopped`, `node_crashed`, `node_restarting`, `node_errored`, `download_started`, `download_progress`, `download_complete`.
+Off in this build: the REST API is served by the node daemon (`darwin node daemon`), which
+`darwin` never starts while `darwin node` is off. `ant-core` still holds upstream's daemon
+(`ant_core::node::daemon`).
 
 ---
 
@@ -1196,6 +832,10 @@ if let Some(data) = cache.get(&address) { /* ... */ }
 
 ### Node Management (Programmatic)
 
+`ant-core` keeps upstream's node manager, which `darwin node` used before it was turned off. It
+installs and runs Autonomi's `ant-node`, which joins Autonomi's network and takes payment on
+Arbitrum, not Darwin's: Darwin storage nodes run from the storage-node image.
+
 ```rust
 use ant_core::node::{add_nodes, AddNodeOpts, BinarySource};
 use ant_core::node::binary::NoopProgress;
@@ -1214,6 +854,9 @@ let result = add_nodes(opts, &data_dir()?.join("node_registry.json"), &NoopProgr
 ---
 
 ## Architecture
+
+The node manager below is upstream's, kept in `ant-core`. `darwin node` is off in this build, so
+`darwin` never starts its daemon.
 
 ```
 ┌──────────┐     HTTP      ┌──────────────────────────────────┐
@@ -1281,9 +924,9 @@ Data operations (upload/download) go directly to the P2P network — they do not
 │       └── commands/
 │           ├── data/
 │           │   ├── file.rs      # darwin file upload/download
-│           │   ├── chunk.rs     # darwin chunk put/get
+│           │   ├── chunk.rs     # darwin chunk get (put is off in this build)
 │           │   └── wallet.rs    # darwin wallet address/balance
-│           └── node/
+│           └── node/            # darwin node: off in this build
 │               ├── add.rs       # darwin node add
 │               ├── daemon.rs    # darwin node daemon start/stop/status/info/run
 │               ├── logs.rs      # darwin node logs forward enable/disable/status
@@ -1329,7 +972,6 @@ cargo fmt --all -- --check
 # Run the CLI
 cargo run --bin darwin -- --help
 cargo run --bin darwin -- file upload photo.jpg --public --devnet-manifest ~/.local/share/ant/devnet-manifest.json --allow-loopback --evm-network local
-cargo run --bin darwin -- node daemon status
 ```
 
 ## License

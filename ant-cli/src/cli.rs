@@ -109,12 +109,14 @@ pub struct Cli {
 
 #[derive(Subcommand)]
 pub enum Commands {
-    /// Manage local Autonomi nodes (not Darwin nodes)
+    /// Manage local Autonomi nodes (off in this build: Darwin nodes run from the storage-node image)
     ///
-    /// Upstream's node manager: `darwin node add` downloads Autonomi's ant-node
-    /// from WithAutonomi's releases, and those nodes join Autonomi's network and
-    /// take payment on Arbitrum. Darwin storage nodes run from the storage-node
-    /// Docker image instead (Project-DSpace/darwin-node).
+    /// Off in this build: every `darwin node` command fails. Upstream's node
+    /// manager would install Autonomi's ant-node from WithAutonomi's releases,
+    /// and those nodes join Autonomi's network and take payment on Arbitrum.
+    /// Darwin storage nodes run from the storage-node image (see the
+    /// darwin-node repository's docker/README.md). Nodes added by an earlier
+    /// build are managed with Autonomi's `ant`.
     Node {
         #[command(subcommand)]
         command: NodeCommand,
@@ -188,6 +190,60 @@ mod definition_tests {
     #[test]
     fn the_command_line_is_well_formed() {
         Cli::command().debug_assert();
+    }
+}
+
+#[cfg(test)]
+mod held_back_tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    /// The words that run each leaf command under `command`, hidden ones
+    /// included.
+    fn leaves(command: &clap::Command, words: &str, found: &mut Vec<String>) {
+        let mut subcommands = command.get_subcommands().peekable();
+        if subcommands.peek().is_none() {
+            found.push(words.to_string());
+        }
+        for subcommand in subcommands {
+            leaves(
+                subcommand,
+                &format!("{words} {}", subcommand.get_name()),
+                found,
+            );
+        }
+    }
+
+    /// Every `darwin node` command is refused before it is looked at, so one
+    /// a merge adds is refused too. These are the commands
+    /// ant-cli/tests/darwin_cli.rs runs to check it: a command that fails
+    /// this test goes there too.
+    #[test]
+    fn the_node_commands_are_the_ones_checked_off() {
+        let cli = Cli::command();
+        let node = cli.find_subcommand("node").expect("darwin node");
+        let mut found = Vec::new();
+        leaves(node, "node", &mut found);
+        found.sort();
+        assert_eq!(
+            found,
+            [
+                "node add",
+                "node daemon info",
+                "node daemon run",
+                "node daemon start",
+                "node daemon status",
+                "node daemon stop",
+                "node dismiss",
+                "node logs forward disable",
+                "node logs forward enable",
+                "node logs forward status",
+                "node reset",
+                "node start",
+                "node status",
+                "node stop",
+            ]
+        );
     }
 }
 

@@ -123,7 +123,7 @@ ant-cli/src/
     │   ├── pointer.rs        # darwin pointer keygen/address/create/update/get/resolve/transfer/finality/controller
     │   ├── manifest.rs       # darwin manifest create/list/show/link/export/download
     │   └── wallet.rs         # darwin wallet address/balance
-    └── node/
+    └── node/                 # darwin node: off in this build (NODE_MANAGER in mod.rs)
         ├── mod.rs
         ├── add.rs            # darwin node add command
         ├── daemon.rs         # daemon start/stop/status/info/run commands
@@ -174,9 +174,14 @@ cargo run --bin darwin -- --help  # Run the CLI
   `ant-core/src/node/daemon/forward/` and the V2-1016 ingest contract documented at the top of
   `forward/es.rs` (`create` actions, per-position `items[].status`, deterministic `_id`s).
 
-## E2E Test Skill
+## Commands that are off in this build
 
-The project includes an E2E test skill at `.claude/skills/e2e-node-management-test/SKILL.md` that tests all node management features against a real testnet (invoked via `/e2e-node-management-test`). When adding new `darwin node` subcommands or changing existing node management behavior, update this command to cover the new or changed functionality.
+`darwin chunk put` (`RAW_CHUNK_PUT` in `commands/data/chunk.rs`) and every `darwin node` command
+(`NODE_MANAGER` in `commands/node/mod.rs`) are refused before they read a key, touch the data
+directories or reach a network; so is `darwin update` (`SELF_UPDATE` in `commands/update.rs`).
+`ant-cli/tests/darwin_cli.rs` runs the binary to check the first two. A `darwin node` command a
+merge adds is refused too, and fails `the_node_commands_are_the_ones_checked_off` (cli.rs) until
+it is added to that file's list.
 
 ## Linear Project
 
