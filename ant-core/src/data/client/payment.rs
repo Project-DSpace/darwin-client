@@ -258,7 +258,15 @@ impl Client {
                     );
                     crate::runtime::sleep(PAYMENT_RECHECK_DELAY).await;
                 }
-                Err(error) => return Err(error),
+                Err(error) => {
+                    // With neither a journal to reconcile nor a proof, as
+                    // when the payment failed before anything was sent or
+                    // failed for good, nothing is left to keep.
+                    if state.pending_payment.is_none() && state.proof(content).is_none() {
+                        checkpoint.finish();
+                    }
+                    return Err(error);
+                }
             }
         }
     }
@@ -722,5 +730,39 @@ mod tests {
         let issued = crate::runtime::system_time() - Duration::from_secs(25 * 60 * 60);
         kept_proof(&client, directory.path(), &record, issued).await;
         assert!(pay(&client, directory.path(), &record).await.is_err());
+        // The old proof, evidence of the earlier payment, stays.
+        assert_eq!(checkpoints(directory.path()).len(), 1);
+    }
+
+    /// An attempt that fails holding neither a journal nor a proof, such as
+    /// one whose payment was refused before anything was sent, removes its
+    /// checkpoint: nothing in it is worth keeping.
+    #[tokio::test]
+    async fn a_failed_attempt_with_nothing_to_keep_leaves_no_checkpoint() {
+        let directory = tempfile::tempdir().unwrap();
+        let (client, _node) = offline_client().await;
+        let record = pointer();
+        let wallet = client.require_wallet().unwrap();
+        let state_id = record.state_id();
+        let (checkpoint, mut state) = RecordCheckpoint::open(
+            directory.path(),
+            wallet.network(),
+            wallet.address().as_slice(),
+            &state_id,
+        )
+        .await
+        .unwrap();
+        // What a payment refused before signing leaves: the plan, no journal.
+        state.prepare(signed_plan(
+            state_id,
+            POINTER_WIRE_LEN as u64,
+            crate::runtime::system_time(),
+        ));
+        checkpoint.save(&state).unwrap();
+        drop(checkpoint);
+        assert_eq!(checkpoints(directory.path()).len(), 1);
+
+        assert!(pay(&client, directory.path(), &record).await.is_err());
+        assert!(checkpoints(directory.path()).is_empty());
     }
 }
