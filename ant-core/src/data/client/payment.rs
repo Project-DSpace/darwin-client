@@ -40,6 +40,11 @@ impl Client {
     /// target set from quote planning: it starts with peers expected to accept
     /// the paid proof and can include non-quoted fallback peers beyond the
     /// quoted close group.
+    ///
+    /// A raw building block: it pays for one record, reading the paid quote
+    /// back ([`Self::pay_for_storage_split`]), and stores nothing; the caller
+    /// stores the record with the proof, with no envelope unless it adds one.
+    /// Upload files with `Client::file_upload`.
     pub async fn pay_for_storage(
         &self,
         address: &[u8; 32],

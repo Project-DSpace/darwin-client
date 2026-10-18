@@ -94,21 +94,22 @@ automatically.
 use std::path::Path;
 use ant_core::data::PaymentMode;
 
-// Upload (streaming — file never fully loaded into memory)
+// Upload (streaming — file never fully loaded into memory), in a private envelope
+// that shows every payment field, as `darwin file upload` stores it
 let result = client.file_upload(Path::new("video.mp4")).await?;
 // result.data_map     — the DataMap (save this to download later)
+// result.envelope     — the envelope, its salt and the record proving its payment
 // result.chunks_stored — number of chunks uploaded
 
-// Upload with explicit payment mode
-let result = client.file_upload_with_mode(
+// Upload readable by anyone with its address, in the unlisted envelope
+// `darwin file upload --public` stores, paid per chunk
+let result = client.file_upload_public_with_mode(
     Path::new("large_dataset.tar"),
-    PaymentMode::Merkle,
+    PaymentMode::Single,
 ).await?;
+let public_address: [u8; 32] = result.data_map_address.expect("the envelope's address");
 
-// Make data publicly downloadable
-let public_address: [u8; 32] = client.data_map_store(&result.data_map).await?;
-
-// Download a file
+// Download a file: the DataMap is read from its envelope
 let data_map = client.data_map_fetch(&public_address).await?;
 let bytes_written = client.file_download(&data_map, Path::new("output.mp4")).await?;
 ```
@@ -119,18 +120,18 @@ For data already in memory (API payloads, generated content, etc.):
 
 ```rust
 use bytes::Bytes;
+use ant_core::data::EnvelopeOptions;
 
-// Upload bytes
-let result = client.data_upload(Bytes::from(my_data)).await?;
-
-// Upload with payment mode control
-let result = client.data_upload_with_mode(
+// `data_upload` and `data_upload_with_mode` are off in this build: they would store
+// the bytes with no envelope. Prepare them with an envelope for an outside signer
+// to pay, then `finalize_upload`, or write them to a file for `file_upload`.
+let prepared = client.data_prepare_upload_with_visibility(
     Bytes::from(my_data),
-    PaymentMode::Merkle,
+    EnvelopeOptions::private().into_visibility(),
 ).await?;
 
 // Download and decrypt
-let content: Bytes = client.data_download(&result.data_map).await?;
+let content: Bytes = client.data_download(&prepared.data_map).await?;
 ```
 
 ### Chunk Operations
@@ -199,8 +200,8 @@ let mut devnet = LocalDevnet::start_minimal().await?;
 let client = devnet.create_funded_client().await?;
 
 // Use the client normally
-let result = client.data_upload(Bytes::from("test")).await?;
-let content = client.data_download(&result.data_map).await?;
+let result = client.file_upload(Path::new("test.txt")).await?;
+client.file_download(&result.data_map, Path::new("test-copy.txt")).await?;
 
 // Export manifest for CLI usage:
 //   ant file upload ... --devnet-manifest /tmp/devnet.json --allow-loopback --evm-network local

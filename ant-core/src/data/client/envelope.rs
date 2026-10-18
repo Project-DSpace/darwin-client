@@ -253,6 +253,25 @@ impl EnvelopeOptions {
     }
 }
 
+/// The visibility of the library's upload shortcuts that take none:
+/// `file_upload`, `file_upload_with_mode`, `file_upload_with_progress`,
+/// `estimate_upload_cost`, `file_prepare_upload` and `data_prepare_upload`.
+/// A private envelope with every payment field shown, as `darwin file upload`
+/// stores by default ([`Visibility::default`]).
+#[cfg_attr(not(feature = "native"), allow(dead_code))]
+pub(crate) fn private_shortcut_visibility() -> Visibility {
+    EnvelopeOptions::private().into_visibility()
+}
+
+/// The visibility of the library's public upload shortcuts,
+/// `file_upload_public_with_mode` and `file_upload_public_with_progress`: the
+/// unlisted envelope `darwin file upload --public` stores, readable by anyone
+/// with its address, every payment field shown.
+#[cfg_attr(not(feature = "native"), allow(dead_code))]
+pub(crate) fn public_shortcut_visibility() -> Visibility {
+    EnvelopeOptions::unlisted().into_visibility()
+}
+
 /// The payment fields a hide list leaves shown. Takes the names
 /// [`PaymentField::name`] gives (`tx-hash`, `block`, `timestamp`,
 /// `log-index`, `quote`) and `all`, so every client accepts the same words.
@@ -713,6 +732,30 @@ mod tests {
         Metadata {
             content_type: Some("text/plain".into()),
             name: Some("notes.txt".into()),
+        }
+    }
+
+    /// The library's upload shortcuts store an envelope: the private one
+    /// `darwin file upload` stores by default, and for the public ones the
+    /// unlisted one `--public` stores. Neither stores a bare data map or no
+    /// envelope at all.
+    #[test]
+    fn upload_shortcuts_store_envelopes_with_every_field_shown() {
+        assert_eq!(private_shortcut_visibility(), Visibility::default());
+        let Visibility::Envelope(private) = private_shortcut_visibility() else {
+            panic!("the private shortcuts store an envelope");
+        };
+        assert_eq!(private, EnvelopeOptions::private());
+        assert!(!private.readable && !private.in_index);
+        let Visibility::Envelope(public) = public_shortcut_visibility() else {
+            panic!("the public shortcuts store an envelope");
+        };
+        assert_eq!(public, EnvelopeOptions::unlisted());
+        assert!(public.readable && !public.in_index);
+        for options in [private, public] {
+            assert_eq!(options.shown, ShownFields::ALL);
+            assert!(options.metadata.is_empty());
+            assert!(options.needs_envelope());
         }
     }
 

@@ -320,7 +320,7 @@ impl Network {
     /// The network [`Network::new_multiaddrs`] starts: a client node that
     /// bootstraps from `bootstrap_peers`, which reads also ask.
     #[cfg(feature = "native")]
-    async fn unstarted(
+    pub(crate) async fn unstarted(
         bootstrap_peers: &[MultiAddr],
         allow_loopback: bool,
         ipv6: bool,

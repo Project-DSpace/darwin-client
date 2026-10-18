@@ -2139,7 +2139,16 @@ impl super::super::upload::UploadAdapter for SpillUploadAdapter<'_> {
 }
 
 impl Client {
-    /// Upload a file to the network using streaming self-encryption.
+    /// Upload a file to the network using streaming self-encryption, in a
+    /// private envelope that shows every payment field, as `darwin file
+    /// upload` stores it by default ([`Visibility::default`]).
+    ///
+    /// The envelope, its salt and the record proving its payment are in
+    /// [`FileUploadResult::envelope`]; the record is also kept under the
+    /// data directory until the caller has saved it and calls
+    /// [`forget_upload_record`]. Use
+    /// [`Client::file_upload_with_visibility_and_progress`] for other
+    /// choices.
     ///
     /// Pays per chunk ([`PaymentMode::Single`], the default; see
     /// [`PaymentMode`] for why not in merkle batches). Encrypted chunks are
@@ -2155,7 +2164,8 @@ impl Client {
             .await
     }
 
-    /// Estimate the cost of uploading a file without actually uploading.
+    /// Estimate the cost of uploading a file without actually uploading, in
+    /// the private envelope [`Client::file_upload`] stores.
     ///
     /// Encrypts the file to determine chunk count and sizes, then requests
     /// a single quote from the network for a representative chunk. The
@@ -2191,13 +2201,17 @@ impl Client {
         mode: PaymentMode,
         progress: Option<mpsc::Sender<UploadEvent>>,
     ) -> Result<UploadCostEstimate> {
-        self.estimate_upload_cost_with_visibility(path, mode, Visibility::Private, progress)
-            .await
+        self.estimate_upload_cost_with_visibility(
+            path,
+            mode,
+            super::super::envelope::private_shortcut_visibility(),
+            progress,
+        )
+        .await
     }
 
     /// Estimate the cost of uploading a file with `visibility`, as
-    /// [`Client::estimate_upload_cost`] does for a private upload without an
-    /// envelope.
+    /// [`Client::estimate_upload_cost`] does for a private envelope.
     ///
     /// A readable upload stores one more chunk, its data map (plain, or in
     /// its envelope), and so does a private upload with an envelope. That
@@ -2445,11 +2459,17 @@ impl Client {
 
     /// Phase 1 of external-signer upload: encrypt file and prepare chunks.
     ///
-    /// Equivalent to [`Client::file_prepare_upload_with_visibility`] with
-    /// [`Visibility::Private`] — see that method for details.
+    /// Equivalent to [`Client::file_prepare_upload_with_visibility`] with a
+    /// private envelope that shows every payment field
+    /// ([`Visibility::default`], as [`Client::file_upload`] stores) — see
+    /// that method for details.
     pub async fn file_prepare_upload(&self, path: &Path) -> Result<PreparedUpload> {
-        self.file_prepare_upload_with_progress(path, Visibility::Private, None)
-            .await
+        self.file_prepare_upload_with_progress(
+            path,
+            super::super::envelope::private_shortcut_visibility(),
+            None,
+        )
+        .await
     }
 
     /// Phase 1 of external-signer upload with explicit [`Visibility`] control.
@@ -3503,7 +3523,8 @@ impl Client {
             .await;
     }
 
-    /// Upload a file with a specific payment mode.
+    /// Upload a file with a specific payment mode, in the private envelope
+    /// [`Client::file_upload`] stores.
     ///
     /// Before encryption, checks that the temp directory has enough free
     /// disk space for the spilled chunks (~1.1× source file size).
@@ -3525,19 +3546,28 @@ impl Client {
         self.file_upload_with_progress(path, mode, None).await
     }
 
-    /// Upload a file publicly, storing the serialized [`DataMap`] as part of
-    /// the same upload payment batch.
+    /// Upload a file readable by anyone with its address, in the unlisted
+    /// envelope `darwin file upload --public` stores: the [`DataMap`] in an
+    /// envelope that shows every payment field, not in the index, paid with
+    /// the content.
     ///
-    /// The returned [`FileUploadResult::data_map_address`] can be shared for
-    /// public downloads via [`Client::data_map_fetch`].
+    /// The returned [`FileUploadResult::data_map_address`] is the envelope's
+    /// address; share it for public downloads via [`Client::data_map_fetch`],
+    /// which reads the data map from the envelope. The envelope and its
+    /// record are in [`FileUploadResult::envelope`].
     #[allow(clippy::too_many_lines)]
     pub async fn file_upload_public_with_mode(
         &self,
         path: &Path,
         mode: PaymentMode,
     ) -> Result<FileUploadResult> {
-        self.file_upload_with_visibility_and_progress(path, mode, Visibility::Public, None)
-            .await
+        self.file_upload_with_visibility_and_progress(
+            path,
+            mode,
+            super::super::envelope::public_shortcut_visibility(),
+            None,
+        )
+        .await
     }
 
     /// Upload a file with progress events sent to the given channel.
@@ -3551,8 +3581,13 @@ impl Client {
         mode: PaymentMode,
         progress: Option<mpsc::Sender<UploadEvent>>,
     ) -> Result<FileUploadResult> {
-        self.file_upload_with_visibility_and_progress(path, mode, Visibility::Private, progress)
-            .await
+        self.file_upload_with_visibility_and_progress(
+            path,
+            mode,
+            super::super::envelope::private_shortcut_visibility(),
+            progress,
+        )
+        .await
     }
 
     /// Upload a file with the given [`Visibility`], with progress events.
@@ -3610,7 +3645,8 @@ impl Client {
             .await
     }
 
-    /// Public file upload with progress events.
+    /// Public file upload with progress events, in the unlisted envelope
+    /// [`Client::file_upload_public_with_mode`] stores.
     ///
     /// Same as [`Client::file_upload_public_with_mode`] but sends
     /// [`UploadEvent`]s to the provided channel for UI progress feedback.
@@ -3621,8 +3657,13 @@ impl Client {
         mode: PaymentMode,
         progress: Option<mpsc::Sender<UploadEvent>>,
     ) -> Result<FileUploadResult> {
-        self.file_upload_with_visibility_and_progress(path, mode, Visibility::Public, progress)
-            .await
+        self.file_upload_with_visibility_and_progress(
+            path,
+            mode,
+            super::super::envelope::public_shortcut_visibility(),
+            progress,
+        )
+        .await
     }
 
     /// Upload a file through the upload engine, paid by `payer` or else by

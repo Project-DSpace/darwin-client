@@ -55,6 +55,10 @@ impl SingleNodeQuotePayment {
     /// The quotes are sorted by price, the median quote receives 3x its quoted
     /// price, and every other quote is included with a zero amount so proof and
     /// payment intent construction stay aligned.
+    ///
+    /// A raw building block: no price ceiling applies and the quotes are not
+    /// checked. `Client::pay_for_storage` and the upload engine check every
+    /// quote, apply `ClientConfig::max_chunk_price` and read paid quotes back.
     pub fn from_quotes(quotes: Vec<PaymentQuote>) -> Result<Self> {
         Self::from_quotes_within(quotes, None)
     }
@@ -95,6 +99,11 @@ impl SingleNodeQuotePayment {
 
     /// Pay the non-zero median quote on-chain, returning tx hashes for the
     /// non-zero entries that must appear in the payment proof.
+    ///
+    /// A raw building block: it pays through `Wallet::pay_for_quotes` and
+    /// reads nothing back, so a quote another payment already recorded in
+    /// the vault goes unnoticed. `Client::pay_for_storage` and the upload
+    /// engine read every paid quote back and pay again.
     pub async fn pay(&self, wallet: &Wallet) -> Result<Vec<TxHash>> {
         let quote_payments: Vec<_> = self
             .quotes
@@ -598,6 +607,11 @@ impl Client {
     /// Stores from wave N overlap with quote collection for wave N+1
     /// via `tokio::join!`.
     ///
+    /// A raw building block: the chunks are paid per chunk, each paid quote
+    /// read back, and stored with no envelope. Upload files with
+    /// `Client::file_upload`, which stores a private envelope that shows
+    /// every payment field.
+    ///
     /// # Errors
     ///
     /// Returns an error if any payment or store operation fails.
@@ -613,7 +627,8 @@ impl Client {
     }
 
     /// Same as [`Client::batch_upload_chunks`] but sends [`UploadEvent::ChunkStored`]
-    /// events as each chunk is stored, enabling per-chunk progress bars.
+    /// events as each chunk is stored, enabling per-chunk progress bars. A raw
+    /// building block, as that one is: no envelope.
     ///
     /// `stored_offset` is the number of chunks already stored in previous waves
     /// (so events report cumulative progress). `file_total` is the total chunk

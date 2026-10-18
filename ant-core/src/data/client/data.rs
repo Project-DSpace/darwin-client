@@ -13,19 +13,31 @@ use crate::data::client::batch::{PaymentIntent, PreparedChunk};
 #[cfg(feature = "native")]
 use crate::data::client::classify_error;
 #[cfg(feature = "native")]
-use crate::data::client::envelope::UploadEnvelope;
+use crate::data::client::envelope::{private_shortcut_visibility, UploadEnvelope};
 #[cfg(feature = "native")]
 use crate::data::client::file::{ExternalPaymentInfo, PreparedUpload, Visibility};
 use crate::data::client::merkle::PaymentMode;
 use crate::data::client::Client;
 use crate::data::error::{Error, Result};
+#[cfg(feature = "native")]
 use ant_protocol::compute_address;
 use bytes::Bytes;
 #[cfg(feature = "native")]
 use futures::stream::StreamExt;
-use self_encryption::{encrypt, DataMap};
+#[cfg(feature = "native")]
+use self_encryption::encrypt;
+use self_encryption::DataMap;
 use std::num::NonZeroUsize;
-use tracing::{debug, info};
+#[cfg(feature = "native")]
+use tracing::debug;
+use tracing::info;
+
+/// What [`Client::data_upload`] and [`Client::data_upload_with_mode`] return:
+/// they are off in this build.
+const DATA_UPLOAD_OFF: &str = "data_upload is off in this build: it would store \
+     the content with no envelope, so the upload would have no payment record or listing. \
+     Upload with file_upload, which stores a private envelope that shows every payment \
+     field, or with data_prepare_upload_with_visibility and an envelope.";
 
 /// Result of an in-memory data upload: the `DataMap` needed to retrieve the data.
 #[derive(Debug, Clone)]
@@ -39,96 +51,43 @@ pub struct DataUploadResult {
 }
 
 impl Client {
-    /// Upload in-memory data to the network using self-encryption.
-    ///
-    /// The content is encrypted and split into chunks, each stored
-    /// as a content-addressed chunk on the network. Returns a `DataMap`
-    /// that can be used to retrieve and decrypt the data.
+    /// Off in this build: it would store the content's chunks with no
+    /// envelope, so the upload would have no payment record or listing.
+    /// Upload a file with `Client::file_upload`, which stores a private
+    /// envelope that shows every payment field, or in-memory content with
+    /// `Client::data_prepare_upload_with_visibility` and an envelope.
     ///
     /// # Errors
     ///
-    /// Returns an error if encryption fails or any chunk cannot be stored.
-    pub async fn data_upload(&self, content: Bytes) -> Result<DataUploadResult> {
-        let content_len = content.len();
-        debug!("Encrypting data ({content_len} bytes)");
-
-        let (data_map, encrypted_chunks) = encrypt(content)
-            .map_err(|e| Error::Encryption(format!("Failed to encrypt data: {e}")))?;
-
-        info!("Data encrypted into {} chunks", encrypted_chunks.len());
-
-        let chunk_contents: Vec<Bytes> = encrypted_chunks
-            .into_iter()
-            .map(|chunk| chunk.content)
-            .collect();
-
-        let (addresses, _storage_cost, _gas_cost) =
-            self.batch_upload_chunks(chunk_contents).await?;
-        let chunks_stored = addresses.len();
-
-        info!("Data uploaded: {chunks_stored} chunks stored ({content_len} bytes original)");
-
-        Ok(DataUploadResult {
-            data_map,
-            chunks_stored,
-            payment_mode_used: PaymentMode::Single,
-        })
+    /// Always returns [`Error::InvalidData`] naming those, before anything
+    /// is encrypted, quoted, paid or stored.
+    pub async fn data_upload(&self, _content: Bytes) -> Result<DataUploadResult> {
+        Err(Error::InvalidData(DATA_UPLOAD_OFF.into()))
     }
 
-    /// Upload in-memory data with a specific payment mode.
-    ///
-    /// When `mode` is `Auto` and the chunk count >= threshold, or when `mode`
-    /// is `Merkle`, this buffers all chunks and pays via a single merkle
-    /// batch transaction. Otherwise falls back to per-chunk payment.
+    /// Off in this build, as [`Client::data_upload`] is, whatever `mode`.
     ///
     /// # Errors
     ///
-    /// Returns an error if encryption fails or any chunk cannot be stored.
+    /// Always returns [`Error::InvalidData`], before anything is encrypted,
+    /// quoted, paid or stored.
     pub async fn data_upload_with_mode(
         &self,
-        content: Bytes,
-        mode: PaymentMode,
+        _content: Bytes,
+        _mode: PaymentMode,
     ) -> Result<DataUploadResult> {
-        let (data_map, encrypted) =
-            encrypt(content).map_err(|e| Error::Encryption(e.to_string()))?;
-        let chunks = encrypted
-            .into_iter()
-            .map(|chunk| chunk.content)
-            .collect::<Vec<_>>();
-        let records = chunks
-            .iter()
-            .enumerate()
-            .map(|(index, bytes)| super::upload::UploadRecord {
-                address: compute_address(bytes),
-                size: bytes.len() as u64,
-                index,
-            })
-            .collect();
-        let adapter = super::upload::MemoryUploadAdapter {
-            client: self,
-            chunks: &chunks,
-            progress: None,
-            stored_offset: 0,
-            file_total: chunks.len(),
-            resume_key: None,
-        };
-        let outcome = self
-            .upload_records(records, &mut Default::default(), &adapter, mode)
-            .await?;
-        Ok(DataUploadResult {
-            data_map,
-            chunks_stored: outcome.addresses.len(),
-            payment_mode_used: outcome.mode,
-        })
+        Err(Error::InvalidData(DATA_UPLOAD_OFF.into()))
     }
 
     /// Phase 1 of external-signer data upload: encrypt and collect quotes.
     ///
-    /// Equivalent to [`Client::data_prepare_upload_with_visibility`] with
-    /// [`Visibility::Private`] — see that method for details.
+    /// Equivalent to [`Client::data_prepare_upload_with_visibility`] with a
+    /// private envelope that shows every payment field
+    /// ([`Visibility::default`], as [`Client::file_upload`] stores) — see
+    /// that method for details.
     #[cfg(feature = "native")]
     pub async fn data_prepare_upload(&self, content: Bytes) -> Result<PreparedUpload> {
-        self.data_prepare_upload_with_visibility(content, Visibility::Private)
+        self.data_prepare_upload_with_visibility(content, private_shortcut_visibility())
             .await
     }
 
@@ -305,6 +264,11 @@ impl Client {
     /// Anyone who knows the returned address can retrieve and use the `DataMap`
     /// to download the original data.
     ///
+    /// A raw building block: the data map is stored with no envelope, so the
+    /// file's address has no payment record or listing. A file readable by
+    /// address is uploaded as `darwin file upload --public` stores it, in an
+    /// unlisted envelope: `Client::file_upload_public_with_mode`.
+    ///
     /// # Errors
     ///
     /// Returns an error if serialization or the chunk store fails.
@@ -377,7 +341,7 @@ impl Client {
     /// Large uploads produce a *shrunk* (child) `DataMap` whose `infos()`
     /// reference wrapper chunks rather than the root content chunks. Such a
     /// map is resolved back to its root form before download, keeping this
-    /// primitive symmetric with `data_upload`.
+    /// primitive symmetric with the upload that made the map.
     ///
     /// Map resolution and network fetching are fully async and also work on a
     /// current-thread runtime.
@@ -587,6 +551,46 @@ fn decode_data_map_chunk(content: &[u8]) -> Result<DataMap> {
         MapError::Withheld => Error::DataMapWithheld(error.to_string()),
         MapError::Invalid(message) => Error::Serialization(message),
     })
+}
+
+#[cfg(all(test, feature = "native"))]
+mod held_back_tests {
+    use super::*;
+
+    /// `data_upload` and `data_upload_with_mode` store no envelope, so they
+    /// are off: each refuses before anything is encrypted, quoted or paid,
+    /// and names what to use instead. The client has no wallet and its node
+    /// was never started, so nothing could have been sent.
+    #[tokio::test]
+    async fn data_upload_is_held_back() {
+        let network = crate::data::Network::unstarted(&[], true, false)
+            .await
+            .unwrap();
+        let client = Client::from_node(std::sync::Arc::clone(network.node()), Default::default());
+        let content = || Bytes::from(vec![7u8; 4096]);
+        for result in [
+            client.data_upload(content()).await,
+            client
+                .data_upload_with_mode(content(), PaymentMode::Single)
+                .await,
+            client
+                .data_upload_with_mode(content(), PaymentMode::Auto)
+                .await,
+            client
+                .data_upload_with_mode(content(), PaymentMode::Merkle)
+                .await,
+        ] {
+            let error = result.expect_err("held back");
+            assert!(matches!(error, Error::InvalidData(_)), "{error}");
+            let text = error.to_string();
+            assert!(text.contains("data_upload is off in this build"), "{text}");
+            assert!(text.contains("file_upload"), "{text}");
+            assert!(
+                text.contains("data_prepare_upload_with_visibility"),
+                "{text}"
+            );
+        }
+    }
 }
 
 /// Compile-time assertions that Client method futures are Send.

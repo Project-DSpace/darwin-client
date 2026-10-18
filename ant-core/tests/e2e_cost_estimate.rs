@@ -11,7 +11,9 @@
 mod support;
 
 use ant_core::data::client::merkle::{merkle_billable_leaves, PaymentMode};
-use ant_core::data::{Client, ClientConfig, CostEstimateConfidence};
+use ant_core::data::{
+    forget_upload_record, Client, ClientConfig, CostEstimateConfidence, Visibility,
+};
 use serial_test::serial;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -57,18 +59,26 @@ fn create_test_file(dir: &Path, size: u64, name: &str, seed: u64) -> PathBuf {
 
 /// Estimate vs actual cost comparison for a single file.
 ///
-/// Runs `estimate_upload_cost`, then actually uploads and compares.
+/// Runs `estimate_upload_cost`, then actually uploads and compares: through
+/// the shortcuts, which store a private envelope, when `visibility` is
+/// `None`, else with `visibility`.
 /// Returns (estimated_atto, actual_atto, chunk_count_estimate, chunk_count_actual).
 async fn compare_estimate_vs_actual(
     client: &Client,
     path: &Path,
     mode: PaymentMode,
+    visibility: Option<Visibility>,
 ) -> (u128, u128, usize, usize) {
     // Phase 1: Estimate
-    let estimate = client
-        .estimate_upload_cost(path, mode, None)
-        .await
-        .expect("estimate should succeed");
+    let estimate = match &visibility {
+        None => client.estimate_upload_cost(path, mode, None).await,
+        Some(visibility) => {
+            client
+                .estimate_upload_cost_with_visibility(path, mode, visibility.clone(), None)
+                .await
+        }
+    }
+    .expect("estimate should succeed");
 
     let estimated_atto: u128 = estimate
         .storage_cost_atto
@@ -76,10 +86,20 @@ async fn compare_estimate_vs_actual(
         .expect("parse estimated atto");
 
     // Phase 2: Actually upload (with a DIFFERENT seed so we don't get AlreadyStored)
-    let result = client
-        .file_upload_with_mode(path, mode)
-        .await
-        .expect("upload should succeed");
+    let result = match visibility {
+        None => client.file_upload_with_mode(path, mode).await,
+        Some(visibility) => {
+            client
+                .file_upload_with_visibility_and_progress(path, mode, visibility, None)
+                .await
+        }
+    }
+    .expect("upload should succeed");
+    if let Some(envelope) = &result.envelope {
+        if envelope.proof.is_some() {
+            forget_upload_record(&envelope.address()).expect("forget the kept record");
+        }
+    }
 
     let actual_atto: u128 = result.storage_cost_atto.parse().expect("parse actual atto");
 
@@ -126,7 +146,7 @@ async fn test_estimate_matches_actual_cost() {
         let path = create_test_file(work_dir.path(), *size, name, *seed);
 
         let (est_atto, act_atto, est_chunks, act_chunks) =
-            compare_estimate_vs_actual(&client, &path, PaymentMode::Auto).await;
+            compare_estimate_vs_actual(&client, &path, PaymentMode::Auto, None).await;
 
         let size_label = if *size >= 1024 * 1024 {
             format!("{} MB", size / (1024 * 1024))
@@ -143,6 +163,12 @@ async fn test_estimate_matches_actual_cost() {
         assert_eq!(
             est_chunks, act_chunks,
             "Chunk count mismatch for {name}: estimate={est_chunks}, actual={act_chunks}"
+        );
+        // Every file here is three content chunks, and the upload, like the
+        // estimate, adds its private envelope.
+        assert_eq!(
+            act_chunks, 4,
+            "{name}: three content chunks and the envelope"
         );
 
         // Storage cost should be within 15% (prices are uniform on a local
@@ -283,14 +309,19 @@ async fn test_estimate_all_stored_partial_sample_is_incomplete() {
     );
 
     // Upload so every chunk is stored on the network.
-    client
+    let uploaded = client
         .file_upload_with_mode(&path, PaymentMode::Auto)
         .await
         .expect("upload should succeed");
+    let envelope = uploaded.envelope.expect("a private envelope");
+    if envelope.proof.is_some() {
+        forget_upload_record(&envelope.address()).expect("forget the kept record");
+    }
 
-    // Re-estimate the same file: every sampled chunk is now AlreadyStored.
+    // Re-estimate the same file without an envelope: every sampled chunk is
+    // now AlreadyStored.
     let estimate = client
-        .estimate_upload_cost(&path, PaymentMode::Auto, None)
+        .estimate_upload_cost_with_visibility(&path, PaymentMode::Auto, Visibility::Private, None)
         .await
         .expect("estimate must return Ok for a partially-sampled all-stored file");
 
@@ -300,6 +331,18 @@ async fn test_estimate_all_stored_partial_sample_is_incomplete() {
         estimate.chunk_count
     );
     assert_eq!(estimate.storage_cost_atto, "0");
+    assert_eq!(
+        estimate.confidence,
+        CostEstimateConfidence::AllSamplesAlreadyStoredIncomplete
+    );
+
+    // The default estimate is for a new private envelope, which is never
+    // stored yet (its salt is new): its price, as a likely total.
+    let estimate = client
+        .estimate_upload_cost(&path, PaymentMode::Auto, None)
+        .await
+        .expect("estimate with the envelope");
+    assert_ne!(estimate.storage_cost_atto, "0", "the envelope is paid");
     assert_eq!(
         estimate.confidence,
         CostEstimateConfidence::AllSamplesAlreadyStoredIncomplete
@@ -320,13 +363,18 @@ async fn test_estimate_all_stored_full_sample_is_verified() {
     // ~4 KB -> 3 chunks, within the sample cap so every chunk is sampled.
     let path = create_test_file(work_dir.path(), 4096, "fully_stored.bin", 0xCAFE_0002);
 
-    client
+    let uploaded = client
         .file_upload_with_mode(&path, PaymentMode::Auto)
         .await
         .expect("upload should succeed");
+    let envelope = uploaded.envelope.expect("a private envelope");
+    if envelope.proof.is_some() {
+        forget_upload_record(&envelope.address()).expect("forget the kept record");
+    }
 
+    // Without an envelope the whole upload is stored already.
     let estimate = client
-        .estimate_upload_cost(&path, PaymentMode::Auto, None)
+        .estimate_upload_cost_with_visibility(&path, PaymentMode::Auto, Visibility::Private, None)
         .await
         .expect("estimate should succeed");
 
@@ -340,6 +388,16 @@ async fn test_estimate_all_stored_full_sample_is_verified() {
         estimate.confidence,
         CostEstimateConfidence::VerifiedAllAlreadyStored
     );
+
+    // The default estimate is for a new private envelope: every content
+    // chunk was sampled and is stored, so its price is the exact total.
+    let estimate = client
+        .estimate_upload_cost(&path, PaymentMode::Auto, None)
+        .await
+        .expect("estimate with the envelope");
+    assert_ne!(estimate.storage_cost_atto, "0", "the envelope is paid");
+    assert_eq!(estimate.confidence, CostEstimateConfidence::PricedSample);
+    assert_eq!(estimate.payment_mode, PaymentMode::Single);
 }
 
 /// Merkle estimate vs actual on a batch whose leaf count is padded.
@@ -367,8 +425,15 @@ async fn test_merkle_estimate_vs_actual_pads_to_the_billed_tree() {
     let file_size = 6 * self_encryption::MAX_CHUNK_SIZE as u64;
     let path = create_test_file(work_dir.path(), file_size, "merkle_padded.bin", 0xEE09_0001);
 
-    let (est_atto, act_atto, est_chunks, act_chunks) =
-        compare_estimate_vs_actual(&client, &path, PaymentMode::Merkle).await;
+    // Without an envelope, so the merkle batch is the whole upload (an
+    // envelope is paid per chunk, on top).
+    let (est_atto, act_atto, est_chunks, act_chunks) = compare_estimate_vs_actual(
+        &client,
+        &path,
+        PaymentMode::Merkle,
+        Some(Visibility::Private),
+    )
+    .await;
 
     eprintln!(
         "merkle padded batch: est_chunks={est_chunks}, act_chunks={act_chunks}, \

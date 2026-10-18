@@ -564,6 +564,11 @@ pub(crate) fn chunk_get_outcome(result: &Result<Option<DataChunk>>) -> Outcome {
 impl Client {
     /// Store a chunk on the Autonomi network with payment.
     ///
+    /// A raw building block: the chunk is stored on its own, with no
+    /// envelope, so nothing records its payment in a listing or a `.record`.
+    /// Upload files with `Client::file_upload`, which stores a private
+    /// envelope that shows every payment field.
+    ///
     /// Checks if the chunk already exists before paying. If it does,
     /// returns the address immediately without incurring on-chain costs.
     /// Otherwise collects quotes, pays on-chain, then stores with proof
@@ -748,6 +753,10 @@ impl Client {
     }
 
     /// Store a chunk on the Autonomi network with a pre-built payment proof.
+    ///
+    /// A raw building block: the proof was paid elsewhere, so nothing here
+    /// reads that payment back or adds an envelope. Upload files with
+    /// `Client::file_upload`.
     ///
     /// Sends to a single peer. Callers that need replication across the
     /// close group should use `chunk_put_to_close_group` instead.

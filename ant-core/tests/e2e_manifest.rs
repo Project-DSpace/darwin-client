@@ -99,7 +99,8 @@ async fn manifest_round_trips_through_file_and_link() {
     let source = TempDir::new().unwrap();
     write_tree(source.path());
 
-    // A public file added by address, uploaded separately.
+    // A public file added by address, uploaded separately: in the unlisted
+    // envelope the public shortcut stores, whose address reads the file.
     let extra = source.path().join("..").join("extra.bin");
     fs::write(&extra, vec![0x44u8; FILE_BYTES]).unwrap();
     let extra_upload = client
@@ -107,6 +108,11 @@ async fn manifest_round_trips_through_file_and_link() {
         .await
         .expect("public upload");
     let extra_address = extra_upload.data_map_address.expect("public address");
+    let extra_envelope = extra_upload.envelope.expect("an envelope");
+    assert_eq!(extra_envelope.address(), extra_address);
+    if extra_envelope.proof.is_some() {
+        forget_upload_record(&extra_address).expect("forget the kept record");
+    }
 
     let mut builder = ManifestBuilder::new(
         &client,
@@ -546,10 +552,16 @@ async fn compact_mode_uses_public_addresses_only_when_the_datamap_is_on_the_netw
     fs::write(source.path().join("private.bin"), vec![0x55u8; FILE_BYTES]).unwrap();
     fs::write(source.path().join("public.bin"), vec![0x66u8; FILE_BYTES]).unwrap();
 
-    // Make public.bin's DataMap public ahead of time; private.bin stays
-    // private, so compact mode must embed it rather than publish it.
+    // Make public.bin's DataMap public ahead of time, as a plain DataMap
+    // chunk (the public shortcut stores an envelope instead); private.bin
+    // stays private, so compact mode must embed it rather than publish it.
     client
-        .file_upload_public_with_mode(&source.path().join("public.bin"), PaymentMode::Auto)
+        .file_upload_with_visibility_and_progress(
+            &source.path().join("public.bin"),
+            PaymentMode::Auto,
+            Visibility::Public,
+            None,
+        )
         .await
         .expect("pre-publish");
 

@@ -1,8 +1,9 @@
 //! E2E tests for merkle batch payment uploads.
 //!
 //! Spins up a 35-node testnet with Anvil EVM, tests merkle payment flow
-//! including upload/download verification, payment mode assertion,
-//! and in-memory data upload path.
+//! including upload/download verification and payment mode assertion, and
+//! that the in-memory data upload, which stores no envelope, is held back
+//! even where a merkle payment would go through.
 
 #![allow(
     clippy::unwrap_used,
@@ -110,39 +111,46 @@ async fn test_merkle_file_upload_download() {
     testnet.teardown().await;
 }
 
-/// Merkle in-memory data upload/download round-trip.
+/// The in-memory data upload stores no envelope, so it is held back in
+/// every payment mode, merkle too, on a network a merkle payment would go
+/// through on: it is refused, and nothing is paid or stored.
 #[tokio::test(flavor = "multi_thread")]
 #[serial]
-async fn test_merkle_data_upload_download() {
+async fn test_merkle_data_upload_is_held_back() {
     let (client, testnet) = setup_merkle_testnet().await;
 
     let data: Vec<u8> = (0u8..=255).cycle().take(100_000).collect();
+    let wallet = client.wallet().expect("wallet should be set");
+    let balance_before = wallet
+        .balance_of_tokens()
+        .await
+        .expect("balance query should succeed");
 
-    eprintln!("Uploading 100KB in-memory data with merkle mode...");
-
-    let result = client
+    let error = client
         .data_upload_with_mode(bytes::Bytes::from(data.clone()), PaymentMode::Merkle)
         .await
-        .expect("merkle data upload should succeed");
-
-    assert_eq!(
-        result.payment_mode_used,
-        PaymentMode::Merkle,
-        "data upload must use Merkle mode"
+        .expect_err("the in-memory upload is held back")
+        .to_string();
+    assert!(
+        error.contains("data_upload is off in this build"),
+        "{error}"
     );
 
-    assert!(result.chunks_stored >= 3, "should produce multiple chunks");
-
-    // Download and verify
-    let downloaded = client
-        .data_download(&result.data_map)
+    let balance_after = wallet
+        .balance_of_tokens()
         .await
-        .expect("data download should succeed");
-
-    assert_eq!(downloaded.len(), data.len());
-    assert_eq!(downloaded.as_ref(), data.as_slice());
-
-    eprintln!("Merkle data upload/download round-trip verified.");
+        .expect("balance query should succeed");
+    assert_eq!(balance_before, balance_after, "nothing is paid");
+    let (data_map, _) = self_encryption::encrypt(bytes::Bytes::from(data)).expect("encrypt");
+    for info in data_map.infos() {
+        assert!(
+            !client
+                .chunk_exists(&info.dst_hash.0)
+                .await
+                .expect("existence check"),
+            "nothing is stored"
+        );
+    }
 
     drop(client);
     testnet.teardown().await;

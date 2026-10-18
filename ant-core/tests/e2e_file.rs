@@ -4,7 +4,11 @@
 
 mod support;
 
-use ant_core::data::{compute_address, Client, ExternalPaymentInfo, PaymentMode, Visibility};
+use ant_core::ant_listings::Envelope;
+use ant_core::data::{
+    compute_address, forget_upload_record, Client, EnvelopeOptions, ExternalPaymentInfo,
+    ListingChain, PaymentMode, Visibility,
+};
 use ant_protocol::evm::{QuoteHash, TxHash};
 use serial_test::serial;
 use std::collections::HashMap;
@@ -43,6 +47,38 @@ async fn test_file_upload_download_round_trip() {
         result.chunks_stored >= 3,
         "self-encryption produces at least 3 chunks"
     );
+
+    // As `darwin file upload` stores a file by default: in a private
+    // envelope that shows every payment field, with the record proving its
+    // payment, which checks out against the chain.
+    let envelope = result
+        .envelope
+        .clone()
+        .expect("file_upload stores an envelope");
+    assert!(!envelope.readable(), "a private envelope");
+    assert!(envelope.salt.is_some());
+    assert_eq!(result.data_map_address, None, "no public address");
+    assert_eq!(
+        envelope.envelope.flags(),
+        EnvelopeOptions::private().flags()
+    );
+    assert!(envelope.proof_checked, "{:?}", envelope.proof_problem);
+    let record = envelope.proof.clone().expect("a record of its payment");
+    assert_eq!(record.address, envelope.address());
+    ListingChain::new(testnet.evm_network())
+        .expect("chain reader")
+        .check_proof(&record)
+        .await
+        .expect("the record checks out against the chain");
+    let stored = client
+        .chunk_get(&envelope.address())
+        .await
+        .expect("fetch")
+        .expect("the envelope is stored");
+    let stored = Envelope::from_bytes(&stored.content).expect("an envelope");
+    assert!(stored.is_withheld());
+    assert_eq!(stored.flags(), EnvelopeOptions::private().flags());
+    forget_upload_record(&envelope.address()).expect("forget the kept record");
 
     let output_dir = TempDir::new().expect("create temp dir");
     let output_path = output_dir.path().join("downloaded.bin");
@@ -362,13 +398,14 @@ async fn test_public_upload_round_trip_wave_batch() {
 
 /// Full wallet-backed public upload round-trip (direct CLI-style path).
 ///
-/// This covers the non-external-signer path used by `ant file upload --public`:
-/// the serialized DataMap must be appended to the upload chunk set before
-/// payment, so the returned address is immediately retrievable without a
-/// second `data_map_store` payment.
+/// The public shortcut stores what `darwin file upload --public` stores: the
+/// data map in an unlisted envelope that shows every payment field, paid
+/// with the content, so the returned address, the envelope's, is
+/// immediately readable without a second payment. No plain data map chunk
+/// is stored.
 #[tokio::test(flavor = "multi_thread")]
 #[serial]
-async fn test_public_file_upload_direct_batches_datamap() {
+async fn test_public_file_upload_stores_the_unlisted_envelope() {
     let (client, testnet) = setup().await;
 
     let original = vec![0x6bu8; 4096];
@@ -383,16 +420,29 @@ async fn test_public_file_upload_direct_batches_datamap() {
 
     let data_map_address = result
         .data_map_address
-        .expect("public upload must return a DataMap address");
-    let expected_bytes = rmp_serde::to_vec(&result.data_map).expect("serialize DataMap");
+        .expect("public upload must return an address");
+    let envelope = result.envelope.clone().expect("an envelope");
     assert_eq!(
         data_map_address,
-        compute_address(&expected_bytes),
-        "data_map_address must point to the serialized DataMap chunk"
+        envelope.address(),
+        "the address is the envelope's"
+    );
+    assert!(envelope.readable());
+    assert_eq!(
+        envelope.envelope.flags(),
+        EnvelopeOptions::unlisted().flags()
+    );
+    assert!(envelope.proof.is_some(), "{:?}", envelope.proof_problem);
+    forget_upload_record(&data_map_address).expect("forget the kept record");
+    let plain = compute_address(&rmp_serde::to_vec(&result.data_map).expect("serialize DataMap"));
+    assert_ne!(data_map_address, plain);
+    assert!(
+        !client.chunk_exists(&plain).await.expect("check"),
+        "no plain data map chunk is stored"
     );
     assert_eq!(
         result.chunks_stored, result.total_chunks,
-        "public upload should store every chunk, including the DataMap"
+        "public upload should store every chunk, including the envelope"
     );
 
     let fetched_data_map = client

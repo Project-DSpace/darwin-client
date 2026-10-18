@@ -999,20 +999,26 @@ client.approve_token_spend().await?;
 
 ```rust
 use std::path::Path;
-use ant_core::data::PaymentMode;
+use ant_core::data::{EnvelopeOptions, PaymentMode};
 
-// Upload a file (streamed, never fully loaded into memory)
+// Upload a file (streamed, never fully loaded into memory) as `darwin file upload`
+// stores it: in a private envelope that shows every payment field, paid per chunk.
+// `result.envelope` holds the envelope, its salt and the record proving its payment
+// (save the record, then call `forget_upload_record`: see below).
 let result = client.file_upload(Path::new("photo.jpg")).await?;
 println!("Stored {} chunks", result.chunks_stored);
 
-// Upload with explicit payment mode
-let result = client.file_upload_with_mode(Path::new("photo.jpg"), PaymentMode::Merkle).await?;
+// Readable by anyone with its address, as `darwin file upload --public` stores it:
+// the data map in an unlisted envelope (`file_upload_public_with_mode` does the same).
+let options = EnvelopeOptions::unlisted();
+let public = client
+    .file_upload_with_visibility_and_progress(
+        Path::new("photo.jpg"), PaymentMode::Single, options.into_visibility(), None)
+    .await?;
+let address = public.data_map_address.expect("the envelope's address");
 
-// Store DataMap publicly (anyone with the address can download)
-let public_address = client.data_map_store(&result.data_map).await?;
-
-// Download a public file
-let data_map = client.data_map_fetch(&public_address).await?;
+// Download a public file: the data map is read from its envelope.
+let data_map = client.data_map_fetch(&address).await?;
 client.file_download(&data_map, Path::new("photo_copy.jpg")).await?;
 ```
 
@@ -1020,13 +1026,18 @@ client.file_download(&data_map, Path::new("photo_copy.jpg")).await?;
 
 ```rust
 use bytes::Bytes;
+use ant_core::data::EnvelopeOptions;
 
-// Upload bytes (encrypted + chunked automatically)
-let result = client.data_upload(Bytes::from("hello darwin")).await?;
+// `data_upload` and `data_upload_with_mode` are off in this build: they would store
+// the content with no envelope. Upload a file with `file_upload`, or prepare in-memory
+// content with an envelope for an outside signer to pay, then `finalize_upload`.
+let prepared = client
+    .data_prepare_upload_with_visibility(
+        Bytes::from("hello darwin"), EnvelopeOptions::private().into_visibility())
+    .await?;
 
-// Download and decrypt
-let content = client.data_download(&result.data_map).await?;
-assert_eq!(content, Bytes::from("hello darwin"));
+// Download and decrypt with a data map
+let content = client.data_download(&data_map).await?;
 ```
 
 ### Envelopes, Proofs and Listings
@@ -1044,7 +1055,7 @@ for warning in options.warnings() {
 }
 let result = client
     .file_upload_with_visibility_and_progress(
-        Path::new("photo.jpg"), PaymentMode::Auto, options.into_visibility(), None)
+        Path::new("photo.jpg"), PaymentMode::Single, options.into_visibility(), None)
     .await?;
 // The envelope, the salt of a private one, and the record proving its payment.
 let envelope = result.envelope.expect("an envelope");
@@ -1066,7 +1077,7 @@ let one = client.listing(&envelope.address(), &chain).await?;
 
 `index_listings` and `listing` merge, date, check and decide listings as the nodes do when they repair one. `index_listings_with` carries on from the `WalkState` of earlier reads (save it between them: it serialises), where `index_listings` starts afresh, and `ListingsIndex::carry` says what to do with a listing an earlier read published: replace it with what this read decided, keep it, or drop it because the network no longer stores its file. An indexer of its own can use the same rules from `ant_core::data::client::listings`: `listing_to_check` (what to look up on chain for a group of copies), `check_copies` (the group's date and check, given what was fetched), `quorum_listing` and `decide_address`, with `ant_listings::IndexWalk` to walk the nodes' indexes.
 
-`Visibility::Private` and `Visibility::Public` upload exactly as they always have; `EnvelopeOptions::into_visibility` picks them when no envelope is needed. An envelope upload's checkpoint and kept record belong to whoever pays: the wallet, or an `UploadPayer`'s `checkpoint_scope()`, which a payer serving several accounts must set to each account's id, so one account never resumes another's interrupted upload or gets its record. An `UploadPayer`'s upload without an envelope has a checkpoint of its own too, so uploads of the same file by different payers neither share a payment nor wait for each other's (an upload holds its checkpoint's lock while its payment is awaited). Only a wallet upload without an envelope shares its file's checkpoint, as before. `file_upload_with_payer` and the external-signer `file_prepare_upload_with_mode`/`finalize_upload*` take `Visibility::Envelope` too; the external path pays an envelope upload per chunk, in one wave batch (its payment intent lists the quotes in quote-hash order: pay them in that order), and fills in the record at finalize once every chunk is stored (unchecked if the client has no EVM network). It refuses, before quoting, an envelope upload the payment mode would pay in merkle batches (`PaymentMode::Auto` from 64 chunks, or `PaymentMode::Merkle`): use `file_upload_with_payer`, or `PaymentMode::Single` to pay every chunk per chunk with all of them held in memory.
+The upload calls that take no visibility (`file_upload`, `file_upload_with_mode`, `file_upload_with_progress`, `estimate_upload_cost`, `file_prepare_upload` and `data_prepare_upload`) store the private envelope `darwin file upload` stores, `Visibility::default()`, and `file_upload_public_with_mode` and `file_upload_public_with_progress` the unlisted one `--public` stores. `Visibility::Private` and `Visibility::Public` upload exactly as they always have, with no envelope, when asked for by name; `EnvelopeOptions::into_visibility` picks them when no envelope is needed. The raw building blocks (`chunk_put`, `chunk_put_with_proof`, `data_map_store`, `upload_records`, `upload_records_then`, `batch_upload_chunks`, `pay_for_storage`, `SingleNodeQuotePayment::from_quotes` and `pay`) store or pay with no envelope; their documentation says what else each leaves out and what to use instead. An envelope upload's checkpoint and kept record belong to whoever pays: the wallet, or an `UploadPayer`'s `checkpoint_scope()`, which a payer serving several accounts must set to each account's id, so one account never resumes another's interrupted upload or gets its record. An `UploadPayer`'s upload without an envelope has a checkpoint of its own too, so uploads of the same file by different payers neither share a payment nor wait for each other's (an upload holds its checkpoint's lock while its payment is awaited). Only a wallet upload without an envelope shares its file's checkpoint, as before. `file_upload_with_payer` and the external-signer `file_prepare_upload_with_mode`/`finalize_upload*` take `Visibility::Envelope` too; the external path pays an envelope upload per chunk, in one wave batch (its payment intent lists the quotes in quote-hash order: pay them in that order), and fills in the record at finalize once every chunk is stored (unchecked if the client has no EVM network). It refuses, before quoting, an envelope upload the payment mode would pay in merkle batches (`PaymentMode::Auto` from 64 chunks, or `PaymentMode::Merkle`): use `file_upload_with_payer`, or `PaymentMode::Single` to pay every chunk per chunk with all of them held in memory.
 
 ### Low-Level Chunk Operations
 
@@ -1092,8 +1103,8 @@ Darwin supports two payment strategies:
 | Mode | Description |
 |------|-------------|
 | `PaymentMode::Single` | Default. Per-chunk payments, in transactions of up to 64 chunks; every paid quote's vault record is read back, and an occupied quote is quoted and paid again (see "How it works" above). |
-| `PaymentMode::Merkle` | Single EVM transaction for a batch of chunks via merkle proof. Lower gas for large uploads, but the DARWIN vault lets the payer steer a batch's payout and can charge a re-sent batch twice. |
-| `PaymentMode::Auto` | Uses merkle when chunk count >= 64, otherwise per-chunk. |
+| `PaymentMode::Merkle` | Single EVM transaction for a batch of chunks via merkle proof. Darwin's nodes refuse batch payments (the DARWIN vault lets the payer steer a batch's payout and can charge a re-sent batch twice), so it fails before paying. |
+| `PaymentMode::Auto` | Merkle from 64 chunks, otherwise per chunk; since nodes refuse batch payments, from 64 chunks it falls back to per-chunk payments. |
 
 `PaymentMode::default()`, `Client::file_upload` and the browser API (no `paymentMode`) pay per chunk. Until 2026-10 they defaulted to `Auto`.
 

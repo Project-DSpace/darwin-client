@@ -204,6 +204,12 @@ impl Client {
     }
 
     /// Drive record uploads using platform adapters and portable recovery state.
+    ///
+    /// A raw building block: it quotes, pays for and stores exactly the
+    /// records it is given, reading each paid quote back, so an upload has an
+    /// envelope only if the caller adds one, as the `last` record of
+    /// [`Client::upload_records_then`]. Upload files with
+    /// `Client::file_upload`, which builds the envelope.
     pub async fn upload_records<A: UploadAdapter>(
         &self,
         records: Vec<UploadRecord>,
@@ -216,7 +222,8 @@ impl Client {
     }
 
     /// As [`Client::upload_records`], with `last` stored after every other
-    /// record. `last` is always paid per chunk: in the same payment as the
+    /// record, as an envelope is: the file upload paths build one and pass it
+    /// here. `last` is always paid per chunk: in the same payment as the
     /// records paid per chunk (all of them below the Merkle threshold, else
     /// those left after the Merkle batches), or alone if there are none. It
     /// is stored only once every other record is stored, so a listing
