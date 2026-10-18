@@ -1,0 +1,136 @@
+# Runs the end-to-end tests (a local devnet of nodes and a local Anvil chain)
+# and the browser core's tests. Kept apart from build.yml, which checks
+# formatting and lints, runs the unit tests and builds the binary.
+#
+# Runs on every push, to any branch, and on pull requests, so a merge branch
+# is tested before it lands; weekly; and by hand. Actions are pinned by commit.
+
+name: Test
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+  schedule:
+    # Mondays, 04:17 UTC: GitHub delays or drops scheduled runs most at the
+    # top of the hour.
+    - cron: '17 4 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: test-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  e2e:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 150
+    # Line tables only, not full debug info, so the test build fits on the
+    # runner's disk; backtraces still give file and line.
+    env:
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable branch
+        with:
+          toolchain: stable
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+
+      # Pinned: a new anvil can break the payment tests with no change here.
+      - name: Install Foundry (anvil)
+        uses: foundry-rs/foundry-toolchain@908c540300062bd5a7e473851cdb4282204cee09 # v1.9.1
+        with:
+          version: v1.8.5
+
+      # The test build fills the runner's disk otherwise. This job uses none
+      # of these preinstalled toolchains.
+      - name: Free disk space
+        run: |
+          df -h /
+          for dir in /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL; do
+            if [ -d "$dir" ]; then sudo rm -rf "$dir"; fi
+          done
+          df -h /
+
+      - name: Build the tests
+        id: build
+        run: cargo test --locked -p ant-core --features test-utils --no-run
+
+      # One target at a time, single-threaded, whether or not an earlier one
+      # failed, so every target reports. e2e_merkle runs against the devnet's
+      # nodes, which are upstream's ant-node: it pins that merkle payments
+      # still work there, while darwin's own nodes refuse them.
+      - name: End-to-end tests
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        shell: bash
+        run: |
+          failed=()
+          for target in e2e_envelope e2e_occupied_quotes e2e_native_payment e2e_pointer \
+                        e2e_manifest e2e_file e2e_data e2e_payment e2e_security e2e_chunk \
+                        e2e_cost_estimate e2e_adr0004 e2e_merkle; do
+            echo "::group::$target"
+            cargo test --locked -p ant-core --features test-utils --test "$target" -- --test-threads=1 \
+              || failed+=("$target")
+            echo "::endgroup::"
+          done
+          if [ ${#failed[@]} -gt 0 ]; then
+            echo "Failed: ${failed[*]}"
+            exit 1
+          fi
+
+  wasm:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable branch
+        with:
+          toolchain: stable
+          targets: wasm32-unknown-unknown
+          components: clippy
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 22
+
+      - name: Lint the browser core
+        run: >-
+          cargo clippy --locked -p ant-core
+          --target wasm32-unknown-unknown
+          --no-default-features
+          --features browser-wasm
+          -- -D warnings
+
+      - name: Install wasm-pack
+        run: cargo install wasm-pack --version 0.15.0 --locked
+
+      - name: Generate the browser bindings
+        working-directory: ant-core
+        run: >-
+          wasm-pack build
+          --target web
+          --out-dir wasm-tests/pkg
+          --release
+          .
+          --no-default-features
+          --features browser-wasm,test-utils
+
+      # There is no package.json in wasm-tests, so node runs them directly.
+      - name: Test the browser bindings
+        working-directory: ant-core
+        run: >-
+          node --import ./wasm-tests/setup-wasm.mjs
+          --test ./wasm-tests/*.test.mjs

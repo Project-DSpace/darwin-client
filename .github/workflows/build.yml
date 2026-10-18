@@ -1,7 +1,11 @@
 # Checks formatting and lints, runs the unit tests, then builds the Linux `darwin`
-# client binary (from the ant-cli crate) on every push to main and uploads it,
+# client binary (from the ant-cli crate) and uploads it,
 # with its licence files and third-party notices, as the `darwin-linux-x64`
 # workflow artifact. Also checks that upstream's installers stay deleted.
+#
+# Runs on every push, to any branch, and on pull requests, so a merge branch
+# is checked before it lands; test.yml runs the end-to-end and browser tests.
+# Actions are pinned by commit.
 #
 # Replaces upstream's workflows, which run Autonomi's test matrix, PR checks
 # and signed multi-platform releases.
@@ -10,7 +14,8 @@ name: Build
 
 on:
   push:
-    branches: [main]
+    branches: ['**']
+  pull_request:
   workflow_dispatch:
 
 permissions:
@@ -25,7 +30,7 @@ jobs:
   upstream-installers:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - name: Upstream's installers stay deleted
         run: |
           tracked=$(git ls-files -- install.sh install.ps1 npm resources/winget resources/release-signing-key.pub)
@@ -35,12 +40,26 @@ jobs:
             exit 1
           fi
 
+      # The vendored ant-listings is darwin-listings v0.2.1 unchanged; the ids
+      # it was vendored at are in its VENDORED.md.
+      - name: Vendored ant-listings is unchanged
+        run: |
+          for path in src Cargo.toml; do
+            want=$(grep -oE "^#   ${path%.toml}[^:]*: +[0-9a-f]{40}" vendor/ant-listings/VENDORED.md | grep -oE '[0-9a-f]{40}')
+            have=$(git rev-parse "HEAD:vendor/ant-listings/$path")
+            if [ "$want" != "$have" ]; then
+              echo "vendor/ant-listings/$path is $have, VENDORED.md records '$want'"
+              exit 1
+            fi
+          done
+
   fmt:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable branch
         with:
+          toolchain: stable
           components: rustfmt
       - run: cargo fmt --all -- --check
 
@@ -49,11 +68,12 @@ jobs:
     env:
       RUSTFLAGS: "-D warnings"
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable branch
         with:
+          toolchain: stable
           components: clippy
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - run: cargo clippy --locked --all-targets --all-features -- -D warnings
 
   linux-x64:
@@ -61,15 +81,23 @@ jobs:
     # glibc will not run on an older one.
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable branch
+        with:
+          toolchain: stable
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
       - name: Unit tests
         run: cargo test --locked -p ant-core --lib && cargo test --locked -p ant-cli
+
+      # vendor/ant-listings' own tests, under this repository's Cargo.lock: a
+      # dependency this lock resolves differently from darwin-listings' fails
+      # here.
+      - name: Vendored ant-listings
+        run: cargo test --locked -p ant-listings
 
       - name: Build
         run: cargo build --release --locked -p ant-cli --bin darwin
@@ -104,7 +132,7 @@ jobs:
           sha256sum darwin-linux-x64.tar.gz > SHA256SUMS.txt
 
       - name: Upload build
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: darwin-linux-x64
           path: |
