@@ -244,3 +244,68 @@ fn chunk_get_still_parses() {
     );
     assert!(run.left_behind.is_empty(), "darwin {args:?}: {run:#?}");
 }
+
+/// `darwin update` is off: with or without `--force`, `--json` or a channel,
+/// it is refused before it reaches a release server or replaces anything.
+#[test]
+fn self_update_is_refused() {
+    for args in [
+        &["update"][..],
+        &["update", "--force"],
+        &["--json", "update"],
+        &["update", "--channel", "beta", "--force"],
+    ] {
+        let run = darwin(args, b"");
+        assert_refused(args, &run, "self-update is off in this build");
+    }
+}
+
+/// `darwin --version`: the binary is named `darwin`, line 1 is its name and
+/// the package version, line 2 the commit it was built from.
+#[test]
+fn the_version_names_darwin_and_the_commit() {
+    let args = ["--version"];
+    let run = darwin(&args, b"");
+    assert_eq!(run.code, Some(0), "{run:#?}");
+    let lines: Vec<&str> = run.stdout.lines().collect();
+    assert_eq!(lines.len(), 2, "{run:#?}");
+    assert_eq!(lines[0], concat!("darwin ", env!("CARGO_PKG_VERSION")));
+    let commit = lines[1].strip_prefix("commit ").expect("a commit line");
+    assert!(
+        commit == "unknown"
+            || (!commit.is_empty() && commit.chars().all(|c| c.is_ascii_hexdigit())),
+        "{commit:?}"
+    );
+    assert!(run.left_behind.is_empty(), "{run:#?}");
+}
+
+/// `darwin --help` names the client and says which commands are off.
+#[test]
+fn the_help_names_the_client_and_what_is_off() {
+    let args = ["--help"];
+    let run = darwin(&args, b"");
+    assert_eq!(run.code, Some(0), "{run:#?}");
+    let help = run.stdout.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(help.contains("Darwin storage network client"), "{help}");
+    assert!(
+        help.contains("Update the darwin binary (off in this build"),
+        "{help}"
+    );
+    assert!(
+        help.contains("Manage local Autonomi nodes (off in this build"),
+        "{help}"
+    );
+    assert!(run.left_behind.is_empty(), "{run:#?}");
+}
+
+/// The subcommand census (src/darwin_pins.rs) is a test module of the
+/// binary: a merge that dropped its declaration would drop the census.
+#[test]
+fn the_binary_declares_the_subcommand_census() {
+    let main = include_str!("../src/main.rs");
+    assert!(
+        main.contains("#[cfg(test)]\nmod darwin_pins;")
+            || main.contains("#[cfg(test)]\r\nmod darwin_pins;"),
+        "ant-cli/src/main.rs must declare `#[cfg(test)] mod darwin_pins;`"
+    );
+}

@@ -1,5 +1,7 @@
 mod cli;
 mod commands;
+#[cfg(test)]
+mod darwin_pins;
 mod progress;
 
 use std::path::PathBuf;
