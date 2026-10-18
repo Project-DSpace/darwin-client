@@ -17,6 +17,12 @@ told apart by the commit `darwin --version` prints. Upstream's entries follow.
 - Listings v2: envelopes on every visibility, optional payment fields, upload records and proofs
   (`darwin file prove`, `darwin file verify`), and the listings index (`darwin listings`,
   `darwin listing`) read with quorum checks.
+- Envelopes are darwin's default: `darwin file upload`, `darwin manifest create` and the
+  library's file upload shortcuts store each upload in an envelope, with its payment record, a
+  listing when listed, and a `.record`. The other ways of using the network remain, with no
+  envelope: raw chunks (`darwin chunk put`), plain data maps (`Visibility::Public`,
+  `data_upload`, `darwin manifest export --compact --yes`), the browser core's uploads and pointer
+  writes, and other clients.
 - Uploads paid by an outside payer; merkle batches paid in exact powers of two.
 - Uploads pay per chunk: `darwin file upload` and `darwin file cost` no longer use batch (merkle)
   payments, which the vault lets a payer steer and can charge twice when re-sent, and refuse
