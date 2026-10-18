@@ -466,8 +466,10 @@ const fn is_version_unaware(error: &Error) -> bool {
     matches!(error, Error::Network(_) | Error::Timeout(_))
 }
 
-/// How a storer's refusal for rate reads in a quote failure: darwin-node
-/// answers `ProtocolError::QuoteFailed("rate limited")` (`RATE_LIMITED` in its
+/// How a storer's refusal for rate reads in a quote failure. No released
+/// darwin-node limits quote requests yet: the per-peer and per-IP quote limits
+/// are on its unmerged branch `refuse-batch-rate-limit`, where a node answers
+/// `ProtocolError::QuoteFailed("rate limited")` (`RATE_LIMITED` in its
 /// `src/storage/handler.rs`) while the requesting peer or its IP is over the
 /// node's quote rate.
 const RATE_LIMITED_QUOTE: &str = "quote failed: rate limited";
@@ -493,8 +495,10 @@ fn refused_for_rate(error: &Error) -> bool {
 /// Run a quote collection, and run it again after each of
 /// [`RATE_LIMITED_RETRY_DELAYS`] while it fails because storers refused for
 /// rate. Without this, a client that meets a node's per-peer or per-IP quote
-/// limit (several uploads at once from one address) fails the whole upload on
-/// the first record left with no quote, though a second's wait would do.
+/// limit (several uploads at once from one address) would fail the whole
+/// upload on the first record left with no quote, though a second's wait
+/// would do. No released darwin-node has such a limit yet (see
+/// [`RATE_LIMITED_QUOTE`]).
 async fn retry_while_rate_limited<T, F, Fut>(address: &[u8; 32], mut collect: F) -> Result<T>
 where
     F: FnMut() -> Fut,

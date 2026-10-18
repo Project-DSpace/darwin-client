@@ -43,9 +43,10 @@ told apart by the commit `darwin --version` prints. Upstream's entries follow.
   and `storePaidPointer` refuse before any quote, wallet callback or request, until they carry
   the payment record, the read-back of paid quotes and per-chunk-only payment. Reads are
   unchanged: downloads, range reads, `getPointer`, `resolvePointer` and `pointerFinality`.
-- A record whose quotes storers refuse for rate (darwin-node's per-peer and per-IP quote limits,
-  met by several uploads at once from one address) is quoted again after 1, 2 and 4 seconds
-  instead of failing the upload.
+- A record whose quotes storers refuse for rate is quoted again after 1, 2 and 4 seconds instead
+  of failing the upload. No released darwin-node limits quote requests yet: the per-peer and
+  per-IP quote limits this retry waits out (met by several uploads at once from one address) are
+  on darwin-node's unmerged branch `refuse-batch-rate-limit`.
 - Uploads no longer take a node's word that it already holds a chunk. A chunk is skipped, unpaid,
   only when `CLOSE_GROUP_MAJORITY` (4) of the 7 nearest nodes claim it and prove it by serving
   it: the client reads it from the claimants one at a time, nearest first, and checks the bytes
