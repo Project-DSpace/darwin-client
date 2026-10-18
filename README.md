@@ -8,7 +8,7 @@ Based on Autonomi's [ant-client](https://github.com/WithAutonomi/ant-client), li
 
 This project provides two Rust crates:
 
-- **ant-core** — A headless Rust library containing the client's business logic: data storage/retrieval with self-encryption and EVM payments, node lifecycle management, and local devnet tooling. Its `browser` module shares manifest validation, protocol framing, authenticated WebRTC Direct access, lookup, quote verification, and complete public-file workflows with browser applications through the `browser-wasm` feature. Uploads and pointer writes from the browser core are off in this build.
+- **ant-core** — A headless Rust library containing the client's business logic: data storage/retrieval with self-encryption and EVM payments, node lifecycle management, and local devnet tooling. Its `browser` module shares manifest validation, protocol framing, authenticated WebRTC Direct access, lookup, quote verification, and complete public-file workflows with browser applications through the `browser-wasm` feature.
 - **ant-cli** — A thin CLI binary (`darwin`) built on `ant-core`.
 
 Data on Darwin is **content-addressed**. Files are split into encrypted chunks (via [self-encryption](https://en.wikipedia.org/wiki/Convergent_encryption)), each stored at an XOR address derived from its content. A `DataMap` tracks which chunks belong to a file. Storage is paid in DARWIN on Robinhood Chain (chain ID 4663), through the payment vault `0xE0f627986c0438De0E314B644f3C8aA21D3f4f6B`. The token, the vault and the RPCs are bundled in `ant-core/resources/payment_network.toml`; `--evm-network robinhood`, the default, selects them.
@@ -29,14 +29,12 @@ project owns the TypeScript API, wallet adapters, browser storage and worker
 integration, media streaming bridge, runnable examples, and browser end-to-end
 tests.
 
-Uploads and pointer writes from the browser core are off in this build:
-`uploadPublicFile`, `uploadStagedPublicFile`, `uploadRecords`, `createPointer`,
-`updatePointer`, `transferPointer` and `storePaidPointer` refuse before any
-quote, wallet callback or request. They don't yet carry the payment record (an
-upload's envelope and `.record`), the read-back of paid quotes, or
-per-chunk-only payment. Reads are unchanged: downloads, range reads,
-`getPointer`, `resolvePointer` and `pointerFinality`. Upload and write pointers
-with the `darwin` client.
+Uploads from the browser core (`uploadPublicFile`, `uploadStagedPublicFile`,
+`uploadRecords`) store a plain data map, or the staged records, with no
+envelope: no payment record, listing or `.record`, which `darwin file upload`
+stores by default. The browser core doesn't yet read paid quotes back, as the
+native client does, and has no price ceiling option like `--max-chunk-price`.
+A page that names no payment mode pays per chunk (`single`).
 
 Native and WASM reads share `ant-core/src/client_engine/read.rs` and
 `client_engine/files.rs`. The engine owns XOR-ordered peer selection, bounded
@@ -126,15 +124,19 @@ There is no browser-specific recovery probe or relaxed payment threshold.
 The requested responder count must be satisfied before quote witnessing and
 storage-majority checks proceed.
 
-Pointers can be read from the browser: `getPointer`, `resolvePointer` and
-`pointerFinality` on `BrowserNetworkClient`, and `pointerAddress(seed)`
-offline. They run the native client's own read quorum and corroboration, and
-only nodes that advertise `pointer_protocol` are asked. `pointerFinality` asks
-the whole close group whether a pointer is final, and the bootstrap peers
-nearest it before calling it open, in `seeds` (see `darwin pointer finality`
-below). `createPointer`, `updatePointer`, `transferPointer` and
-`storePaidPointer` are off in this build (above); `darwin pointer` writes
-pointers.
+Pointers work from the browser too: `getPointer`, `resolvePointer`,
+`createPointer` and `updatePointer` on `BrowserNetworkClient`, and
+`pointerAddress(seed)` offline. They run the native client's own read quorum,
+corroboration and write quorum, and pay each state through the same wallet
+callback file uploads take. The owner key is passed as its 32-byte seed. Only
+nodes that advertise `pointer_protocol` are asked. A write can hand the paid
+record and proof to an `onPaid` callback; `storePaidPointer` stores them later
+without paying again. `transferPointer` hands a pointer over for good.
+`pointerFinality` asks the whole close group whether a pointer is final, and
+the bootstrap peers nearest it before calling it open, in `seeds` (see
+`darwin pointer transfer` and `darwin pointer finality` below). Like the
+browser's uploads, its pointer writes read no paid quote back and take no price
+ceiling.
 
 Browser protocol v5 and browser manifest v6 advertise only the payment chain ID
 and token/vault addresses. RPC providers belong to the application or wallet;
@@ -789,7 +791,7 @@ Darwin supports two payment strategies:
 | `PaymentMode::Merkle` | Single EVM transaction for a batch of chunks via merkle proof. Darwin's nodes refuse batch payments (the DARWIN vault lets the payer steer a batch's payout and can charge a re-sent batch twice), so it fails before paying. |
 | `PaymentMode::Auto` | Merkle from 64 chunks, otherwise per chunk; since nodes refuse batch payments, from 64 chunks it falls back to per-chunk payments. |
 
-`PaymentMode::default()` and `Client::file_upload` pay per chunk, and so would the browser API with no `paymentMode`, whose uploads are off in this build. Until 2026-10 they defaulted to `Auto`.
+`PaymentMode::default()`, `Client::file_upload` and the browser API (no `paymentMode`) pay per chunk. Until 2026-10 they defaulted to `Auto`.
 
 `ClientConfig::max_chunk_price` sets a price ceiling, the most a node's quote may ask to store one chunk, in the token's base units (`None`, the default: no ceiling). Every quote the client collects is checked against it, for its own wallet, an `UploadPayer` or the external-signer preparation, and so is every merkle candidate: one asking more is dropped as if its node hadn't answered, and the payment planner refuses to plan a payment on one. A chunk then costs at most 3 times the ceiling. A payment planned before the ceiling was set or lowered, and saved by an interrupted upload, is resumed as saved, so it is never made twice.
 

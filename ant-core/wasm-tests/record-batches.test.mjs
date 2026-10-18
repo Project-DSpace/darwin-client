@@ -1,10 +1,11 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { BrowserNetworkClient, PageClient, PAID_WRITES_OFF } from "./client-fixture.mjs";
+import { BrowserNetworkClient } from "./client-fixture.mjs";
 import { encryptPublicFile } from "./pkg/ant_core.js";
 import { mockWebRtc, paymentNetwork } from "./mock-webrtc.mjs";
 
 const content = new TextEncoder().encode("Record batch regression fixture. ".repeat(2000));
+const noSingle = () => { throw new Error("unexpected single payment"); };
 const receipt = (_, quotes) => ({
   transactionHash: `0x${"ab".repeat(32)}`,
   totalAmount: quotes.reduce((sum, quote) => sum + BigInt(quote.amount), 0n).toString(),
@@ -49,24 +50,19 @@ test("consecutive record batches pay separately and download as one public file"
   } finally { client.close(); }
 });
 
-test("record batches are refused in every payment mode before any quote or payment", async () => {
+test("record batches report the payment mode the shared coordinator used", async () => {
   const rtc = mockWebRtc(Array.from({ length: 16 }, () => ({})));
-  const client = new PageClient(rtc.endpoints);
+  const client = new BrowserNetworkClient(rtc.endpoints);
   const { encrypted, metadata } = encryptedRecords();
-  const calls = [];
-  const load = index => { calls.push("load"); return encrypted.records[index].content; };
-  const pay = (...args) => { calls.push("single"); return receipt(...args); };
-  const payMerkle = (...args) => { calls.push("merkle"); return merkleReceipt(...args); };
-  const refused = error => error === PAID_WRITES_OFF;
   try {
-    for (const mode of ["merkle", "auto", "single", undefined]) {
-      await assert.rejects(client.uploadRecords({ records: metadata }, paymentNetwork, load, pay,
-        undefined, undefined, undefined, mode, payMerkle), refused, String(mode));
-    }
-    await assert.rejects(client.uploadPublicFile(new TextEncoder().encode("single payment fixture"),
-      "single.txt", "text/plain", paymentNetwork, pay, undefined, undefined, undefined, "single"), refused);
-    assert.deepEqual(calls, []);
-    assert.equal(rtc.requests.length, 0);
+    const merkle = await client.uploadRecords({ records: metadata }, paymentNetwork,
+      index => encrypted.records[index].content, noSingle, undefined, undefined, undefined, "merkle", merkleReceipt);
+    assert.equal(merkle.paymentMode, "merkle");
+    assert.equal(merkle.records, metadata.length);
+    assert(rtc.requests.some(request => request.method === "merkle_quote"));
+    const single = await client.uploadPublicFile(new TextEncoder().encode("single payment fixture"), "single.txt",
+      "text/plain", paymentNetwork, receipt, undefined, undefined, undefined, "single");
+    assert.equal(single.paymentMode, "single");
   } finally { client.close(); }
 });
 

@@ -38,11 +38,12 @@ told apart by the commit `darwin --version` prints. Upstream's entries follow.
   through the payment network's RPC and then, on the bundled network, the RPCs reads of payments
   fall back to, each call within 15 seconds; before, through its RPC alone, with no time limit.
   Browser builds don't read records back.
-- Uploads and pointer writes from the browser core are off in this build: `uploadPublicFile`,
-  `uploadStagedPublicFile`, `uploadRecords`, `createPointer`, `updatePointer`, `transferPointer`
-  and `storePaidPointer` refuse before any quote, wallet callback or request, until they carry
-  the payment record, the read-back of paid quotes and per-chunk-only payment. Reads are
-  unchanged: downloads, range reads, `getPointer`, `resolvePointer` and `pointerFinality`.
+- The browser core's uploads and pointer writes (`uploadPublicFile`, `uploadStagedPublicFile`,
+  `uploadRecords`, `createPointer`, `updatePointer`, `transferPointer` and `storePaidPointer`)
+  are available, as upstream's are. A browser upload stores a plain data map, or the staged
+  records, with no envelope: no payment record, listing or `.record`. The browser core doesn't
+  yet read paid quotes back, and has no price ceiling option. A page that names no payment mode
+  pays per chunk (`single`).
 - A record whose quotes storers refuse for rate is quoted again after 1, 2 and 4 seconds instead
   of failing the upload. No released darwin-node limits quote requests yet: the per-peer and
   per-IP quote limits this retry waits out (met by several uploads at once from one address) are

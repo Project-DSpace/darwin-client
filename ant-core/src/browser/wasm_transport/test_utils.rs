@@ -1124,13 +1124,6 @@ pub async fn test_operation_timeout(endpoint: &str, timeout_ms: u32) -> Result<(
 
 #[wasm_bindgen]
 impl BrowserNetworkClient {
-    /// Let this client upload and write pointers, which are off in this
-    /// build, so the tests of the code underneath the exports still run.
-    /// Test builds only: a page's client is always refused.
-    pub fn test_allow_paid_writes(&self) {
-        self.test_paid_writes.set(true);
-    }
-
     /// Simulate a refusal corroborated by other concurrent quote requests.
     pub fn test_refuse_settlement(&self) {
         for seed in 1..=crate::data::client::SETTLEMENT_REFUSAL_QUORUM {
