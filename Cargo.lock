@@ -921,8 +921,12 @@ dependencies = [
  "ant-protocol",
  "postcard",
  "rmp-serde",
+ "saorsa-core",
+ "saorsa-pqc",
  "self_encryption",
  "serde",
+ "serde_json",
+ "sha3 0.10.9",
  "thiserror 2.0.18",
 ]
 

@@ -749,3 +749,41 @@ async fn an_external_signer_pays_the_envelope_in_the_same_intent() {
     drop(client);
     testnet.teardown().await;
 }
+
+/// The library's file shortcuts store envelopes by default, every payment
+/// field shown: `file_prepare_upload` prepares a private one (withheld, not
+/// in the index, with a salt), and `file_upload_public_with_progress` stores
+/// an unlisted one (readable, not in the index) at the upload's address.
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn the_file_shortcuts_store_envelopes_by_default() {
+    let (client, testnet) = setup().await;
+
+    let (file, _) = input(0x31);
+    let prepared = client
+        .file_prepare_upload(file.path())
+        .await
+        .expect("prepare");
+    let private = prepared.envelope.as_ref().expect("a private envelope");
+    let flags = private.envelope.flags();
+    assert_eq!(flags.shown, ShownFields::ALL);
+    assert!(!flags.in_index);
+    assert!(flags.withheld);
+    assert!(private.salt.is_some());
+
+    let (file, _) = input(0x32);
+    let result = client
+        .file_upload_public_with_progress(file.path(), PaymentMode::Single, None)
+        .await
+        .expect("upload");
+    let unlisted = result.envelope.clone().expect("an unlisted envelope");
+    let flags = unlisted.envelope.flags();
+    assert_eq!(flags.shown, ShownFields::ALL);
+    assert!(!flags.in_index);
+    assert!(!flags.withheld);
+    assert!(unlisted.salt.is_none());
+    assert_eq!(result.data_map_address, Some(unlisted.address()));
+
+    drop(client);
+    testnet.teardown().await;
+}

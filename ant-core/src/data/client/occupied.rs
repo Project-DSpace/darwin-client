@@ -307,7 +307,7 @@ impl Client {
             }
             return Vec::new();
         };
-        match ListingChain::new(network) {
+        match read_back_chain(network) {
             Ok(chain) => occupied_quotes_via(&chain, plans).await,
             Err(error) => {
                 tracing::warn!(
@@ -323,6 +323,16 @@ impl Client {
     pub(crate) async fn occupied_quotes(&self, _plans: &[ChunkPaymentPlan]) -> Vec<OccupiedQuote> {
         Vec::new()
     }
+}
+
+/// The reader [`Client::occupied_quotes`] reads paid quotes back through:
+/// `network`'s RPC, then the RPCs it falls back to
+/// ([`crate::config::fallback_rpc_urls`]).
+#[cfg(feature = "native")]
+fn read_back_chain(
+    network: &ant_protocol::evm::Network,
+) -> crate::data::error::Result<ListingChain> {
+    ListingChain::new(network)
 }
 
 /// [`Client::occupied_quotes`], reading through `chain`.
@@ -380,6 +390,21 @@ pub(crate) async fn occupied_quotes_via(
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    /// The read-back reads through the payment network's RPC first, then
+    /// every RPC the bundled network falls back to, in order: a provider
+    /// that refuses a read doesn't stop it.
+    #[cfg(feature = "native")]
+    #[test]
+    fn the_read_back_reads_through_the_rpc_fallback_list() {
+        let bundled = crate::config::bundled_payment_network().unwrap();
+        let fallbacks = crate::config::fallback_rpc_urls(&bundled);
+        assert!(!fallbacks.is_empty());
+        let mut expected = vec![bundled.rpc_url().to_string()];
+        expected.extend(fallbacks);
+        let chain = read_back_chain(&bundled).unwrap();
+        assert_eq!(chain.rpc_urls(), expected.as_slice());
+    }
     use crate::data::client::batch::SingleNodeQuotePayment;
     use ant_protocol::evm::PaymentQuote;
     use std::time::SystemTime;

@@ -1680,6 +1680,12 @@ impl ListingChain {
         Self::with_rpcs(rpc_urls, vault)
     }
 
+    /// The RPCs this reader reads through, first to last.
+    #[cfg(test)]
+    pub(crate) fn rpc_urls(&self) -> &[String] {
+        &self.rpc_urls
+    }
+
     /// A reader for the chain at `rpc_url` and the vault at `vault`.
     ///
     /// # Errors

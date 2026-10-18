@@ -1,6 +1,10 @@
 [workspace]
-members = ["ant-core", "ant-cli"]
-exclude = ["vendor"]
+# vendor/ant-listings is a member so its own tests run under this lock
+# (`cargo test -p ant-listings`); a plain `cargo build` or `cargo test` covers
+# the default members only.
+members = ["ant-core", "ant-cli", "vendor/ant-listings"]
+default-members = ["ant-core", "ant-cli"]
+exclude = ["vendor/ant-protocol"]
 resolver = "2"
 
 
