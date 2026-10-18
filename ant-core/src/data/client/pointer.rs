@@ -1968,7 +1968,9 @@ impl Client {
     /// sent. If the vault had already recorded the quote for another payment,
     /// it skipped this one, and nodes would refuse the state: nothing is sent,
     /// and the state has to be quoted ([`Self::prepare_pointer_payment`]) and
-    /// paid again. Browser builds read nothing back.
+    /// paid again. The read-back goes through the client's EVM network
+    /// (`with_wallet` or `with_evm_network`): a native client with neither
+    /// reads nothing back and logs a warning. Browser builds read nothing back.
     ///
     /// # Errors
     ///

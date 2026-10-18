@@ -1252,7 +1252,10 @@ impl Client {
     /// Merkle batching: one chunk's worth of quotes is well below the
     /// wave-batch threshold.
     ///
-    /// The paid quote's vault record is read back before the chunk is sent.
+    /// The paid quote's vault record is read back before the chunk is sent,
+    /// through the client's EVM network ([`Client::with_wallet`] or
+    /// [`Client::with_evm_network`]; a client with neither reads nothing back
+    /// and logs a warning).
     /// If the vault had already recorded the quote for another payment, it
     /// skipped this one, so nodes would refuse the chunk: it is not sent, and
     /// has to be prepared again, since nothing here can quote it again.

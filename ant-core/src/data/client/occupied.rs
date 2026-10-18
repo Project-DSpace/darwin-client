@@ -293,11 +293,18 @@ impl Client {
     /// quote whose record stays empty, or that no RPC answers for, is not
     /// reported: the upload then goes on as it would have without the
     /// read-back, and nodes decide. Without an EVM network (a client with
-    /// neither `with_wallet` nor `with_evm_network`) nothing is read.
+    /// neither `with_wallet` nor `with_evm_network`) nothing is read, and a
+    /// warning says so whenever there are paid quotes to read.
     #[cfg(feature = "native")]
     pub(crate) async fn occupied_quotes(&self, plans: &[ChunkPaymentPlan]) -> Vec<OccupiedQuote> {
         let Some(network) = self.evm_network.as_ref() else {
-            tracing::debug!("no EVM network configured: payment records not read back");
+            if !plans.is_empty() {
+                tracing::warn!(
+                    "no EVM network configured (with_wallet or with_evm_network): the vault \
+                     records of {} paid record(s) are not read back",
+                    plans.len()
+                );
+            }
             return Vec::new();
         };
         match ListingChain::new(network) {

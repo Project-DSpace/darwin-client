@@ -2888,7 +2888,10 @@ impl Client {
     /// of `quote_hash -> tx_hash` provided by the external signer after on-chain
     /// payment. Builds payment proofs and stores chunks on the network.
     ///
-    /// Every paid quote's vault record is read back first. A chunk whose
+    /// Every paid quote's vault record is read back first, through the
+    /// client's EVM network ([`Client::with_wallet`] or
+    /// [`Client::with_evm_network`]; a client with neither reads nothing back
+    /// and logs a warning). A chunk whose
     /// quote the vault had already recorded for another payment was not paid
     /// (the vault skipped the payment, which moved no tokens), so it is not
     /// sent: it fails with an error starting
