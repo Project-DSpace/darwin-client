@@ -67,7 +67,8 @@ pub use client::merkle::{
 };
 pub use client::occupied::{OccupiedQuote, VaultRecord, MAX_OCCUPIED_REQUOTES, QUOTES_OCCUPIED};
 pub use client::pointer::{
-    FinalState, FinalityStatus, PointerController, PointerFinality, PointerTransfer,
+    FinalState, FinalityStatus, PointerController, PointerFinality, PointerTransfer, SeedState,
+    SeedsView,
 };
 pub use client::upload::{MerkleUploadPayment, UploadPayment};
 

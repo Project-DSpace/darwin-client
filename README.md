@@ -130,7 +130,8 @@ Pointers can be read from the browser: `getPointer`, `resolvePointer` and
 `pointerFinality` on `BrowserNetworkClient`, and `pointerAddress(seed)`
 offline. They run the native client's own read quorum and corroboration, and
 only nodes that advertise `pointer_protocol` are asked. `pointerFinality` asks
-the whole close group whether a pointer is final (see `darwin pointer transfer`
+the whole close group whether a pointer is final, and the bootstrap peers
+nearest it before calling it open, in `seeds` (see `darwin pointer finality`
 below). `createPointer`, `updatePointer`, `transferPointer` and
 `storePaidPointer` are off in this build (above); `darwin pointer` writes
 pointers.
@@ -526,11 +527,24 @@ transfer failed.
 
 #### `darwin pointer finality <ADDRESS>`
 
-Ask every peer of the close group whether a pointer is final, and on what:
+Ask every peer of the close group whether a pointer is final, and on what.
+`finality` asks the close group and the bootstrap peers nearest the address;
+it reports a pointer open with no state only when neither holds one. While
+the close group shows no final state, the pointer is read as
+`darwin pointer get` reads it, from the close group and the bootstrap peers
+nearest it (nine at most), and a `seeds:` line says how many of those were
+asked and answered and what they hold. Final, unconfirmed, settling and
+forked are otherwise the close group's to decide.
 
-- `open` — no peer that answered holds a final state; its owner can still
-  move it. Check `answered`: a peer that did not answer could hold one.
-- `settling` — one final state, not yet on a majority of the group.
+- `open` — no peer of the close group that answered holds a final state, and
+  the read returns none; its owner can still move it. The counter is the one
+  of the state that read returns, whichever set holds it. With no state, it
+  is reported only once every bootstrap peer asked has answered or failed.
+  Check `answered`: a peer of the close group that did not answer could hold
+  a final state. A read that fails fails the check too, as `darwin pointer
+  get` would.
+- `settling` — one final state, not yet on a majority of the group; or one
+  only the bootstrap peers hold (held by 0 of the group).
 - `unconfirmed` — one final state on a majority, but not every peer answered,
   so a rival could be unseen. Ask again.
 - `final` — one final state, held by a majority, every peer answered and none
@@ -545,6 +559,12 @@ address:  9f3c...
 answered: 7 of 7
 status:   final
 state:    pointer 4b1e... (state 77a0..., held by 7 of 7)
+
+$ darwin pointer finality 2d08...
+address:  2d08...
+answered: 7 of 7
+status:   open (counter 3; its owner can move it)
+seeds:    5 of 9 answered; 5 hold counter 3 (state c41f...)
 ```
 
 #### `darwin pointer controller <ADDRESS>`

@@ -16,7 +16,7 @@ use super::*;
 use crate::data::client::batch::ChunkPaymentPlan;
 use crate::data::{
     ml_dsa_65, pointer_address, FinalState, FinalityStatus, MlDsaPublicKey, MlDsaSecretKey,
-    Pointer, PointerFinality, PointerTarget, PointerTargetKind,
+    Pointer, PointerFinality, PointerTarget, PointerTargetKind, SeedsView,
 };
 use ant_protocol::evm::{QuoteHash, TxHash};
 
@@ -111,6 +111,8 @@ impl From<&FinalState> for BrowserFinalState {
 /// `status` is `"open"`, `"settling"`, `"final"`, `"unconfirmed"` (final on a
 /// majority, but not every peer answered) or `"forked"`. `states` holds every
 /// final state seen, most-held first; `majority` the one reads return.
+/// `seeds` is what the bootstrap peers nearest the pointer hold, when the
+/// close group showed it open and they were asked too.
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct BrowserPointerFinality {
@@ -125,6 +127,57 @@ struct BrowserPointerFinality {
     states: Vec<BrowserFinalState>,
     #[serde(skip_serializing_if = "Option::is_none")]
     majority: Option<BrowserFinalState>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    seeds: Option<BrowserSeedsView>,
+}
+
+/// What the bootstrap peers asked hold, as JavaScript sees it.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BrowserSeedsView {
+    asked: usize,
+    answered: usize,
+    /// The state their answers settle on, or `null`.
+    state: Option<BrowserSeedState>,
+}
+
+/// A state the bootstrap peers hold, as JavaScript sees it.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BrowserSeedState {
+    state_id: String,
+    /// Decimal: a counter can exceed JavaScript's safe integers.
+    counter: String,
+    #[serde(rename = "final")]
+    is_final: bool,
+    kind: String,
+    kind_tag: u8,
+    target: String,
+    holders: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    transferred_to: Option<String>,
+}
+
+impl From<&SeedsView> for BrowserSeedsView {
+    fn from(seeds: &SeedsView) -> Self {
+        Self {
+            asked: seeds.asked,
+            answered: seeds.answered,
+            state: seeds.state.as_ref().map(|state| {
+                let target = PointerTarget::from_raw_tag(state.kind_tag, state.target);
+                BrowserSeedState {
+                    state_id: hex::encode(state.state_id),
+                    counter: state.counter.to_string(),
+                    is_final: state.is_final(),
+                    kind: kind_name(&target).to_string(),
+                    kind_tag: state.kind_tag,
+                    target: hex::encode(state.target),
+                    holders: state.holders,
+                    transferred_to: state.transferred_to().map(hex::encode),
+                }
+            }),
+        }
+    }
 }
 
 impl From<&PointerFinality> for BrowserPointerFinality {
@@ -153,6 +206,7 @@ impl From<&PointerFinality> for BrowserPointerFinality {
             counter,
             states,
             majority,
+            seeds: finality.seeds.as_ref().map(BrowserSeedsView::from),
         }
     }
 }
@@ -346,8 +400,9 @@ impl BrowserNetworkClient {
     }
 
     /// Ask the whole close group whether the pointer at `address` is final,
-    /// and on what. Only `status: "final"` means one final state, held by a
-    /// majority of the group, with no rival.
+    /// and on what, and, before calling it open, the bootstrap peers nearest
+    /// it too (`seeds`). Only `status: "final"` means one final state, held
+    /// by a majority of the group, with no rival.
     #[wasm_bindgen(js_name = pointerFinality)]
     pub async fn pointer_finality(&self, address: &str) -> Result<JsValue, JsValue> {
         let at = parse_lookup_key(address, "pointer address").map_err(|e| JsValue::from_str(&e))?;

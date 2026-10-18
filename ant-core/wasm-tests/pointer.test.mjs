@@ -563,6 +563,7 @@ test("reads follow a transfer, which a page itself can't make", async () => {
     assert.equal(finality.states.length, 1);
     assert.equal(finality.majority.transferredTo, recipient.pointer.address);
     assert.ok(finality.majority.holders >= 5, "the write reached a majority plus one");
+    assert.equal(finality.seeds, undefined, "a final pointer is the close group's to report");
     assert.deepEqual(await client.resolvePointer(address), { kind: "chunk", kindTag: 0, target: target(9) });
 
     // A page can move neither the recipient nor the former pointer.
@@ -595,6 +596,12 @@ test("an open pointer reports its counter, and a page's transfer is refused befo
     assert.equal(finality.status, "open");
     assert.equal(finality.counter, "0");
     assert.deepEqual(finality.states, []);
+    // Before calling it open, the client's seeds were asked too.
+    assert.equal(finality.seeds.asked, 7);
+    assert.ok(finality.seeds.answered >= 4, `${finality.seeds.answered} answered`);
+    assert.equal(finality.seeds.state.stateId, written.pointer.stateId);
+    assert.equal(finality.seeds.state.counter, "0");
+    assert.equal(finality.seeds.state.final, false);
 
     // Refused before the recipient is even looked up.
     await assert.rejects(

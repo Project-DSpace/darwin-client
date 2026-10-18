@@ -26,7 +26,8 @@
 //!   different nodes, and each node keeps the one it took first. A read that
 //!   meets a final state returns the one a majority of the close group holds,
 //!   and reports a fork when none does; [`Client::pointer_finality`] asks the
-//!   whole group, so a recipient can check a transfer before relying on it.
+//!   whole group, so a recipient can check a transfer before relying on it,
+//!   and, before calling a pointer open, the bootstrap peers nearest it too.
 
 use std::cmp::Reverse;
 use std::collections::HashSet;
@@ -232,6 +233,14 @@ impl Replies {
         !self.seen.is_empty()
     }
 
+    /// How many peers named `record`'s state.
+    fn holding(&self, record: &Pointer) -> usize {
+        self.seen
+            .iter()
+            .find(|(held, _)| held.state_id() == record.state_id())
+            .map_or(0, |(_, count)| *count)
+    }
+
     /// The distinct final states named, with how many peers named each.
     fn finals(&self) -> impl Iterator<Item = &(Pointer, usize)> {
         self.seen.iter().filter(|(record, _)| record.is_terminal())
@@ -344,21 +353,28 @@ impl FinalState {
 }
 
 /// Where a pointer stands with respect to finality, as the whole close group
-/// reports it.
+/// reports it, and, while it reports the pointer open, as a read of the close
+/// group and the bootstrap peers nearest the pointer finds it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum FinalityStatus {
-    /// No peer that answered holds a final state: the owner can still move
-    /// the pointer. A peer that did not answer could hold one, so this rules a
-    /// final state out only when every peer of the group answered
-    /// ([`PointerFinality::answered`] equals [`PointerFinality::group`]).
-    /// `counter` is the corroborated state's, or `None` if no state is.
+    /// No peer of the close group that answered holds a final state, and a
+    /// read of the close group and the bootstrap peers nearest the pointer
+    /// returns none: the owner can still move the pointer. A peer that did
+    /// not answer could hold one, so this rules a final state out only when
+    /// every peer of the group answered ([`PointerFinality::answered`]
+    /// equals [`PointerFinality::group`]). `counter` is the counter of the
+    /// state that read returns, or `None` when neither the close group nor
+    /// the bootstrap peers hold one, which the read reports only once every
+    /// bootstrap peer asked has answered or failed.
     Open {
         /// The counter of the state a read would return.
         counter: Option<u64>,
     },
     /// One final state, and no other, but a majority of the group does not
     /// hold it yet: a transfer still spreading, or a write that fell short.
+    /// Also a final state the close group doesn't hold but the bootstrap
+    /// peers do, which a read returns ([`PointerFinality::seeds`]).
     Settling(FinalState),
     /// One final state, held by a majority of the group, and no other: every
     /// peer of the group answered and none holds a rival. Nothing can move
@@ -391,6 +407,72 @@ pub struct PointerFinality {
     pub answered: usize,
     /// What they said.
     pub status: FinalityStatus,
+    /// What the bootstrap peers nearest the pointer said, when the close
+    /// group showed the pointer open and they were asked too; `None` when
+    /// the close group holds a final state, or the client knows no
+    /// bootstrap peer by peer ID.
+    #[serde(default)]
+    pub seeds: Option<SeedsView>,
+}
+
+/// What the bootstrap peers nearest a pointer hold, as
+/// [`Client::pointer_finality`] reports it beside the close group's answer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SeedsView {
+    /// How many bootstrap peers were asked: those nearest the pointer, nine
+    /// at most, of the ones the client knows by peer ID.
+    pub asked: usize,
+    /// How many of them answered before the read settled.
+    pub answered: usize,
+    /// The state their answers settle on: the best state at least two of
+    /// them name (the one peer, of one), or the final state a majority of
+    /// them holds. `None` when no state is named by enough of them, or they
+    /// name two final states and no majority holds either.
+    pub state: Option<SeedState>,
+}
+
+/// A state the bootstrap peers hold ([`SeedsView::state`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SeedState {
+    /// The state's identifier.
+    pub state_id: XorName,
+    /// Its counter: [`FINAL_COUNTER`] for a final state.
+    pub counter: u64,
+    /// The target's raw kind tag.
+    pub kind_tag: u8,
+    /// The target's address.
+    pub target: XorName,
+    /// How many of the bootstrap peers that answered name it.
+    pub holders: usize,
+}
+
+impl SeedState {
+    fn of(record: &Pointer, holders: usize) -> Self {
+        let target = record.target();
+        Self {
+            state_id: record.state_id(),
+            counter: record.counter(),
+            kind_tag: target.kind_tag(),
+            target: target.address,
+            holders,
+        }
+    }
+
+    /// Whether this is a final state.
+    #[must_use]
+    pub fn is_final(&self) -> bool {
+        self.counter == FINAL_COUNTER
+    }
+
+    /// The pointer a final state hands the address over to, if it is a
+    /// transfer rather than a freeze.
+    #[must_use]
+    pub fn transferred_to(&self) -> Option<XorName> {
+        match PointerTargetKind::from_tag(self.kind_tag) {
+            Some(PointerTargetKind::Pointer) if self.is_final() => Some(self.target),
+            _ => None,
+        }
+    }
 }
 
 impl PointerFinality {
@@ -564,6 +646,124 @@ fn finality_status(replies: &Replies, group: usize, answered: usize) -> Finality
     }
 }
 
+/// Ask every peer of the close group of `address` (`close_group`, its
+/// lookup) for the pointer, each within its own deadline (`get`), and say
+/// where it stands from their answers alone, with the tally they make.
+///
+/// This is the census [`Client::pointer_finality`] starts from, and the whole
+/// of the check an update or a transfer makes before paying, which asks no
+/// bootstrap peer. Unlike a read it does not stop once it has an answer, so a
+/// second final state held by even one peer is seen. Its quorum is counted
+/// over the configured close group ([`quorum_width`]).
+async fn close_group_census<L, G, GF>(
+    address: &XorName,
+    close_group: L,
+    close_group_size: usize,
+    get: G,
+) -> Result<(PointerFinality, Replies)>
+where
+    L: Future<Output = Result<Vec<(PeerId, Vec<MultiAddr>)>>>,
+    G: Fn(PeerId, Vec<MultiAddr>) -> GF,
+    GF: Future<Output = Result<Option<Pointer>>>,
+{
+    let peers = close_group.await?;
+    let in_flight: FuturesUnordered<_> = peers
+        .iter()
+        .map(|(peer, addrs)| get(*peer, addrs.clone()))
+        .collect();
+    let mut replies = Replies::default();
+    let answered = ask_the_group(in_flight, peers.len(), |found| {
+        replies.add(found);
+        false
+    })
+    .await;
+
+    // Counted over the configured group, as every pointer quorum is: a
+    // lookup that came back short is peers that did not answer, not a
+    // smaller group.
+    let width = quorum_width(peers.len(), close_group_size);
+    let wanted = read_quorum(width);
+    if answered.count < wanted {
+        let count = answered.count;
+        return Err(answered
+            .failure()
+            .filter(|_| count == 0)
+            .unwrap_or_else(|| {
+                Error::CloseGroupShortfall(format!(
+                    "only {count} of the close group answered for pointer {}",
+                    hex::encode(address)
+                ))
+            }));
+    }
+    let finality = PointerFinality {
+        address: *address,
+        group: width,
+        answered: answered.count,
+        status: finality_status(&replies, width, answered.count),
+        seeds: None,
+    };
+    Ok((finality, replies))
+}
+
+/// What a census of the close group that shows the pointer open (`census`,
+/// whose tally is `replies`) comes to once `read`, a read of the close group
+/// and the bootstrap peers nearest the pointer, has asked them as well:
+///
+/// - the read's error, as [`Client::pointer_get`] gives it;
+/// - a final state the read returns: [`FinalityStatus::Settling`], held by
+///   the peers of the close group that named it in the census (none, since
+///   the census showed no final state), never open;
+/// - another state: open, at the counter of the state the read returns;
+/// - none: open with no state, which the read returns only once every
+///   bootstrap peer asked has answered or failed.
+fn with_the_read(
+    census: PointerFinality,
+    replies: &Replies,
+    read: PointerRead,
+) -> Result<PointerFinality> {
+    let status = match read.found? {
+        None => FinalityStatus::Open { counter: None },
+        Some(state) if state.is_terminal() => {
+            FinalityStatus::Settling(FinalState::of(&state, replies.holding(&state)))
+        }
+        Some(state) => FinalityStatus::Open {
+            counter: Some(state.counter()),
+        },
+    };
+    Ok(PointerFinality {
+        status,
+        seeds: read.seeds,
+        ..census
+    })
+}
+
+/// [`Client::pointer_finality`] on a network given as functions: the close
+/// group's census (`close_group` looks the group up, `get` asks one peer),
+/// and, while it shows the pointer open, the read [`Client::pointer_get`]
+/// makes, which also asks `bootstrap` ([`with_the_read`]).
+async fn pointer_finality_from<L, LF, G, GF>(
+    address: &XorName,
+    close_group: L,
+    close_group_size: usize,
+    bootstrap: &[(PeerId, Vec<MultiAddr>)],
+    get: G,
+) -> Result<PointerFinality>
+where
+    L: Fn() -> LF,
+    LF: Future<Output = Result<Vec<(PeerId, Vec<MultiAddr>)>>>,
+    G: Fn(PeerId, Vec<MultiAddr>) -> GF,
+    GF: Future<Output = Result<Option<Pointer>>>,
+{
+    let (census, replies) =
+        close_group_census(address, close_group(), close_group_size, &get).await?;
+    if !matches!(census.status, FinalityStatus::Open { .. }) {
+        return Ok(census);
+    }
+    let read =
+        read_pointer_with_seeds(address, close_group(), close_group_size, bootstrap, &get).await;
+    with_the_read(census, &replies, read)
+}
+
 /// What one peer's acknowledgement of a pointer PUT says.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PutAck {
@@ -734,6 +934,23 @@ impl ReadTally {
         }
     }
 
+    /// What this set, the bootstrap peers asked, holds, for
+    /// [`PointerFinality::seeds`]: the state its answers settle on, and how
+    /// many of them named it.
+    fn seeds_view(&self) -> SeedsView {
+        let state = match self.chosen() {
+            Chosen::State(Some(record)) => {
+                Some(SeedState::of(record, self.replies.holding(record)))
+            }
+            Chosen::State(None) | Chosen::Forked => None,
+        };
+        SeedsView {
+            asked: self.peers,
+            answered: self.answered.count,
+            state,
+        }
+    }
+
     fn outcome(self, address: &XorName, asked: Asked) -> Result<Option<Pointer>> {
         let needed = corroboration(self.peers);
         let majority = read_quorum(self.peers);
@@ -854,16 +1071,54 @@ where
     G: Fn(PeerId, Vec<MultiAddr>) -> GF,
     GF: Future<Output = Result<Option<Pointer>>>,
 {
+    read_pointer_with_seeds(address, close_group, close_group_size, bootstrap, get)
+        .await
+        .found
+}
+
+/// A pointer read, and what the bootstrap peers asked beside the close group
+/// said.
+struct PointerRead {
+    /// The read's answer, as [`read_pointer`] gives it.
+    found: Result<Option<Pointer>>,
+    /// The bootstrap peers' part, or `None` when there were none to ask.
+    seeds: Option<SeedsView>,
+}
+
+/// [`read_pointer`], also reporting what the bootstrap peers said.
+async fn read_pointer_with_seeds<L, G, GF>(
+    address: &XorName,
+    close_group: L,
+    close_group_size: usize,
+    bootstrap: &[(PeerId, Vec<MultiAddr>)],
+    get: G,
+) -> PointerRead
+where
+    L: Future<Output = Result<Vec<(PeerId, Vec<MultiAddr>)>>>,
+    G: Fn(PeerId, Vec<MultiAddr>) -> GF,
+    GF: Future<Output = Result<Option<Pointer>>>,
+{
     if bootstrap.is_empty() {
-        let peers = close_group.await?;
+        let peers = match close_group.await {
+            Ok(peers) => peers,
+            Err(failure) => {
+                return PointerRead {
+                    found: Err(failure),
+                    seeds: None,
+                }
+            }
+        };
         let in_flight = peers
             .iter()
             .map(|(peer, addrs)| get(*peer, addrs.clone()))
             .collect();
         let width = quorum_width(peers.len(), close_group_size);
-        return read_pointer_from(in_flight, width, address, Asked::CloseGroup)
-            .await
-            .outcome;
+        return PointerRead {
+            found: read_pointer_from(in_flight, width, address, Asked::CloseGroup)
+                .await
+                .outcome,
+            seeds: None,
+        };
     }
     let ask = |peer: PeerId, addrs: Vec<MultiAddr>| {
         let reply = get(peer, addrs);
@@ -999,7 +1254,11 @@ where
             seen: None,
         },
     };
-    newest_pointer(close, boot.finish(address, Asked::Bootstrap))
+    let seeds = boot.seeds_view();
+    PointerRead {
+        found: newest_pointer(close, boot.finish(address, Asked::Bootstrap)),
+        seeds: Some(seeds),
+    }
 }
 
 /// Combine a read of the close group with a read of the bootstrap peers, each
@@ -1357,8 +1616,9 @@ impl Client {
         // peer holding it may have answered, so the whole group is asked:
         // finish the final state rather than move the rest of the group
         // somewhere those nodes never follow. An update can be replaced, so a
-        // peer that does not answer does not hold it up.
-        let finality = self.pointer_finality(&address).await?;
+        // peer that does not answer does not hold it up. The close group
+        // alone is asked: the read below asks the bootstrap peers too.
+        let finality = self.close_group_finality(&address).await?;
         if let Some(refusal) = final_already(&finality) {
             return Err(refusal);
         }
@@ -1442,7 +1702,7 @@ impl Client {
         record: &Pointer,
         error: Error,
     ) -> Result<PointerFinality> {
-        let finality = self.pointer_finality(&record.address()).await;
+        let finality = self.close_group_finality(&record.address()).await;
         after_failed_transfer(error, finality, record)
     }
 
@@ -1455,8 +1715,9 @@ impl Client {
     /// recipient pointer must exist, and following it must not lead back
     /// here.
     ///
-    /// "Final already" is asked of the whole close group
-    /// ([`Self::pointer_finality`]), not of an ordinary read. A read returns a
+    /// "Final already" is asked of the whole close group, as
+    /// [`Self::pointer_finality`] asks it, not of an ordinary read (the read
+    /// made first asks the bootstrap peers too). A read returns a
     /// state only once two peers name it, so a final state an earlier
     /// transfer left on one peer is not what it returns, and signing a second
     /// final state past that one would fork the pointer for good. Any final
@@ -1503,7 +1764,7 @@ impl Client {
         }
         .map_err(|e| Error::InvalidData(format!("cannot sign pointer transfer: {e}")))?;
 
-        let finality = self.pointer_finality(&address).await?;
+        let finality = self.close_group_finality(&address).await?;
         if let Some(refusal) = rival_final(&finality, &record) {
             return Err(refusal);
         }
@@ -1532,7 +1793,8 @@ impl Client {
     }
 
     /// Ask the whole close group where `address` stands with respect to
-    /// finality.
+    /// finality, and, while it shows the pointer open, the bootstrap peers
+    /// nearest it too.
     ///
     /// Unlike [`Self::pointer_get`], this does not stop once it has an answer:
     /// every peer is asked, within its own deadline, so a second final state
@@ -1540,48 +1802,52 @@ impl Client {
     /// relying on a transfer — [`FinalityStatus::Final`] means one final state,
     /// held by a majority, with every peer of the configured close group
     /// answering and none holding a rival. A group that did not all answer
-    /// can show at most [`FinalityStatus::Unconfirmed`].
+    /// can show at most [`FinalityStatus::Unconfirmed`]. Final, unconfirmed,
+    /// settling and forked are the close group's to decide.
+    ///
+    /// When no peer of the close group that answered holds a final state,
+    /// the pointer is then read as [`Self::pointer_get`] reads it, from the
+    /// close group and the bootstrap peers nearest it, so a state only they
+    /// hold is not missed: the pointer is reported open at the counter of the
+    /// state that read returns, settling on a final state only the bootstrap
+    /// peers hold, and open with no state only when neither set holds one,
+    /// once every bootstrap peer asked has answered or failed
+    /// ([`PointerFinality::seeds`] says what they hold).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if no peer is responsible for the address, if too
+    /// few of the group answer to speak for it, or, when the pointer is open,
+    /// with the error that read gives.
+    pub async fn pointer_finality(&self, address: &XorName) -> Result<PointerFinality> {
+        pointer_finality_from(
+            address,
+            || self.pointer_group(address),
+            self.config().close_group_size,
+            &self.network().bootstrap_peers_near(address),
+            |peer, addrs| self.send_pointer_get(*address, peer, addrs),
+        )
+        .await
+    }
+
+    /// Ask the whole close group where `address` stands with respect to
+    /// finality, and no bootstrap peer: [`Self::pointer_finality`]'s census
+    /// on its own, which the checks an update and a transfer make before
+    /// paying use, as does a transfer whose write reported failure.
     ///
     /// # Errors
     ///
     /// Returns an error if no peer is responsible for the address, or if too
     /// few of the group answer to speak for it.
-    pub async fn pointer_finality(&self, address: &XorName) -> Result<PointerFinality> {
-        let peers = self.pointer_group(address).await?;
-        let in_flight = FuturesUnordered::new();
-        for (peer_id, addrs) in &peers {
-            in_flight.push(self.send_pointer_get(*address, *peer_id, addrs.clone()));
-        }
-        let mut replies = Replies::default();
-        let answered = ask_the_group(in_flight, peers.len(), |found| {
-            replies.add(found);
-            false
-        })
-        .await;
-
-        // Counted over the configured group, as every pointer quorum is: a
-        // lookup that came back short is peers that did not answer, not a
-        // smaller group.
-        let width = quorum_width(peers.len(), self.config().close_group_size);
-        let wanted = read_quorum(width);
-        if answered.count < wanted {
-            let count = answered.count;
-            return Err(answered
-                .failure()
-                .filter(|_| count == 0)
-                .unwrap_or_else(|| {
-                    Error::CloseGroupShortfall(format!(
-                        "only {count} of the close group answered for pointer {}",
-                        hex::encode(address)
-                    ))
-                }));
-        }
-        Ok(PointerFinality {
-            address: *address,
-            group: width,
-            answered: answered.count,
-            status: finality_status(&replies, width, answered.count),
-        })
+    pub(crate) async fn close_group_finality(&self, address: &XorName) -> Result<PointerFinality> {
+        close_group_census(
+            address,
+            self.pointer_group(address),
+            self.config().close_group_size,
+            |peer, addrs| self.send_pointer_get(*address, peer, addrs),
+        )
+        .await
+        .map(|(finality, _)| finality)
     }
 
     /// Follow `address` through every transfer to the pointer whose owner now
@@ -3564,6 +3830,7 @@ mod tests {
             group: 7,
             answered: 4,
             status,
+            seeds: None,
         };
         assert!(!finality.is_final());
         assert_eq!(finality.transferred_to(), None);
@@ -3665,6 +3932,7 @@ mod tests {
             group: 7,
             answered,
             status,
+            seeds: None,
         };
         let lost = || Error::Timeout("no acknowledgement".to_string());
 
@@ -3728,6 +3996,7 @@ mod tests {
             group: 7,
             answered: 7,
             status,
+            seeds: None,
         };
         assert!(final_already(&finality(FinalityStatus::Open { counter: Some(3) })).is_none());
         for status in [
@@ -3754,6 +4023,7 @@ mod tests {
             group: 7,
             answered: 7,
             status,
+            seeds: None,
         };
 
         let beaten = finality(FinalityStatus::Final(FinalState::of(&theirs, 7)));
@@ -3867,5 +4137,215 @@ mod tests {
         let parsed = Pointer::from_bytes(&record.to_bytes()).expect("parse");
         assert_eq!(parsed.target().kind_tag(), 200);
         assert_eq!(parsed.target().kind(), None);
+    }
+
+    /// A finality check as `pointer_finality` makes one with the default
+    /// close-group size, on a simulated network in paused time: the close
+    /// group's census, then, while it shows the pointer open, the read of the
+    /// close group and `bootstrap`. Each peer gives its answer from `answers`
+    /// every time it is asked, or times out after ten seconds when it has
+    /// none. Returns the check, and how many GETs each peer was sent.
+    async fn simulated_finality(
+        address: XorName,
+        close_group: impl IntoIterator<Item = u8>,
+        bootstrap: impl IntoIterator<Item = u8>,
+        answers: Answers,
+    ) -> (Result<PointerFinality>, HashMap<u8, usize>) {
+        let close_group: Vec<(PeerId, Vec<MultiAddr>)> = close_group
+            .into_iter()
+            .map(|n| (id(n), Vec::new()))
+            .collect();
+        let bootstrap: Vec<(PeerId, Vec<MultiAddr>)> =
+            bootstrap.into_iter().map(|n| (id(n), Vec::new())).collect();
+        let answers: HashMap<PeerId, (Duration, Result<Option<Pointer>>)> = answers
+            .into_iter()
+            .map(|(n, after, reply)| (id(n), (after, reply)))
+            .collect();
+        let asked = std::cell::RefCell::new(HashMap::new());
+        let finality = pointer_finality_from(
+            &address,
+            || {
+                let close_group = close_group.clone();
+                async move { Ok::<_, Error>(close_group) }
+            },
+            ant_protocol::CLOSE_GROUP_SIZE,
+            &bootstrap,
+            |peer, _| {
+                *asked.borrow_mut().entry(peer.as_bytes()[0]).or_insert(0) += 1;
+                let (after, reply) = match answers.get(&peer) {
+                    Some((after, Ok(state))) => (*after, Ok(state.clone())),
+                    _ => (Duration::from_secs(10), silent()),
+                };
+                async move {
+                    tokio::time::sleep(after).await;
+                    reply
+                }
+            },
+        )
+        .await;
+        (finality, asked.into_inner())
+    }
+
+    /// Every peer of the close group answers that it holds no state, and the
+    /// bootstrap peers agree on one: the pointer is open at that state's
+    /// counter, the state a read returns, not open with no state. What the
+    /// bootstrap peers hold is shown.
+    #[tokio::test(start_paused = true)]
+    async fn finality_counts_a_state_only_the_bootstrap_peers_hold() {
+        let (pk, sk) = keypair(50);
+        let mut held = Pointer::create(&sk, &pk, chunk_target(1)).expect("create");
+        for target in 2..=4 {
+            held = held.update(&sk, chunk_target(target)).expect("update");
+        }
+        assert_eq!(held.counter(), 3);
+        let mut answers = answering(1..=7, 50, || Ok(None));
+        answers.extend(answering(101..=105, 100, || Ok(Some(held.clone()))));
+        answers.extend(answering(106..=109, 200, || Ok(None)));
+        let (finality, asked) = simulated_finality(held.address(), 1..=7, 101..=109, answers).await;
+        let finality = finality.expect("a check");
+        assert_eq!(finality.status, FinalityStatus::Open { counter: Some(3) });
+        assert_eq!((finality.group, finality.answered), (7, 7));
+        let seeds = finality.seeds.expect("the bootstrap peers were asked");
+        assert_eq!((seeds.asked, seeds.answered), (9, 5));
+        let state = seeds.state.expect("the state they agree on");
+        assert_eq!(state.state_id, held.state_id());
+        assert_eq!((state.counter, state.holders), (3, 5));
+        assert!(!state.is_final());
+        assert_eq!(state.transferred_to(), None);
+        // The close group was asked by the census and again by the read.
+        assert!((1..=7).all(|n| asked.get(&n) == Some(&2)), "{asked:?}");
+    }
+
+    /// The close group holds counter 1 and the bootstrap peers counter 2:
+    /// the newer is the state a read returns, and its counter is reported.
+    #[tokio::test(start_paused = true)]
+    async fn finality_reports_a_newer_state_the_bootstrap_peers_hold() {
+        let (pk, sk) = keypair(51);
+        let older = Pointer::create(&sk, &pk, chunk_target(1))
+            .expect("create")
+            .update(&sk, chunk_target(2))
+            .expect("update");
+        let newer = older.update(&sk, chunk_target(3)).expect("update");
+        let mut answers = answering(1..=7, 50, || Ok(Some(older.clone())));
+        answers.extend(answering(101..=109, 100, || Ok(Some(newer.clone()))));
+        let (finality, _) = simulated_finality(older.address(), 1..=7, 101..=109, answers).await;
+        assert_eq!(
+            finality.expect("a check").status,
+            FinalityStatus::Open { counter: Some(2) }
+        );
+    }
+
+    /// The bootstrap peers hold a transfer the close group doesn't: the
+    /// pointer is settling on it, held by no peer of the close group, never
+    /// open, and not final.
+    #[tokio::test(start_paused = true)]
+    async fn a_final_state_only_the_bootstrap_peers_hold_is_settling_not_open() {
+        let (pk, sk) = keypair(52);
+        let before = Pointer::create(&sk, &pk, chunk_target(1)).expect("create");
+        let transfer = handed_to(&pk, &sk, 0x77);
+        let mut answers = answering(1..=7, 50, || Ok(Some(before.clone())));
+        answers.extend(answering(101..=109, 100, || Ok(Some(transfer.clone()))));
+        let (finality, _) = simulated_finality(before.address(), 1..=7, 101..=109, answers).await;
+        let finality = finality.expect("a check");
+        match &finality.status {
+            FinalityStatus::Settling(state) => {
+                assert_eq!(state.state_id, transfer.state_id());
+                assert_eq!(state.holders, 0, "no peer of the close group holds it");
+                assert_eq!(state.transferred_to(), Some([0x77; 32]));
+            }
+            other => panic!("expected Settling, got {other:?}"),
+        }
+        assert!(!finality.is_final());
+        assert_eq!(finality.transferred_to(), None);
+        let state = finality
+            .seeds
+            .clone()
+            .expect("asked")
+            .state
+            .expect("the transfer");
+        assert!(state.is_final());
+        assert_eq!(state.transferred_to(), Some([0x77; 32]));
+        // A transfer a check settles on is refused, as one the close group
+        // holds is.
+        assert!(matches!(
+            rival_final(&finality, &handed_to(&pk, &sk, 0x01)),
+            Some(Error::PointerFinal(_))
+        ));
+    }
+
+    /// Neither the close group nor any bootstrap peer holds a state: open
+    /// with no state, reported only once every bootstrap peer has answered.
+    #[tokio::test(start_paused = true)]
+    async fn finality_reports_no_state_only_once_every_bootstrap_peer_answered() {
+        let (pk, _) = keypair(53);
+        let address = pointer_address(&pk);
+        let mut answers = answering(1..=7, 50, || Ok(None));
+        answers.extend(answering(101..=108, 100, || Ok(None)));
+        answers.extend(answering([109], 3_000, || Ok(None)));
+        let started = tokio::time::Instant::now();
+        let (finality, _) = simulated_finality(address, 1..=7, 101..=109, answers).await;
+        let finality = finality.expect("a check");
+        assert_eq!(finality.status, FinalityStatus::Open { counter: None });
+        assert!(
+            started.elapsed() >= Duration::from_secs(3),
+            "the last bootstrap peer is waited for"
+        );
+        let seeds = finality.seeds.expect("asked");
+        assert_eq!((seeds.asked, seeds.answered), (9, 9));
+        assert_eq!(seeds.state, None);
+    }
+
+    /// Two bootstrap peers name a newer state than the close group holds,
+    /// and the others don't answer: the check fails as a read of the
+    /// pointer does, rather than call it open at the older counter.
+    #[tokio::test(start_paused = true)]
+    async fn a_bootstrap_shortfall_naming_a_newer_state_fails_as_a_read_does() {
+        let (pk, sk) = keypair(54);
+        let older = Pointer::create(&sk, &pk, chunk_target(1)).expect("create");
+        let newer = older.update(&sk, chunk_target(2)).expect("update");
+        let answers = || {
+            let mut answers = answering(1..=7, 50, || Ok(Some(older.clone())));
+            answers.extend(answering(101..=102, 100, || Ok(Some(newer.clone()))));
+            answers
+        };
+        let (finality, _) = simulated_finality(older.address(), 1..=7, 101..=109, answers()).await;
+        let (read, _, _) = simulated_read(older.address(), 0, 1..=7, 101..=109, answers()).await;
+        let read = read.expect_err("a read fails");
+        let finality = finality.expect_err("so does the check");
+        assert!(
+            matches!(&finality, Error::CloseGroupShortfall(message)
+                if message.starts_with("only 2 of the bootstrap peers answered")),
+            "{finality:?}"
+        );
+        assert_eq!(finality.to_string(), read.to_string());
+    }
+
+    /// A final state the close group holds, or two, is the close group's to
+    /// report: no bootstrap peer is asked and none is shown. Without
+    /// bootstrap peers an open pointer is read from the close group alone.
+    #[tokio::test(start_paused = true)]
+    async fn the_close_group_decides_final_states_and_reads_alone_without_bootstrap_peers() {
+        let (pk, sk) = keypair(55);
+        let transfer = handed_to(&pk, &sk, 0x77);
+        let mut answers = answering(1..=7, 50, || Ok(Some(transfer.clone())));
+        answers.extend(answering(101..=109, 50, || Ok(None)));
+        let (finality, asked) =
+            simulated_finality(transfer.address(), 1..=7, 101..=109, answers).await;
+        let finality = finality.expect("a check");
+        assert!(finality.is_final());
+        assert_eq!(finality.seeds, None);
+        assert!((101..=109).all(|n| !asked.contains_key(&n)), "{asked:?}");
+
+        let held = Pointer::create(&sk, &pk, chunk_target(1)).expect("create");
+        let (finality, _) = simulated_finality(
+            held.address(),
+            1..=7,
+            std::iter::empty(),
+            answering(1..=7, 50, || Ok(Some(held.clone()))),
+        )
+        .await;
+        let finality = finality.expect("a check");
+        assert_eq!(finality.status, FinalityStatus::Open { counter: Some(0) });
+        assert_eq!(finality.seeds, None);
     }
 }

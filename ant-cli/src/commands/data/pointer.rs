@@ -15,7 +15,8 @@ use std::path::{Path, PathBuf};
 
 use ant_core::data::{
     ml_dsa_65, pointer_address, Client, FinalState, FinalityStatus, MlDsaPublicKey, MlDsaSecretKey,
-    Pointer, PointerFinality, PointerTarget, PointerTargetKind, PointerTransfer, XorName,
+    Pointer, PointerFinality, PointerTarget, PointerTargetKind, PointerTransfer, SeedsView,
+    XorName,
 };
 use clap::{Subcommand, ValueEnum};
 use rand::rngs::OsRng;
@@ -106,7 +107,8 @@ pub enum PointerAction {
     /// Ask the whole close group whether a pointer is final, and on what.
     ///
     /// Check this before relying on a transfer: only `final` means one final
-    /// state, held by a majority of the group, with no rival.
+    /// state, held by a majority of the group, with no rival. Before calling
+    /// a pointer open, the bootstrap peers nearest it are asked too.
     Finality {
         /// Hex-encoded pointer address (64 hex chars).
         address: String,
@@ -364,7 +366,48 @@ fn print_transfer(transfer: &PointerTransfer, json: bool) {
     }
 }
 
-/// A finality check as JSON: the group, how many answered, and the status.
+/// What the bootstrap peers asked hold, as JSON.
+fn seeds_json(seeds: &SeedsView) -> serde_json::Value {
+    let state = seeds.state.as_ref().map(|state| {
+        let (kind, target) =
+            describe_target(&PointerTarget::from_raw_tag(state.kind_tag, state.target));
+        json!({
+            "state_id": hex::encode(state.state_id),
+            "counter": state.counter,
+            "final": state.is_final(),
+            "kind": kind,
+            "target": target,
+            "holders": state.holders,
+            "transferred_to": state.transferred_to().map(hex::encode),
+        })
+    });
+    json!({
+        "asked": seeds.asked,
+        "answered": seeds.answered,
+        "state": state,
+    })
+}
+
+/// What the bootstrap peers asked hold, as a line of text.
+fn seeds_line(seeds: &SeedsView) -> String {
+    let answered = format!("{} of {} answered", seeds.answered, seeds.asked);
+    let Some(state) = &seeds.state else {
+        return format!("{answered}; none holds a state");
+    };
+    let id = hex::encode(state.state_id);
+    let holders = state.holders;
+    if state.is_final() {
+        let (kind, target) =
+            describe_target(&PointerTarget::from_raw_tag(state.kind_tag, state.target));
+        format!("{answered}; {holders} hold final state {kind} {target} (state {id})")
+    } else {
+        let counter = state.counter;
+        format!("{answered}; {holders} hold counter {counter} (state {id})")
+    }
+}
+
+/// A finality check as JSON: the group, how many answered, the status, and
+/// what the bootstrap peers hold when they were asked too.
 fn finality_json(finality: &PointerFinality) -> serde_json::Value {
     let status = match &finality.status {
         FinalityStatus::Open { counter } => json!({ "status": "open", "counter": counter }),
@@ -388,50 +431,72 @@ fn finality_json(finality: &PointerFinality) -> serde_json::Value {
         "group": finality.group,
         "answered": finality.answered,
         "finality": status,
+        "seeds": finality.seeds.as_ref().map(seeds_json),
     })
 }
 
 fn print_finality(finality: &PointerFinality, json: bool) {
-    let address = hex::encode(finality.address);
-    let group = finality.group;
-    let answered = finality.answered;
     if json {
         println!("{}", finality_json(finality));
         return;
     }
-    println!("address:  {address}");
-    println!("answered: {answered} of {group}");
+    for line in finality_lines(finality) {
+        println!("{line}");
+    }
+}
+
+/// A finality check as lines of text.
+fn finality_lines(finality: &PointerFinality) -> Vec<String> {
+    let address = hex::encode(finality.address);
+    let group = finality.group;
+    let answered = finality.answered;
+    let mut lines = vec![
+        format!("address:  {address}"),
+        format!("answered: {answered} of {group}"),
+    ];
     match &finality.status {
-        FinalityStatus::Open { counter } => match counter {
-            Some(counter) => println!("status:   open (counter {counter}; its owner can move it)"),
-            None => println!("status:   open (no state held)"),
-        },
+        FinalityStatus::Open { counter } => lines.push(match (counter, &finality.seeds) {
+            (Some(counter), _) => {
+                format!("status:   open (counter {counter}; its owner can move it)")
+            }
+            (None, Some(_)) => {
+                "status:   open (no state held by the close group or the bootstrap peers)".into()
+            }
+            (None, None) => "status:   open (no state held by the close group; no bootstrap \
+                             peer was asked)"
+                .into(),
+        }),
         FinalityStatus::Settling(state) => {
-            println!("status:   settling (final, but not yet on a majority of the group)");
-            println!("state:    {}", final_state_line(state, group));
+            lines.push("status:   settling (final, but not yet on a majority of the group)".into());
+            lines.push(format!("state:    {}", final_state_line(state, group)));
         }
         FinalityStatus::Final(state) => {
-            println!("status:   final");
-            println!("state:    {}", final_state_line(state, group));
+            lines.push("status:   final".into());
+            lines.push(format!("state:    {}", final_state_line(state, group)));
         }
         FinalityStatus::Unconfirmed(state) => {
-            println!(
+            lines.push(
                 "status:   unconfirmed (final on a majority, but not every peer answered, so a \
                  rival could be unseen; ask again)"
+                    .into(),
             );
-            println!("state:    {}", final_state_line(state, group));
+            lines.push(format!("state:    {}", final_state_line(state, group)));
         }
         FinalityStatus::Forked { states, majority } => {
-            println!("status:   forked (its owner signed more than one final state)");
+            lines.push("status:   forked (its owner signed more than one final state)".into());
             for state in states {
-                println!("state:    {}", final_state_line(state, group));
+                lines.push(format!("state:    {}", final_state_line(state, group)));
             }
-            match majority {
-                Some(state) => println!("reads:    {}", final_state_line(state, group)),
-                None => println!("reads:    fail (no state is held by a majority)"),
-            }
+            lines.push(match majority {
+                Some(state) => format!("reads:    {}", final_state_line(state, group)),
+                None => "reads:    fail (no state is held by a majority)".into(),
+            });
         }
     }
+    if let Some(seeds) = &finality.seeds {
+        lines.push(format!("seeds:    {}", seeds_line(seeds)));
+    }
+    lines
 }
 
 /// A target's kind and hex address, for printing. A tag this build does not
@@ -574,6 +639,96 @@ mod tests {
         assert!(!keygen.needs_wallet() && !keygen.needs_network());
         let address = parse(&["t", "address", "--key", key]);
         assert!(!address.needs_wallet() && !address.needs_network());
+    }
+
+    fn open(counter: Option<u64>, seeds: Option<SeedsView>) -> PointerFinality {
+        PointerFinality {
+            address: [9; 32],
+            group: 7,
+            answered: 7,
+            status: FinalityStatus::Open { counter },
+            seeds,
+        }
+    }
+
+    /// The "no state held" line says who was asked: the close group and the
+    /// bootstrap peers, or the close group alone when no bootstrap peer was
+    /// known. What the bootstrap peers hold is printed after the status, and
+    /// is in the JSON.
+    #[test]
+    fn the_no_state_line_says_who_was_asked() {
+        use ant_core::data::{SeedState, FINAL_COUNTER};
+
+        let nothing = SeedsView {
+            asked: 9,
+            answered: 9,
+            state: None,
+        };
+        let lines = finality_lines(&open(None, Some(nothing)));
+        assert_eq!(
+            lines[2],
+            "status:   open (no state held by the close group or the bootstrap peers)"
+        );
+        assert_eq!(lines[3], "seeds:    9 of 9 answered; none holds a state");
+        let lines = finality_lines(&open(None, None));
+        assert_eq!(
+            lines[2],
+            "status:   open (no state held by the close group; no bootstrap peer was asked)"
+        );
+        assert_eq!(lines.len(), 3);
+
+        let held = SeedsView {
+            asked: 9,
+            answered: 5,
+            state: Some(SeedState {
+                state_id: [1; 32],
+                counter: 3,
+                kind_tag: PointerTarget::new(PointerTargetKind::Chunk, [2; 32]).kind_tag(),
+                target: [2; 32],
+                holders: 5,
+            }),
+        };
+        let lines = finality_lines(&open(Some(3), Some(held.clone())));
+        assert_eq!(
+            lines[2],
+            "status:   open (counter 3; its owner can move it)"
+        );
+        assert_eq!(
+            lines[3],
+            format!(
+                "seeds:    5 of 9 answered; 5 hold counter 3 (state {})",
+                hex::encode([1; 32])
+            )
+        );
+        let json = finality_json(&open(Some(3), Some(held)));
+        assert_eq!(json["seeds"]["asked"], 9);
+        assert_eq!(json["seeds"]["answered"], 5);
+        assert_eq!(json["seeds"]["state"]["counter"], 3);
+        assert_eq!(json["seeds"]["state"]["final"], false);
+        assert!(finality_json(&open(None, None))["seeds"].is_null());
+
+        let transfer = SeedsView {
+            asked: 9,
+            answered: 9,
+            state: Some(SeedState {
+                state_id: [3; 32],
+                counter: FINAL_COUNTER,
+                kind_tag: PointerTarget::new(PointerTargetKind::Pointer, [4; 32]).kind_tag(),
+                target: [4; 32],
+                holders: 9,
+            }),
+        };
+        assert_eq!(
+            seeds_line(&transfer),
+            format!(
+                "9 of 9 answered; 9 hold final state pointer {} (state {})",
+                hex::encode([4; 32]),
+                hex::encode([3; 32])
+            )
+        );
+        let json = seeds_json(&transfer);
+        assert_eq!(json["state"]["final"], true);
+        assert_eq!(json["state"]["transferred_to"], hex::encode([4; 32]));
     }
 
     #[test]

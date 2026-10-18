@@ -163,6 +163,14 @@ told apart by the commit `darwin --version` prints. Upstream's entries follow.
   stored (its envelope's), whatever its metadata or hidden fields. Private uploads are not
   recorded, so no private data map is kept under the data directory: it stays in the upload's
   `.datamap` and `.record`, or in the manifest file written.
+  Here `darwin pointer finality` (`Client::pointer_finality`, the browser's `pointerFinality`,
+  and the check `pointer transfer` reports) asks the close group and the bootstrap peers nearest
+  the address: while the close group shows no final state, the pointer is read as
+  `darwin pointer get` reads it, so it is reported open at the counter of the state that read
+  returns, settling on a final state only the bootstrap peers hold, and open with no state only
+  when neither set holds one, once every bootstrap peer asked has answered;
+  `PointerFinality::seeds` says what they hold. The checks an update and a transfer make before
+  paying still ask the close group alone.
   Here `darwin manifest create` uploads each file as `darwin file upload` uploads it, with the
   same `--visibility`, `--public`, `--readable`, `--index` and `--hide` choices: private by
   default, in an envelope that shows every payment field, with the same warnings first, paid
