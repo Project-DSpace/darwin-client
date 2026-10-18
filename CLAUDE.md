@@ -181,7 +181,7 @@ cargo run --bin darwin -- --help  # Run the CLI
 directories or reach a network; so is `darwin update` (`SELF_UPDATE` in `commands/update.rs`).
 `ant-cli/tests/darwin_cli.rs` runs the binary to check the first two. A `darwin node` command a
 merge adds is refused too, and fails `the_node_commands_are_the_ones_checked_off` (cli.rs) until
-it is added to that file's list.
+it is added to that test's list and to `NODE_COMMANDS` in `darwin_cli.rs`.
 
 ## Linear Project
 

@@ -835,8 +835,8 @@ if let Some(data) = cache.get(&address) { /* ... */ }
 ### Node Management (Programmatic)
 
 `ant-core` keeps upstream's node manager, which `darwin node` used before it was turned off. It
-installs and runs Autonomi's `ant-node`, which joins Autonomi's network and takes payment on
-Arbitrum, not Darwin's: Darwin storage nodes run from the storage-node image.
+installs and runs Autonomi's `ant-node`, which joins Autonomi's network, not Darwin's, and takes
+payment on Arbitrum. Darwin storage nodes run from the storage-node image.
 
 ```rust
 use ant_core::node::{add_nodes, AddNodeOpts, BinarySource};
