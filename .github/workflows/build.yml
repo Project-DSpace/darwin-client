@@ -1,7 +1,7 @@
 # Checks formatting and lints, runs the unit tests, then builds the Linux `darwin`
 # client binary (from the ant-cli crate) on every push to main and uploads it,
 # with its licence files and third-party notices, as the `darwin-linux-x64`
-# workflow artifact.
+# workflow artifact. Also checks that upstream's installers stay deleted.
 #
 # Replaces upstream's workflows, which run Autonomi's test matrix, PR checks
 # and signed multi-platform releases.
@@ -17,6 +17,24 @@ permissions:
   contents: read
 
 jobs:
+  # Upstream's installers (install.sh, install.ps1), npm packages, winget
+  # manifest and release-signing key install or verify Autonomi's `ant`, not
+  # `darwin`, and the installers write Autonomi's seeds into the config
+  # directory `darwin` shares. They are deleted; a merge of upstream must keep
+  # them deleted.
+  upstream-installers:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Upstream's installers stay deleted
+        run: |
+          tracked=$(git ls-files -- install.sh install.ps1 npm resources/winget resources/release-signing-key.pub)
+          if [ -n "$tracked" ]; then
+            echo "Upstream's installers are tracked again; they install Autonomi's ant, not darwin. Delete them:"
+            echo "$tracked"
+            exit 1
+          fi
+
   fmt:
     runs-on: ubuntu-24.04
     steps:

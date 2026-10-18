@@ -166,6 +166,12 @@ told apart by the commit `darwin --version` prints. Upstream's entries follow.
   library's `ant_core::node` is unchanged.
 - `darwin-linux-x64.tar.gz` from CI carries license notices: `LICENSE-MIT`, `LICENSE-APACHE`,
   `THIRD-PARTY-NOTICES.txt` and `RUST-STD-COPYRIGHT.html` next to `darwin`, like upstream's archives.
+- Upstream's installers are removed: `install.sh`, `install.ps1`, the npm packages (`npm/`), the
+  winget manifest (`resources/winget/`) and the release-signing key
+  (`resources/release-signing-key.pub`). They installed or verified Autonomi's `ant`, not
+  `darwin`, and the installers wrote Autonomi's `bootstrap_peers.toml` into the config directory
+  `darwin` shares. CI fails if any of them is tracked again. `darwin` is built from source or
+  taken from the `darwin-linux-x64` CI artifact.
 - In the library, the upload calls that take no visibility (`file_upload`, `file_upload_with_mode`,
   `file_upload_with_progress`, `estimate_upload_cost`, `file_prepare_upload`,
   `data_prepare_upload`) store the private envelope `darwin file upload` stores, with every

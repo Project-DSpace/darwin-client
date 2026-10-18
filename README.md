@@ -174,8 +174,8 @@ installers leave in the same directories name Autonomi's network, and `darwin` n
 A seed file written for an earlier `darwin` build is read again once renamed
 `darwin_bootstrap_peers.toml`. See [Bootstrap multiaddresses and browser defaults](#bootstrap-multiaddresses-and-browser-defaults).
 
-> **Note:** `install.sh`, `install.ps1` and the npm packages in this repository are upstream's
-> and install Autonomi's `ant`, not `darwin`.
+This repository has no installer or npm package for darwin: build from source or take the
+`darwin-linux-x64` CI artifact.
 
 ## Quick Start
 
