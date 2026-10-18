@@ -1352,6 +1352,7 @@ async fn open_upload_checkpoint(
         .map_err(|e| Error::Config(e.to_string()))?
         .join("payments/upload");
     std::fs::create_dir_all(&cache_dir)?;
+    let cache_dir = long_path_safe(cache_dir);
     let cache_path = cache_dir.join(format!(
         "{}.msgpack",
         hex::encode(blake3::hash(&scope).as_bytes())
@@ -1375,6 +1376,26 @@ async fn open_upload_checkpoint(
         Err(error) => return Err(Error::Io(error)),
     };
     Ok((cache_path, lock, saved))
+}
+
+/// `directory` in the form Windows takes past MAX_PATH (260 characters):
+/// verbatim (`\\?\C:\...`), as `std::fs::canonicalize` gives it. The
+/// checkpoints, salts and kept records under it are written through
+/// tempfile's `persist`, which hands its paths to `MoveFileExW` as they are,
+/// and a kept record's path ([`kept_path`]) is over 100 characters longer
+/// than the directory's. Under a long data directory the rename failed: the
+/// record wasn't kept and the checkpoint stayed, so a later upload of the
+/// same file by the same payer resumed the finished one and returned its
+/// record again, even after the caller had saved and forgotten it.
+/// Elsewhere, or if the directory can't be resolved, it is returned as it is.
+fn long_path_safe(directory: PathBuf) -> PathBuf {
+    #[cfg(windows)]
+    {
+        if let Ok(verbatim) = std::fs::canonicalize(&directory) {
+            return verbatim;
+        }
+    }
+    directory
 }
 
 /// Where a completed upload keeps what proves its envelope until the caller
@@ -5537,6 +5558,40 @@ mod tests {
         let (envelope, _) =
             build_upload_envelope(&EnvelopeOptions::private(), &map, Some(salt)).unwrap();
         (envelope, map)
+    }
+
+    /// Under a folder so deep that a kept record's path is longer than
+    /// Windows' MAX_PATH (260 characters), a completed upload still keeps
+    /// its record and removes its checkpoint, once the folder is
+    /// [`long_path_safe`], as [`open_upload_checkpoint`] makes it.
+    #[cfg(windows)]
+    #[test]
+    fn a_long_data_directory_still_keeps_the_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let deep = dir.path().join("d".repeat(120)).join("e".repeat(100));
+        std::fs::create_dir_all(&deep).unwrap();
+        let deep = long_path_safe(deep);
+        assert!(deep.to_string_lossy().starts_with(r"\\?\"), "{deep:?}");
+        let checkpoint = deep.join("upload.msgpack");
+        let salt = upload_salt(&checkpoint).unwrap();
+        std::fs::write(&checkpoint, b"state").unwrap();
+        let (mut envelope, map) = private_envelope(5, salt);
+        let record = record_for(&envelope, &map);
+        envelope.proof = Some(record.clone());
+        let payer = b"wallet one";
+        let kept = kept_path(&deep, &envelope.address(), payer, "record");
+        assert!(kept.as_os_str().len() > 264, "{}", kept.display());
+
+        finish_upload_checkpoint(&checkpoint, Some(&envelope), payer);
+        assert!(!checkpoint.exists(), "the checkpoint is removed");
+        assert!(!checkpoint.with_extension("salt").exists());
+        assert_eq!(
+            kept_upload_record(&deep, &envelope, payer),
+            Some(record),
+            "the record is kept"
+        );
+        forget_kept(&deep, &envelope.address()).unwrap();
+        assert_eq!(kept_upload_record(&deep, &envelope, payer), None);
     }
 
     #[test]
