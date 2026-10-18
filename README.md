@@ -465,6 +465,15 @@ of the address are redirected there, the address stays the same, and the
 former owner's key can change nothing any more (ADR-0018 in Autonomi's
 `ant-node`).
 
+Pointer writes (`create`, `update` and `transfer`) are paid in DARWIN, one
+record per payment, with the checks uploads have: the paid quote's vault record
+is read back, and a quote someone else recorded first is quoted and paid again,
+up to 3 times; `--max-chunk-price` applies; and the wallet signs for the
+payment chain only. A pointer record holds no data map, so no envelope or
+`.record` is stored for it. Unlike an upload, a pointer write doesn't recover a
+payment the RPC answered with an error: the command fails, and running it again
+quotes and pays afresh.
+
 #### `darwin pointer keygen --output <FILE>`
 
 Create a new owner key and print the address of the pointer it controls. Never
@@ -518,7 +527,8 @@ Follow a chain of pointers to the target at its end.
 
 Hand the pointer over for good to the pointer at `RECIPIENT` (hex), which the
 new owner creates first, with a fresh key for each pointer they receive.
-Requires `SECRET_KEY` to pay for the final state. Refused before paying if any
+Requires `SECRET_KEY` to pay for the final state, which is paid as any pointer
+write is (above). Refused before paying if any
 peer of the close group holds a final state for the pointer, if not every peer
 of the group answers, or if `RECIPIENT` does not exist or leads back to this
 pointer. Irreversible once stored. Prints the stored state and the result of

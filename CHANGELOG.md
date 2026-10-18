@@ -171,6 +171,11 @@ told apart by the commit `darwin --version` prints. Upstream's entries follow.
   when neither set holds one, once every bootstrap peer asked has answered;
   `PointerFinality::seeds` says what they hold. The checks an update and a transfer make before
   paying still ask the close group alone.
+  `darwin pointer transfer` pays for the final state as `pointer create` and `pointer update` pay
+  for theirs: one record in DARWIN, its paid quote read back and quoted again if someone recorded
+  it first, under `--max-chunk-price`, with a wallet that signs for the payment chain only. Like
+  them, and unlike an upload, it doesn't recover a payment the RPC answered with an error: the
+  command fails, and running it again quotes and pays afresh.
   Here `darwin manifest create` uploads each file as `darwin file upload` uploads it, with the
   same `--visibility`, `--public`, `--readable`, `--index` and `--hide` choices: private by
   default, in an envelope that shows every payment field, with the same warnings first, paid
