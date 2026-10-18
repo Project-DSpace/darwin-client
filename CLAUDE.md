@@ -84,7 +84,7 @@ ant-core/src/
 │       ├── wire.rs           # Manifest-owned DataMap layout; pre-decode structure check
 │       ├── build.rs          # ManifestBuilder (uploads files, embedded or compact refs)
 │       ├── embed.rs          # Root-vs-shrunk DataMap choice for embedding
-│       ├── compact.rs        # Plan/publish/apply compaction (embedded DataMaps -> addresses)
+│       ├── compact.rs        # Plan/apply compaction (embedded DataMaps -> addresses; publishes nothing)
 │       └── extract.rs        # Containment-safe extraction with per-entry results
 └── node/                     # Node management
     ├── mod.rs                # add_nodes, remove_node, reset

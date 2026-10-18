@@ -14,11 +14,10 @@ use std::sync::Arc;
 use ant_core::ant_listings::Envelope;
 use ant_core::data::{
     apply_compaction, data_map_address, embeddable_data_map, embedded_len, extract_manifest,
-    forget_upload_record, manifest_link, parse_link, plan_compaction, publish_data_maps,
-    read_manifest_file, record_upload, write_manifest_file, BuildEvent, BuildOptions, Client,
-    ContentRef, EntryStatus, EnvelopeOptions, ExtractOptions, Link, ListingChain, Manifest,
-    ManifestBuilder, ManifestEntry, ManifestError, PaymentMode, ReferenceMode, Visibility,
-    MAX_EMBEDDED_ROOT_MAP_BYTES,
+    forget_upload_record, manifest_link, parse_link, plan_compaction, read_manifest_file,
+    record_upload, write_manifest_file, BuildEvent, BuildOptions, Client, ContentRef, EntryStatus,
+    EnvelopeOptions, ExtractOptions, Link, ListingChain, Manifest, ManifestBuilder, ManifestEntry,
+    ManifestError, PaymentMode, PublicForm, ReferenceMode, Visibility, MAX_EMBEDDED_ROOT_MAP_BYTES,
 };
 use self_encryption::{shrink_data_map, ChunkInfo, DataMap};
 use serial_test::serial;
@@ -622,62 +621,119 @@ async fn compact_mode_uses_public_addresses_only_when_the_datamap_is_on_the_netw
     testnet.teardown().await;
 }
 
+/// `export --compact` finds a file readable in the envelope
+/// `darwin file upload --public` stores (unlisted), or in a listed one, at
+/// the address the embedded data map alone gives, and compacts the entry to
+/// that address, which extracts. A private file is readable by no address:
+/// the plan is not free, which the CLI refuses, compaction leaves the entry
+/// embedded, and nothing is published, so its plain data map address still
+/// holds nothing.
 #[tokio::test(flavor = "multi_thread")]
 #[serial]
-async fn compact_export_publishes_private_data_maps_then_replaces_them() {
+async fn compact_export_finds_readable_envelopes_and_publishes_nothing() {
     let (client, testnet) = setup().await;
 
     let source = TempDir::new().unwrap();
-    fs::write(source.path().join("x.bin"), vec![0x77u8; FILE_BYTES]).unwrap();
-    fs::write(source.path().join("y.bin"), vec![0x88u8; FILE_BYTES]).unwrap();
+    let files = [
+        ("listed.bin", 0x66u8),
+        ("private.bin", 0x77),
+        ("unlisted.bin", 0x88),
+    ];
+    for (name, fill) in files {
+        fs::write(source.path().join(name), vec![fill; FILE_BYTES]).unwrap();
+    }
 
-    // Plain private uploads, with no envelope.
-    let mut builder = ManifestBuilder::new(
-        &client,
-        BuildOptions {
-            visibility: Visibility::Private,
-            ..Default::default()
-        },
-    );
+    // Two of the files are made readable first, as `darwin file upload
+    // --public` and `--visibility listed` upload them.
+    let mut readable = Vec::new();
+    for (name, options) in [
+        ("unlisted.bin", EnvelopeOptions::unlisted()),
+        ("listed.bin", EnvelopeOptions::listed()),
+    ] {
+        let result = client
+            .file_upload_with_visibility_and_progress(
+                &source.path().join(name),
+                PaymentMode::Single,
+                options.into_visibility(),
+                None,
+            )
+            .await
+            .expect("readable upload");
+        let envelope = result.envelope.expect("an envelope");
+        if envelope.proof.is_some() {
+            forget_upload_record(&envelope.address()).expect("forget the kept record");
+        }
+        readable.push((name, envelope.address()));
+    }
+
+    // A private manifest of all three embeds every data map.
+    let mut builder = ManifestBuilder::new(&client, BuildOptions::default());
     builder.add_directory(source.path(), None).unwrap();
     let built = builder.finish(None).await.expect("build");
-    assert!(built
-        .manifest
+    for uploaded in &built.envelopes {
+        forget_upload_record(&uploaded.envelope.address()).expect("forget the kept record");
+    }
+    let manifest = built.manifest;
+    assert!(manifest
         .entries
         .iter()
         .all(|e| e.source.kind() == "embedded"));
+    let index_of = |name: &str| {
+        manifest
+            .entries
+            .iter()
+            .position(|e| e.path.as_deref() == Some(name))
+            .unwrap()
+    };
 
-    // Nothing is public yet, so every entry needs publishing.
-    let plan = plan_compaction(&client, &built.manifest, &CancellationToken::new())
+    let plan = plan_compaction(&client, &manifest, &CancellationToken::new())
         .await
         .expect("plan");
-    assert!(plan.already_public.is_empty());
-    assert_eq!(plan.needs_publish.len(), 2);
-    assert!(!plan.is_free());
+    assert_eq!(plan.already_public.len(), 2, "{plan:?}");
+    for (name, address) in &readable {
+        let planned = plan
+            .already_public
+            .iter()
+            .find(|e| e.index == index_of(name))
+            .expect("planned as already public");
+        assert_eq!(planned.address, *address, "{name}: the envelope's address");
+        let form = if *name == "unlisted.bin" {
+            PublicForm::UnlistedEnvelope
+        } else {
+            PublicForm::ListedEnvelope
+        };
+        assert_eq!(planned.form, Some(form), "{name}");
+    }
+    let [private] = plan.needs_publish.as_slice() else {
+        panic!("only the private file needs publishing: {plan:?}");
+    };
+    assert_eq!(private.index, index_of("private.bin"));
+    assert_eq!(private.form, None);
+    assert!(!plan.is_free(), "the CLI refuses a plan that isn't free");
 
-    let stored = publish_data_maps(
-        &client,
-        &built.manifest,
-        &plan.needs_publish,
-        &CancellationToken::new(),
-    )
-    .await
-    .expect("publish");
-    assert_eq!(stored.len(), 2);
+    let compacted = apply_compaction(&manifest, &plan).unwrap();
+    for (name, address) in &readable {
+        assert_eq!(
+            compacted.entries[index_of(name)].source,
+            ContentRef::Public { address: *address },
+            "{name}"
+        );
+    }
+    assert_eq!(
+        compacted.entries[index_of("private.bin")].source,
+        manifest.entries[index_of("private.bin")].source,
+        "the private file stays embedded"
+    );
 
-    // A second plan sees them as public, and compaction is free.
-    let plan = plan_compaction(&client, &built.manifest, &CancellationToken::new())
-        .await
-        .expect("replan");
-    assert!(plan.is_free());
-    assert_eq!(plan.already_public.len(), 2);
-
-    let compacted = apply_compaction(&built.manifest, &plan.all_indices()).unwrap();
-    assert!(compacted
-        .entries
-        .iter()
-        .all(|e| e.source.kind() == "public"));
-    assert!(compacted.encode().unwrap().len() < built.manifest.encode().unwrap().len());
+    // Nothing was published: no data map is stored on its own.
+    for entry in &manifest.entries {
+        let address = entry.source.content_address().unwrap();
+        assert!(
+            !client.chunk_exists(&address).await.expect("check"),
+            "{:?}: a plain data map was stored",
+            entry.path
+        );
+    }
 
     let out = TempDir::new().unwrap();
     let report = extract_manifest(
@@ -688,11 +744,14 @@ async fn compact_export_publishes_private_data_maps_then_replaces_them() {
     )
     .await
     .expect("extract compacted");
-    assert_eq!(report.written(), 2, "{:?}", report.entries);
-    assert_eq!(
-        fs::read(out.path().join("y.bin")).unwrap(),
-        vec![0x88u8; FILE_BYTES]
-    );
+    assert_eq!(report.written(), 3, "{:?}", report.entries);
+    for (name, fill) in files {
+        assert_eq!(
+            fs::read(out.path().join(name)).unwrap(),
+            vec![fill; FILE_BYTES],
+            "{name}"
+        );
+    }
 
     drop(client);
     testnet.teardown().await;
@@ -785,6 +844,7 @@ async fn embedded_root_identity_is_the_published_address() {
     assert!(plan.is_free(), "{plan:?}");
     assert_eq!(plan.already_public.len(), 1);
     assert_eq!(plan.already_public[0].address, published);
+    assert_eq!(plan.already_public[0].form, Some(PublicForm::Plain));
 
     // The link form carries the shrunk map and keeps the identity.
     let link = manifest.link_form().unwrap();

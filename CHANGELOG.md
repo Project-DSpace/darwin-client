@@ -146,9 +146,13 @@ told apart by the commit `darwin --version` prints. Upstream's entries follow.
   `darwin manifest create --embed-public` adds a file stored with an envelope by the envelope's
   address, which keeps its payment record, without embedding its data map, and refuses a
   private file's envelope.
-  `darwin manifest export --compact` looks for a file's plain data map chunk, so it counts a
-  readable file stored with an envelope as still private, and offers to publish its data map
-  again, at a second address without an envelope. The vendored ant-protocol is 5.0.0, still
+  `darwin manifest export --compact` replaces embedded data maps with addresses for files
+  already readable by address, including files uploaded with `darwin file upload --public`. It
+  publishes nothing; a file not yet readable is listed with how to make it so. It needs no
+  wallet, and `--yes` is accepted and does nothing. In the library, `plan_compaction` finds a
+  file in a readable envelope (`PublicForm`), `apply_compaction` takes the plan, and
+  `publish_data_maps`, which stored a data map with no envelope, is no longer exported. The
+  vendored ant-protocol is 5.0.0, still
   with the price multiplier, darwin-listings is vendored at 0.2.1 to match, and rustls is
   0.23.46, as on upstream's main.
 

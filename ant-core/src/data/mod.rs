@@ -80,7 +80,7 @@ pub use manifest::{
     build::{
         BuildEvent, BuildOptions, BuildResult, ManifestBuilder, ReferenceMode, UploadedEnvelope,
     },
-    compact::{apply_compaction, plan_compaction, publish_data_maps, CompactPlan, EmbeddedEntry},
+    compact::{apply_compaction, plan_compaction, CompactPlan, EmbeddedEntry, PublicForm},
     embed::embeddable_data_map,
     extract::{
         extract_manifest, select_entries, EntryOutcome, EntryStatus, ExtractEvent, ExtractOptions,

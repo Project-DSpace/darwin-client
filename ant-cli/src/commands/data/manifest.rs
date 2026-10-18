@@ -14,7 +14,7 @@
 //! the manifest file written.
 
 use std::ffi::OsString;
-use std::io::{self, BufRead, IsTerminal, Write};
+use std::io;
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -25,8 +25,8 @@ use ant_core::data::{
     apply_compaction, compute_address, data_map_address, default_history_dir, embeddable_data_map,
     extract_manifest, forget_upload_record, format_timestamp, is_link, list_uploads, load_upload,
     manifest_filename_for, manifest_link_bytes, manifest_link_from_bytes, parse_link,
-    plan_compaction, publish_data_maps, read_manifest_file, record_upload, write_manifest_file,
-    BuildEvent, BuildOptions, BuildResult, Client, CollisionPolicy, ContentRef, DataMap,
+    plan_compaction, read_manifest_file, record_upload, write_manifest_file, BuildEvent,
+    BuildOptions, BuildResult, Client, CollisionPolicy, CompactPlan, ContentRef, DataMap,
     DownloadEvent, EntryStatus, EnvelopeOptions, ExtractEvent, ExtractOptions, Link, Manifest,
     ManifestBuilder, ManifestError, PaymentMode, ReferenceMode, TorrentReference, UploadEvent,
     UploadRecord, UploadedEnvelope, MANIFEST_LINK_RECOMMENDED_MAX_BYTES,
@@ -50,8 +50,6 @@ const DEFAULT_CONCURRENCY: usize = 1;
 const PROGRESS_CHANNEL_CAPACITY: usize = 64;
 /// Separator between address and path in `--public-file ADDRESS=PATH`.
 const PUBLIC_FILE_SEPARATOR: char = '=';
-/// Answers accepted as "yes" at the publish prompt.
-const YES_ANSWERS: &[&str] = &["y", "yes"];
 /// Exit code for a second Ctrl-C, matching the shell convention for SIGINT.
 const FORCE_QUIT_EXIT_CODE: i32 = 130;
 /// Marks a size in `manifest show` that only the manifest's creator vouches for.
@@ -140,14 +138,10 @@ pub enum ManifestAction {
     },
     /// Write a manifest out as a `.darwin` file, optionally compacted.
     ///
-    /// Compacting replaces embedded DataMaps with public addresses, which
-    /// is only possible for DataMaps that are on the network. Any that are
-    /// still private are listed and you are asked whether to publish them
-    /// first; publishing is paid and makes those files public. A readable
-    /// file stored with an envelope (by `darwin file upload` or
-    /// `darwin manifest create`) counts as still private here: its DataMap
-    /// is in the envelope, not stored on its own, so publishing it gives
-    /// the file a second address.
+    /// `--compact` replaces embedded data maps with addresses for files
+    /// already readable by address, including files uploaded with
+    /// `darwin file upload --public`. It publishes nothing; a file not yet
+    /// readable is listed with how to make it so.
     Export {
         /// A `.darwin` file, a `darwin://manifest/...` link, or an upload id
         /// from `darwin manifest list`.
@@ -155,11 +149,13 @@ pub enum ManifestAction {
         /// Where to write the manifest. Defaults to `<name>.darwin` here.
         #[arg(short, long)]
         output: Option<PathBuf>,
-        /// Replace embedded DataMaps with public addresses.
+        /// Replace embedded data maps with the addresses their files are
+        /// readable at. Needs the network, no wallet.
         #[arg(long)]
         compact: bool,
-        /// Publish still-private DataMaps without asking.
-        #[arg(long, short)]
+        /// Does nothing, since compacting publishes nothing; kept so
+        /// scripts that pass it still run.
+        #[arg(long, short, hide = true)]
         yes: bool,
         /// Replace an existing file at the output path.
         #[arg(long)]
@@ -218,9 +214,12 @@ impl ManifestAction {
     pub fn needs_wallet(&self) -> bool {
         match self {
             Self::Create { paths, .. } => !paths.is_empty(),
-            // Compacting may have to publish DataMap chunks, which is paid.
-            Self::Export { compact, .. } => *compact,
-            Self::List | Self::Show { .. } | Self::Link { .. } | Self::Download { .. } => false,
+            // Compacting only reads: it publishes nothing.
+            Self::Export { .. }
+            | Self::List
+            | Self::Show { .. }
+            | Self::Link { .. }
+            | Self::Download { .. } => false,
         }
     }
 
@@ -273,7 +272,7 @@ impl ManifestAction {
                 let manifest = load_manifest(&source)?;
                 let out = resolve_output(manifest.name.as_deref(), output)?;
                 write_manifest(&manifest, &out, overwrite)?;
-                report_exported(&manifest, &out, 0, link, json)
+                report_exported(&manifest, &out, link, json)
             }
             Self::Create { .. } | Self::Download { .. } | Self::Export { .. } => {
                 anyhow::bail!("this command needs a network connection")
@@ -344,12 +343,12 @@ impl ManifestAction {
                 source,
                 output,
                 compact: true,
-                yes,
+                yes: _,
                 overwrite,
                 link,
             } => {
                 let manifest = load_manifest(&source)?;
-                export_compact(client, &manifest, output, yes, overwrite, link, json).await
+                export_compact(client, &manifest, output, overwrite, link, json).await
             }
             Self::List | Self::Show { .. } | Self::Link { .. } | Self::Export { .. } => {
                 self.execute_offline(json)
@@ -358,16 +357,17 @@ impl ManifestAction {
     }
 }
 
+/// `export --compact`: replace each embedded data map with the address its
+/// file is readable at. Reads only: it pays for and publishes nothing, so it
+/// never stores a data map without its envelope.
 async fn export_compact(
     client: &Client,
     manifest: &Manifest,
     output: Option<PathBuf>,
-    yes: bool,
     overwrite: bool,
     with_link: bool,
     json: bool,
 ) -> anyhow::Result<()> {
-    // Nothing is published until the output is known to be writable.
     let out = resolve_output(manifest.name.as_deref(), output)?;
     check_output_writable(&out, overwrite)?;
     let cancel = CancellationToken::new();
@@ -376,65 +376,42 @@ async fn export_compact(
     let plan = if json {
         plan_compaction(client, manifest, &cancel).await?
     } else {
-        let spinner = progress::new_spinner("Checking which DataMaps are on the network...");
+        let spinner = progress::new_spinner("Checking which files are readable by address...");
         let plan = plan_compaction(client, manifest, &cancel).await;
         spinner.finish_and_clear();
         plan?
     };
+    compaction_decision(&plan)?;
 
-    if !plan.is_free() {
-        if !json {
-            eprintln!(
-                "{} embedded DataMap(s) are already public; {} are still private:",
-                plan.already_public.len(),
-                plan.needs_publish.len()
-            );
-            for entry in &plan.needs_publish {
-                eprintln!("  {}", entry.name);
-            }
-        }
-        if !yes && !confirm_publish(plan.needs_publish.len(), json)? {
-            anyhow::bail!("export cancelled: the manifest was not compacted");
-        }
-        info!("Publishing {} DataMap chunk(s)", plan.needs_publish.len());
-        if json {
-            publish_data_maps(client, manifest, &plan.needs_publish, &cancel).await?;
-        } else {
-            let spinner = progress::new_spinner(&format!(
-                "Publishing {} DataMap chunk(s)...",
-                plan.needs_publish.len()
-            ));
-            let result = publish_data_maps(client, manifest, &plan.needs_publish, &cancel).await;
-            spinner.finish_and_clear();
-            result?;
-        }
-    }
-
-    let compacted = apply_compaction(manifest, &plan.all_indices())?;
+    let compacted = apply_compaction(manifest, &plan)?;
     write_manifest(&compacted, &out, overwrite)?;
-    report_exported(&compacted, &out, plan.needs_publish.len(), with_link, json)
+    report_exported(&compacted, &out, with_link, json)
 }
 
-/// Ask on the terminal whether to publish `count` DataMaps. Without a
-/// terminal, or in JSON mode, the answer must come from `--yes`.
-fn confirm_publish(count: usize, json: bool) -> anyhow::Result<bool> {
-    if json || !io::stdin().is_terminal() {
-        anyhow::bail!(
-            "{count} DataMap(s) must be published to compact this manifest; \
-             pass --yes to publish them (this is paid and makes those files public)"
-        );
+/// Whether a compaction plan can be applied: only when every embedded file
+/// is readable by an address already, since compacting publishes nothing.
+/// Otherwise the files that aren't are named, with how to make each
+/// readable.
+fn compaction_decision(plan: &CompactPlan) -> anyhow::Result<()> {
+    if plan.is_free() {
+        return Ok(());
     }
-    eprint!("Publish {count} DataMap chunk(s)? This is paid and makes those files public. [y/N] ");
-    io::stderr().flush()?;
-    let mut answer = String::new();
-    io::stdin().lock().read_line(&mut answer)?;
-    Ok(YES_ANSWERS.contains(&answer.trim().to_ascii_lowercase().as_str()))
+    let names: String = plan
+        .needs_publish
+        .iter()
+        .map(|entry| format!("\n  {}", entry.name))
+        .collect();
+    anyhow::bail!(
+        "{} file(s) have no public address yet:{names}\n\
+         Make each readable with `darwin file upload --visibility unlisted <FILE>` \
+         (no --name, --content-type or --hide) and export again.",
+        plan.needs_publish.len()
+    )
 }
 
 fn report_exported(
     manifest: &Manifest,
     out: &Path,
-    published: usize,
     with_link: bool,
     json: bool,
 ) -> anyhow::Result<()> {
@@ -458,7 +435,8 @@ fn report_exported(
                 "entries": entries_json(manifest)?,
                 "embedded_entries": embedded,
                 "public_entries": manifest.entries.len() - embedded,
-                "data_maps_published": published,
+                // Kept for scripts that read it: compacting publishes nothing.
+                "data_maps_published": 0,
                 "link": link_text.as_ref().map(|(link, _)| link),
             }))?
         );
@@ -470,9 +448,6 @@ fn report_exported(
         embedded,
         manifest.entries.len() - embedded
     );
-    if published > 0 {
-        println!("Published {published} DataMap chunk(s)");
-    }
     if let Some((link, len)) = link_text {
         warn_if_long_link(len);
         println!("{link}");
@@ -1913,12 +1888,95 @@ mod tests {
         };
         assert!(download.needs_network());
         assert!(!download.needs_wallet());
+        let compact = ManifestAction::Export {
+            source: "x.ant".into(),
+            output: None,
+            compact: true,
+            yes: true,
+            overwrite: false,
+            link: false,
+        };
+        assert!(compact.needs_network());
+        assert!(!compact.needs_wallet(), "compacting publishes nothing");
     }
 
     #[derive(Debug, clap::Parser)]
     struct TestManifestCli {
         #[command(subcommand)]
         action: ManifestAction,
+    }
+
+    /// `export --compact` only reads, so it needs the network and no
+    /// wallet, and `--yes`/`-y` still parse, hidden, so scripts that pass
+    /// them still run.
+    #[test]
+    fn export_compact_needs_no_wallet() {
+        use clap::Parser;
+        for argv in [
+            &["test", "export", "x.darwin", "--compact"][..],
+            &["test", "export", "x.darwin", "--compact", "--yes"],
+            &["test", "export", "x.darwin", "--compact", "-y"],
+        ] {
+            let action = TestManifestCli::try_parse_from(argv)
+                .expect("parses")
+                .action;
+            assert!(
+                matches!(action, ManifestAction::Export { compact: true, .. }),
+                "{argv:?}"
+            );
+            assert!(action.needs_network(), "{argv:?}");
+            assert!(!action.needs_wallet(), "{argv:?}");
+            action.validate().unwrap();
+        }
+        let plain = TestManifestCli::try_parse_from(["test", "export", "x.darwin"])
+            .unwrap()
+            .action;
+        assert!(!plain.needs_network());
+        assert!(!plain.needs_wallet());
+        let help = TestManifestCli::try_parse_from(["test", "export", "--help"])
+            .expect_err("--help")
+            .to_string();
+        let help = help.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(!help.contains("--yes"), "{help}");
+        assert!(help.contains("It publishes nothing"), "{help}");
+        assert!(help.contains("darwin file upload --public"), "{help}");
+    }
+
+    /// A plan with a file no address reads is refused, whatever `--yes`
+    /// says: compacting publishes nothing. The refusal names each such file
+    /// and how to make it readable.
+    #[test]
+    fn compaction_decision_refuses_a_plan_that_is_not_free() {
+        use ant_core::data::{EmbeddedEntry, PublicForm};
+        let entry = |index: u8, name: &str, form| EmbeddedEntry {
+            index: usize::from(index),
+            name: name.into(),
+            address: [index; 32],
+            form,
+        };
+        let free = CompactPlan {
+            already_public: vec![entry(0, "a.bin", Some(PublicForm::UnlistedEnvelope))],
+            needs_publish: vec![],
+        };
+        compaction_decision(&free).unwrap();
+        compaction_decision(&CompactPlan::default()).unwrap();
+
+        let mut not_free = free;
+        not_free.needs_publish = vec![entry(1, "docs/b.bin", None), entry(2, "c.bin", None)];
+        let error = compaction_decision(&not_free).unwrap_err().to_string();
+        assert!(
+            error.starts_with("2 file(s) have no public address yet:"),
+            "{error}"
+        );
+        assert!(error.contains("\n  docs/b.bin\n  c.bin\n"), "{error}");
+        assert!(
+            error.contains(
+                "Make each readable with `darwin file upload --visibility unlisted <FILE>` \
+                 (no --name, --content-type or --hide) and export again."
+            ),
+            "{error}"
+        );
+        assert!(!error.contains("--yes"), "{error}");
     }
 
     /// `create` takes the merkle flags as `darwin file upload` does:
