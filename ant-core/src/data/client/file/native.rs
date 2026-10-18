@@ -13,7 +13,8 @@
 use super::*;
 use crate::data::client::adaptive::observe_op;
 use crate::data::client::batch::{
-    finalize_batch_payment, PaidChunk, PaymentIntent, PreparedChunk, WaveAggregateStats, WaveResult,
+    finalize_batch_payment, ChunkPaymentPlan, PaidChunk, PaymentIntent, PreparedChunk,
+    WaveAggregateStats, WaveResult,
 };
 use crate::data::client::chunk::{ChunkFetchDiagnostics, ChunkPeerGetResult};
 use crate::data::client::classify_error;
@@ -23,6 +24,9 @@ use crate::data::client::merkle::{
     finalize_merkle_batch, merge_merkle_batch_results, merkle_deferred_retry,
     merkle_store_with_retry, merkle_upload_billable_units, merkle_upload_split, should_use_merkle,
     MerkleBatchPaymentResult, PaymentMode, PreparedMerkleBatch, DEFERRED_ROUND_DELAYS_SECS,
+};
+use crate::data::client::occupied::{
+    occupied_at_finalize, plans_of, set_aside_occupied, skipped_amount,
 };
 use crate::data::client::Client;
 use crate::data::error::{Error, PartialUploadSpend, Result};
@@ -241,7 +245,7 @@ fn file_chunk_peer_status(
 /// Gas used by one `pay_for_quotes` transaction that packs up to
 /// `UPLOAD_WAVE_SIZE` (quote_hash, rewards_address, amount) entries.
 ///
-/// `batch_pay` in `batch.rs` flattens every chunk's close-group quotes into a
+/// A wave's payment flattens every chunk's close-group quotes into a
 /// single EVM call, so the dominant cost is the SSTOREs for each entry plus
 /// the base tx overhead. On Arbitrum that is roughly
 /// `21_000 + 64 × (20_000 + small)` ≈ 1.3M; we round up to 1.5M as a
@@ -851,6 +855,21 @@ fn assemble_merkle_finalize_outcome(
     }
 }
 
+/// What an outside payer's payment came to once its paid quotes were read
+/// back ([`Client::read_back_outside_payment`]).
+struct OutsidePaymentReadBack {
+    /// The chunks to store.
+    paid: Vec<PaidChunk>,
+    /// The chunks set aside, never to be sent, each with why: the vault had
+    /// recorded its paid quote for another payment first.
+    unpaid: Vec<([u8; 32], String)>,
+    /// The payment intent's total, less the payments the vault skipped.
+    storage_cost_atto: String,
+    /// Why the upload can't complete on this payment, if any chunk was set
+    /// aside.
+    reason: Option<String>,
+}
+
 /// Assemble the outcome of one wave-batch external store pass into
 /// [`FinalizeOutcome`]. Pure (no `self`/network) so the resume-handoff contract
 /// is unit-testable.
@@ -860,10 +879,14 @@ fn assemble_merkle_finalize_outcome(
 /// [`FinalizeOutcome::Complete`]; otherwise the failed chunks' [`PaidChunk`]s
 /// are pulled out of `retained` into a [`WaveFinalizeResume`] so the caller can
 /// re-store just those against the same payment — the store never returns an
-/// `Err` for a partial, so this function is infallible.
+/// `Err` for a partial, so this function is infallible. `occupied` lists the
+/// chunks this payment can't store (their failures are in `wave_result` too,
+/// and their paid chunks are not in `retained`); the handle carries the list.
+#[allow(clippy::too_many_arguments)]
 fn assemble_wave_finalize_outcome(
     wave_result: WaveResult,
     mut retained: HashMap<[u8; 32], PaidChunk>,
+    occupied: Vec<([u8; 32], String)>,
     data_map: DataMap,
     data_map_address: Option<[u8; 32]>,
     total_chunks: usize,
@@ -922,6 +945,7 @@ fn assemble_wave_finalize_outcome(
         total_chunks,
         stored_count,
         failed_paid_chunks,
+        occupied,
         storage_cost_atto,
         envelope: None,
     };
@@ -1762,8 +1786,21 @@ pub struct WaveFinalizeResume {
     total_chunks: usize,
     stored_count: usize,
     failed_paid_chunks: Vec<PaidChunk>,
+    occupied: Vec<([u8; 32], String)>,
     storage_cost_atto: String,
     envelope: Option<UploadEnvelope>,
+}
+
+impl WaveFinalizeResume {
+    /// The chunks this payment can't store, each with why: the vault had
+    /// recorded its paid quote for another payment first and skipped this
+    /// one. They are not in the handle: every resume reports them failed and
+    /// holds the envelope back, so the upload doesn't complete on this
+    /// payment. Prepare it again to quote and pay them afresh.
+    #[must_use]
+    pub fn occupied(&self) -> &[([u8; 32], String)] {
+        &self.occupied
+    }
 }
 
 impl std::fmt::Debug for WaveFinalizeResume {
@@ -1772,6 +1809,7 @@ impl std::fmt::Debug for WaveFinalizeResume {
             .field("total_chunks", &self.total_chunks)
             .field("stored", &self.stored_count)
             .field("unstored", &self.failed_paid_chunks.len())
+            .field("occupied", &self.occupied.len())
             .field("public", &self.data_map_address.is_some())
             .finish_non_exhaustive()
     }
@@ -2408,7 +2446,7 @@ impl Client {
         // Estimate gas cost from realistic per-transaction budgets rather
         // than a flat per-chunk or per-wave number.
         //
-        // - Single mode: `batch_pay` packs up to UPLOAD_WAVE_SIZE chunks'
+        // - Single mode: a wave's payment packs up to UPLOAD_WAVE_SIZE chunks'
         //   close-group quotes into one `pay_for_quotes` call on Arbitrum.
         //   The dominant cost is one SSTORE per entry plus base tx overhead,
         //   so we use GAS_PER_WAVE_TX (≈1.5M) as a conservative upper bound
@@ -2829,11 +2867,21 @@ impl Client {
     /// of `quote_hash -> tx_hash` provided by the external signer after on-chain
     /// payment. Builds payment proofs and stores chunks on the network.
     ///
+    /// Every paid quote's vault record is read back first. A chunk whose
+    /// quote the vault had already recorded for another payment was not paid
+    /// (the vault skipped the payment, which moved no tokens), so it is not
+    /// sent: it fails with an error starting
+    /// [`QUOTES_OCCUPIED`](crate::data::QUOTES_OCCUPIED) naming the node that
+    /// issued the quote, the envelope is held back, the cost reported leaves
+    /// the skipped payment out, and the upload has to be prepared again for
+    /// that chunk, since a finalize can't quote it again.
+    ///
     /// # Errors
     ///
     /// Returns an error if the prepared upload used merkle payment (use
     /// [`Client::finalize_upload_merkle`] instead), proof construction fails,
-    /// or any chunk cannot be stored.
+    /// or any chunk cannot be stored, an occupied one included
+    /// ([`Error::PartialUpload`]).
     pub async fn finalize_upload(
         &self,
         prepared: PreparedUpload,
@@ -2867,12 +2915,17 @@ impl Client {
                 prepared_chunks,
                 payment_intent,
             } => {
+                let plans = plans_of(&prepared_chunks);
                 let paid_chunks = finalize_batch_payment(prepared_chunks, tx_hash_map)?;
-                let envelope_proof = envelope_payment_proof(envelope.as_ref(), &paid_chunks);
+                let read_back = self
+                    .read_back_outside_payment(&plans, paid_chunks, payment_intent.total_amount)
+                    .await;
+                let envelope_proof = envelope_payment_proof(envelope.as_ref(), &read_back.paid);
                 let wave_result = self
                     .store_paid_chunks_then(
-                        paid_chunks,
+                        read_back.paid,
                         envelope.as_ref().map(UploadEnvelope::address),
+                        read_back.unpaid,
                         progress.as_ref(),
                         already_stored_count,
                         total_chunks,
@@ -2890,13 +2943,17 @@ impl Client {
                         failed_count,
                         total_chunks,
                         // Report the storage spend known from the payment intent
-                        // the external signer was handed. Gas is paid by the
-                        // signer out-of-band, so it stays unknown (0).
+                        // the external signer was handed, less the payments the
+                        // vault skipped. Gas is paid by the signer out-of-band,
+                        // so it stays unknown (0).
                         spend: Box::new(PartialUploadSpend {
-                            storage_cost_atto: payment_intent.total_amount.to_string(),
+                            storage_cost_atto: read_back.storage_cost_atto,
                             gas_cost_wei: 0,
                         }),
-                        reason: "finalize_upload: chunk storage failed after retries".into(),
+                        reason: read_back.reason.map_or_else(
+                            || "finalize_upload: chunk storage failed after retries".into(),
+                            |occupied| format!("finalize_upload: {occupied}"),
+                        ),
                     });
                 }
                 let chunks_stored = already_stored_count + wave_result.stored.len();
@@ -2924,7 +2981,7 @@ impl Client {
                     payment_mode_used: PaymentMode::Single,
                     // Storage spend is known from the payment intent; gas is
                     // paid by the external signer out-of-band (unknown here).
-                    storage_cost_atto: payment_intent.total_amount.to_string(),
+                    storage_cost_atto: read_back.storage_cost_atto,
                     gas_cost_wei: 0,
                     data_map_address,
                     chunk_attempts_total: stats.chunk_attempts_total,
@@ -3206,6 +3263,12 @@ impl Client {
     /// to re-store only those chunks against the **same** on-chain payment — no
     /// re-quoting, no second signature, no double payment (#140).
     ///
+    /// Paid quotes are read back first, as [`Client::finalize_upload`] reads
+    /// them: a chunk whose quote was occupied is not sent, is counted failed,
+    /// and is left out of the handle, which lists it
+    /// ([`WaveFinalizeResume::occupied`]) and never completes the upload; the
+    /// cost reported leaves the skipped payment out.
+    ///
     /// # Errors
     ///
     /// Returns an error if a `tx_hash` is missing for a quote, the payment info
@@ -3244,16 +3307,20 @@ impl Client {
                 prepared_chunks,
                 payment_intent,
             } => {
+                let plans = plans_of(&prepared_chunks);
                 let paid_chunks = finalize_batch_payment(prepared_chunks, tx_hash_map)?;
-                let storage_cost_atto = payment_intent.total_amount.to_string();
+                let read_back = self
+                    .read_back_outside_payment(&plans, paid_chunks, payment_intent.total_amount)
+                    .await;
                 Ok(self
                     .drive_wave_finalize(
                         data_map,
                         data_map_address,
                         total_chunks,
                         already_stored_count,
-                        paid_chunks,
-                        storage_cost_atto,
+                        read_back.paid,
+                        read_back.unpaid,
+                        read_back.storage_cost_atto,
                         envelope,
                         progress.as_ref(),
                     )
@@ -3275,7 +3342,11 @@ impl Client {
     /// No re-quoting and no new signature: the handle owns the retained chunk
     /// bodies (wave path) or the spill + merkle proofs (merkle path). Every
     /// chunk in the handle has its payment material, so the upload always
-    /// *can* complete once the network cooperates. Safe to call repeatedly —
+    /// *can* complete once the network cooperates, unless the wave path's
+    /// finalize found a chunk's paid quote occupied
+    /// ([`WaveFinalizeResume::occupied`]): that chunk is not in the handle,
+    /// every call reports it failed and holds the envelope back, and the
+    /// upload has to be prepared again for it. Safe to call repeatedly —
     /// each call stores what it can and either completes the upload
     /// ([`FinalizeOutcome::Complete`]) or hands back the remainder, so a
     /// caller can loop until it drains or gives up (#140).
@@ -3316,6 +3387,7 @@ impl Client {
                     total_chunks,
                     stored_count,
                     failed_paid_chunks,
+                    occupied,
                     storage_cost_atto,
                     envelope,
                 } = *w;
@@ -3326,6 +3398,7 @@ impl Client {
                         total_chunks,
                         stored_count,
                         failed_paid_chunks,
+                        occupied,
                         storage_cost_atto,
                         envelope,
                         progress.as_ref(),
@@ -3409,6 +3482,12 @@ impl Client {
     /// [`WaveFinalizeResume`] ([`FinalizeOutcome::Partial`]) for re-store against
     /// the same payment, instead of the shortfall being dropped. The store never
     /// errors on a partial, so this is infallible.
+    ///
+    /// `occupied` lists the chunks whose paid quote the vault had recorded for
+    /// another payment, with why ([`Client::read_back_outside_payment`]): they
+    /// are never sent, every pass reports them failed, so the envelope is held
+    /// back and the upload never completes on this payment, and the resume
+    /// handle carries only that list for them, not their paid chunks.
     #[allow(clippy::too_many_arguments)]
     async fn drive_wave_finalize(
         &self,
@@ -3417,6 +3496,7 @@ impl Client {
         total_chunks: usize,
         already_stored_count: usize,
         paid_chunks: Vec<PaidChunk>,
+        occupied: Vec<([u8; 32], String)>,
         storage_cost_atto: String,
         envelope: Option<UploadEnvelope>,
         progress: Option<&mpsc::Sender<UploadEvent>>,
@@ -3430,6 +3510,7 @@ impl Client {
             .store_paid_chunks_then(
                 paid_chunks,
                 envelope.as_ref().map(UploadEnvelope::address),
+                occupied.clone(),
                 progress,
                 already_stored_count,
                 total_chunks,
@@ -3438,6 +3519,7 @@ impl Client {
         let mut outcome = assemble_wave_finalize_outcome(
             wave_result,
             retained,
+            occupied,
             data_map,
             data_map_address,
             total_chunks,
@@ -3472,11 +3554,14 @@ impl Client {
 
     /// Store `paid_chunks`, the one at `last` (an envelope) only once every
     /// other chunk is stored, so it never points at missing content. If any
-    /// other chunk fails, `last` is reported failed without being sent.
+    /// other chunk fails, or `failed_before` names chunks of the upload that
+    /// can't be stored (reported failed first, as they are), `last` is
+    /// reported failed without being sent.
     async fn store_paid_chunks_then(
         &self,
         paid_chunks: Vec<PaidChunk>,
         last: Option<[u8; 32]>,
+        failed_before: Vec<([u8; 32], String)>,
         progress: Option<&mpsc::Sender<UploadEvent>>,
         stored_before: usize,
         total_chunks: usize,
@@ -3487,6 +3572,8 @@ impl Client {
         let mut result = self
             .store_paid_chunks_with_events(others, progress, stored_before, total_chunks)
             .await;
+        let stored_failures = std::mem::replace(&mut result.failed, failed_before);
+        result.failed.extend(stored_failures);
         // Paid chunks are unique by address, so at most one is held.
         let Some(held) = super::super::upload::release_last(
             held.into_iter().next(),
@@ -3505,6 +3592,36 @@ impl Client {
         result.store_durations_ms.extend(last.store_durations_ms);
         result.retries_per_chunk.extend(last.retries_per_chunk);
         result
+    }
+
+    /// Read back the vault record of every quote an outside payer paid for
+    /// `paid_chunks` (`plans`, from the prepared chunks), before any chunk is
+    /// sent, and set aside each chunk whose quote the vault had recorded for
+    /// another payment first. The vault skipped that payment, which moved no
+    /// tokens, so nodes would refuse the chunk, and a finalize can't quote it
+    /// again: it fails, naming the node that issued the quote. `paid_total`
+    /// is the payment intent's total.
+    async fn read_back_outside_payment(
+        &self,
+        plans: &[ChunkPaymentPlan],
+        paid_chunks: Vec<PaidChunk>,
+        paid_total: Amount,
+    ) -> OutsidePaymentReadBack {
+        let occupied = self.occupied_quotes(plans).await;
+        let reason = (!occupied.is_empty()).then(|| {
+            let reason = occupied_at_finalize(&occupied).to_string();
+            warn!("{reason}");
+            reason
+        });
+        let (paid, unpaid) = set_aside_occupied(paid_chunks, &occupied);
+        OutsidePaymentReadBack {
+            paid,
+            unpaid,
+            storage_cost_atto: paid_total
+                .saturating_sub(skipped_amount(&occupied))
+                .to_string(),
+            reason,
+        }
     }
 
     /// Fill in an external-signer upload's envelope record, once every chunk
@@ -4732,6 +4849,7 @@ mod tests {
         let outcome = assemble_wave_finalize_outcome(
             wave_result,
             retained,
+            Vec::new(),
             DataMap::new(vec![]),
             Some([9u8; 32]),
             1,
@@ -4769,6 +4887,7 @@ mod tests {
         let outcome = assemble_wave_finalize_outcome(
             wave_result,
             retained,
+            Vec::new(),
             DataMap::new(vec![]),
             Some([9u8; 32]),
             3,
@@ -4790,9 +4909,93 @@ mod tests {
                 assert_eq!(got, vec![b, c]);
                 assert_eq!(w.stored_count, 1);
                 assert_eq!(w.total_chunks, 3);
+                assert!(w.occupied().is_empty());
             }
             FinalizeOutcome::Complete(_) => panic!("expected Partial"),
         }
+    }
+
+    /// A chunk whose paid quote was occupied can't be stored on this payment:
+    /// it is counted failed, its paid chunk is not in the resume handle, and
+    /// the handle lists it, so every pass reports it failed again and none
+    /// completes the upload.
+    #[test]
+    fn an_occupied_chunk_stays_failed_and_out_of_the_resume_handle() {
+        let a = [1u8; 32]; // stored
+        let b = [2u8; 32]; // occupied
+        let e = [7u8; 32]; // the envelope, held back
+        let occupied = vec![(b, "payment error: quotes occupied: …".to_string())];
+        let wave_result = WaveResult {
+            stored: vec![a],
+            failed: vec![
+                occupied[0].clone(),
+                (e, crate::data::client::upload::HELD_BACK.into()),
+            ],
+            chunk_attempts_total: 1,
+            store_durations_ms: vec![5],
+            retries_per_chunk: vec![0],
+        };
+        // The occupied chunk was set aside before storing: never retained.
+        let mut retained = HashMap::new();
+        for addr in [a, e] {
+            retained.insert(addr, paid_chunk(addr));
+        }
+        let outcome = assemble_wave_finalize_outcome(
+            wave_result,
+            retained,
+            occupied.clone(),
+            DataMap::new(vec![]),
+            None,
+            3,
+            0,
+            "450".into(),
+        );
+        let FinalizeOutcome::Partial { result, resume } = outcome else {
+            panic!("an occupied chunk never completes the upload");
+        };
+        assert_eq!(result.chunks_failed, 2);
+        assert_eq!(result.storage_cost_atto, "450");
+        let FinalizeResume::Wave(w) = resume else {
+            panic!("expected a wave resume handle");
+        };
+        let kept: Vec<[u8; 32]> = w.failed_paid_chunks.iter().map(|c| c.address).collect();
+        assert_eq!(kept, vec![e], "only the held-back envelope is kept");
+        assert_eq!(w.occupied(), occupied.as_slice());
+        assert!(format!("{w:?}").contains("occupied: 1"), "{w:?}");
+    }
+
+    /// Chunks set aside before storing count as failed for the envelope: it
+    /// is held back, not sent, and they are reported first, with their own
+    /// reasons. The client's node was never started, so the envelope could
+    /// only have been held back.
+    #[tokio::test]
+    async fn chunks_set_aside_hold_the_envelope_back() {
+        let network = crate::data::Network::unstarted(&[], true, false)
+            .await
+            .unwrap();
+        let client = Client::from_node(Arc::clone(network.node()), Default::default());
+        let occupied = [2u8; 32];
+        let envelope = [7u8; 32];
+        let reason = "payment error: quotes occupied: …".to_string();
+        let result = client
+            .store_paid_chunks_then(
+                vec![paid_chunk(envelope)],
+                Some(envelope),
+                vec![(occupied, reason.clone())],
+                None,
+                0,
+                3,
+            )
+            .await;
+        assert!(result.stored.is_empty());
+        assert_eq!(
+            result.failed,
+            vec![
+                (occupied, reason),
+                (envelope, crate::data::client::upload::HELD_BACK.into())
+            ]
+        );
+        assert_eq!(result.chunk_attempts_total, 0, "nothing was sent");
     }
 
     #[test]

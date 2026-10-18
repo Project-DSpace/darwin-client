@@ -35,6 +35,12 @@ use web_time::Instant;
 /// Number of chunks per payment wave.
 pub(super) const PAYMENT_WAVE_SIZE: usize = 64;
 
+/// What [`Client::batch_pay`] returns: it is off in this build.
+const BATCH_PAY_OFF: &str = "batch_pay is off in this build: it pays with no read-back of the \
+     paid quotes, so a quote the vault had already recorded for another payment would go \
+     unnoticed and its chunk unpaid. Upload chunks with batch_upload_chunks, which reads every \
+     paid quote back and pays again.";
+
 /// Variable-size single-node payment plan for a chunk.
 ///
 /// The shared `ant-protocol::payment::SingleNodePayment` helper still models
@@ -206,7 +212,7 @@ impl ChunkPaymentPlan {
     }
 }
 
-/// Chunk paid but not yet stored. Produced by [`Client::batch_pay`].
+/// Chunk paid but not yet stored. Produced by [`finalize_batch_payment`].
 #[derive(Debug, Clone)]
 pub struct PaidChunk {
     /// The chunk content bytes.
@@ -339,9 +345,8 @@ impl PaymentIntent {
     }
 }
 
-/// Build [`PaidChunk`]s from prepared chunks and externally-provided transaction hashes.
-///
-/// Shared by [`Client::batch_pay`] (wallet flow) and [`finalize_batch_payment`] (external signer).
+/// Build [`PaidChunk`]s from prepared chunks and externally-provided transaction hashes,
+/// for [`finalize_batch_payment`] (external signer).
 ///
 /// Returns an error if any non-zero-amount quote hash is missing from `tx_hash_map`,
 /// since chunks uploaded without valid proofs would be rejected by the network.
@@ -437,6 +442,10 @@ fn payment_plan_from_quotes(
 ///
 /// Takes prepared chunks and a map of `quote_hash -> tx_hash` from the
 /// external signer. Builds per-chunk `PaymentProof` bytes without needing a wallet.
+///
+/// A raw building block: it reads no paid quote back. `Client::finalize_upload`,
+/// `Client::finalize_upload_resumable` and `Client::finalize_chunk` read every
+/// paid quote back before storing.
 pub fn finalize_batch_payment(
     prepared: Vec<PreparedChunk>,
     tx_hash_map: &HashMap<QuoteHash, TxHash>,
@@ -532,69 +541,21 @@ impl Client {
         )
     }
 
-    /// Pay for multiple chunks in a single EVM transaction.
-    ///
-    /// Flattens all quote payments from the prepared chunks into one
-    /// `wallet.pay_for_quotes()` call, then maps transaction hashes
-    /// back to per-chunk [`PaymentProof`] bytes.
+    /// Off in this build: it would pay the chunks' quotes with no read-back,
+    /// so a quote the vault had already recorded for another payment would
+    /// go unnoticed, its payment skipped and its chunk unpaid. Upload chunks
+    /// with `Client::batch_upload_chunks`, which reads every paid quote back
+    /// and quotes and pays again a chunk whose quote was occupied.
     ///
     /// # Errors
     ///
-    /// Returns an error if the wallet is not configured or the on-chain
-    /// payment fails.
-    /// Returns `(paid_chunks, storage_cost_atto, gas_cost_wei)`.
+    /// Always returns [`Error::Payment`] naming that, before anything is
+    /// paid.
     pub async fn batch_pay(
         &self,
-        prepared: Vec<PreparedChunk>,
+        _prepared: Vec<PreparedChunk>,
     ) -> Result<(Vec<PaidChunk>, String, u128)> {
-        if prepared.is_empty() {
-            return Ok((Vec::new(), "0".to_string(), 0));
-        }
-
-        // Re-checked immediately before the spend, not only at preparation.
-        // Waves are pipelined, so chunks quoted for wave N+1 while wave N is
-        // still storing can have been prepared before a refusal landed.
-        if let Some(refusal) = self.corroborated_settlement_refusal() {
-            return Err(Error::ClientUpdateRequired(refusal));
-        }
-
-        let wallet = self.require_wallet()?;
-
-        // Compute total storage cost from the prepared chunks before paying.
-        let intent = PaymentIntent::from_prepared_chunks(&prepared);
-        let storage_cost_atto = intent.total_amount.to_string();
-
-        // Flatten all quote payments from all chunks into a single batch.
-        let total_quotes: usize = prepared.iter().map(|c| c.payment.quotes.len()).sum();
-        let mut all_payments = Vec::with_capacity(total_quotes);
-        for chunk in &prepared {
-            for info in &chunk.payment.quotes {
-                all_payments.push((info.quote_hash, info.rewards_address, info.amount));
-            }
-        }
-
-        debug!(
-            "Batch payment for {} chunks ({} quote entries)",
-            prepared.len(),
-            all_payments.len()
-        );
-
-        let (tx_hash_map, gas_info) =
-            wallet
-                .pay_for_quotes(all_payments)
-                .await
-                .map_err(|PayForQuotesError(err, _)| {
-                    Error::Payment(format!("Batch payment failed: {err}"))
-                })?;
-
-        info!(
-            "Batch payment succeeded: {} transactions",
-            tx_hash_map.len()
-        );
-
-        let tx_hash_map: HashMap<QuoteHash, TxHash> = tx_hash_map.into_iter().collect();
-        let paid_chunks = build_paid_chunks(prepared, &tx_hash_map)?;
-        Ok((paid_chunks, storage_cost_atto, gas_info.gas_cost_wei))
+        Err(Error::Payment(BATCH_PAY_OFF.into()))
     }
 
     /// Upload chunks in waves with pipelined EVM payments.
@@ -1355,5 +1316,27 @@ mod tests {
             std::time::SystemTime::now(),
             Duration::from_secs(CACHED_PROOF_MAX_AGE_SECS),
         ));
+    }
+}
+
+#[cfg(all(test, feature = "native"))]
+mod held_back_tests {
+    use super::*;
+
+    /// `batch_pay` pays with no read-back, so it is off: it refuses before
+    /// anything is paid, even with nothing to pay, and names what to use
+    /// instead. The client has no wallet and its node was never started, so
+    /// nothing could have been sent.
+    #[tokio::test]
+    async fn batch_pay_is_held_back() {
+        let network = crate::data::Network::unstarted(&[], true, false)
+            .await
+            .unwrap();
+        let client = Client::from_node(std::sync::Arc::clone(network.node()), Default::default());
+        let error = client.batch_pay(Vec::new()).await.expect_err("held back");
+        assert!(matches!(error, Error::Payment(_)), "{error}");
+        let text = error.to_string();
+        assert!(text.contains("batch_pay is off in this build"), "{text}");
+        assert!(text.contains("batch_upload_chunks"), "{text}");
     }
 }

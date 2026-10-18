@@ -53,6 +53,8 @@ use web_time::Duration;
 use crate::client_engine::{store_retry_delay, STORE_MAX_RETRIES};
 use crate::data::client::batch::ChunkPaymentPlan;
 use crate::data::client::chunk::STORE_RESPONSE_TIMEOUT;
+#[cfg(feature = "native")]
+use crate::data::client::occupied::{occupied_pointer_proof, plan_of_proof};
 use crate::data::client::Client;
 use crate::data::error::{Error, Result};
 use crate::data::network::send_and_await_chunk_response;
@@ -1653,7 +1655,8 @@ impl Client {
         self.pointer_write_group(&address).await?;
 
         // The quote names the state; the peers that may issue it are the close
-        // group around the address. One payment, one state.
+        // group around the address. One payment, one state. The payment has
+        // read its quote's vault record back already.
         let (proof, _) = self
             .pay_for_storage_split(
                 &address,
@@ -1662,7 +1665,7 @@ impl Client {
                 DATA_TYPE_POINTER,
             )
             .await?;
-        self.pointer_put_paid(record, proof).await
+        self.pointer_put_paid_unchecked(record, proof).await
     }
 
     /// Quote a signed pointer's state for a payer outside this client, such as
@@ -1695,11 +1698,52 @@ impl Client {
     /// again: the proof stays valid for its state, and a node that already
     /// holds that state answers as stored.
     ///
+    /// The proof's paid quote is read back from the vault before the state is
+    /// sent. If the vault had already recorded the quote for another payment,
+    /// it skipped this one, and nodes would refuse the state: nothing is sent,
+    /// and the state has to be quoted ([`Self::prepare_pointer_payment`]) and
+    /// paid again. Browser builds read nothing back.
+    ///
     /// # Errors
     ///
-    /// Returns an error if no peer is responsible for the address or if too few
-    /// of the close group accept the record.
+    /// Returns an error if the proof isn't a single-node payment proof, an
+    /// error starting [`QUOTES_OCCUPIED`](crate::data::QUOTES_OCCUPIED)
+    /// naming the node that issued the quote if it was occupied, or an error
+    /// if no peer is responsible for the address or if too few of the close
+    /// group accept the record.
     pub async fn pointer_put_paid(&self, record: &Pointer, proof: Vec<u8>) -> Result<XorName> {
+        self.check_paid_pointer_proof(record, &proof).await?;
+        self.pointer_put_paid_unchecked(record, proof).await
+    }
+
+    /// Refuse a proof for `record`'s state whose paid quote the vault had
+    /// already recorded for another payment (see [`Self::pointer_put_paid`]).
+    #[cfg(feature = "native")]
+    async fn check_paid_pointer_proof(&self, record: &Pointer, proof: &[u8]) -> Result<()> {
+        let plan = plan_of_proof(record.state_id(), POINTER_WIRE_LEN as u64, proof)
+            .map_err(|e| Error::Payment(format!("cannot read the pointer's payment proof: {e}")))?;
+        let occupied = self.occupied_quotes(std::slice::from_ref(&plan)).await;
+        if occupied.is_empty() {
+            return Ok(());
+        }
+        let error = occupied_pointer_proof(&occupied);
+        warn!("{error}");
+        Err(error)
+    }
+
+    /// Browser builds read no records back: the wallet callback owns the RPC.
+    #[cfg(not(feature = "native"))]
+    async fn check_paid_pointer_proof(&self, _record: &Pointer, _proof: &[u8]) -> Result<()> {
+        Ok(())
+    }
+
+    /// [`Self::pointer_put_paid`] without reading the paid quote back, for a
+    /// proof whose payment already read it back ([`Self::pointer_put`]).
+    async fn pointer_put_paid_unchecked(
+        &self,
+        record: &Pointer,
+        proof: Vec<u8>,
+    ) -> Result<XorName> {
         // A write that fell short is retried with the same proof, as a chunk
         // store is: peers that took it the first time answer `Unchanged`, which
         // counts, so each round only has to reach the ones that did not. A

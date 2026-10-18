@@ -10,7 +10,11 @@
 //! its own is quoted again (a fresh quote has a new hash, so a clean record)
 //! and paid again, up to [`MAX_OCCUPIED_REQUOTES`] times.
 
-use super::batch::ChunkPaymentPlan;
+#[cfg(any(feature = "native", test))]
+use super::batch::PaidChunk;
+#[cfg(feature = "native")]
+use super::batch::SingleNodeQuotePayment;
+use super::batch::{ChunkPaymentPlan, PreparedChunk};
 #[cfg(feature = "native")]
 use super::listings::ListingChain;
 use super::Client;
@@ -125,6 +129,42 @@ pub(crate) fn skipped_amount(occupied: &[OccupiedQuote]) -> Amount {
 /// them, oldest first; the error names the nodes that issued them, most often
 /// first.
 pub(crate) fn occupied_error(history: &[OccupiedQuote]) -> Error {
+    Error::Payment(occupied_message(
+        history,
+        "chunk",
+        &format!("after {MAX_OCCUPIED_REQUOTES} fresh quotes the chunk(s) are still unpaid"),
+    ))
+}
+
+/// The error for chunks an outside payer paid whose quote was occupied, found
+/// when the upload is finalized: named as [`occupied_error`] names them, but a
+/// finalize can't quote them again, so they are never sent.
+pub(crate) fn occupied_at_finalize(history: &[OccupiedQuote]) -> Error {
+    Error::Payment(occupied_message(
+        history,
+        "chunk",
+        "a finalize can't quote them again, so the chunk(s) are unpaid and were not sent: \
+         prepare the upload again to quote and pay them afresh",
+    ))
+}
+
+/// The error for a pointer state stored with a paid proof whose quote was
+/// occupied: named as [`occupied_error`] names it, refused before the state
+/// is sent.
+#[cfg(any(feature = "native", test))]
+pub(crate) fn occupied_pointer_proof(history: &[OccupiedQuote]) -> Error {
+    Error::Payment(occupied_message(
+        history,
+        "pointer state",
+        "the state is unpaid and was not sent: quote it again (prepare_pointer_payment) and \
+         pay the new quote",
+    ))
+}
+
+/// The message of the errors above: how many paid quotes of how many records
+/// (`kind`, such as "chunk") were occupied, what became of the records
+/// (`unpaid`), and the nodes that issued the quotes.
+fn occupied_message(history: &[OccupiedQuote], kind: &str, unpaid: &str) -> String {
     let mut by_issuer: Vec<(EncodedPeerId, RewardsAddress, usize)> = Vec::new();
     for quote in history {
         match by_issuer
@@ -157,15 +197,88 @@ pub(crate) fn occupied_error(history: &[OccupiedQuote]) -> Error {
             hex::encode(q.recorded.rewards_prefix)
         )
     });
-    Error::Payment(format!(
+    format!(
         "{QUOTES_OCCUPIED}: the vault already held another payment's record for {} paid quote(s) \
-         of {} chunk(s), so those payments were skipped and moved no tokens; after {} fresh \
-         quotes the chunk(s) are still unpaid. Occupied quotes: {nodes}{}",
+         of {} {kind}(s), so those payments were skipped and moved no tokens; {unpaid}. \
+         Occupied quotes: {nodes}{}",
         history.len(),
         chunks.len(),
-        MAX_OCCUPIED_REQUOTES,
         last.unwrap_or_default()
-    ))
+    )
+}
+
+/// The payment plan of each of `prepared`, to read its paid quote back once
+/// a payer outside this client has paid it.
+pub(crate) fn plans_of(prepared: &[PreparedChunk]) -> Vec<ChunkPaymentPlan> {
+    prepared
+        .iter()
+        .map(|chunk| ChunkPaymentPlan {
+            address: chunk.address,
+            data_size: chunk.content.len() as u64,
+            quoted_peers: Vec::new(),
+            payment: chunk.payment.clone(),
+            peer_quotes: chunk.peer_quotes.clone(),
+            commitment_sidecars: Vec::new(),
+        })
+        .collect()
+}
+
+/// Take out of `paid` the chunks whose paid quote is in `occupied`: the vault
+/// skipped those payments, so nodes would refuse the chunks. Returns the
+/// chunks to store, and each chunk taken out with why
+/// ([`occupied_at_finalize`], naming its own occupied quotes).
+#[cfg(any(feature = "native", test))]
+pub(crate) fn set_aside_occupied(
+    paid: Vec<PaidChunk>,
+    occupied: &[OccupiedQuote],
+) -> (Vec<PaidChunk>, Vec<([u8; 32], String)>) {
+    let mut kept = Vec::with_capacity(paid.len());
+    let mut unpaid = Vec::new();
+    for chunk in paid {
+        let met: Vec<OccupiedQuote> = occupied
+            .iter()
+            .filter(|quote| quote.address == chunk.address)
+            .cloned()
+            .collect();
+        if met.is_empty() {
+            kept.push(chunk);
+        } else {
+            unpaid.push((chunk.address, occupied_at_finalize(&met).to_string()));
+        }
+    }
+    (kept, unpaid)
+}
+
+/// The payment plan a single-node payment proof was paid from, for the
+/// record it pays for (`address`: a chunk's address, or a pointer's state):
+/// the quotes it carries, the median paid three times its price, as
+/// [`SingleNodeQuotePayment::from_quotes`] plans them.
+///
+/// # Errors
+///
+/// Returns why if the proof isn't a single-node proof, or its quotes can't be
+/// planned.
+#[cfg(feature = "native")]
+pub(crate) fn plan_of_proof(
+    address: XorName,
+    data_size: u64,
+    proof: &[u8],
+) -> Result<ChunkPaymentPlan, String> {
+    let (proof, _) = ant_protocol::payment::deserialize_proof(proof)?;
+    let quotes = proof
+        .peer_quotes
+        .iter()
+        .map(|(_, quote)| quote.clone())
+        .collect();
+    let payment = SingleNodeQuotePayment::from_quotes(quotes).map_err(|e| e.to_string())?;
+    Ok(ChunkPaymentPlan {
+        address,
+        data_size,
+        quoted_peers: Vec::new(),
+        payment,
+        peer_quotes: proof.peer_quotes,
+        commitment_sidecars: Vec::new(),
+    })
 }
 
 impl Client {
@@ -481,5 +594,441 @@ mod tests {
         assert!(message.contains("issued 3"), "{message}");
         assert!(message.contains("1 chunk(s)"), "{message}");
         assert!(message.contains(&hex::encode([0xee; 16])), "{message}");
+    }
+}
+
+/// What a payer outside the client paid, read back before anything is stored:
+/// the finalize paths, `finalize_chunk` and `pointer_put_paid`, against a mock
+/// vault RPC. The client's node was never started, so a refusal naming the
+/// occupied quote was made before anything was sent, and a record stored
+/// after an honest payment fails only for want of peers.
+#[cfg(all(test, feature = "native"))]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod outside_payer_tests {
+    use super::*;
+    use crate::data::client::batch::{build_plan_proof, PaymentIntent, PreparedChunk};
+    use crate::data::client::file::{
+        ExternalPaymentInfo, FinalizeOutcome, FinalizeResume, PreparedUpload,
+    };
+    use crate::data::client::listings::test_chain::{serve, MockChain, VAULT};
+    use ant_protocol::compute_address;
+    use ant_protocol::evm::{Address, CustomNetwork, Network as EvmNetwork, PaymentQuote, TxHash};
+    use ant_protocol::pointer::{Pointer, PointerTarget, PointerTargetKind};
+    use bytes::Bytes;
+    use std::sync::{Arc, Mutex};
+    use std::time::SystemTime;
+
+    /// Where an occupier sends its dust.
+    const STRANGER: [u8; 20] = [0xee; 20];
+
+    /// Five quotes for `address`, priced 10 to 50, each node's rewards
+    /// address and peer ID filled with its number; the median is paid 90.
+    fn plan_for(address: XorName, data_size: u64) -> ChunkPaymentPlan {
+        let quotes: Vec<PaymentQuote> = (1..=5u8)
+            .map(|seed| PaymentQuote {
+                content: xor_name::XorName(address),
+                timestamp: SystemTime::now(),
+                price: Amount::from(10 * u64::from(seed)),
+                rewards_address: RewardsAddress::new([seed; 20]),
+                pub_key: vec![seed; 4],
+                signature: vec![seed; 4],
+                committed_key_count: 0,
+                commitment_pin: None,
+            })
+            .collect();
+        ChunkPaymentPlan {
+            address,
+            data_size,
+            quoted_peers: Vec::new(),
+            payment: SingleNodeQuotePayment::from_quotes(quotes.clone()).unwrap(),
+            peer_quotes: quotes
+                .into_iter()
+                .map(|q| (EncodedPeerId::new([q.rewards_address.0[0]; 32]), q))
+                .collect(),
+            commitment_sidecars: Vec::new(),
+        }
+    }
+
+    /// A chunk of `byte` repeated, quoted and planned, not yet paid.
+    fn prepared(byte: u8) -> PreparedChunk {
+        let content = Bytes::from(vec![byte; 1024]);
+        plan_for(compute_address(&content), 1024)
+            .with_content(content)
+            .unwrap()
+    }
+
+    /// The paid quote of `plan`: its hash, rewards address and amount.
+    fn paid_of(plan: &ChunkPaymentPlan) -> (QuoteHash, RewardsAddress, Amount) {
+        let q = plan
+            .payment
+            .quotes
+            .iter()
+            .find(|q| !q.amount.is_zero())
+            .unwrap();
+        (q.quote_hash, q.rewards_address, q.amount)
+    }
+
+    /// How the node that issued `plan`'s paid quote is named in an error.
+    fn issuer_of(plan: &ChunkPaymentPlan) -> String {
+        let (hash, _, _) = paid_of(plan);
+        let (peer, _) = plan
+            .peer_quotes
+            .iter()
+            .find(|(_, q)| q.hash() == hash)
+            .unwrap();
+        format!("node {}", hex::encode(peer.as_bytes()))
+    }
+
+    /// A transaction for every paid quote of `plans`, as an outside payer
+    /// hands them back.
+    fn transactions(plans: &[ChunkPaymentPlan]) -> HashMap<QuoteHash, TxHash> {
+        plans
+            .iter()
+            .zip(1u8..)
+            .map(|(plan, n)| (paid_of(plan).0, TxHash::from([n; 32])))
+            .collect()
+    }
+
+    /// The vault's record of `plan`'s paid quote: the payment itself, or,
+    /// `occupied`, a stranger's dust recorded first.
+    fn vault_record(plan: &ChunkPaymentPlan, occupied: bool) -> (QuoteHash, VaultRecord) {
+        let (hash, rewards, amount) = paid_of(plan);
+        let (rewards, amount) = if occupied {
+            (RewardsAddress::new(STRANGER), Amount::from(1u64))
+        } else {
+            (rewards, amount)
+        };
+        let mut rewards_prefix = [0u8; 16];
+        rewards_prefix.copy_from_slice(&rewards.as_slice()[..16]);
+        (
+            hash,
+            VaultRecord {
+                rewards_prefix,
+                amount,
+            },
+        )
+    }
+
+    /// A client of the vault behind a mock RPC that holds `records`, its
+    /// node never started; and the network, kept for the client's life.
+    async fn client_of(records: &[(QuoteHash, VaultRecord)]) -> (Client, crate::data::Network) {
+        let mut chain = MockChain::default();
+        for (hash, record) in records {
+            chain
+                .vault_records
+                .insert(hash.0, (record.rewards_prefix, record.amount.to::<u128>()));
+        }
+        let url = serve(Arc::new(Mutex::new(chain))).await;
+        let network = crate::data::Network::unstarted(&[], true, false)
+            .await
+            .unwrap();
+        let client = Client::from_node(Arc::clone(network.node()), Default::default())
+            .with_evm_network(EvmNetwork::Custom(CustomNetwork {
+                rpc_url_http: url.parse().unwrap(),
+                payment_token_address: Address::from([0x11; 20]),
+                payment_vault_address: Address::from(VAULT),
+            }));
+        (client, network)
+    }
+
+    /// An upload of `chunks`, prepared for an outside payer.
+    fn upload_of(chunks: Vec<PreparedChunk>) -> PreparedUpload {
+        let total_chunks = chunks.len();
+        let payment_intent = PaymentIntent::from_prepared_chunks(&chunks);
+        PreparedUpload {
+            data_map: self_encryption::DataMap::new(Vec::new()),
+            payment_info: ExternalPaymentInfo::WaveBatch {
+                prepared_chunks: chunks,
+                payment_intent,
+            },
+            data_map_address: None,
+            already_stored_addresses: Vec::new(),
+            total_chunks,
+            envelope: None,
+        }
+    }
+
+    /// The errors name the node whose quote was occupied and say what became
+    /// of the record: an upload quoted it again 3 times; a finalize or a
+    /// pointer write can't quote it again.
+    #[test]
+    fn each_occupied_error_names_the_node_and_what_became_of_the_record() {
+        let plan = plan_for([4; 32], 1024);
+        let records = HashMap::from([vault_record(&plan, true)]);
+        let occupied = occupied_in(std::slice::from_ref(&plan), &records);
+        let messages = [
+            occupied_error(&occupied).to_string(),
+            occupied_at_finalize(&occupied).to_string(),
+            occupied_pointer_proof(&occupied).to_string(),
+        ];
+        for message in &messages {
+            assert!(message.contains(QUOTES_OCCUPIED), "{message}");
+            assert!(message.contains(&issuer_of(&plan)), "{message}");
+            assert!(message.contains(&hex::encode(&STRANGER[..16])), "{message}");
+        }
+        assert!(messages[0].contains("of 1 chunk(s)"), "{}", messages[0]);
+        assert!(
+            messages[0].contains("after 3 fresh quotes the chunk(s) are still unpaid"),
+            "{}",
+            messages[0]
+        );
+        assert!(messages[1].contains("of 1 chunk(s)"), "{}", messages[1]);
+        assert!(
+            messages[1].contains("a finalize can't quote them again")
+                && !messages[1].contains("fresh quotes"),
+            "{}",
+            messages[1]
+        );
+        assert!(
+            messages[2].contains("of 1 pointer state(s)"),
+            "{}",
+            messages[2]
+        );
+        assert!(
+            messages[2].contains("prepare_pointer_payment"),
+            "{}",
+            messages[2]
+        );
+    }
+
+    /// Only the chunks whose quote was occupied are set aside, each named
+    /// with its own quote; the plans read back are what the chunks pay.
+    #[test]
+    fn only_occupied_chunks_are_set_aside() {
+        let chunks = vec![prepared(1), prepared(2), prepared(3)];
+        let plans = plans_of(&chunks);
+        for (plan, chunk) in plans.iter().zip(&chunks) {
+            assert_eq!(plan.address, chunk.address);
+            assert_eq!(plan.data_size, chunk.content.len() as u64);
+            assert_eq!(plan.peer_quotes.len(), chunk.peer_quotes.len());
+        }
+        assert_eq!(
+            paid_quotes(&plans),
+            PaymentIntent::from_prepared_chunks(&chunks)
+                .payments
+                .iter()
+                .map(|(hash, _, _)| *hash)
+                .collect::<Vec<_>>()
+        );
+        let records = HashMap::from([
+            vault_record(&plans[0], false),
+            vault_record(&plans[1], true),
+        ]);
+        let occupied = occupied_in(&plans, &records);
+        let paid =
+            crate::data::client::batch::finalize_batch_payment(chunks, &transactions(&plans))
+                .unwrap();
+        let (kept, unpaid) = set_aside_occupied(paid, &occupied);
+        let kept: Vec<XorName> = kept.iter().map(|chunk| chunk.address).collect();
+        assert_eq!(kept, vec![plans[0].address, plans[2].address]);
+        assert_eq!(unpaid.len(), 1);
+        assert_eq!(unpaid[0].0, plans[1].address);
+        assert!(unpaid[0].1.contains(QUOTES_OCCUPIED), "{}", unpaid[0].1);
+        assert!(
+            unpaid[0].1.contains(&issuer_of(&plans[1])),
+            "{}",
+            unpaid[0].1
+        );
+    }
+
+    /// A single-node proof plans back to the payment it carries; anything
+    /// else is refused.
+    #[test]
+    fn a_proof_plans_back_to_the_payment_it_carries() {
+        let plan = plan_for([5; 32], 2048);
+        let proof = build_plan_proof(&plan, &transactions(std::slice::from_ref(&plan))).unwrap();
+        let back = plan_of_proof(plan.address, 2048, &proof).unwrap();
+        let quotes = |plan: &ChunkPaymentPlan| {
+            plan.payment
+                .quotes
+                .iter()
+                .map(|q| (q.quote_hash, q.rewards_address, q.amount))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(quotes(&back), quotes(&plan));
+        assert_eq!(back.address, plan.address);
+        assert_eq!(back.peer_quotes.len(), plan.peer_quotes.len());
+        assert!(plan_of_proof(plan.address, 2048, b"not a proof").is_err());
+    }
+
+    /// `finalize_upload` sets the chunk whose quote was occupied aside before
+    /// storing: it fails naming the node, is never sent, and the cost leaves
+    /// its skipped payment out. The other chunk goes on to the store, which
+    /// fails here for want of peers.
+    #[tokio::test]
+    async fn finalize_upload_sets_an_occupied_chunk_aside() {
+        let plans = plans_of(&[prepared(1), prepared(2)]);
+        let (client, _network) = client_of(&[
+            vault_record(&plans[0], true),
+            vault_record(&plans[1], false),
+        ])
+        .await;
+        let error = client
+            .finalize_upload(
+                upload_of(vec![prepared(1), prepared(2)]),
+                &transactions(&plans),
+            )
+            .await
+            .expect_err("an occupied chunk can't complete the upload");
+        let Error::PartialUpload {
+            stored,
+            failed,
+            spend,
+            reason,
+            ..
+        } = error
+        else {
+            panic!("expected a partial upload, got {error}");
+        };
+        assert!(stored.is_empty());
+        assert_eq!(failed.len(), 2);
+        assert_eq!(
+            failed[0].0, plans[0].address,
+            "the occupied chunk comes first"
+        );
+        assert!(failed[0].1.contains(QUOTES_OCCUPIED), "{}", failed[0].1);
+        assert!(
+            failed[0].1.contains(&issuer_of(&plans[0])),
+            "{}",
+            failed[0].1
+        );
+        assert_eq!(failed[1].0, plans[1].address);
+        assert!(!failed[1].1.contains(QUOTES_OCCUPIED), "{}", failed[1].1);
+        assert_eq!(spend.storage_cost_atto, paid_of(&plans[1]).2.to_string());
+        assert!(reason.starts_with("finalize_upload: "), "{reason}");
+        assert!(reason.contains(QUOTES_OCCUPIED), "{reason}");
+    }
+
+    /// The resumable finalize does the same and leaves the occupied chunk out
+    /// of the resume handle, which lists it; a resume reports it failed
+    /// again and never completes the upload.
+    #[tokio::test]
+    async fn the_resumable_finalize_keeps_an_occupied_chunk_out_of_the_handle() {
+        let plans = plans_of(&[prepared(1), prepared(2)]);
+        let (client, _network) = client_of(&[
+            vault_record(&plans[0], true),
+            vault_record(&plans[1], false),
+        ])
+        .await;
+        let outcome = client
+            .finalize_upload_resumable(
+                upload_of(vec![prepared(1), prepared(2)]),
+                &transactions(&plans),
+            )
+            .await
+            .unwrap();
+        let FinalizeOutcome::Partial { result, resume } = outcome else {
+            panic!("an occupied chunk can't complete the upload");
+        };
+        assert_eq!(result.chunks_stored, 0);
+        assert_eq!(result.chunks_failed, 2);
+        assert_eq!(result.storage_cost_atto, paid_of(&plans[1]).2.to_string());
+        let FinalizeResume::Wave(handle) = &resume else {
+            panic!("expected a wave handle");
+        };
+        assert_eq!(handle.occupied().len(), 1);
+        assert_eq!(handle.occupied()[0].0, plans[0].address);
+        let shown = format!("{handle:?}");
+        assert!(
+            shown.contains("unstored: 1") && shown.contains("occupied: 1"),
+            "{shown}"
+        );
+
+        let FinalizeOutcome::Partial { result, resume } =
+            client.finalize_resume(resume).await.unwrap()
+        else {
+            panic!("a resume can't complete it either");
+        };
+        assert_eq!(result.chunks_failed, 2);
+        let FinalizeResume::Wave(handle) = &resume else {
+            panic!("expected a wave handle");
+        };
+        assert_eq!(handle.occupied()[0].0, plans[0].address);
+    }
+
+    /// `finalize_chunk` refuses an occupied chunk before sending it; an
+    /// honest payment goes on to the store.
+    #[tokio::test]
+    async fn finalize_chunk_refuses_an_occupied_chunk_before_sending() {
+        let plans = plans_of(&[prepared(1), prepared(2)]);
+        let (client, _network) = client_of(&[
+            vault_record(&plans[0], true),
+            vault_record(&plans[1], false),
+        ])
+        .await;
+        let refused = client
+            .finalize_chunk(prepared(1), &transactions(&plans[..1]))
+            .await
+            .expect_err("occupied");
+        let text = refused.to_string();
+        assert!(matches!(refused, Error::Payment(_)), "{text}");
+        assert!(text.contains(QUOTES_OCCUPIED), "{text}");
+        assert!(text.contains(&issuer_of(&plans[0])), "{text}");
+        assert!(text.contains("a finalize can't quote them again"), "{text}");
+        let stored = client
+            .finalize_chunk(prepared(2), &transactions(&plans[1..]))
+            .await
+            .expect_err("no peers to store on");
+        assert!(!stored.to_string().contains(QUOTES_OCCUPIED), "{stored}");
+    }
+
+    /// `pointer_put_paid` reads the proof's paid quote back and refuses an
+    /// occupied one before sending the state; an honest proof goes on to the
+    /// write, and a proof that isn't a single-node proof is refused.
+    #[tokio::test]
+    async fn pointer_put_paid_refuses_an_occupied_proof_before_sending() {
+        let (owner, secret) =
+            ant_protocol::pqc::api::ml_dsa_65().generate_keypair_from_seed(&[9; 32]);
+        let first = Pointer::create(
+            &secret,
+            &owner,
+            PointerTarget::new(PointerTargetKind::Chunk, [1; 32]),
+        )
+        .unwrap();
+        let second = first
+            .update(
+                &secret,
+                PointerTarget::new(PointerTargetKind::Chunk, [2; 32]),
+            )
+            .unwrap();
+        let size = ant_protocol::pointer::POINTER_WIRE_LEN as u64;
+        let plans = [
+            plan_for(first.state_id(), size),
+            plan_for(second.state_id(), size),
+        ];
+        let (client, _network) = client_of(&[
+            vault_record(&plans[0], true),
+            vault_record(&plans[1], false),
+        ])
+        .await;
+        let proof = |plan: &ChunkPaymentPlan| {
+            build_plan_proof(plan, &transactions(std::slice::from_ref(plan))).unwrap()
+        };
+
+        let refused = client
+            .pointer_put_paid(&first, proof(&plans[0]))
+            .await
+            .expect_err("occupied");
+        let text = refused.to_string();
+        assert!(text.contains(QUOTES_OCCUPIED), "{text}");
+        assert!(text.contains("of 1 pointer state(s)"), "{text}");
+        assert!(text.contains(&issuer_of(&plans[0])), "{text}");
+
+        let written = client
+            .pointer_put_paid(&second, proof(&plans[1]))
+            .await
+            .expect_err("no peers to write to");
+        assert!(!written.to_string().contains(QUOTES_OCCUPIED), "{written}");
+
+        let garbage = client
+            .pointer_put_paid(&second, b"not a proof".to_vec())
+            .await
+            .expect_err("unreadable proof");
+        assert!(
+            garbage
+                .to_string()
+                .contains("cannot read the pointer's payment proof"),
+            "{garbage}"
+        );
     }
 }

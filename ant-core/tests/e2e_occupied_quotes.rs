@@ -5,7 +5,8 @@
 //! paid (realistically the node that issued it) can record it first with a
 //! dust payment to an address of its own. These tests play that node: each
 //! payment's first quote is recorded with 1 atto to a stranger's address just
-//! before the upload pays it.
+//! before the upload pays it, or, for a payer outside the client, just before
+//! that payer pays.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
@@ -14,14 +15,18 @@ mod support;
 use ant_core::data::client::upload::{UploadAdapter, UploadPayment, UploadRecord};
 use ant_core::data::client::upload_state::UploadState;
 use ant_core::data::{
-    compute_address, ChunkPaymentPlan, Client, Error, PaymentMode, MAX_OCCUPIED_REQUOTES,
-    QUOTES_OCCUPIED,
+    compute_address, ml_dsa_65, ChunkPaymentPlan, Client, Error, ExternalPaymentInfo,
+    FinalizeOutcome, FinalizeResume, PaymentMode, Pointer, PointerTarget, PointerTargetKind,
+    SingleNodeQuotePayment, MAX_OCCUPIED_REQUOTES, QUOTES_OCCUPIED,
 };
 use ant_protocol::evm::contract::payment_vault::interface::IPaymentVault;
 use ant_protocol::evm::utils::http_provider;
-use ant_protocol::evm::{Amount, EncodedPeerId, QuoteHash, RewardsAddress, Wallet};
+use ant_protocol::evm::{
+    Amount, EncodedPeerId, PaymentQuote, QuoteHash, RewardsAddress, TxHash, Wallet,
+};
 use bytes::Bytes;
 use serial_test::serial;
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use support::{test_client_config, MiniTestnet, DEFAULT_NODE_COUNT};
 
@@ -238,6 +243,274 @@ async fn a_chunk_whose_quotes_keep_being_occupied_names_the_node() {
     assert!(
         reason.contains(&format!("node {}", hex::encode(issuer.as_bytes()))),
         "{reason}"
+    );
+
+    drop(client);
+    testnet.teardown().await;
+}
+
+/// Record `hash`'s payment first, with 1 atto to the stranger, as the node
+/// that issued the quote could.
+async fn occupy(wallet: &Wallet, hash: QuoteHash) {
+    wallet
+        .pay_for_quotes([(hash, RewardsAddress::new(STRANGER), Amount::from(1u64))])
+        .await
+        .expect("occupy the quote");
+}
+
+/// The paid quote of a payment: its hash, the node that issued it, and the
+/// amount.
+fn paid_quote(
+    payment: &SingleNodeQuotePayment,
+    peer_quotes: &[(EncodedPeerId, PaymentQuote)],
+) -> (QuoteHash, EncodedPeerId, Amount) {
+    let paid = payment
+        .quotes
+        .iter()
+        .find(|quote| !quote.amount.is_zero())
+        .expect("a paid quote");
+    let issuer = peer_quotes
+        .iter()
+        .find(|(_, quote)| quote.hash() == paid.quote_hash)
+        .map(|(peer, _)| peer.clone())
+        .expect("its issuer");
+    (paid.quote_hash, issuer, paid.amount)
+}
+
+/// The non-zero payments of `payment`.
+fn payments_of(payment: &SingleNodeQuotePayment) -> Vec<(QuoteHash, RewardsAddress, Amount)> {
+    payment
+        .quotes
+        .iter()
+        .filter(|quote| !quote.amount.is_zero())
+        .map(|quote| (quote.quote_hash, quote.rewards_address, quote.amount))
+        .collect()
+}
+
+/// Pay `payments` as a payer outside the client does, returning the
+/// transaction of each quote.
+async fn pay_outside(
+    wallet: &Wallet,
+    payments: Vec<(QuoteHash, RewardsAddress, Amount)>,
+) -> HashMap<QuoteHash, TxHash> {
+    let (transactions, _) = wallet.pay_for_quotes(payments).await.expect("pay");
+    transactions.into_iter().collect()
+}
+
+/// A payer outside the client pays an upload whose content chunk's quote
+/// was occupied just before. `finalize_upload` and the resumable finalize
+/// read every paid quote back before storing: the occupied chunk is never
+/// sent and fails naming the node that issued its quote, the other chunks
+/// are stored, the envelope is held back, and the cost leaves the skipped
+/// payment out. The resume handle leaves the chunk out, so a resume never
+/// completes the upload.
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn an_outside_payers_occupied_quote_is_set_aside_at_finalize() {
+    let (client, testnet) = setup().await;
+    for resumable in [false, true] {
+        let content: Vec<u8> = (0..20_000).map(|_| rand::random::<u8>()).collect();
+        let prepared = client
+            .data_prepare_upload(Bytes::from(content))
+            .await
+            .expect("prepare");
+        let envelope = prepared.envelope.as_ref().expect("an envelope").address();
+        let ExternalPaymentInfo::WaveBatch {
+            prepared_chunks,
+            payment_intent,
+        } = &prepared.payment_info
+        else {
+            panic!("expected a wave batch");
+        };
+        let chunk = prepared_chunks
+            .iter()
+            .find(|chunk| chunk.address != envelope)
+            .expect("a content chunk");
+        let others: Vec<[u8; 32]> = prepared_chunks
+            .iter()
+            .map(|other| other.address)
+            .filter(|address| *address != chunk.address && *address != envelope)
+            .collect();
+        let occupied_chunk = chunk.address;
+        let (hash, issuer, skipped) = paid_quote(&chunk.payment, &chunk.peer_quotes);
+        let total = payment_intent.total_amount;
+        occupy(testnet.wallet(), hash).await;
+        let transactions = pay_outside(testnet.wallet(), payment_intent.payments.clone()).await;
+        let named = |reason: &str| {
+            reason.contains(QUOTES_OCCUPIED)
+                && reason.contains(&format!("node {}", hex::encode(issuer.as_bytes())))
+        };
+
+        if resumable {
+            let outcome = client
+                .finalize_upload_resumable(prepared, &transactions)
+                .await
+                .expect("finalize");
+            let FinalizeOutcome::Partial { result, resume } = outcome else {
+                panic!("an occupied chunk can't complete the upload");
+            };
+            assert_eq!(result.chunks_stored, others.len());
+            assert_eq!(
+                result.chunks_failed, 2,
+                "the occupied chunk and the envelope"
+            );
+            assert_eq!(result.storage_cost_atto, (total - skipped).to_string());
+            let FinalizeResume::Wave(handle) = &resume else {
+                panic!("expected a wave handle");
+            };
+            assert_eq!(handle.occupied().len(), 1);
+            assert_eq!(handle.occupied()[0].0, occupied_chunk);
+            assert!(named(&handle.occupied()[0].1), "{}", handle.occupied()[0].1);
+            let FinalizeOutcome::Partial { result, .. } =
+                client.finalize_resume(resume).await.expect("resume")
+            else {
+                panic!("a resume can't complete it either");
+            };
+            assert_eq!(result.chunks_failed, 2);
+        } else {
+            let error = client
+                .finalize_upload(prepared, &transactions)
+                .await
+                .expect_err("an occupied chunk can't complete the upload");
+            let Error::PartialUpload {
+                mut stored,
+                failed,
+                spend,
+                ..
+            } = error
+            else {
+                panic!("expected a partial upload, got {error}");
+            };
+            stored.sort_unstable();
+            let mut expected = others.clone();
+            expected.sort_unstable();
+            assert_eq!(stored, expected, "every other chunk is stored");
+            assert_eq!(failed.len(), 2);
+            assert_eq!(failed[0].0, occupied_chunk);
+            assert!(named(&failed[0].1), "{}", failed[0].1);
+            assert_eq!(failed[1].0, envelope, "the envelope is held back");
+            assert_eq!(spend.storage_cost_atto, (total - skipped).to_string());
+        }
+
+        for address in &others {
+            assert!(client.chunk_get(address).await.expect("fetch").is_some());
+        }
+        assert!(client
+            .chunk_get(&occupied_chunk)
+            .await
+            .expect("fetch")
+            .is_none());
+        assert!(client.chunk_get(&envelope).await.expect("fetch").is_none());
+        assert_eq!(
+            record(&testnet, hash).await,
+            (STRANGER[..16].try_into().unwrap(), 1)
+        );
+    }
+
+    drop(client);
+    testnet.teardown().await;
+}
+
+/// `finalize_chunk`, and `pointer_put_paid` after `prepare_pointer_payment`,
+/// refuse a quote occupied before the outside payer paid it, naming the node,
+/// and send nothing; a fresh quote paid honestly is stored.
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn finalize_chunk_and_pointer_put_paid_refuse_an_occupied_quote() {
+    let (client, testnet) = setup().await;
+    let wallet = testnet.wallet();
+
+    let content = Bytes::from((0..2_000).map(|_| rand::random::<u8>()).collect::<Vec<_>>());
+    let address = compute_address(&content);
+    let prepared = client
+        .prepare_chunk_payment(content.clone())
+        .await
+        .expect("quote")
+        .expect("not stored yet");
+    let (hash, issuer, _) = paid_quote(&prepared.payment, &prepared.peer_quotes);
+    occupy(wallet, hash).await;
+    let transactions = pay_outside(wallet, payments_of(&prepared.payment)).await;
+    let refused = client
+        .finalize_chunk(prepared, &transactions)
+        .await
+        .expect_err("occupied");
+    let text = refused.to_string();
+    assert!(text.contains(QUOTES_OCCUPIED), "{text}");
+    assert!(
+        text.contains(&format!("node {}", hex::encode(issuer.as_bytes()))),
+        "{text}"
+    );
+    assert!(client.chunk_get(&address).await.expect("fetch").is_none());
+    let prepared = client
+        .prepare_chunk_payment(content.clone())
+        .await
+        .expect("quote again")
+        .expect("still not stored");
+    let transactions = pay_outside(wallet, payments_of(&prepared.payment)).await;
+    assert_eq!(
+        client
+            .finalize_chunk(prepared, &transactions)
+            .await
+            .expect("an honest payment is stored"),
+        address
+    );
+    assert_eq!(
+        client
+            .chunk_get(&address)
+            .await
+            .expect("fetch")
+            .expect("stored")
+            .content,
+        content
+    );
+
+    let (owner, secret) = ml_dsa_65().generate_keypair().expect("owner key");
+    let record = Pointer::create(
+        &secret,
+        &owner,
+        PointerTarget::new(PointerTargetKind::Chunk, address),
+    )
+    .expect("sign");
+    let plan = client
+        .prepare_pointer_payment(&record)
+        .await
+        .expect("quote the state");
+    let (hash, issuer, _) = paid_quote(&plan.payment, &plan.peer_quotes);
+    occupy(wallet, hash).await;
+    let transactions = pay_outside(wallet, payments_of(&plan.payment)).await;
+    let refused = client
+        .pointer_put_paid(&record, plan.proof(&transactions).expect("proof"))
+        .await
+        .expect_err("occupied");
+    let text = refused.to_string();
+    assert!(text.contains(QUOTES_OCCUPIED), "{text}");
+    assert!(text.contains("pointer state"), "{text}");
+    assert!(
+        text.contains(&format!("node {}", hex::encode(issuer.as_bytes()))),
+        "{text}"
+    );
+    assert!(client
+        .pointer_get(&record.address())
+        .await
+        .expect("read")
+        .is_none());
+    let plan = client
+        .prepare_pointer_payment(&record)
+        .await
+        .expect("quote the state again");
+    let transactions = pay_outside(wallet, payments_of(&plan.payment)).await;
+    client
+        .pointer_put_paid(&record, plan.proof(&transactions).expect("proof"))
+        .await
+        .expect("an honest payment is stored");
+    assert_eq!(
+        client
+            .pointer_get(&record.address())
+            .await
+            .expect("read")
+            .expect("present")
+            .state_id(),
+        record.state_id()
     );
 
     drop(client);

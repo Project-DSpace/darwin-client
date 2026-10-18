@@ -214,6 +214,7 @@ fn classify_peer_attempt(
 use crate::client_engine::single_flight::Flown;
 use crate::data::client::adaptive::Outcome;
 use crate::data::client::batch::{finalize_batch_payment, PreparedChunk};
+use crate::data::client::occupied::{occupied_at_finalize, plans_of};
 use crate::data::client::peer_xor_distance;
 use crate::data::client::Client;
 use crate::data::error::{Error, Result};
@@ -1251,16 +1252,24 @@ impl Client {
     /// Merkle batching: one chunk's worth of quotes is well below the
     /// wave-batch threshold.
     ///
+    /// The paid quote's vault record is read back before the chunk is sent.
+    /// If the vault had already recorded the quote for another payment, it
+    /// skipped this one, so nodes would refuse the chunk: it is not sent, and
+    /// has to be prepared again, since nothing here can quote it again.
+    ///
     /// # Errors
     ///
     /// Returns an error if the proof construction fails (e.g. missing
-    /// `tx_hash` for a non-zero quote) or if fewer than
+    /// `tx_hash` for a non-zero quote), an error starting
+    /// [`QUOTES_OCCUPIED`](crate::data::QUOTES_OCCUPIED) naming the node that
+    /// issued the quote if it was occupied, or an error if fewer than
     /// `CLOSE_GROUP_MAJORITY` peers accept the chunk.
     pub async fn finalize_chunk(
         &self,
         prepared: PreparedChunk,
         tx_hash_map: &HashMap<QuoteHash, TxHash>,
     ) -> Result<XorName> {
+        let plans = plans_of(std::slice::from_ref(&prepared));
         let mut paid = finalize_batch_payment(vec![prepared], tx_hash_map)?;
         // finalize_batch_payment returns one PaidChunk per PreparedChunk
         // input; we passed exactly one. If that invariant is ever violated
@@ -1272,6 +1281,12 @@ impl Client {
                     .into(),
             )
         })?;
+        let occupied = self.occupied_quotes(&plans).await;
+        if !occupied.is_empty() {
+            let error = occupied_at_finalize(&occupied);
+            warn!("{error}");
+            return Err(error);
+        }
         self.chunk_put_to_close_group(chunk.content, chunk.proof_bytes, &chunk.quoted_peers)
             .await
     }

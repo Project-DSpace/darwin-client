@@ -15,7 +15,7 @@
 //! user had to re-quote and re-pay on the next attempt.
 //!
 //! This module persists the `(chunk_address, proof_bytes)` pair to
-//! disk **immediately after each wave's `batch_pay` confirms**, before
+//! disk **immediately after each wave's payment confirms**, before
 //! the wave's PUT phase begins. On the next upload attempt for the same
 //! source file, the cache is loaded and any chunk whose address matches
 //! the current encryption skips quote+pay and goes straight to PUT.

@@ -24,11 +24,20 @@ told apart by the commit `darwin --version` prints. Upstream's entries follow.
 - Uploads read every paid quote's vault record back after paying. A quote someone else recorded
   first (the vault then skips the payment, with no revert and no event) is quoted again and paid
   again, up to 3 times per chunk; after that the chunk fails with a `quotes occupied` error naming
-  the node that issued the quotes. Applies to uploads paid by the wallet or an outside payer, and
-  to single records (`chunk_put`, pointers). The records are read through the payment network's
-  RPC and then, on the bundled network, the RPCs reads of payments fall back to, each call within
-  15 seconds; before, through its RPC alone, with no time limit. Browser builds don't read records
-  back.
+  the node that issued the quotes. Applies to uploads paid by the wallet or an outside payer
+  (`UploadPayer`), and to single records (`chunk_put`, pointer create, update and transfer). A
+  payment made outside the client and handed to it to store is read back before anything is sent:
+  `finalize_upload` and `finalize_upload_resumable` don't send a chunk whose quote was occupied,
+  which fails with the same error (a finalize can't quote it again, so the upload has to be
+  prepared again), hold the envelope back, report the cost without the skipped payment, and leave
+  the chunk out of the resume handle, which lists it (`WaveFinalizeResume::occupied`);
+  `finalize_chunk` and `pointer_put_paid` refuse it before sending. `batch_pay`, which paid with
+  no read-back and had no callers, is off: it returns an error naming `batch_upload_chunks`. The
+  merkle finalize paths and the raw building blocks (`chunk_put_with_proof`,
+  `finalize_batch_payment`, `SingleNodeQuotePayment::pay`) read nothing back. The records are read
+  through the payment network's RPC and then, on the bundled network, the RPCs reads of payments
+  fall back to, each call within 15 seconds; before, through its RPC alone, with no time limit.
+  Browser builds don't read records back.
 - Uploads and pointer writes from the browser core are off in this build: `uploadPublicFile`,
   `uploadStagedPublicFile`, `uploadRecords`, `createPointer`, `updatePointer`, `transferPointer`
   and `storePaidPointer` refuse before any quote, wallet callback or request, until they carry
