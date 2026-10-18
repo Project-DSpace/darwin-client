@@ -154,10 +154,9 @@ told apart by the commit `darwin --version` prints. Upstream's entries follow.
   `ant_core::config::resolve_evm_network` refuses them too (`UnsupportedEvmNetwork`);
   `token_symbol` names no token but the bundled network's.
 - The CLI is `darwin`, shows costs in the payment token, and has self-update turned off.
-- `darwin chunk put` is off: it stored a paid raw chunk, which has no data map and so can't carry
-  an envelope, with no payment record, listing or `.record`. It fails before reading its input
-  or `SECRET_KEY`, or joining the network, and names `darwin file upload`. `darwin chunk get`
-  and the library's `Client::chunk_put` are unchanged.
+- `darwin chunk put` stores a raw chunk, as upstream's does. A raw chunk has no data map, so it
+  carries no envelope: no payment record, listing or `.record`. `darwin file upload` is the
+  standard way to store a file.
 - `darwin node`, upstream's node manager, is off: it installed Autonomi's `ant-node` from
   WithAutonomi's releases, which joins Autonomi's network and is paid on Arbitrum, and its log
   forwarding shipped node logs to Autonomi's endpoint. Every `darwin node` command, the hidden

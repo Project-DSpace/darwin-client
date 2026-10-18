@@ -223,16 +223,20 @@ darwin file download abc123... -o photo_copy.jpg \
     --devnet-manifest ~/.local/share/ant/devnet-manifest.json --allow-loopback --evm-network local
 ```
 
-### Low-level chunk reads
+### Low-level chunk operations
 
 ```bash
-# Read a single chunk by its address
-darwin chunk get abc123def456... -o chunk.bin
+# Store a single raw chunk (< 1 MB), with no envelope
+echo "hello darwin" | SECRET_KEY=0x... darwin chunk put
+# Output: abc123def456...
+
+# Retrieve it
+darwin chunk get abc123def456...
+# Output: hello darwin
 ```
 
-`darwin chunk put` is off in this build: a raw chunk can't carry an envelope, so it would be
-stored without the payment record, listing and `.record` every upload carries. Upload with
-`darwin file upload`.
+A raw chunk has no data map, so it carries no envelope: no payment record, listing or `.record`.
+`darwin file upload` is the standard way to store a file.
 
 ---
 
@@ -427,15 +431,19 @@ Asks the 7 nodes nearest the address for its listing, in the index or not, and c
 
 ### `darwin chunk` — Single-Chunk Operations
 
-Low-level reads of individual chunks (max ~1 MB each).
+Low-level put/get for individual chunks (max ~1 MB each). Useful for small data or building custom data structures.
 
 #### `darwin chunk put [FILE]`
 
-Off in this build: `darwin chunk put` exits with an error, before it reads its input or
-`SECRET_KEY` or joins the network. A raw chunk has no data map, so it can't carry an envelope,
-and it would be stored without the payment record, listing and `.record` every upload carries.
-Use `darwin file upload <FILE>`: private by default, with every payment field shown. The
-library's `Client::chunk_put` is unchanged.
+Store a single raw chunk. Reads from `FILE` or stdin. Requires `SECRET_KEY`. A raw chunk has no
+data map, so it carries no envelope: no payment record, listing or `.record`, unlike
+`darwin file upload`, the standard way to store a file. It is paid per chunk in DARWIN, with the
+read-back of paid quotes and `--max-chunk-price`, as uploads are.
+
+```
+$ echo "small payload" | SECRET_KEY=0x... darwin chunk put
+a1b2c3d4...
+```
 
 #### `darwin chunk get <ADDRESS>`
 

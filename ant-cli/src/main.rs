@@ -177,8 +177,6 @@ async fn run() -> anyhow::Result<()> {
             result?;
         }
         Commands::Chunk { action } => {
-            // `chunk put` is off: refused before SECRET_KEY or the network.
-            action.validate()?;
             let needs_wallet = matches!(action, commands::data::ChunkAction::Put { .. });
             let client = build_data_client(&data_ctx, needs_wallet, json, None, None).await?;
             let result = action.execute(&client).await;

@@ -1,6 +1,6 @@
 //! The `darwin` binary as users run it: commands this build holds back are
 //! refused before they read a key, touch the data or config directories, or
-//! reach a network.
+//! reach a network, and commands it keeps get as far as asking for the key.
 //!
 //! Each run gets home, data and config directories of its own, which must
 //! still be empty afterwards; `SECRET_KEY` is unset; and every proxy variable
@@ -25,10 +25,9 @@ const RUN_LIMIT: Duration = Duration::from_secs(60);
 /// if a process it started holds its stdout or stderr open.
 const OUTPUT_GRACE: Duration = Duration::from_secs(10);
 
-/// What `darwin chunk put` says while raw chunks are off.
-const CHUNK_PUT_OFF: &str = "`darwin chunk put` is off in this build: a raw chunk can't carry an \
-     envelope, so it would be stored without the payment record, listing and .record every upload \
-     carries. Use `darwin file upload <FILE>`: private by default, every payment field shown.";
+/// What a paid command says when `SECRET_KEY` is unset, before it reads its
+/// input or joins the network.
+const NEEDS_KEY: &str = "SECRET_KEY environment variable required for this operation";
 
 /// What every `darwin node` command says while the node manager is off.
 const NODE_OFF: &str = "`darwin node` is off in this build: it would install Autonomi's ant-node, \
@@ -183,10 +182,12 @@ fn assert_refused(args: &[&str], run: &Run, message: &str) {
     assert!(run.left_behind.is_empty(), "darwin {args:?}: {run:#?}");
 }
 
-/// `darwin chunk put` is off: refused from a file and from stdin, before
-/// `SECRET_KEY` is asked for or the network is joined.
+/// `darwin chunk put` is available: from a file or from stdin it goes on to
+/// ask for `SECRET_KEY`, as every paid command does first, and nothing turns
+/// it away before that. Its help says it stores a raw chunk with no
+/// envelope, and names the standard way to store a file.
 #[test]
-fn chunk_put_is_refused() {
+fn chunk_put_asks_for_the_key_and_says_it_stores_a_raw_chunk() {
     let input = tempfile::tempdir().expect("a temporary folder");
     let file = input.path().join("chunk.bin");
     std::fs::write(&file, b"hello darwin").expect("a chunk to store");
@@ -197,8 +198,21 @@ fn chunk_put_is_refused() {
         &["--json", "chunk", "put", file],
     ] {
         let run = darwin(args, b"hello darwin");
-        assert_refused(args, &run, CHUNK_PUT_OFF);
+        assert_refused(args, &run, NEEDS_KEY);
+        assert!(!run.stderr.contains("off in this build"), "{run:#?}");
     }
+
+    let args = ["chunk", "put", "--help"];
+    let run = darwin(&args, b"");
+    assert_eq!(run.code, Some(0), "darwin {args:?}: {run:#?}");
+    let help = run.stdout.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(help.contains("Store a single raw chunk"), "{help}");
+    assert!(help.contains("it carries no envelope"), "{help}");
+    assert!(
+        help.contains("`darwin file upload` is the standard way"),
+        "{help}"
+    );
+    assert!(run.left_behind.is_empty(), "darwin {args:?}: {run:#?}");
 }
 
 /// `darwin node` is off: every command, with or without `--json`, is

@@ -132,7 +132,7 @@ pub enum Commands {
         #[command(subcommand)]
         action: FileAction,
     },
-    /// Single-chunk reads (put is off in this build: a raw chunk can't carry an envelope)
+    /// Single-chunk operations (low-level put/get without file splitting)
     Chunk {
         #[command(subcommand)]
         action: ChunkAction,
