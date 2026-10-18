@@ -393,15 +393,16 @@ async fn export_compact(
     } else {
         eprintln!("warning: {}", plain_publish_warning(&plan));
         info!("Publishing {published} data map chunk(s) with no envelope");
-        if json {
-            publish_data_maps(client, manifest, &plan.needs_publish, &cancel).await?;
+        let result = if json {
+            publish_data_maps(client, manifest, &plan.needs_publish, &cancel).await
         } else {
             let spinner =
                 progress::new_spinner(&format!("Publishing {published} data map chunk(s)..."));
             let result = publish_data_maps(client, manifest, &plan.needs_publish, &cancel).await;
             spinner.finish_and_clear();
-            result?;
-        }
+            result
+        };
+        result.map_err(publish_failed)?;
         plan.published()
     };
 
@@ -439,6 +440,19 @@ fn plain_publish_warning(plan: &CompactPlan) -> String {
         plan.needs_publish.len(),
         entry_names(plan)
     )
+}
+
+/// Why `export --compact --yes` failed to publish the data maps: a network
+/// or payment error says what failed, and after a payment error that running
+/// the same export again finds a payment that went through. Data maps
+/// already published are found readable by that export, and not paid again.
+fn publish_failed(error: ManifestError) -> anyhow::Error {
+    match error {
+        ManifestError::Data(error) => {
+            super::paid_command_failed("Publishing the data maps", &error)
+        }
+        error => error.into(),
+    }
 }
 
 /// The names of the files a plan has to publish, one per line, indented.
@@ -2051,6 +2065,39 @@ mod tests {
             "{warning}"
         );
         assert!(warning.ends_with(":\n  docs/b.bin\n  c.bin"), "{warning}");
+    }
+
+    /// A publish that failed on a payment error says that running the same
+    /// export again carries on without paying twice; other errors say what
+    /// failed, and a cancellation is reported as it was.
+    #[test]
+    fn a_failed_publish_says_to_run_the_export_again_after_a_payment_error() {
+        use ant_core::data::Error as DataError;
+        let paid = publish_failed(ManifestError::Data(DataError::Payment(
+            "payment outcome pending; retry will reconcile the journaled transaction".into(),
+        )))
+        .to_string();
+        assert!(
+            paid.starts_with("Publishing the data maps failed: payment error: payment outcome"),
+            "{paid}"
+        );
+        assert!(
+            paid.ends_with(
+                "\nIf the payment went through, run the same command again: it finds the \
+                 payment on the chain and carries on without paying twice."
+            ),
+            "{paid}"
+        );
+        let network =
+            publish_failed(ManifestError::Data(DataError::Network("down".into()))).to_string();
+        assert_eq!(
+            network,
+            "Publishing the data maps failed: network error: down"
+        );
+        assert_eq!(
+            publish_failed(ManifestError::Cancelled).to_string(),
+            "operation cancelled"
+        );
     }
 
     /// `create` takes the merkle flags as `darwin file upload` does:

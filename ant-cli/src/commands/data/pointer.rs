@@ -189,7 +189,7 @@ impl PointerAction {
                 let address = client
                     .pointer_create(&secret, &owner, target)
                     .await
-                    .map_err(|e| anyhow::anyhow!("Pointer create failed: {e}"))?;
+                    .map_err(|e| super::paid_command_failed("Pointer create", &e))?;
                 print_address(&address, json);
             }
             Self::Update { key, target, kind } => {
@@ -199,7 +199,7 @@ impl PointerAction {
                 let address = client
                     .pointer_update(&secret, &owner, target)
                     .await
-                    .map_err(|e| anyhow::anyhow!("Pointer update failed: {e}"))?;
+                    .map_err(|e| super::paid_command_failed("Pointer update", &e))?;
                 print_address(&address, json);
             }
             Self::Transfer { key, recipient } => {
@@ -209,7 +209,7 @@ impl PointerAction {
                 let transfer = client
                     .pointer_transfer(&secret, &owner, recipient)
                     .await
-                    .map_err(|e| anyhow::anyhow!("Pointer transfer failed: {e}"))?;
+                    .map_err(|e| super::paid_command_failed("Pointer transfer", &e))?;
                 print_transfer(&transfer, json);
             }
             Self::Finality { address } => {

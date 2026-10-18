@@ -1193,7 +1193,10 @@ pub(crate) fn order_by_quote_hash(plans: &mut [ChunkPaymentPlan]) {
     });
 }
 
-fn validate_payment_total(plans: &[ChunkPaymentPlan], payment: &UploadPayment) -> Result<()> {
+pub(super) fn validate_payment_total(
+    plans: &[ChunkPaymentPlan],
+    payment: &UploadPayment,
+) -> Result<()> {
     let expected = plans.iter().try_fold(Amount::ZERO, |sum, plan| {
         sum.checked_add(plan.payment.total_amount())
             .ok_or_else(|| Error::Payment("payment total overflow".into()))

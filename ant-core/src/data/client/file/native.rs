@@ -25,6 +25,7 @@ use crate::data::client::merkle::{
     merkle_store_with_retry, merkle_upload_billable_units, merkle_upload_split, should_use_merkle,
     MerkleBatchPaymentResult, PaymentMode, PreparedMerkleBatch, DEFERRED_ROUND_DELAYS_SECS,
 };
+use crate::data::client::native_payment::{payment_outcome_unknown, PAYMENT_RECHECK_DELAY};
 use crate::data::client::occupied::{
     occupied_at_finalize, plans_of, set_aside_occupied, skipped_amount,
 };
@@ -1256,24 +1257,6 @@ impl std::fmt::Debug for ExternalChunkStore {
     }
 }
 
-/// An envelope upload's checkpoint scope: its choices
-/// ([`EnvelopeOptions::scope`]) and its payer (`payer`:
-/// [`UploadPayer::checkpoint_scope`], or the wallet's address), so only the
-/// same payer resumes it, reusing its salt and the envelope's payment. The
-/// choices end where their msgpack ends, so the payer can simply follow.
-/// How long an upload waits before reconciling a payment whose outcome is
-/// unknown, so the RPC has caught up with the transaction.
-const PAYMENT_RECHECK_DELAY: std::time::Duration = std::time::Duration::from_secs(10);
-
-/// Whether `state` holds a payment whose outcome is unknown: a transaction
-/// was signed and sent, and neither confirmed nor shown to have failed.
-fn payment_outcome_unknown(state: &crate::data::client::upload_state::UploadState) -> bool {
-    state
-        .pending_payment
-        .as_ref()
-        .is_some_and(|attempt| !attempt.submissions.is_empty())
-}
-
 /// What the payment whose outcome is unknown pays, from its prepared plans:
 /// zero for a Merkle payment or if the plans are missing.
 fn unresolved_payment_amount(state: &crate::data::client::upload_state::UploadState) -> Amount {
@@ -1294,6 +1277,11 @@ fn unresolved_payment_amount(state: &crate::data::client::upload_state::UploadSt
         .unwrap_or(Amount::ZERO)
 }
 
+/// An envelope upload's checkpoint scope: its choices
+/// ([`EnvelopeOptions::scope`]) and its payer (`payer`:
+/// [`UploadPayer::checkpoint_scope`], or the wallet's address), so only the
+/// same payer resumes it, reusing its salt and the envelope's payment. The
+/// choices end where their msgpack ends, so the payer can simply follow.
 fn envelope_checkpoint_scope(options: &EnvelopeOptions, payer: &[u8]) -> Vec<u8> {
     let mut scope = options.scope();
     scope.extend_from_slice(payer);
@@ -1386,9 +1374,10 @@ async fn open_upload_checkpoint(
 /// than the directory's. Under a long data directory the rename failed: the
 /// record wasn't kept and the checkpoint stayed, so a later upload of the
 /// same file by the same payer resumed the finished one and returned its
-/// record again, even after the caller had saved and forgotten it.
+/// record again, even after the caller had saved and forgotten it. The
+/// checkpoints of records paid one at a time are written the same way.
 /// Elsewhere, or if the directory can't be resolved, it is returned as it is.
-fn long_path_safe(directory: PathBuf) -> PathBuf {
+pub(crate) fn long_path_safe(directory: PathBuf) -> PathBuf {
     #[cfg(windows)]
     {
         if let Ok(verbatim) = std::fs::canonicalize(&directory) {
@@ -4632,27 +4621,6 @@ impl Client {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn only_a_sent_payment_without_an_outcome_is_rechecked() {
-        let mut state = crate::data::client::upload_state::UploadState::default();
-        // Nothing pending.
-        assert!(!payment_outcome_unknown(&state));
-        // Pending, but no transaction sent yet: nothing on the chain to find.
-        state.start_payment(false, vec![[1; 32]]).unwrap();
-        assert!(!payment_outcome_unknown(&state));
-        // A transaction sent and no outcome: the chain may hold the payment.
-        state
-            .pending_payment
-            .as_mut()
-            .unwrap()
-            .submissions
-            .push(serde_json::json!({ "native_payment_v1": {} }));
-        assert!(payment_outcome_unknown(&state));
-        // Settled either way (confirmed, or shown to have failed): nothing to reconcile.
-        state.pending_payment = None;
-        assert!(!payment_outcome_unknown(&state));
-    }
 
     /// Throwaway payment result — the assembler only moves it into the resume
     /// handle, never inspects it.

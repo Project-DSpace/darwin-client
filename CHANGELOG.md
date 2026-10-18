@@ -146,6 +146,22 @@ told apart by the commit `darwin --version` prints. Upstream's entries follow.
   `Client::file_upload`, `file_prepare_upload`) and of the browser API, so programs built on
   ant-core pay per chunk unless they ask for batches.
 - Reads of payments fall back to other RPCs, and uploads recover a payment the RPC errored on.
+- Records paid one at a time recover a payment the RPC errored on, as uploads do:
+  `darwin chunk put`, `darwin pointer create`, `update` and `transfer`, and the data maps
+  `darwin manifest export --compact --yes` publishes (in the library, `pay_for_storage`,
+  `pay_for_storage_split`, `chunk_put`, `data_map_store`, `publish_data_maps`, `pointer_put` and
+  the pointer writes). The payment is journaled before its transaction is signed, in a
+  checkpoint under the data directory (`payments/record/`) named by the payment network, the
+  wallet and the record's address (a pointer's `state_id`). A payment whose outcome is unknown is
+  checked on the chain again 10 seconds later; if it still can't be seen, the command fails,
+  keeping the journal, and says that running it again carries on without paying twice, which the
+  next attempt at the same record with the same wallet does by reconciling the journaled
+  transaction. The paid proof stays in the checkpoint until the record is stored (`chunk_put`,
+  `pointer_put`), so a record whose store failed after it was paid is stored by the next attempt
+  with that proof; `pay_for_storage` and `pay_for_storage_split`, whose callers store the record,
+  remove the checkpoint once they return the proof. Before, these payments had no journal: when
+  the RPC answered a payment with an error after taking it, the wallet's own retry sent a second
+  transaction, or the command failed and running it again paid again.
 - The seeds bundled in `darwin` are replaced only by a `darwin_bootstrap_peers.toml` in the config
   directory (`config::DARWIN_BOOTSTRAP_PEERS_FILE`), and the client peer cache is
   `darwin_client_peer_cache.json` in the data directory. Before, `bootstrap_peers.toml` and
@@ -214,8 +230,7 @@ told apart by the commit `darwin --version` prints. Upstream's entries follow.
   `darwin pointer transfer` pays for the final state as `pointer create` and `pointer update` pay
   for theirs: one record in DARWIN, its paid quote read back and quoted again if someone recorded
   it first, under `--max-chunk-price`, with a wallet that signs for the payment chain only. Like
-  them, and unlike an upload, it doesn't recover a payment the RPC answered with an error: the
-  command fails, and running it again quotes and pays afresh.
+  them, it recovers a payment the RPC answered with an error, as an upload does.
   Here `darwin manifest create` uploads each file as `darwin file upload` uploads it, with the
   same `--visibility`, `--public`, `--readable`, `--index` and `--hide` choices: private by
   default, in an envelope that shows every payment field, with the same warnings first, paid

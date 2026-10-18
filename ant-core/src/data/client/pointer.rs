@@ -1899,11 +1899,18 @@ impl Client {
 
     /// Pay for and store an already-signed pointer.
     ///
-    /// Each call settles a payment for the state it is given. A state the
-    /// network already holds is answered as stored, but the payment for it has
-    /// been made either way — so a retry after a timeout costs a second quote.
-    /// Read first if that matters; the node cannot tell a retry from a fresh
-    /// submission before it has been paid to look.
+    /// Each call settles a payment for the state it is given, unless an
+    /// earlier call with the same wallet paid for that state and didn't store
+    /// it. The payment is journaled and recovered as
+    /// [`Client::pay_for_storage_split`] describes, and its proof is kept in
+    /// the state's payment checkpoint until the state is stored, so a call
+    /// that failed after paying, such as a write that fell short, is retried
+    /// by calling again with the same record, without paying again. A state
+    /// the network already holds is answered as stored, but once its
+    /// checkpoint is gone a call pays for it again: read first if that
+    /// matters; the node cannot tell a retry from a fresh submission before
+    /// it has been paid to look. Browser builds journal and keep nothing, so
+    /// each of their calls pays.
     ///
     /// # Errors
     ///
@@ -1923,15 +1930,34 @@ impl Client {
         // The quote names the state; the peers that may issue it are the close
         // group around the address. One payment, one state. The payment has
         // read its quote's vault record back already.
-        let (proof, _) = self
-            .pay_for_storage_split(
-                &address,
-                &state_id,
-                POINTER_WIRE_LEN as u64,
-                DATA_TYPE_POINTER,
-            )
-            .await?;
-        self.pointer_put_paid_unchecked(record, proof).await
+        #[cfg(feature = "native")]
+        {
+            let paid = self
+                .pay_for_record(
+                    &address,
+                    &state_id,
+                    POINTER_WIRE_LEN as u64,
+                    DATA_TYPE_POINTER,
+                )
+                .await?;
+            let stored = self
+                .pointer_put_paid_unchecked(record, paid.proof.clone())
+                .await?;
+            paid.stored();
+            Ok(stored)
+        }
+        #[cfg(not(feature = "native"))]
+        {
+            let (proof, _) = self
+                .pay_for_storage_split(
+                    &address,
+                    &state_id,
+                    POINTER_WIRE_LEN as u64,
+                    DATA_TYPE_POINTER,
+                )
+                .await?;
+            self.pointer_put_paid_unchecked(record, proof).await
+        }
     }
 
     /// Quote a signed pointer's state for a payer outside this client, such as

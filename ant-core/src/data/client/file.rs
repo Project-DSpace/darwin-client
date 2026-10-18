@@ -10,6 +10,8 @@ use crate::data::client::merkle::PaymentMode;
 use ant_protocol::transport::{MultiAddr, PeerId};
 use ant_protocol::XorName as ChunkAddress;
 #[cfg(feature = "native")]
+pub(crate) use native::long_path_safe;
+#[cfg(feature = "native")]
 pub use native::{
     file_data_map, forget_upload_record, ExternalChunkStore, ExternalPaymentInfo, FinalizeOutcome,
     FinalizeResume, MerkleFinalizeResume, PreparedUpload, UploadPayer, WaveFinalizeResume,

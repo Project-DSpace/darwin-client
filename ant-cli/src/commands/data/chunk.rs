@@ -51,7 +51,7 @@ impl ChunkAction {
                 let address = client
                     .chunk_put(Bytes::from(content))
                     .await
-                    .map_err(|e| anyhow::anyhow!("Chunk put failed: {e}"))?;
+                    .map_err(|e| super::paid_command_failed("Chunk put", &e))?;
 
                 let hex_addr = hex::encode(address);
                 info!("Chunk stored at {hex_addr}");

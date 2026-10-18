@@ -576,6 +576,13 @@ impl Client {
     /// on the close group, needing `CLOSE_GROUP_MAJORITY` peers to accept
     /// (`chunk_put_to_close_group`).
     ///
+    /// The payment is journaled and recovered as
+    /// [`Client::pay_for_storage_split`] describes, and its proof is kept in
+    /// the chunk's payment checkpoint until the chunk is stored: if the store
+    /// fails, the next `chunk_put` of the same content with the same wallet
+    /// stores it with that proof instead of paying again. Browser builds
+    /// keep nothing.
+    ///
     /// # Errors
     ///
     /// Returns an error if payment or the network operation fails.
@@ -584,10 +591,24 @@ impl Client {
         let data_size = u64::try_from(content.len())
             .map_err(|e| Error::InvalidData(format!("content size too large: {e}")))?;
 
-        match self
+        #[cfg(feature = "native")]
+        let paid = self
+            .pay_for_record(&address, &address, data_size, CHUNK_DATA_TYPE)
+            .await;
+        #[cfg(not(feature = "native"))]
+        let paid = self
             .pay_for_storage(&address, data_size, CHUNK_DATA_TYPE)
-            .await
-        {
+            .await;
+        match paid {
+            #[cfg(feature = "native")]
+            Ok(paid) => {
+                let stored = self
+                    .chunk_put_to_close_group(content, paid.proof.clone(), &paid.put_peers)
+                    .await?;
+                paid.stored();
+                Ok(stored)
+            }
+            #[cfg(not(feature = "native"))]
             Ok((proof, peers)) => self.chunk_put_to_close_group(content, proof, &peers).await,
             Err(Error::AlreadyStored) => {
                 debug!(
