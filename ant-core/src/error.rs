@@ -80,11 +80,11 @@ pub enum Error {
     NoBootstrapPeers,
 
     #[error(
-        "Devnet manifest contains EVM config but no EVM network was selected: pass 'local' to use the manifest's EVM config, or an explicit preset ('arbitrum-one', 'arbitrum-sepolia') to override it"
+        "Devnet manifest contains EVM config but no EVM network was selected: pass 'local' to use the manifest's EVM config, or 'robinhood' (the default network) to override it"
     )]
     EvmNetworkAmbiguous,
 
-    #[error("Unsupported EVM network: {0}. Use 'arbitrum-one', 'arbitrum-sepolia', or 'local'.")]
+    #[error("Unsupported EVM network: {0}. Use 'robinhood' (the default) or 'local'.")]
     UnsupportedEvmNetwork(String),
 
     #[error("EVM network 'local' requires a devnet manifest with EVM info")]

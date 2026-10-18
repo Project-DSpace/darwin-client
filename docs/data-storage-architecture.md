@@ -70,15 +70,14 @@ let client = Client::connect(
 
 ### Attaching a Wallet
 
-Upload operations require a funded EVM wallet:
+Upload operations require a funded EVM wallet. On the bundled network, DARWIN on Robinhood
+Chain, `config::wallet` gives one that signs for chain 4663 only:
 
 ```rust
-use ant_core::data::{Wallet, EvmNetwork};
+use ant_core::config::{self, bundled_payment_network};
 
-let wallet = Wallet::new_from_private_key(
-    EvmNetwork::ArbitrumOne,
-    "your_private_key_hex",
-)?;
+let network = bundled_payment_network()?;
+let wallet = config::wallet(network.clone(), "your_private_key_hex", config::chain_id(&network))?;
 let client = client.with_wallet(wallet);
 
 // Approve the payment contract to spend tokens (one-time per session)
@@ -241,9 +240,12 @@ All data operations return `ant_core::data::Result<T>`, where `Error` covers:
 
 | Network | Chain | Use case |
 |---------|-------|----------|
-| `EvmNetwork::ArbitrumOne` | Arbitrum mainnet | Production |
-| `EvmNetwork::ArbitrumSepoliaTest` | Arbitrum Sepolia | Staging / testing |
+| `config::bundled_payment_network()` (an `EvmNetwork::Custom`) | Robinhood Chain (4663), DARWIN | Production: the Darwin network |
 | `EvmNetwork::Custom(...)` | Any EVM chain | Local dev (Anvil), custom deployments |
+
+`EvmNetwork::ArbitrumOne` and `EvmNetwork::ArbitrumSepoliaTest` are Autonomi's networks, paid in
+its ANT; Darwin's nodes don't accept their payments, and `config::resolve_evm_network` refuses
+their names.
 
 For local development, `LocalDevnet` handles all EVM setup automatically. For custom deployments,
 construct a `CustomNetwork` with the RPC URL, token address, and payment contract addresses.

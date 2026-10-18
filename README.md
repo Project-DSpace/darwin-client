@@ -246,7 +246,7 @@ stored without the payment record, listing and `.record` every upload carries. U
 | `--allow-loopback` | Allow loopback connections (required for local devnet) |
 | `--timeout-secs <N>` | Network operation timeout in seconds (default: 60) |
 | `-v, --verbose` | Increase verbosity: `-v` info, `-vv` debug, `-vvv` trace. Default: no logs (privacy by design) |
-| `--evm-network <NET>` | Payment network: `robinhood` (default: Robinhood Chain, DARWIN), `local` (the devnet manifest's chain), or upstream's `arbitrum-one` and `arbitrum-sepolia` (Autonomi's network, which our nodes don't accept) |
+| `--evm-network <NET>` | Payment network: `robinhood` (default: Robinhood Chain, DARWIN) or `local` (the devnet manifest's chain). Upstream's `arbitrum-one` and `arbitrum-sepolia`, which pay Autonomi's ANT, are refused |
 | `--max-chunk-price <BASE_UNITS>` | The most a node's quote may ask to store one chunk, in the token's base units (10^-18 DARWIN, a whole number). Quotes asking more are ignored, as if their node hadn't answered; a chunk then costs at most 3 times this. Default: no ceiling |
 
 ### `darwin file` — File Operations
@@ -943,10 +943,12 @@ Data operations (upload/download) go directly to the P2P network — they do not
 |-------|---------|----------|
 | `robinhood` | Robinhood Chain (4663), DARWIN, from `ant-core/resources/payment_network.toml` | Default: the Darwin network |
 | `local` | Custom (Anvil) | Local development (requires `--devnet-manifest`) |
-| `arbitrum-one` | Arbitrum One, Autonomi's ANT | Upstream's network only; our nodes don't accept it |
-| `arbitrum-sepolia` | Arbitrum Sepolia testnet | Upstream's test network only |
 
-Payments on `robinhood` are signed for chain 4663 only: an RPC that reports another chain is refused before anything is signed. On `local` the same check uses the devnet manifest's `evm.chain_id` when it has one (`"chain_id": 4663` for your own Robinhood Chain RPC); without one, and on the Arbitrum presets, payments are signed for whatever chain the RPC reports.
+Payments are made in DARWIN only. Upstream's `arbitrum-one` and `arbitrum-sepolia` presets, which
+pay Autonomi's ANT on Arbitrum, are refused when the command line is read, before `SECRET_KEY` or
+the network, and `ant_core::config::resolve_evm_network` refuses them too.
+
+Payments on `robinhood` are signed for chain 4663 only: an RPC that reports another chain is refused before anything is signed. On `local` the same check uses the devnet manifest's `evm.chain_id` when it has one (`"chain_id": 4663` for your own Robinhood Chain RPC); without one, payments are signed for whatever chain the RPC reports.
 
 ## Environment Variables
 

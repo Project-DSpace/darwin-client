@@ -86,13 +86,14 @@ pub struct Cli {
     #[arg(short, long, action = ArgAction::Count)]
     pub verbose: u8,
 
-    /// EVM network for payment processing: robinhood (our network), the
-    /// upstream arbitrum-one and arbitrum-sepolia, or local (reads the
-    /// devnet manifest's EVM config). Defaults to robinhood — except when a
-    /// devnet manifest with EVM config is loaded, where an explicit choice
-    /// is required so an irreversible on-chain payment never silently
-    /// targets the wrong network.
-    #[arg(long)]
+    /// EVM network for payment processing: robinhood (DARWIN on Robinhood
+    /// Chain, our network) or local (reads the devnet manifest's EVM config).
+    /// Defaults to robinhood — except when a devnet manifest with EVM config
+    /// is loaded, where an explicit choice is required so an irreversible
+    /// on-chain payment never silently targets the wrong network. Upstream's
+    /// arbitrum-one and arbitrum-sepolia, which pay Autonomi's ANT, are
+    /// refused.
+    #[arg(long, value_parser = ["robinhood", "local"])]
     pub evm_network: Option<String>,
 
     /// The most a node's quote may ask to store one chunk, in the payment
@@ -302,6 +303,84 @@ mod naming_tests {
         }
         assert!(help(&[]).contains(".darwin files or darwin:// links"));
         assert!(help(&["manifest", "create"]).contains("<name>.darwin"));
+    }
+}
+
+#[cfg(test)]
+mod payment_network_tests {
+    use super::*;
+
+    /// A command of each kind that pays or holds a wallet, as typed after
+    /// the global flags.
+    const PAYING_COMMANDS: &[&[&str]] = &[
+        &["file", "upload", "notes.txt"],
+        &["chunk", "put", "chunk.bin"],
+        &[
+            "pointer",
+            "create",
+            "--key",
+            "owner.key",
+            "0000000000000000000000000000000000000000000000000000000000000001",
+        ],
+        &[
+            "pointer",
+            "update",
+            "--key",
+            "owner.key",
+            "0000000000000000000000000000000000000000000000000000000000000002",
+        ],
+        &[
+            "pointer",
+            "transfer",
+            "--key",
+            "owner.key",
+            "0000000000000000000000000000000000000000000000000000000000000003",
+        ],
+        &["manifest", "create", "photos"],
+        &["manifest", "export", "--compact", "photos.darwin"],
+        &["wallet", "balance"],
+    ];
+
+    fn parse(network: Option<&str>, command: &[&str]) -> Result<Cli, clap::Error> {
+        let mut argv = vec!["darwin"];
+        if let Some(network) = network {
+            argv.extend(["--evm-network", network]);
+        }
+        argv.extend_from_slice(command);
+        Cli::try_parse_from(argv)
+    }
+
+    /// Payments are made in DARWIN only: upstream's Arbitrum presets, which
+    /// pay Autonomi's ANT, are refused when the command line is read, before
+    /// SECRET_KEY or the network, for every command that pays or holds a
+    /// wallet. `robinhood` and `local` are taken, and no flag means the
+    /// default.
+    #[test]
+    fn the_arbitrum_presets_are_refused() {
+        for command in PAYING_COMMANDS {
+            for preset in [
+                "arbitrum-one",
+                "arbitrum-sepolia",
+                "Arbitrum-One",
+                "mainnet",
+            ] {
+                let error = parse(Some(preset), command)
+                    .err()
+                    .unwrap_or_else(|| panic!("{preset} {command:?} parsed"));
+                assert_eq!(
+                    error.kind(),
+                    clap::error::ErrorKind::InvalidValue,
+                    "{preset} {command:?}: {error}"
+                );
+            }
+            for network in ["robinhood", "local"] {
+                let cli = parse(Some(network), command)
+                    .unwrap_or_else(|error| panic!("{network} {command:?}: {error}"));
+                assert_eq!(cli.evm_network.as_deref(), Some(network));
+            }
+            let cli = parse(None, command).unwrap_or_else(|error| panic!("{command:?}: {error}"));
+            assert_eq!(cli.evm_network, None);
+        }
     }
 }
 

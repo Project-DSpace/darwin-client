@@ -191,16 +191,9 @@ pub fn fallback_rpc_urls(network: &EvmNetwork) -> Vec<String> {
 }
 
 /// The symbol amounts of `network`'s payment token are shown in: the
-/// bundled network's `token_symbol`, `ANT` on the upstream Arbitrum presets
-/// (their real token), and a neutral word on any other network.
+/// bundled network's `token_symbol`, and a neutral word on any other network.
 #[must_use]
 pub fn token_symbol(network: &EvmNetwork) -> String {
-    if matches!(
-        network,
-        EvmNetwork::ArbitrumOne | EvmNetwork::ArbitrumSepoliaTest
-    ) {
-        return "ANT".to_string();
-    }
     match (
         toml::from_str::<PaymentNetworkConfig>(BUNDLED_PAYMENT_NETWORK),
         bundled_payment_network(),
@@ -274,10 +267,12 @@ fn custom_network(rpc_url: &str, token: &str, vault: &str) -> Result<EvmNetwork>
 /// Resolve the EVM network for payment operations.
 ///
 /// `name` is the frontend's network selector (e.g. the CLI's
-/// `--evm-network` flag): `robinhood` (our network, bundled), the upstream
-/// presets `arbitrum-one` and `arbitrum-sepolia`, or `local`, which reads
-/// the RPC URL and contract addresses from the devnet manifest's `evm`
-/// block.
+/// `--evm-network` flag): `robinhood` (our network, bundled: DARWIN on
+/// Robinhood Chain), or `local`, which reads the RPC URL and contract
+/// addresses from the devnet manifest's `evm` block. Upstream's presets
+/// `arbitrum-one` and `arbitrum-sepolia`, which pay Autonomi's ANT on
+/// Arbitrum, are refused like any other name, with
+/// [`Error::UnsupportedEvmNetwork`]: payments are made in DARWIN only.
 ///
 /// With no selector, the default is our bundled network — **unless** the
 /// devnet manifest carries an `evm` block. Defaulting there used to
@@ -298,8 +293,6 @@ pub fn resolve_evm_network(
                 bundled_payment_network()
             }
         }
-        Some("arbitrum-one") => Ok(EvmNetwork::ArbitrumOne),
-        Some("arbitrum-sepolia") => Ok(EvmNetwork::ArbitrumSepoliaTest),
         Some("robinhood") => bundled_payment_network(),
         Some("local") => {
             let evm = manifest
@@ -414,16 +407,40 @@ mod tests {
         ));
     }
 
+    /// Payments are made in DARWIN only: upstream's Arbitrum presets, which
+    /// pay Autonomi's ANT, are refused, with a devnet manifest's EVM block or
+    /// without one, and the refusal names the networks that are taken.
     #[test]
-    fn resolve_evm_network_maps_presets() {
-        assert!(matches!(
-            resolve_evm_network(Some("arbitrum-one"), None),
-            Ok(EvmNetwork::ArbitrumOne)
-        ));
-        assert!(matches!(
-            resolve_evm_network(Some("arbitrum-sepolia"), None),
-            Ok(EvmNetwork::ArbitrumSepoliaTest)
-        ));
+    fn the_arbitrum_presets_are_refused() {
+        let evm = manifest_with_evm();
+        let no_evm = test_manifest(vec![]);
+        for preset in ["arbitrum-one", "arbitrum-sepolia"] {
+            for manifest in [None, Some(&evm), Some(&no_evm)] {
+                let error = resolve_evm_network(Some(preset), manifest).unwrap_err();
+                assert!(
+                    matches!(&error, Error::UnsupportedEvmNetwork(name) if name == preset),
+                    "{preset}: {error:?}"
+                );
+                let message = error.to_string();
+                let (_, offered) = message.split_once("Use ").expect("what to use instead");
+                assert!(offered.contains("'robinhood'"), "{message}");
+                assert!(offered.contains("'local'"), "{message}");
+                assert!(!offered.contains("arbitrum"), "{message}");
+            }
+        }
+    }
+
+    /// `robinhood` and no selector are the bundled network: DARWIN on
+    /// Robinhood Chain, signed for chain 4663.
+    #[test]
+    fn robinhood_and_the_default_are_the_bundled_network() {
+        let bundled = bundled_payment_network().unwrap();
+        for name in [None, Some("robinhood")] {
+            let network = resolve_evm_network(name, None).unwrap();
+            assert_eq!(network, bundled, "{name:?}");
+            assert_eq!(chain_id(&network), Some(4663), "{name:?}");
+            assert_eq!(token_symbol(&network), "DARWIN", "{name:?}");
+        }
     }
 
     #[test]
@@ -447,8 +464,9 @@ mod tests {
         let bundled = bundled_payment_network().unwrap();
         let symbol = token_symbol(&bundled);
         assert!(!symbol.is_empty() && symbol != "tokens", "{symbol}");
-        assert_eq!(token_symbol(&EvmNetwork::ArbitrumOne), "ANT");
-        assert_eq!(token_symbol(&EvmNetwork::ArbitrumSepoliaTest), "ANT");
+        // No network but the bundled one is named, upstream's included.
+        assert_eq!(token_symbol(&EvmNetwork::ArbitrumOne), "tokens");
+        assert_eq!(token_symbol(&EvmNetwork::ArbitrumSepoliaTest), "tokens");
         let local = resolve_evm_network(Some("local"), Some(&manifest_with_evm())).unwrap();
         assert_eq!(token_symbol(&local), "tokens");
     }

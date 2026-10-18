@@ -138,6 +138,11 @@ told apart by the commit `darwin --version` prints. Upstream's entries follow.
 - Reads of payments fall back to other RPCs, and uploads recover a payment the RPC errored on.
 - Payments are signed for the payment network's chain only (4663, or a devnet manifest's
   `evm.chain_id`), so an RPC that reports another chain gets nothing signed.
+- `--evm-network` takes `robinhood`, the default, or `local` (a devnet manifest's chain).
+  Upstream's `arbitrum-one` and `arbitrum-sepolia`, which paid Autonomi's ANT on Arbitrum, are
+  refused when the command line is read, before `SECRET_KEY` or the network, and
+  `ant_core::config::resolve_evm_network` refuses them too (`UnsupportedEvmNetwork`);
+  `token_symbol` names no token but the bundled network's.
 - The CLI is `darwin`, shows costs in the payment token, and has self-update turned off.
 - `darwin chunk put` is off: it stored a paid raw chunk, which has no data map and so can't carry
   an envelope, with no payment record, listing or `.record`. It fails before reading its input

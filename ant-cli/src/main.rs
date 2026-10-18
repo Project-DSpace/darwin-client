@@ -527,7 +527,7 @@ fn token_symbol(ctx: &DataCliContext) -> String {
 
 /// Resolve the EVM network through ant-core, with a CLI-side warning for
 /// the one remaining silent-discard path: a devnet manifest that carries
-/// an EVM block while a preset network is selected (V2-471).
+/// an EVM block while the bundled network is selected (V2-471).
 fn resolve_evm_network(
     evm_network: Option<&str>,
     manifest: Option<&DevnetManifest>,
@@ -536,8 +536,9 @@ fn resolve_evm_network(
         if m.evm.is_some() && name != "local" {
             eprintln!(
                 "warning: the devnet manifest contains an EVM block, but \
-                 --evm-network={name} selects a preset; the manifest's EVM \
-                 config is ignored. Pass --evm-network local to use it."
+                 --evm-network={name} selects the bundled network; the \
+                 manifest's EVM config is ignored. Pass --evm-network local \
+                 to use it."
             );
         }
     }
