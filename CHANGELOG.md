@@ -136,6 +136,15 @@ told apart by the commit `darwin --version` prints. Upstream's entries follow.
   `Client::file_upload`, `file_prepare_upload`) and of the browser API, so programs built on
   ant-core pay per chunk unless they ask for batches.
 - Reads of payments fall back to other RPCs, and uploads recover a payment the RPC errored on.
+- The seeds bundled in `darwin` are replaced only by a `darwin_bootstrap_peers.toml` in the config
+  directory (`config::DARWIN_BOOTSTRAP_PEERS_FILE`), and the client peer cache is
+  `darwin_client_peer_cache.json` in the data directory. Before, `bootstrap_peers.toml` and
+  `client_peer_cache.json` were read, which Autonomi's `ant` and its installers write in the
+  same directories: on a machine that also has `ant`, uploads and lookups went to Autonomi's
+  network (whose quotes fail the price check, so nothing was paid there) and reads lost the
+  bundled seeds. A seed file written for an earlier build is read again once renamed.
+  Precedence is unchanged: `--bootstrap`, then a devnet manifest, then the seed file, then the
+  bundled seeds.
 - Payments are signed for the payment network's chain only (4663, or a devnet manifest's
   `evm.chain_id`), so an RPC that reports another chain gets nothing signed.
 - `--evm-network` takes `robinhood`, the default, or `local` (a devnet manifest's chain).

@@ -71,11 +71,11 @@ pub enum Error {
     #[error("Update failed: {0}")]
     UpdateFailed(String),
 
-    #[error("Failed to parse bootstrap_peers.toml: {0}")]
+    #[error("Failed to parse darwin_bootstrap_peers.toml: {0}")]
     BootstrapConfigParse(String),
 
     #[error(
-        "No bootstrap peers available: pass peers explicitly, use a devnet manifest, or install bootstrap_peers.toml in the config directory"
+        "No bootstrap peers available: pass peers explicitly, use a devnet manifest, or install darwin_bootstrap_peers.toml in the config directory"
     )]
     NoBootstrapPeers,
 

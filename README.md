@@ -167,10 +167,12 @@ the current network.
 where they were. Autonomi's `ant` keeps its upload history in `uploads/` there; darwin's is
 `darwin-uploads/`, so neither lists or loads the other's.
 
-> **Warning:** a `bootstrap_peers.toml` in that config directory overrides the seeds bundled in
-> `darwin`. On a machine where Autonomi's `ant` was installed, that file names Autonomi's
-> network, and `darwin` would join it instead of ours. Delete or rename the file, or pass
-> `--bootstrap`. See [Bootstrap multiaddresses and browser defaults](#bootstrap-multiaddresses-and-browser-defaults).
+The seeds bundled in `darwin` are replaced only by a `darwin_bootstrap_peers.toml` in that config
+directory, and `darwin` keeps its peer cache in `darwin_client_peer_cache.json` in the data
+directory. The `bootstrap_peers.toml` and `client_peer_cache.json` that Autonomi's `ant` and its
+installers leave in the same directories name Autonomi's network, and `darwin` never reads them.
+A seed file written for an earlier `darwin` build is read again once renamed
+`darwin_bootstrap_peers.toml`. See [Bootstrap multiaddresses and browser defaults](#bootstrap-multiaddresses-and-browser-defaults).
 
 > **Note:** `install.sh`, `install.ps1` and the npm packages in this repository are upstream's
 > and install Autonomi's `ant`, not `darwin`.
@@ -241,7 +243,7 @@ stored without the payment record, listing and `.record` every upload carries. U
 | Flag | Description |
 |------|-------------|
 | `--json` | Output structured JSON instead of human-readable text |
-| `-b, --bootstrap <ADDR>` | Bootstrap peers as QUIC multiaddresses (`/ip4/1.2.3.4/udp/10000/quic`) or `ip:port`, comma-separated or repeated. Default: the bundled seeds, unless a config file names others |
+| `-b, --bootstrap <ADDR>` | Bootstrap peers as QUIC multiaddresses (`/ip4/1.2.3.4/udp/10000/quic`) or `ip:port`, comma-separated or repeated. Default: the bundled seeds, unless `darwin_bootstrap_peers.toml` in the config directory names others |
 | `--devnet-manifest <PATH>` | Path to devnet manifest JSON file |
 | `--allow-loopback` | Allow loopback connections (required for local devnet) |
 | `--timeout-secs <N>` | Network operation timeout in seconds (default: 60) |
@@ -1000,10 +1002,10 @@ its identity or certificate does. A node's QUIC port is its WebRTC port minus
 1000, under the same peer ID.
 
 The CLI accepts `--bootstrap /ip4/127.0.0.1/udp/10000/quic` (including optional
-`/p2p/<peer-id>`). Legacy `ip:port` arguments and installed `peers = [...]`
-configuration remain readable. Explicit peers take precedence over a selected
-devnet manifest, which takes precedence over a `bootstrap_peers.toml` in the
-config directory, which takes precedence over the bundled seeds. Only QUIC seeds
+`/p2p/<peer-id>`). Legacy `ip:port` arguments and a `peers = [...]` list in the
+seed file remain readable. Explicit peers take precedence over a selected
+devnet manifest, which takes precedence over a `darwin_bootstrap_peers.toml` in
+the config directory, which takes precedence over the bundled seeds. Only QUIC seeds
 are selected for native dialing. `darwin -v` logs "using N bundled bootstrap
 seed(s)" when it falls back to the bundled ones.
 
@@ -1047,10 +1049,14 @@ hints, or among the known peers (20 at most) a round falls back to before it
 reports a chunk missing.
 
 The config directory is `ant`'s: `~/.config/ant` on Linux,
-`~/Library/Application Support/ant` on macOS, `%APPDATA%\ant` on Windows. A
-`bootstrap_peers.toml` left there by Autonomi's `ant` installer names Autonomi's
-network, and `darwin` would join it (the price check then refuses to pay).
-Delete or rename that file to use the bundled seeds.
+`~/Library/Application Support/ant` on macOS, `%APPDATA%\ant` on Windows.
+`darwin` reads its seed file there only as `darwin_bootstrap_peers.toml`, never
+the `bootstrap_peers.toml` that Autonomi's `ant` and its installers write, which
+names Autonomi's network; and its peer cache, whose peers are dialled before the
+seeds, is `darwin_client_peer_cache.json` in the data directory, never `ant`'s
+`client_peer_cache.json`. So `darwin` keeps to its own network on a machine that
+also has `ant`. Before, it joined Autonomi's network there; the price check
+refused to pay Autonomi's nodes, but uploads and lookups went to them.
 
 Native library callers can use `config::resolve_bootstrap_multiaddrs()` and
 `Client::connect_multiaddrs()` to retain peer pins, which reads then use; a

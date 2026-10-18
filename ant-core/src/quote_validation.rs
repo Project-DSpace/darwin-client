@@ -218,6 +218,39 @@ mod tests {
     /// the same multiplier, or the forced-price check drops the nodes' quotes.
     const PRICE_MULTIPLIER: u128 = 32;
 
+    /// A quote priced as Autonomi's nodes price it, without this network's
+    /// multiplier, fails the forced-price check, so nothing is paid to a node
+    /// of Autonomi's network a client reaches. The same quote at 32 times the
+    /// price passes.
+    #[test]
+    fn quotes_priced_at_upstreams_rate_are_rejected() {
+        let public_key = vec![7u8; ML_DSA_PUB_KEY_LEN];
+        let peer = *blake3::hash(&public_key).as_bytes();
+        let content = [9u8; 32];
+        let quote_at = |wei: u128| {
+            let fields = QuoteFields {
+                public_key: &public_key,
+                content: &content,
+                price: Amount::from(wei),
+                committed_key_count: 0,
+                commitment_pin: None,
+            };
+            validate_quote::<Amount, ant_protocol::payment::commitment::StorageCommitment>(
+                &peer,
+                &content,
+                &fields,
+                || true,
+                None,
+            )
+        };
+        let error = quote_at(UPSTREAM_BASELINE_WEI).unwrap_err().to_string();
+        assert!(
+            error.contains("does not equal calculate_price(committed_key_count=0)"),
+            "{error}"
+        );
+        assert!(quote_at(UPSTREAM_BASELINE_WEI * PRICE_MULTIPLIER).is_ok());
+    }
+
     #[test]
     fn forced_prices_carry_the_networks_multiplier() {
         let baseline = Amount::from(UPSTREAM_BASELINE_WEI * PRICE_MULTIPLIER);

@@ -28,7 +28,11 @@ pub enum BootstrapAddressFilter {
 }
 
 const CLIENT_PEER_CACHE_SCHEMA_VERSION: u32 = 1;
-const CLIENT_PEER_CACHE_FILE_NAME: &str = "client_peer_cache.json";
+/// darwin's own cache file in the data directory. Autonomi's `ant` keeps its
+/// cache, peers of its network, as `client_peer_cache.json` in the same
+/// directory; that file is never read, since cached peers are dialled before
+/// the seeds.
+const CLIENT_PEER_CACHE_FILE_NAME: &str = "darwin_client_peer_cache.json";
 const CLIENT_PEER_CACHE_TEMP_SUFFIX: &str = "tmp";
 const DEFAULT_MAX_PER_EXACT_IP: usize = 2;
 const SUBNET_LIMIT_K_DIVISOR: usize = 4;
@@ -72,12 +76,17 @@ struct DiversityTracker {
 #[must_use]
 pub fn cache_path() -> Option<PathBuf> {
     match config::data_dir() {
-        Ok(data_dir) => Some(data_dir.join(CLIENT_PEER_CACHE_FILE_NAME)),
+        Ok(data_dir) => Some(cache_path_in(&data_dir)),
         Err(err) => {
             warn!("client peer cache disabled: failed to resolve data dir: {err}");
             None
         }
     }
+}
+
+/// The client peer cache's path in the data directory `data_dir`.
+fn cache_path_in(data_dir: &Path) -> PathBuf {
+    data_dir.join(CLIENT_PEER_CACHE_FILE_NAME)
 }
 
 /// Load cache addresses to try before configured bootstrap peers.
@@ -896,6 +905,34 @@ mod tests {
         let selected = select_bootstrap_peers(Vec::new(), vec![configured.clone()]);
 
         assert_eq!(selected, vec![configured]);
+    }
+
+    /// A peer cache Autonomi's `ant` left in the data directory, whose peers
+    /// would be dialled before darwin's seeds, is not read: darwin's cache is
+    /// its own file.
+    #[test]
+    fn a_peer_cache_left_by_autonomis_ant_is_not_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cache = ClientPeerCacheFile::empty();
+        cache.upsert_connected_peer(
+            peer_id(1),
+            vec![direct_addr(v4(203, 0, 113, 10), FIRST_PORT)],
+            TEST_NOW,
+            &IPDiversityConfig::permissive(),
+            TEST_K_VALUE,
+        );
+        cache.save(&dir.path().join("client_peer_cache.json"));
+
+        let path = cache_path_in(dir.path());
+        assert_eq!(path.file_name().unwrap(), "darwin_client_peer_cache.json");
+        assert!(cached_bootstrap_peers(&path, TEST_K_VALUE).is_empty());
+
+        // The same cache under darwin's name is read.
+        cache.save(&path);
+        assert_eq!(cached_bootstrap_peers(&path, TEST_K_VALUE).len(), 1);
+        if let Some(path) = cache_path() {
+            assert_eq!(path.file_name().unwrap(), "darwin_client_peer_cache.json");
+        }
     }
 
     #[test]

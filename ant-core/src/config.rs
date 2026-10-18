@@ -1,5 +1,5 @@
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use alloy::network::EthereumWallet;
 use alloy::signers::{local::PrivateKeySigner, Signer};
@@ -60,7 +60,14 @@ pub fn log_dir() -> Result<PathBuf> {
     }
 }
 
-/// Loads bootstrap peers from the platform-appropriate `bootstrap_peers.toml` file.
+/// The file in the config directory whose seeds replace the ones bundled in
+/// the binary. It is darwin's own: Autonomi's `ant` and its installers keep
+/// their network's seeds in `bootstrap_peers.toml` in the same directory,
+/// which is never read, so a machine that also has `ant` keeps darwin's seeds.
+pub const DARWIN_BOOTSTRAP_PEERS_FILE: &str = "darwin_bootstrap_peers.toml";
+
+/// Loads bootstrap peers from [`DARWIN_BOOTSTRAP_PEERS_FILE`] in the config
+/// directory.
 ///
 /// Returns `Ok(Some(peers))` if the file exists and parses successfully,
 /// `Ok(None)` if the file does not exist, or `Err` on parse/IO failures.
@@ -69,9 +76,18 @@ pub fn load_bootstrap_peers() -> Result<Option<Vec<SocketAddr>>> {
         .map(|peers| peers.iter().filter_map(MultiAddr::socket_addr).collect()))
 }
 
-/// Load native QUIC bootstrap multiaddresses, preserving optional peer pins.
+/// Load native QUIC bootstrap multiaddresses from
+/// [`DARWIN_BOOTSTRAP_PEERS_FILE`] in the config directory, preserving
+/// optional peer pins.
 pub fn load_bootstrap_multiaddrs() -> Result<Option<Vec<MultiAddr>>> {
-    let path = config_dir()?.join("bootstrap_peers.toml");
+    load_bootstrap_multiaddrs_in(&config_dir()?)
+}
+
+/// [`load_bootstrap_multiaddrs`] from the config directory `dir`: the QUIC
+/// seeds of its [`DARWIN_BOOTSTRAP_PEERS_FILE`], or `None` when there is no
+/// such file or it names none. A `bootstrap_peers.toml` there is not read.
+pub fn load_bootstrap_multiaddrs_in(dir: &Path) -> Result<Option<Vec<MultiAddr>>> {
+    let path = dir.join(DARWIN_BOOTSTRAP_PEERS_FILE);
     if !path.exists() {
         return Ok(None);
     }
@@ -82,11 +98,22 @@ pub fn load_bootstrap_multiaddrs() -> Result<Option<Vec<MultiAddr>>> {
 
 /// Resolve native QUIC bootstrap addresses without losing peer identity suffixes.
 /// Explicit input and selected manifests are authoritative; neither falls back.
-/// With neither, the config file wins, and the seeds bundled into the binary
-/// stand in when there is no config file.
+/// With neither, [`DARWIN_BOOTSTRAP_PEERS_FILE`] in the config directory wins,
+/// and the seeds bundled into the binary stand in when there is no such file.
 pub fn resolve_bootstrap_multiaddrs(
     explicit: &[MultiAddr],
     manifest: Option<&DevnetManifest>,
+) -> Result<Vec<MultiAddr>> {
+    resolve_bootstrap_multiaddrs_with(explicit, manifest, load_bootstrap_multiaddrs)
+}
+
+/// [`resolve_bootstrap_multiaddrs`], with the override file's seeds read by
+/// `override_file`, which is called only when there are no explicit or
+/// manifest peers.
+fn resolve_bootstrap_multiaddrs_with(
+    explicit: &[MultiAddr],
+    manifest: Option<&DevnetManifest>,
+    override_file: impl FnOnce() -> Result<Option<Vec<MultiAddr>>>,
 ) -> Result<Vec<MultiAddr>> {
     let peers = if !explicit.is_empty() {
         explicit
@@ -101,15 +128,13 @@ pub fn resolve_bootstrap_multiaddrs(
             .filter(|addr| addr.is_quic())
             .cloned()
             .collect()
-    } else if let Some(peers) = load_bootstrap_multiaddrs()? {
+    } else if let Some(peers) = override_file()? {
         peers
     } else {
-        // No config file. Fall back to the seeds compiled into the binary, so an install that
-        // never wrote one still reaches the network: npm has blocked package install scripts by
-        // default since npm 12, so the postinstall that copies `bootstrap_peers.toml` into the
-        // config directory frequently does not run. Reached only where the alternative is
-        // `NoBootstrapPeers`, so it cannot override a user's choice, and the branches above mean
-        // an explicitly selected devnet manifest still errors rather than reaching for mainnet.
+        // No override file: the seeds compiled into the binary. Reached only where the
+        // alternative is `NoBootstrapPeers`, so it cannot override a user's choice, and the
+        // branches above mean an explicitly selected devnet manifest still errors rather than
+        // reaching for the bundled network.
         let seeds = crate::network_defaults::bundled_bootstrap_seeds()
             .map_err(|e| Error::BootstrapConfigParse(e.to_string()))?;
         tracing::info!(
@@ -127,8 +152,8 @@ pub fn resolve_bootstrap_multiaddrs(
 /// Resolve the bootstrap peers for a client connection.
 ///
 /// Priority: explicitly supplied peers (e.g. a frontend's `--bootstrap`
-/// flag) > devnet manifest peers > the platform `bootstrap_peers.toml`
-/// config file > the seeds bundled into the binary. Manifest peers
+/// flag) > devnet manifest peers > [`DARWIN_BOOTSTRAP_PEERS_FILE`] in the
+/// config directory > the seeds bundled into the binary. Manifest peers
 /// without a resolvable socket address are filtered out. A selected
 /// manifest is authoritative: if it yields no usable peers, resolution
 /// fails rather than falling back to the config file or the bundled
@@ -581,6 +606,85 @@ mod tests {
         // Set config dir to a temp location where no file exists
         let _result = load_bootstrap_peers();
         // Just verify it doesn't panic — actual None depends on whether the file exists
+    }
+
+    /// Upstream's `ant-core/resources/bootstrap_peers.toml` at 4b4bf51 (0.3.11):
+    /// Autonomi's seeds, which its installers copy into the config directory
+    /// as `bootstrap_peers.toml`.
+    const UPSTREAM_BOOTSTRAP_PEERS: &str = r#"# Autonomi mainnet bootstrap seeds. Shared by native releases and WASM.
+# Preserve optional /p2p/<peer-id> suffixes on QUIC addresses.
+quic = [
+    "/ip4/207.148.94.42/udp/10000/quic",
+    "/ip4/45.77.50.10/udp/10000/quic",
+    "/ip4/66.135.23.83/udp/10000/quic",
+    "/ip4/149.248.9.2/udp/10000/quic",
+    "/ip4/49.12.119.240/udp/10000/quic",
+    "/ip4/5.161.25.133/udp/10000/quic",
+    "/ip4/18.228.202.183/udp/10000/quic",
+]
+
+# Certificate-pinned mainnet WebRTC Direct bootstrap nodes.
+# Format: /ip4|ip6/<ip>/udp/<port>/webrtc-direct/certhash/<hash>/p2p/<peer-id>
+webrtc = [
+    "/ip4/207.148.94.42/udp/10001/webrtc-direct/certhash/uEiAkAsFZc-iV5UToJHyETA8GLBIVdzB10Qv6VuNlwqTwkQ/p2p/57a89f84e1652d22fd6b791c29d83f187fbed3ba8e08e265fe3031b3a6f725da",
+    "/ip4/45.77.50.10/udp/10001/webrtc-direct/certhash/uEiBPw-6EWRHA5goZVyE06nBT6BdumpDyuWb40bAbG4tJ2A/p2p/bb72725f8f4383eb475ac9cb681505d9147e8b2c5a4c0197d4efdb328c54601f",
+    "/ip4/66.135.23.83/udp/10001/webrtc-direct/certhash/uEiAsKBTTrUfWCXvv8MpV1SPannw0o0qFi2z6Or16O36Jaw/p2p/a1f073e0ffc1a1890e8d072015fa2437a1090997b47c0412c0bfabe7c7e16199",
+    "/ip4/149.248.9.2/udp/10001/webrtc-direct/certhash/uEiDdXDebnE74XGEYaA50qZP8xCA7g3Z4dmiWuHiatkOfEg/p2p/3926125b8454101fd39739a09320ca0174be90d3423c1287926172bea69a0f5a",
+    "/ip4/167.235.239.18/udp/10001/webrtc-direct/certhash/uEiBypdPUMOpNrjnQ-cW4aq5QnM8bfIeC8NK-Os6WJKbesQ/p2p/dac90975f872f6401519f7b14bfd860792c9052964ffdbd40d190f35469e4ad1",
+    "/ip4/87.99.148.210/udp/10001/webrtc-direct/certhash/uEiBPDRe3LCcusQgkHsvEQM8ti3R4ekzpSTGzJPFqq9wpTg/p2p/825916f9447f45d93554d3be742f9a76f7dede9190368dbdb15d34ff7211e9e1",
+    "/ip4/18.228.202.183/udp/10001/webrtc-direct/certhash/uEiAZ4mNGJrYmrVVVDi4t8TS9oYoQ-NavFK8cWAF1X3NEjA/p2p/2ed6785d3aab00fc4ef048884c63b2a85fb587441413a94a7eb8f8e8b65bd582",
+]
+"#;
+
+    /// A seed file Autonomi's `ant` left in the config directory is not read:
+    /// darwin keeps its 16 bundled seeds. Only darwin's own file replaces
+    /// them, and explicit peers and a devnet manifest still come first.
+    #[test]
+    fn a_bootstrap_file_left_by_autonomis_ant_does_not_replace_darwins_seeds() {
+        let dir = tempfile::tempdir().unwrap();
+        let resolve = |explicit: &[MultiAddr], manifest: Option<&DevnetManifest>| {
+            resolve_bootstrap_multiaddrs_with(explicit, manifest, || {
+                load_bootstrap_multiaddrs_in(dir.path())
+            })
+        };
+        let autonomi = crate::network_defaults::parse_bootstrap_seeds(UPSTREAM_BOOTSTRAP_PEERS)
+            .unwrap()
+            .quic;
+        assert_eq!(autonomi.len(), 7);
+        std::fs::write(
+            dir.path().join("bootstrap_peers.toml"),
+            UPSTREAM_BOOTSTRAP_PEERS,
+        )
+        .unwrap();
+
+        assert_eq!(load_bootstrap_multiaddrs_in(dir.path()).unwrap(), None);
+        let bundled = crate::network_defaults::bundled_bootstrap_seeds()
+            .unwrap()
+            .quic;
+        assert_eq!(bundled.len(), 16);
+        let resolved = resolve(&[], None).unwrap();
+        assert_eq!(resolved, bundled);
+        assert!(resolved.iter().all(|seed| !autonomi.contains(seed)));
+
+        // darwin's own file still replaces the bundled seeds.
+        let own: MultiAddr = format!("/ip4/203.0.113.7/udp/10000/quic/p2p/{}", "cd".repeat(32))
+            .parse()
+            .unwrap();
+        std::fs::write(
+            dir.path().join(DARWIN_BOOTSTRAP_PEERS_FILE),
+            format!("quic = [\"{own}\"]\n"),
+        )
+        .unwrap();
+        assert_eq!(resolve(&[], None).unwrap(), vec![own.clone()]);
+
+        // Explicit peers, then a devnet manifest, come before it.
+        let explicit: MultiAddr = "/ip4/10.0.0.1/udp/10000/quic".parse().unwrap();
+        assert_eq!(
+            resolve(std::slice::from_ref(&explicit), None).unwrap(),
+            vec![explicit]
+        );
+        let manifest = test_manifest(vec!["10.0.0.2:10000".parse().unwrap()]);
+        assert_eq!(resolve(&[], Some(&manifest)).unwrap(), manifest.bootstrap);
     }
 
     #[test]
