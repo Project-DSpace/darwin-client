@@ -139,6 +139,10 @@ told apart by the commit `darwin --version` prints. Upstream's entries follow.
 - Payments are signed for the payment network's chain only (4663, or a devnet manifest's
   `evm.chain_id`), so an RPC that reports another chain gets nothing signed.
 - The CLI is `darwin`, shows costs in the payment token, and has self-update turned off.
+- `darwin chunk put` is off: it stored a paid raw chunk, which has no data map and so can't carry
+  an envelope, with no payment record, listing or `.record`. It fails before reading its input
+  or `SECRET_KEY`, or joining the network, and names `darwin file upload`. `darwin chunk get`
+  and the library's `Client::chunk_put` are unchanged.
 - `darwin-linux-x64.tar.gz` from CI carries license notices: `LICENSE-MIT`, `LICENSE-APACHE`,
   `THIRD-PARTY-NOTICES.txt` and `RUST-STD-COPYRIGHT.html` next to `darwin`, like upstream's archives.
 - In the library, the upload calls that take no visibility (`file_upload`, `file_upload_with_mode`,

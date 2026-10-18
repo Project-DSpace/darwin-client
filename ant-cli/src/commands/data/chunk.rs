@@ -9,10 +9,32 @@ use tracing::info;
 use ant_core::data::client::chunk::ChunkPeerGetResult;
 use ant_core::data::{Client, DataChunk, Error as DataError, MAX_CHUNK_SIZE};
 
+/// Whether `darwin chunk put` stores paid raw chunks. Off: a raw chunk has no
+/// data map, so it can't carry an envelope, and it would be stored without
+/// the payment record, listing and `.record` every upload carries.
+/// `darwin chunk get` and the library's `Client::chunk_put` are unchanged.
+const RAW_CHUNK_PUT: bool = false;
+
+/// Why `darwin chunk put` is refused while [`RAW_CHUNK_PUT`] is off.
+const RAW_CHUNK_PUT_OFF: &str = "`darwin chunk put` is off in this build: a raw chunk can't carry \
+     an envelope, so it would be stored without the payment record, listing and .record every \
+     upload carries. Use `darwin file upload <FILE>`: private by default, every payment field \
+     shown.";
+
+/// Refuse `darwin chunk put` while [`RAW_CHUNK_PUT`] is off.
+fn raw_chunk_put_allowed() -> anyhow::Result<()> {
+    if !RAW_CHUNK_PUT {
+        anyhow::bail!(RAW_CHUNK_PUT_OFF);
+    }
+    Ok(())
+}
+
 /// Chunk subcommands.
 #[derive(Subcommand, Debug)]
 pub enum ChunkAction {
-    /// Store a single chunk. Reads from FILE or stdin.
+    /// Off in this build: a raw chunk can't carry an envelope, so it would be
+    /// stored without the payment record, listing and .record every upload
+    /// carries. Use `darwin file upload`.
     Put {
         /// Input file (reads from stdin if omitted).
         file: Option<PathBuf>,
@@ -37,9 +59,20 @@ pub enum ChunkAction {
 }
 
 impl ChunkAction {
+    /// Refuse what this build doesn't do before `SECRET_KEY` is read or the
+    /// network is joined: `put`, while raw chunks are off. Its file and stdin
+    /// are not read.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        match self {
+            ChunkAction::Put { .. } => raw_chunk_put_allowed(),
+            ChunkAction::Get { .. } => Ok(()),
+        }
+    }
+
     pub async fn execute(self, client: &Client) -> anyhow::Result<()> {
         match self {
             ChunkAction::Put { file } => {
+                raw_chunk_put_allowed()?;
                 let content = read_input(file.as_deref())?;
                 let content_len = content.len();
                 info!("Storing single chunk ({content_len} bytes)");
@@ -354,6 +387,28 @@ mod tests {
             }
             ChunkAction::Put { .. } => panic!("expected chunk get action"),
         }
+    }
+
+    /// `put` is refused, from a file or stdin, before anything is read, and
+    /// `get` is not.
+    #[test]
+    fn put_is_held_back() {
+        const { assert!(!RAW_CHUNK_PUT) };
+        for file in [None, Some(PathBuf::from("chunk.bin"))] {
+            let error = ChunkAction::Put { file }
+                .validate()
+                .unwrap_err()
+                .to_string();
+            assert_eq!(error, RAW_CHUNK_PUT_OFF);
+            assert!(error.contains("Use `darwin file upload <FILE>`"), "{error}");
+        }
+        let get = ChunkAction::Get {
+            address: test_address(),
+            output: None,
+            all_peers: false,
+            peer_count: None,
+        };
+        assert!(get.validate().is_ok());
     }
 
     #[test]

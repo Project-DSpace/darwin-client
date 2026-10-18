@@ -119,7 +119,7 @@ ant-cli/src/
 └── commands/
     ├── data/
     │   ├── file.rs           # darwin file upload/download
-    │   ├── chunk.rs          # darwin chunk put/get
+    │   ├── chunk.rs          # darwin chunk get (put is off in this build: RAW_CHUNK_PUT)
     │   ├── pointer.rs        # darwin pointer keygen/address/create/update/get/resolve/transfer/finality/controller
     │   ├── manifest.rs       # darwin manifest create/list/show/link/export/download
     │   └── wallet.rs         # darwin wallet address/balance

@@ -221,17 +221,16 @@ darwin file download abc123... -o photo_copy.jpg \
     --devnet-manifest ~/.local/share/ant/devnet-manifest.json --allow-loopback --evm-network local
 ```
 
-### Low-level chunk operations
+### Low-level chunk reads
 
 ```bash
-# Store a single chunk (< 1 MB)
-echo "hello darwin" | SECRET_KEY=0x... darwin chunk put
-# Output: abc123def456...
-
-# Retrieve it
-darwin chunk get abc123def456...
-# Output: hello darwin
+# Read a single chunk by its address
+darwin chunk get abc123def456... -o chunk.bin
 ```
+
+`darwin chunk put` is off in this build: a raw chunk can't carry an envelope, so it would be
+stored without the payment record, listing and `.record` every upload carries. Upload with
+`darwin file upload`.
 
 ---
 
@@ -426,16 +425,15 @@ Asks the 7 nodes nearest the address for its listing, in the index or not, and c
 
 ### `darwin chunk` — Single-Chunk Operations
 
-Low-level put/get for individual chunks (max ~1 MB each). Useful for small data or building custom data structures.
+Low-level reads of individual chunks (max ~1 MB each).
 
 #### `darwin chunk put [FILE]`
 
-Store a single chunk. Reads from `FILE` or stdin. Requires `SECRET_KEY`.
-
-```
-$ echo "small payload" | SECRET_KEY=0x... darwin chunk put
-a1b2c3d4...
-```
+Off in this build: `darwin chunk put` exits with an error, before it reads its input or
+`SECRET_KEY` or joins the network. A raw chunk has no data map, so it can't carry an envelope,
+and it would be stored without the payment record, listing and `.record` every upload carries.
+Use `darwin file upload <FILE>`: private by default, with every payment field shown. The
+library's `Client::chunk_put` is unchanged.
 
 #### `darwin chunk get <ADDRESS>`
 
