@@ -121,16 +121,19 @@ For data already in memory (API payloads, generated content, etc.):
 use bytes::Bytes;
 use ant_core::data::EnvelopeOptions;
 
-// `data_upload` and `data_upload_with_mode` are off in this build: they would store
-// the bytes with no envelope. Prepare them with an envelope for an outside signer
-// to pay, then `finalize_upload`, or write them to a file for `file_upload`.
+// Raw: `data_upload` (and `data_upload_with_mode`) stores the bytes' chunks with no
+// envelope, so no payment record, listing or `.record`
+let result = client.data_upload(Bytes::from(my_data)).await?;
+
+// The standard way stores an envelope: prepare the bytes with one for an outside
+// signer to pay, then `finalize_upload`, or write them to a file for `file_upload`
 let prepared = client.data_prepare_upload_with_visibility(
     Bytes::from(my_data),
     EnvelopeOptions::private().into_visibility(),
 ).await?;
 
 // Download and decrypt
-let content: Bytes = client.data_download(&prepared.data_map).await?;
+let content: Bytes = client.data_download(&result.data_map).await?;
 ```
 
 ### Chunk Operations

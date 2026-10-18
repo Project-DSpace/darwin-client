@@ -178,11 +178,11 @@ told apart by the commit `darwin --version` prints. Upstream's entries follow.
   `data_prepare_upload`) store the private envelope `darwin file upload` stores, with every
   payment field shown, and `file_upload_public_with_mode` and `file_upload_public_with_progress`
   the unlisted envelope `--public` stores; before, they stored no envelope, or a plain data map.
-  `data_upload` and `data_upload_with_mode`, which store no envelope, are off: they return an
-  error naming `file_upload` and `data_prepare_upload_with_visibility`. `Visibility::Private`
-  and `Visibility::Public` still upload with no envelope when asked for by name, and the raw
-  building blocks (`chunk_put`, `data_map_store`, `upload_records`, `batch_upload_chunks`,
-  `pay_for_storage`, `SingleNodeQuotePayment`) say in their documentation what they leave out.
+  `Visibility::Private` and `Visibility::Public` still upload with no envelope when asked for by
+  name, and the raw building blocks (`data_upload`, `data_upload_with_mode`, `chunk_put`,
+  `data_map_store`, `upload_records`, `batch_upload_chunks`, `pay_for_storage`,
+  `SingleNodeQuotePayment`), which store or pay as upstream's do, say in their documentation
+  that they store no envelope, what else they leave out, and what stores one.
 - The merge of upstream 0.3.11 (ant-core 0.13.0) brings pointer transfer, finality and controller
   (`darwin pointer transfer`, `finality`, `controller`), file manifests and links
   (`darwin manifest`), large-file downloads in the browser, and concurrent reads that share their

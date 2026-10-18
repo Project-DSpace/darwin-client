@@ -1,13 +1,10 @@
-//! E2E tests for in-memory data with real EVM payments: content encrypted
-//! in memory and stored through the raw chunk building blocks downloads and
-//! range-reads, and the in-memory upload shortcuts, which store no envelope,
-//! are held back.
+//! E2E tests for in-memory data upload/download using self-encryption with real EVM payments.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 mod support;
 
-use ant_core::data::{Client, DataMap, PaymentMode};
+use ant_core::data::Client;
 use bytes::Bytes;
 use self_encryption::encrypt;
 use self_encryption::MAX_CHUNK_SIZE;
@@ -33,19 +30,6 @@ async fn setup() -> (Client, MiniTestnet) {
     (client, testnet)
 }
 
-/// Encrypt `content` in memory and store its chunks through the raw
-/// `batch_upload_chunks` building block, with no envelope, as
-/// `data_upload` did before it was held back. Returns the data map and the
-/// number of chunks stored.
-async fn store_content(client: &Client, content: Bytes) -> (DataMap, usize) {
-    let (data_map, chunks) = encrypt(content).expect("encrypt");
-    let (addresses, _storage_cost, _gas_cost) = client
-        .batch_upload_chunks(chunks.into_iter().map(|chunk| chunk.content).collect())
-        .await
-        .expect("store the chunks");
-    (data_map, addresses.len())
-}
-
 #[tokio::test(flavor = "multi_thread")]
 #[serial]
 async fn test_data_upload_download_round_trip() {
@@ -54,15 +38,18 @@ async fn test_data_upload_download_round_trip() {
     // Self-encryption requires at least 3072 bytes
     let content = Bytes::from(vec![0x42u8; 4096]);
 
-    let (data_map, chunks_stored) = store_content(&client, content.clone()).await;
+    let result = client
+        .data_upload(content.clone())
+        .await
+        .expect("data_upload should succeed");
 
     assert!(
-        chunks_stored >= 3,
+        result.chunks_stored >= 3,
         "self-encryption produces at least 3 chunks"
     );
 
     let downloaded = client
-        .data_download(&data_map)
+        .data_download(&result.data_map)
         .await
         .expect("data_download should succeed");
 
@@ -72,12 +59,12 @@ async fn test_data_upload_download_round_trip() {
     );
 
     let range = client
-        .data_download_range(&data_map, 1020, 1500)
+        .data_download_range(&result.data_map, 1020, 1500)
         .await
         .expect("shared range reader should succeed");
     assert_eq!(range, content.slice(1020..2520));
     assert!(client
-        .data_download_range(&data_map, content.len(), 10)
+        .data_download_range(&result.data_map, content.len(), 10)
         .await
         .unwrap()
         .is_empty());
@@ -95,12 +82,15 @@ async fn test_data_large_content() {
     let content: Vec<u8> = (0u8..=255).cycle().take(100_000).collect();
     let content = Bytes::from(content);
 
-    let (data_map, chunks_stored) = store_content(&client, content.clone()).await;
+    let result = client
+        .data_upload(content.clone())
+        .await
+        .expect("data_upload should succeed");
 
-    assert!(chunks_stored >= 3, "should produce multiple chunks");
+    assert!(result.chunks_stored >= 3, "should produce multiple chunks");
 
     let downloaded = client
-        .data_download(&data_map)
+        .data_download(&result.data_map)
         .await
         .expect("data_download should succeed");
 
@@ -116,7 +106,7 @@ async fn test_data_large_content() {
 }
 
 /// Regression test: a payload large enough to shrink the `DataMap` must still
-/// round-trip through storing its chunks and `data_download`.
+/// round-trip through `data_upload`/`data_download`.
 ///
 /// Before the fix, `data_download` fed the shrunk map's wrapper-level `infos()`
 /// straight to `self_encryption::decrypt`, which never fetched the root content
@@ -135,15 +125,18 @@ async fn test_data_shrunk_datamap_round_trip() {
         .collect();
     let content = Bytes::from(content);
 
-    let (data_map, _) = store_content(&client, content.clone()).await;
+    let result = client
+        .data_upload(content.clone())
+        .await
+        .expect("data_upload should succeed");
 
     // Guard: if this payload ever stops producing a shrunk (child) map, the
     // test would silently stop exercising the regression it protects against.
     assert!(
-        data_map.is_child(),
+        result.data_map.is_child(),
         "payload of {} bytes should produce a shrunk (child) DataMap (infos={})",
         SHRUNK_DATAMAP_PAYLOAD_BYTES,
-        data_map.infos().len()
+        result.data_map.infos().len()
     );
 
     let mut downloaded = None;
@@ -151,7 +144,7 @@ async fn test_data_shrunk_datamap_round_trip() {
         if attempt > 0 {
             tokio::time::sleep(std::time::Duration::from_secs(2)).await;
         }
-        match client.data_download(&data_map).await {
+        match client.data_download(&result.data_map).await {
             Ok(d) => {
                 downloaded = Some(d);
                 break;
@@ -173,62 +166,20 @@ async fn test_data_shrunk_datamap_round_trip() {
     testnet.teardown().await;
 }
 
-/// `data_upload` and `data_upload_with_mode` store no envelope, so they are
-/// off: each refuses, naming what to use instead, and nothing is paid or
-/// stored.
 #[tokio::test(flavor = "multi_thread")]
 #[serial]
-async fn test_data_upload_is_held_back() {
+async fn test_data_upload_too_small_fails() {
     let (client, testnet) = setup().await;
 
-    let content = Bytes::from(vec![0x4cu8; 4096]);
-    let (_, chunks) = encrypt(content.clone()).expect("encrypt");
-    let balance_before = client
-        .wallet()
-        .expect("wallet should be set")
-        .balance_of_tokens()
-        .await
-        .expect("balance query should succeed");
+    // MIN_ENCRYPTABLE_BYTES = 3 (3 * MIN_CHUNK_SIZE where MIN_CHUNK_SIZE=1)
+    // So only 0, 1, or 2 bytes should fail
+    let content = Bytes::from(vec![0x42u8; 2]);
 
-    for result in [
-        client.data_upload(content.clone()).await,
-        client
-            .data_upload_with_mode(content.clone(), PaymentMode::Single)
-            .await,
-        client
-            .data_upload_with_mode(content.clone(), PaymentMode::Merkle)
-            .await,
-    ] {
-        let error = result.expect_err("held back").to_string();
-        assert!(
-            error.contains("data_upload is off in this build"),
-            "{error}"
-        );
-        assert!(error.contains("file_upload"), "{error}");
-        assert!(
-            error.contains("data_prepare_upload_with_visibility"),
-            "{error}"
-        );
-    }
-
-    let balance_after = client
-        .wallet()
-        .expect("wallet should be set")
-        .balance_of_tokens()
-        .await
-        .expect("balance query should succeed");
-    assert_eq!(balance_before, balance_after, "nothing is paid");
-    for chunk in &chunks {
-        let address = ant_core::data::compute_address(&chunk.content);
-        assert!(
-            !client.chunk_exists(&address).await.expect("check"),
-            "nothing is stored"
-        );
-    }
-
-    // Content too small to encrypt (under 3 bytes) is refused before any
-    // chunk exists.
-    assert!(encrypt(Bytes::from(vec![0x42u8; 2])).is_err());
+    let result = client.data_upload(content).await;
+    assert!(
+        result.is_err(),
+        "files smaller than MIN_ENCRYPTABLE_BYTES (3) should fail"
+    );
 
     drop(client);
     testnet.teardown().await;
@@ -241,9 +192,15 @@ async fn test_data_deterministic_encryption() {
 
     let content = Bytes::from(vec![0xAA; 4096]);
 
-    let (data_map1, _) = store_content(&client, content.clone()).await;
+    let result1 = client
+        .data_upload(content.clone())
+        .await
+        .expect("first upload should succeed");
 
-    let (data_map2, _) = store_content(&client, content.clone()).await;
+    let result2 = client
+        .data_upload(content.clone())
+        .await
+        .expect("second upload should succeed");
 
     // Verify download produces the original content (retry for CI transport flakiness)
     let mut downloaded = None;
@@ -251,7 +208,7 @@ async fn test_data_deterministic_encryption() {
         if attempt > 0 {
             tokio::time::sleep(std::time::Duration::from_secs(2)).await;
         }
-        match client.data_download(&data_map2).await {
+        match client.data_download(&result2.data_map).await {
             Ok(d) => {
                 downloaded = Some(d);
                 break;
@@ -270,13 +227,18 @@ async fn test_data_deterministic_encryption() {
 
     // Convergent encryption: same content produces same DataMap
     assert_eq!(
-        data_map1.infos().len(),
-        data_map2.infos().len(),
+        result1.data_map.infos().len(),
+        result2.data_map.infos().len(),
         "same content should produce same number of chunks"
     );
 
     // Verify chunk addresses match (convergent encryption property)
-    for (a, b) in data_map1.infos().iter().zip(data_map2.infos().iter()) {
+    for (a, b) in result1
+        .data_map
+        .infos()
+        .iter()
+        .zip(result2.data_map.infos().iter())
+    {
         assert_eq!(
             a.dst_hash, b.dst_hash,
             "same content should produce same chunk addresses"
@@ -324,9 +286,15 @@ async fn test_data_upload_partial_overlap_skips_payment_for_existing_chunks() {
 
     // Upload the full data — chunk_put will be called for each encrypted chunk,
     // but the pre-stored one should be detected as AlreadyStored and skipped
-    let (data_map, chunks_stored) = store_content(&client, content.clone()).await;
+    let result = client
+        .data_upload(content.clone())
+        .await
+        .expect("data_upload should succeed");
 
-    assert!(chunks_stored >= 3, "should store at least 3 chunks total");
+    assert!(
+        result.chunks_stored >= 3,
+        "should store at least 3 chunks total"
+    );
 
     let balance_after_partial = client
         .wallet()
@@ -343,10 +311,13 @@ async fn test_data_upload_partial_overlap_skips_payment_for_existing_chunks() {
 
     // Now upload the SAME data again — ALL chunks exist, so zero payment
     let balance_before_dup = balance_after_partial;
-    let (_, chunks_stored2) = store_content(&client, content.clone()).await;
+    let result2 = client
+        .data_upload(content.clone())
+        .await
+        .expect("duplicate data_upload should succeed");
 
     assert_eq!(
-        chunks_stored, chunks_stored2,
+        result.chunks_stored, result2.chunks_stored,
         "same content should produce same chunk count"
     );
 
@@ -368,7 +339,7 @@ async fn test_data_upload_partial_overlap_skips_payment_for_existing_chunks() {
         if attempt > 0 {
             tokio::time::sleep(std::time::Duration::from_secs(2)).await;
         }
-        match client.data_download(&data_map).await {
+        match client.data_download(&result.data_map).await {
             Ok(d) => {
                 downloaded = Some(d);
                 break;
@@ -391,13 +362,16 @@ async fn test_data_upload_partial_overlap_skips_payment_for_existing_chunks() {
 async fn test_public_data_map_store_and_fetch() {
     let (client, testnet) = setup().await;
 
-    // Store the content's chunks, get a DataMap
+    // Upload data, get a DataMap
     let content = Bytes::from(vec![0xFFu8; 4096]);
-    let (data_map, _) = store_content(&client, content.clone()).await;
+    let result = client
+        .data_upload(content.clone())
+        .await
+        .expect("data_upload should succeed");
 
     // Store the DataMap publicly (as a chunk on the network)
     let dm_address = client
-        .data_map_store(&data_map)
+        .data_map_store(&result.data_map)
         .await
         .expect("data_map_store should succeed");
 
@@ -408,7 +382,7 @@ async fn test_public_data_map_store_and_fetch() {
         .expect("data_map_fetch should succeed");
 
     assert_eq!(
-        data_map.infos().len(),
+        result.data_map.infos().len(),
         fetched_dm.infos().len(),
         "Fetched DataMap should have same number of chunks"
     );
