@@ -25,7 +25,10 @@ told apart by the commit `darwin --version` prints. Upstream's entries follow.
   first (the vault then skips the payment, with no revert and no event) is quoted again and paid
   again, up to 3 times per chunk; after that the chunk fails with a `quotes occupied` error naming
   the node that issued the quotes. Applies to uploads paid by the wallet or an outside payer, and
-  to single records (`chunk_put`, pointers). Browser builds don't read records back.
+  to single records (`chunk_put`, pointers). The records are read through the payment network's
+  RPC and then, on the bundled network, the RPCs reads of payments fall back to, each call within
+  15 seconds; before, through its RPC alone, with no time limit. Browser builds don't read records
+  back.
 - Uploads and pointer writes from the browser core are off in this build: `uploadPublicFile`,
   `uploadStagedPublicFile`, `uploadRecords`, `createPointer`, `updatePointer`, `transferPointer`
   and `storePaidPointer` refuse before any quote, wallet callback or request, until they carry

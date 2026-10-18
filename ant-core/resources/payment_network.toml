@@ -13,7 +13,8 @@ rpc_url = "https://robinhood-rpc.publicnode.com"
 # the native client signs payments for this chain only, refusing an RPC that
 # reports another.
 chain_id = 4663
-# Where reads of payments (listings, upload proofs) go when `rpc_url` refuses
+# Where reads of payments (listings, upload proofs, and the vault record of
+# each quote an upload paid, read back after paying) go when `rpc_url` refuses
 # or fails a call: PublicNode refuses `eth_getLogs`, which finding a payment
 # whose transaction hash is hidden needs. Robinhood's own RPC comes last, for
 # the reason above.

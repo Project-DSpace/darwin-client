@@ -11,6 +11,8 @@
 //! and paid again, up to [`MAX_OCCUPIED_REQUOTES`] times.
 
 use super::batch::ChunkPaymentPlan;
+#[cfg(feature = "native")]
+use super::listings::ListingChain;
 use super::Client;
 use crate::data::error::Error;
 use ant_protocol::evm::{Amount, EncodedPeerId, QuoteHash, RewardsAddress};
@@ -170,72 +172,30 @@ impl Client {
     /// Read back the vault record of every paid quote in `plans`, and return
     /// the quotes whose record isn't the payment.
     ///
-    /// Reads are retried for up to 8 seconds while a record is still empty,
-    /// since an RPC can lag the chain. A quote whose record stays empty, or can't be
-    /// read, is not reported: the upload then goes on as it would have without
-    /// the read-back, and nodes decide. Without an EVM network (a client
-    /// with neither `with_wallet` nor `with_evm_network`) nothing is read.
+    /// The records are read through the payment network's RPC and then the
+    /// RPCs reads of payments fall back to ([`crate::config::fallback_rpc_urls`]:
+    /// the bundled network's, none for any other), each call within its own
+    /// time limit, as a [`ListingChain`] reads. A record still empty is read
+    /// again, up to 5 reads 2 seconds apart, since an RPC can lag the chain. A
+    /// quote whose record stays empty, or that no RPC answers for, is not
+    /// reported: the upload then goes on as it would have without the
+    /// read-back, and nodes decide. Without an EVM network (a client with
+    /// neither `with_wallet` nor `with_evm_network`) nothing is read.
     #[cfg(feature = "native")]
     pub(crate) async fn occupied_quotes(&self, plans: &[ChunkPaymentPlan]) -> Vec<OccupiedQuote> {
-        use ant_protocol::evm::contract::payment_vault::interface::IPaymentVault;
-        use futures::StreamExt;
-
-        /// Reads while some records are still empty, and the pause between
-        /// them: as the console and the `dspace` CLI read records back.
-        const READS: usize = 5;
-        const PAUSE: std::time::Duration = std::time::Duration::from_secs(2);
-
         let Some(network) = self.evm_network.as_ref() else {
             tracing::debug!("no EVM network configured: payment records not read back");
             return Vec::new();
         };
-        let provider = ant_protocol::evm::utils::http_provider(network.rpc_url().clone());
-        let vault = IPaymentVault::new(*network.payment_vault_address(), provider);
-        let mut pending = paid_quotes(plans);
-        let mut records = HashMap::new();
-        for read in 0..READS {
-            if pending.is_empty() {
-                break;
-            }
-            if read > 0 {
-                crate::runtime::sleep(PAUSE).await;
-            }
-            let read = futures::stream::iter(pending.iter().copied())
-                .map(|hash| {
-                    let vault = &vault;
-                    async move { (hash, vault.completedPayments(hash).call().await) }
-                })
-                .buffer_unordered(16)
-                .collect::<Vec<_>>()
-                .await;
-            pending.clear();
-            for (hash, result) in read {
-                match result {
-                    Ok(record) if record.amount != 0 => {
-                        records.insert(
-                            hash,
-                            VaultRecord {
-                                rewards_prefix: record.rewardsAddress.0,
-                                amount: Amount::from(record.amount),
-                            },
-                        );
-                    }
-                    Ok(_) => pending.push(hash),
-                    Err(error) => {
-                        tracing::debug!("reading the vault record of {hash:#x} failed: {error}");
-                        pending.push(hash);
-                    }
-                }
+        match ListingChain::new(network) {
+            Ok(chain) => occupied_quotes_via(&chain, plans).await,
+            Err(error) => {
+                tracing::warn!(
+                    "cannot read payment records back ({error}); storing the paid quotes as paid"
+                );
+                Vec::new()
             }
         }
-        if !pending.is_empty() {
-            tracing::warn!(
-                "the vault showed no record for {} paid quote(s) after the payment; storing \
-                 them as paid",
-                pending.len()
-            );
-        }
-        occupied_in(plans, &records)
     }
 
     /// Browser builds read no records back: the wallet callback owns the RPC.
@@ -243,6 +203,57 @@ impl Client {
     pub(crate) async fn occupied_quotes(&self, _plans: &[ChunkPaymentPlan]) -> Vec<OccupiedQuote> {
         Vec::new()
     }
+}
+
+/// [`Client::occupied_quotes`], reading through `chain`.
+#[cfg(feature = "native")]
+pub(crate) async fn occupied_quotes_via(
+    chain: &ListingChain,
+    plans: &[ChunkPaymentPlan],
+) -> Vec<OccupiedQuote> {
+    use futures::StreamExt;
+
+    /// Reads while some records are still empty, and the pause between
+    /// them.
+    const READS: usize = 5;
+    const PAUSE: std::time::Duration = std::time::Duration::from_secs(2);
+
+    let mut pending = paid_quotes(plans);
+    let mut records = HashMap::new();
+    for read in 0..READS {
+        if pending.is_empty() {
+            break;
+        }
+        if read > 0 {
+            crate::runtime::sleep(PAUSE).await;
+        }
+        let read = futures::stream::iter(pending.iter().copied())
+            .map(|hash| async move { (hash, chain.completed_payment(&hash).await) })
+            .buffer_unordered(16)
+            .collect::<Vec<_>>()
+            .await;
+        pending.clear();
+        for (hash, result) in read {
+            match result {
+                Ok(record) if !record.amount.is_zero() => {
+                    records.insert(hash, record);
+                }
+                Ok(_) => pending.push(hash),
+                Err(error) => {
+                    tracing::debug!("reading the vault record of {hash:#x} failed: {error}");
+                    pending.push(hash);
+                }
+            }
+        }
+    }
+    if !pending.is_empty() {
+        tracing::warn!(
+            "the vault showed no record for {} paid quote(s) after the payment; storing \
+             them as paid",
+            pending.len()
+        );
+    }
+    occupied_in(plans, &records)
 }
 
 #[cfg(test)]
@@ -346,6 +357,111 @@ mod tests {
         let (hash, rewards, amount) = paid(&plans[0]);
         let records = HashMap::from([(hash, record(&rewards, amount + Amount::from(5u64)))]);
         assert!(occupied_in(&plans, &records).is_empty());
+    }
+
+    /// How a mock RPC answers the vault reads.
+    #[cfg(feature = "native")]
+    #[derive(Clone, Copy)]
+    enum Rpc {
+        /// HTTP 403, as PublicNode refuses methods it doesn't serve.
+        Forbidden,
+        /// A JSON-RPC error of this code, such as -32005 over a request
+        /// limit.
+        Failing(i64),
+        /// Answers from the records it holds.
+        Answering,
+    }
+
+    /// A mock payment chain whose vault holds `records`, answering as `rpc`
+    /// says; its URL, and the chain to count its calls.
+    #[cfg(feature = "native")]
+    async fn vault_rpc(
+        rpc: Rpc,
+        records: &[(QuoteHash, VaultRecord)],
+    ) -> (
+        String,
+        std::sync::Arc<std::sync::Mutex<crate::data::client::listings::test_chain::MockChain>>,
+    ) {
+        use crate::data::client::listings::test_chain::{serve, MockChain};
+        let mut chain = MockChain::default();
+        match rpc {
+            Rpc::Forbidden => chain.refused = vec!["eth_call"],
+            Rpc::Failing(code) => chain.failing = vec![("eth_call", code)],
+            Rpc::Answering => {}
+        }
+        for (hash, record) in records {
+            chain
+                .vault_records
+                .insert(hash.0, (record.rewards_prefix, record.amount.to::<u128>()));
+        }
+        let chain = std::sync::Arc::new(std::sync::Mutex::new(chain));
+        (serve(std::sync::Arc::clone(&chain)).await, chain)
+    }
+
+    /// A reader of the test vault through `urls`, first to last.
+    #[cfg(feature = "native")]
+    fn reader(urls: Vec<String>) -> ListingChain {
+        ListingChain::with_rpcs(urls, crate::data::client::listings::test_chain::VAULT).unwrap()
+    }
+
+    /// The first RPC refuses the read, as a provider that doesn't serve
+    /// `eth_call` or is over its limit does; the next one holds a
+    /// stranger's record, and the quote is reported occupied.
+    #[cfg(feature = "native")]
+    #[tokio::test]
+    async fn a_record_the_first_rpc_refuses_is_read_from_the_next() {
+        let plans = [plan(1)];
+        let (hash, _, _) = paid(&plans[0]);
+        let stranger = RewardsAddress::new([0xee; 20]);
+        let dust = record(&stranger, Amount::from(1u64));
+        for refusal in [Rpc::Forbidden, Rpc::Failing(-32_005)] {
+            let (first, first_chain) = vault_rpc(refusal, &[]).await;
+            let (second, second_chain) = vault_rpc(Rpc::Answering, &[(hash, dust)]).await;
+            let occupied = occupied_quotes_via(&reader(vec![first, second]), &plans).await;
+            assert_eq!(occupied.len(), 1);
+            assert_eq!(occupied[0].address, [1; 32]);
+            assert_eq!(occupied[0].quote_hash, hash);
+            assert_eq!(occupied[0].recorded, dust);
+            assert_eq!(first_chain.lock().unwrap().calls_to("eth_call"), 1);
+            assert_eq!(second_chain.lock().unwrap().calls_to("eth_call"), 1);
+        }
+    }
+
+    /// The first RPC can't be reached or fails the call; the next one holds
+    /// the payment's own record, and nothing is reported.
+    #[cfg(feature = "native")]
+    #[tokio::test]
+    async fn the_payments_own_record_from_the_next_rpc_is_not_occupied() {
+        let plans = [plan(2)];
+        let (hash, rewards, amount) = paid(&plans[0]);
+        let ours = record(&rewards, amount);
+        let closed = {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            format!("http://{}", listener.local_addr().unwrap())
+        };
+        let (failing, _) = vault_rpc(Rpc::Failing(-32_000), &[]).await;
+        for first in [closed, failing] {
+            let (second, second_chain) = vault_rpc(Rpc::Answering, &[(hash, ours)]).await;
+            let occupied = occupied_quotes_via(&reader(vec![first, second]), &plans).await;
+            assert!(occupied.is_empty(), "{occupied:?}");
+            assert_eq!(second_chain.lock().unwrap().calls_to("eth_call"), 1);
+        }
+    }
+
+    /// No RPC answers: every read fails, 5 times 2 seconds apart, and the
+    /// quote is not reported, so the upload goes on and nodes decide.
+    #[cfg(feature = "native")]
+    #[tokio::test]
+    async fn nothing_is_reported_when_no_rpc_answers() {
+        let plans = [plan(3)];
+        let (forbidden, forbidden_chain) = vault_rpc(Rpc::Forbidden, &[]).await;
+        let (limited, limited_chain) = vault_rpc(Rpc::Failing(-32_005), &[]).await;
+        let started = std::time::Instant::now();
+        let occupied = occupied_quotes_via(&reader(vec![forbidden, limited]), &plans).await;
+        assert!(occupied.is_empty(), "{occupied:?}");
+        assert!(started.elapsed() >= std::time::Duration::from_secs(8));
+        assert_eq!(forbidden_chain.lock().unwrap().calls_to("eth_call"), 5);
+        assert_eq!(limited_chain.lock().unwrap().calls_to("eth_call"), 5);
     }
 
     #[test]

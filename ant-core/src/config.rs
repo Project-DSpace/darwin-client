@@ -175,9 +175,10 @@ pub fn bundled_payment_network() -> Result<EvmNetwork> {
     )
 }
 
-/// The RPCs reads of payments on `network` fall back to when its own RPC
-/// refuses or fails a call: the bundled network's `fallback_rpc_urls`, and
-/// none for any other network.
+/// The RPCs reads of payments on `network` (listings, upload proofs, and the
+/// vault record of each quote an upload paid, read back after paying) fall
+/// back to when its own RPC refuses or fails a call: the bundled network's
+/// `fallback_rpc_urls`, and none for any other network.
 #[must_use]
 pub fn fallback_rpc_urls(network: &EvmNetwork) -> Vec<String> {
     let Ok(config) = toml::from_str::<PaymentNetworkConfig>(BUNDLED_PAYMENT_NETWORK) else {

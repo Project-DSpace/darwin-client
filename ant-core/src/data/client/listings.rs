@@ -34,6 +34,7 @@
 //! stopped early carries on in the next read ([`WalkState`]), and a read
 //! never says a listing it didn't decide is gone ([`ListingsIndex::carry`]).
 
+use crate::data::client::occupied::VaultRecord;
 use crate::data::client::Client;
 use crate::data::error::{Error, Result};
 #[cfg(doc)]
@@ -47,7 +48,7 @@ use ant_listings::{
     ProvenUpload, WalkOutcome, WalkResult, CLOCK_MARGIN, DATA_PAYMENT_MADE_TOPIC,
     FIRST_SEEN_ROUNDING, MAX_LIST_LIMIT, QUORUM_THRESHOLD, TOPIC,
 };
-use ant_protocol::evm::Network as EvmNetwork;
+use ant_protocol::evm::{Amount, Network as EvmNetwork, QuoteHash};
 use ant_protocol::transport::{MultiAddr, P2PEvent, P2PNode, PeerId};
 use ant_protocol::{XorName, CLOSE_GROUP_SIZE};
 use futures::stream::{self, FuturesUnordered, StreamExt};
@@ -1643,7 +1644,8 @@ async fn check_group<P: PartialEq>(
 }
 
 /// Reads payments from the payment chain, for checking listings and upload
-/// proofs.
+/// proofs, and for the vault records an upload reads back after paying
+/// ([`Self::completed_payment`]).
 pub struct ListingChain {
     http: reqwest::Client,
     /// The RPCs to read through. A call starts at the last one that
@@ -1732,6 +1734,47 @@ impl ListingChain {
             .ok_or("the payment transaction is not on chain")?;
         ant_listings::check_proof(proof, &receipt, timestamp, &self.vault)
             .map_err(|e| e.to_string())
+    }
+
+    /// The vault's record of the payment for `quote_hash`, as its
+    /// `completedPayments(bytes32)` holds it: the first 16 bytes of the
+    /// rewards address paid, and the amount, zero when nothing is recorded.
+    /// An upload reads back the record of every quote it paid.
+    ///
+    /// # Errors
+    ///
+    /// Returns every RPC's error if none answers, or why the answer can't be
+    /// decoded.
+    pub async fn completed_payment(
+        &self,
+        quote_hash: &QuoteHash,
+    ) -> std::result::Result<VaultRecord, String> {
+        use alloy::sol_types::SolCall as _;
+        use ant_protocol::evm::contract::payment_vault::interface::IPaymentVault;
+
+        let data = IPaymentVault::completedPaymentsCall(*quote_hash).abi_encode();
+        let answer = self
+            .call(
+                "eth_call",
+                json!([
+                    {
+                        "to": format!("0x{}", hex::encode(self.vault)),
+                        "data": format!("0x{}", hex::encode(data)),
+                    },
+                    "latest",
+                ]),
+            )
+            .await?;
+        let bytes = answer
+            .as_str()
+            .and_then(|hex| hex::decode(hex.trim_start_matches("0x")).ok())
+            .ok_or("payment chain eth_call: the answer is not hex")?;
+        let record = IPaymentVault::completedPaymentsCall::abi_decode_returns(&bytes)
+            .map_err(|e| format!("payment chain eth_call: {e}"))?;
+        Ok(VaultRecord {
+            rewards_prefix: record.rewardsAddress.0,
+            amount: Amount::from(record.amount),
+        })
     }
 
     /// The receipt of `tx_hash` and its block's timestamp, or `None` if the
@@ -2172,6 +2215,12 @@ pub(crate) mod test_chain {
         /// Methods answered with HTTP 403, as PublicNode answers
         /// `eth_getLogs`.
         pub(crate) refused: Vec<&'static str>,
+        /// Methods answered with a JSON-RPC error of this code, such as
+        /// -32005 from a provider over its request limit.
+        pub(crate) failing: Vec<(&'static str, i64)>,
+        /// The vault's `completedPayments` records by quote hash: the first
+        /// 16 bytes of the rewards address paid, and the amount.
+        pub(crate) vault_records: HashMap<[u8; 32], ([u8; 16], u128)>,
         /// The methods called, in order.
         pub(crate) calls: Vec<String>,
     }
@@ -2264,8 +2313,31 @@ pub(crate) mod test_chain {
                     }
                     Value::Array(logs)
                 }
+                "eth_call" => self.vault_call(&params[0]),
                 _ => Value::Null,
             }
+        }
+
+        /// An `eth_call` of the vault's `completedPayments(bytes32)`, ABI
+        /// encoded as the vault returns it; `0x`, as a chain answers a call
+        /// to an address with no such function, for anything else.
+        fn vault_call(&self, call: &Value) -> Value {
+            let to = call["to"].as_str().and_then(parse_bytes::<20>);
+            let data = call["data"]
+                .as_str()
+                .and_then(|data| hex::decode(data.trim_start_matches("0x")).ok())
+                .unwrap_or_default();
+            let selector = alloy::primitives::keccak256(b"completedPayments(bytes32)");
+            if to != Some(VAULT) || data.len() != 36 || data[..4] != selector[..4] {
+                return json!("0x");
+            }
+            let mut hash = [0u8; 32];
+            hash.copy_from_slice(&data[4..]);
+            let (prefix, amount) = self.vault_records.get(&hash).copied().unwrap_or_default();
+            let mut words = [0u8; 64];
+            words[..16].copy_from_slice(&prefix);
+            words[48..].copy_from_slice(&amount.to_be_bytes());
+            json!(format!("0x{}", hex::encode(words)))
         }
     }
 
@@ -2298,7 +2370,13 @@ pub(crate) mod test_chain {
                         let mut chain = chain.lock().expect("chain lock");
                         chain.calls.push(method.clone());
                         let refused = chain.refused.iter().any(|refused| *refused == method);
-                        (chain.answer(&method, &request["params"]), refused)
+                        let answer = match chain.failing.iter().find(|(name, _)| *name == method) {
+                            Some((_, code)) => Err((*code, format!("{method} refused"))),
+                            None => chain
+                                .answer(&method, &request["params"])
+                                .map_err(|message| (-32_000, message)),
+                        };
+                        (answer, refused)
                     };
                     if refused {
                         let _ = socket
@@ -2309,10 +2387,10 @@ pub(crate) mod test_chain {
                     }
                     let body = match answer {
                         Ok(result) => json!({ "jsonrpc": "2.0", "id": 1, "result": result }),
-                        Err(message) => json!({
+                        Err((code, message)) => json!({
                             "jsonrpc": "2.0",
                             "id": 1,
-                            "error": { "code": -32_000, "message": message },
+                            "error": { "code": code, "message": message },
                         }),
                     }
                     .to_string();
