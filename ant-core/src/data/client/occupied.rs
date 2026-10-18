@@ -623,11 +623,13 @@ mod outside_payer_tests {
 
     /// Five quotes for `address`, priced 10 to 50, each node's rewards
     /// address and peer ID filled with its number; the median is paid 90.
+    /// Signed at one fixed time, so the same chunk is quoted alike however
+    /// often it is prepared, and its quote hashes match what was paid.
     fn plan_for(address: XorName, data_size: u64) -> ChunkPaymentPlan {
         let quotes: Vec<PaymentQuote> = (1..=5u8)
             .map(|seed| PaymentQuote {
                 content: xor_name::XorName(address),
-                timestamp: SystemTime::now(),
+                timestamp: SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_800_000_000),
                 price: Amount::from(10 * u64::from(seed)),
                 rewards_address: RewardsAddress::new([seed; 20]),
                 pub_key: vec![seed; 4],
