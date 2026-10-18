@@ -219,12 +219,14 @@ told apart by the commit `darwin --version` prints. Upstream's entries follow.
   address, which keeps its payment record, without embedding its data map, and refuses a
   private file's envelope.
   `darwin manifest export --compact` replaces embedded data maps with addresses for files
-  already readable by address, including files uploaded with `darwin file upload --public`. It
-  publishes nothing; a file not yet readable is listed with how to make it so. It needs no
-  wallet, and `--yes` is accepted and does nothing. In the library, `plan_compaction` finds a
-  file in a readable envelope (`PublicForm`), `apply_compaction` takes the plan, and
-  `publish_data_maps`, which stored a data map with no envelope, is no longer exported. The
-  vendored ant-protocol is 5.0.0, still
+  already readable by address, including files uploaded with `darwin file upload --public`. A
+  file not yet readable is listed with the standard way to make it so (`darwin file upload
+  --visibility unlisted`, an envelope); with `--yes`, as upstream, its data map is published as a
+  plain chunk instead, after a warning that it gets no envelope (no payment record, listing or
+  `.record`). It needs a wallet only with `--yes`. In the library, `plan_compaction` finds a file
+  in a readable envelope (`PublicForm`), `apply_compaction` takes the plan, `publish_data_maps`
+  stores plain data maps as upstream's does, and `CompactPlan::published` gives the plan after
+  it. The vendored ant-protocol is 5.0.0, still
   with the price multiplier, darwin-listings is vendored at 0.2.1 to match, and rustls is
   0.23.46, as on upstream's main.
 

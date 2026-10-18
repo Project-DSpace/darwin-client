@@ -7,8 +7,11 @@
 //! `darwin file upload --public` stores (unlisted) or that
 //! `--visibility listed` stores, or a plain DataMap chunk, as an upload
 //! stores one that hides every payment field and has no metadata. An entry
-//! readable in none of these forms stays embedded: compacting publishes
-//! nothing, so it never stores a DataMap without its envelope.
+//! readable in none of these forms stays embedded, unless its DataMap is
+//! published on request ([`publish_data_maps`]) as a plain DataMap chunk,
+//! with no envelope: no payment record, listing or `.record`. The standard
+//! way to make a file readable is to upload it in an envelope, as
+//! `darwin file upload --visibility unlisted` does, which planning finds.
 //!
 //! Every address here is derived from the embedded DataMap itself; nothing a
 //! manifest's author wrote can point compaction at other content. A readable
@@ -114,7 +117,8 @@ pub struct CompactPlan {
     /// Embedded entries whose file is already readable by an address.
     pub already_public: Vec<EmbeddedEntry>,
     /// Embedded entries readable by no address yet. Compacting leaves them
-    /// embedded.
+    /// embedded, unless their DataMaps are published ([`publish_data_maps`],
+    /// then [`CompactPlan::published`]).
     pub needs_publish: Vec<EmbeddedEntry>,
 }
 
@@ -131,6 +135,21 @@ impl CompactPlan {
             .chain(&self.needs_publish)
             .map(|e| e.index)
             .collect()
+    }
+
+    /// The plan once [`publish_data_maps`] has stored the DataMap of every
+    /// entry in [`Self::needs_publish`]: those entries join
+    /// [`Self::already_public`] as plain DataMap chunks
+    /// ([`PublicForm::Plain`]) at their identity address, where the publish
+    /// stored them, so [`apply_compaction`] replaces them too. Entries keep
+    /// manifest order.
+    pub fn published(mut self) -> Self {
+        for mut entry in std::mem::take(&mut self.needs_publish) {
+            entry.form = Some(PublicForm::Plain);
+            self.already_public.push(entry);
+        }
+        self.already_public.sort_by_key(|entry| entry.index);
+        self
     }
 }
 
@@ -205,24 +224,22 @@ async fn first_stored(
 
 /// Store the published DataMap chunk of each entry in `entries`, with no
 /// envelope. Paid; makes those files public. Returns the addresses stored,
-/// in the same order.
+/// in the same order. [`CompactPlan::published`] then gives the plan that
+/// compacts them.
 ///
-/// Held back: nothing calls it, and it is not exported. A file published
-/// this way has no envelope, so no payment record or listing, and a file
-/// already readable in an envelope would get a second address. Publishing
-/// from compaction comes back as an envelope stored the way
-/// `darwin file upload --visibility unlisted` stores one.
+/// A raw building block: a file published this way has no envelope, so no
+/// payment record, listing or `.record`, and a file already readable in an
+/// envelope would get a second address. The standard way to make a file
+/// readable is to upload it in an envelope, as
+/// `darwin file upload --visibility unlisted` does, which
+/// [`plan_compaction`] finds.
 ///
 /// Before anything is paid for, every entry is checked: it must be embedded,
 /// its published map must hash to the planned address, and when that map
 /// is shrunk, the wrapper records it points at must be on the network, or
 /// the published chunk would not resolve. Cancellation is honoured between
 /// stores, never in the middle of one.
-#[expect(
-    dead_code,
-    reason = "held back: compaction publishes nothing until it stores envelopes"
-)]
-pub(crate) async fn publish_data_maps(
+pub async fn publish_data_maps(
     client: &Client,
     manifest: &Manifest,
     entries: &[EmbeddedEntry],
@@ -492,6 +509,33 @@ mod tests {
             ContentRef::Public { address: [9; 32] }
         );
         assert_eq!(compacted.entries[0].path.as_deref(), Some("unlisted"));
+
+        // Once the private file's DataMap is published, the plan takes it in
+        // as a plain DataMap chunk, in manifest order, and it compacts to
+        // that chunk's address.
+        let published = plan.clone().published();
+        assert!(published.is_free());
+        assert_eq!(
+            published
+                .already_public
+                .iter()
+                .map(|e| (e.index, e.form))
+                .collect::<Vec<_>>(),
+            vec![
+                (0, Some(PublicForm::UnlistedEnvelope)),
+                (1, Some(PublicForm::ListedEnvelope)),
+                (2, Some(PublicForm::Plain)),
+                (3, Some(PublicForm::Plain)),
+            ]
+        );
+        let all = apply_compaction(&manifest, &published).unwrap();
+        assert_eq!(
+            all.entries[3].source,
+            ContentRef::Public {
+                address: data_map_address(&private).unwrap()
+            }
+        );
+        assert_eq!(all.entries[..3], compacted.entries[..3]);
 
         // A plan whose address isn't the one the DataMap gives in its form,
         // or that names no form, is refused.

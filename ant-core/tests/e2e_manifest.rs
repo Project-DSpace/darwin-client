@@ -14,10 +14,11 @@ use std::sync::Arc;
 use ant_core::ant_listings::Envelope;
 use ant_core::data::{
     apply_compaction, data_map_address, embeddable_data_map, embedded_len, extract_manifest,
-    forget_upload_record, manifest_link, parse_link, plan_compaction, read_manifest_file,
-    record_upload, write_manifest_file, BuildEvent, BuildOptions, Client, ContentRef, EntryStatus,
-    EnvelopeOptions, ExtractOptions, Link, ListingChain, Manifest, ManifestBuilder, ManifestEntry,
-    ManifestError, PaymentMode, PublicForm, ReferenceMode, Visibility, MAX_EMBEDDED_ROOT_MAP_BYTES,
+    forget_upload_record, manifest_link, parse_link, plan_compaction, publish_data_maps,
+    read_manifest_file, record_upload, write_manifest_file, BuildEvent, BuildOptions, Client,
+    ContentRef, EntryStatus, EnvelopeOptions, ExtractOptions, Link, ListingChain, Manifest,
+    ManifestBuilder, ManifestEntry, ManifestError, PaymentMode, PublicForm, ReferenceMode,
+    Visibility, MAX_EMBEDDED_ROOT_MAP_BYTES,
 };
 use self_encryption::{shrink_data_map, ChunkInfo, DataMap};
 use serial_test::serial;
@@ -637,12 +638,14 @@ async fn compact_mode_uses_public_addresses_only_when_the_datamap_is_on_the_netw
 /// `darwin file upload --public` stores (unlisted), or in a listed one, at
 /// the address the embedded data map alone gives, and compacts the entry to
 /// that address, which extracts. A private file is readable by no address:
-/// the plan is not free, which the CLI refuses, compaction leaves the entry
-/// embedded, and nothing is published, so its plain data map address still
-/// holds nothing.
+/// the plan is not free, which the CLI refuses without `--yes`, compaction
+/// leaves the entry embedded, and nothing is published, so its plain data
+/// map address holds nothing. Once its data map is published as `--yes`
+/// publishes it, a plain chunk with no envelope, every entry compacts, a new
+/// plan finds the private file in that form, and all three extract.
 #[tokio::test(flavor = "multi_thread")]
 #[serial]
-async fn compact_export_finds_readable_envelopes_and_publishes_nothing() {
+async fn compact_export_finds_readable_envelopes_and_publishes_only_when_asked() {
     let (client, testnet) = setup().await;
 
     let source = TempDir::new().unwrap();
@@ -721,7 +724,10 @@ async fn compact_export_finds_readable_envelopes_and_publishes_nothing() {
     };
     assert_eq!(private.index, index_of("private.bin"));
     assert_eq!(private.form, None);
-    assert!(!plan.is_free(), "the CLI refuses a plan that isn't free");
+    assert!(
+        !plan.is_free(),
+        "the CLI refuses a plan that isn't free without --yes"
+    );
 
     let compacted = apply_compaction(&manifest, &plan).unwrap();
     for (name, address) in &readable {
@@ -756,6 +762,61 @@ async fn compact_export_finds_readable_envelopes_and_publishes_nothing() {
     )
     .await
     .expect("extract compacted");
+    assert_eq!(report.written(), 3, "{:?}", report.entries);
+    for (name, fill) in files {
+        assert_eq!(
+            fs::read(out.path().join(name)).unwrap(),
+            vec![fill; FILE_BYTES],
+            "{name}"
+        );
+    }
+
+    // `--yes`: the private file's data map is published as a plain chunk,
+    // with no envelope, and the plan then compacts every entry.
+    let stored = publish_data_maps(
+        &client,
+        &manifest,
+        &plan.needs_publish,
+        &CancellationToken::new(),
+    )
+    .await
+    .expect("publish");
+    assert_eq!(stored, vec![private.address]);
+    let plain = manifest.entries[index_of("private.bin")]
+        .source
+        .content_address()
+        .unwrap();
+    assert_eq!(private.address, plain, "published at its plain address");
+    assert!(client.chunk_exists(&plain).await.expect("check"));
+    let published = plan.clone().published();
+    assert!(published.is_free());
+    let all = apply_compaction(&manifest, &published).unwrap();
+    assert!(all.entries.iter().all(|e| e.source.kind() == "public"));
+    assert_eq!(
+        all.entries[index_of("private.bin")].source,
+        ContentRef::Public { address: plain }
+    );
+    assert!(all.encode().unwrap().len() < manifest.encode().unwrap().len());
+
+    // A new plan finds it as a plain data map chunk, and needs nothing else.
+    let replan = plan_compaction(&client, &manifest, &CancellationToken::new())
+        .await
+        .expect("replan");
+    assert!(replan.is_free(), "{replan:?}");
+    let found = replan
+        .already_public
+        .iter()
+        .find(|e| e.index == index_of("private.bin"))
+        .expect("the private file is readable now");
+    assert_eq!(
+        (found.address, found.form),
+        (plain, Some(PublicForm::Plain))
+    );
+
+    let out = TempDir::new().unwrap();
+    let report = extract_manifest(&client, &all, &extract_options(out.path(), vec![]), None)
+        .await
+        .expect("extract the published manifest");
     assert_eq!(report.written(), 3, "{:?}", report.entries);
     for (name, fill) in files {
         assert_eq!(
