@@ -26,7 +26,10 @@ use cli::{Cli, Commands};
 /// keepalives can't fire, and connections die silently.
 #[tokio::main(flavor = "multi_thread", worker_threads = 4)]
 async fn main() {
-    let code = match run().await {
+    // On the heap: on the main thread's stack, a debug build overflowed the
+    // 1 MB stack a Windows main thread has on every run, `--version`
+    // included.
+    let code = match Box::pin(run()).await {
         Ok(()) => 0,
         Err(e) => {
             eprintln!("Error: {e:#}");
