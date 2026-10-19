@@ -982,6 +982,10 @@ impl Client {
                         return Decision::again(address, &groups, &nearest, &problem, rejected);
                     }
                     Err(GroupProblem::Invalid(problem)) => {
+                        // No other listing for the address is left.
+                        if groups.len() == 1 {
+                            return Decision::refused(address, group, &nearest, problem, rejected);
+                        }
                         rejected.push(rejected_group(group, &nearest, needed, problem, false));
                         failed.push(group_listing(group, &nearest, needed));
                         continue;
@@ -1585,6 +1589,33 @@ impl Decision {
                     rejected_group(group, nearest, QUORUM_THRESHOLD, problem.into(), false)
                 })
                 .collect(),
+            decided: true,
+        }
+    }
+
+    /// `group`, the listing a quorum of `nearest` serve, failed its check
+    /// for good, for `problem`, and no other listing for the address is
+    /// left: nothing is listed, and `group` is rejected after `rejected`.
+    /// The address is decided, so an entry an earlier read published for it
+    /// is dropped ([`ListingsIndex::carry`]), however many nodes serve it.
+    fn refused(
+        address: XorName,
+        group: &MergedListing<PeerId>,
+        nearest: &[PeerId],
+        problem: String,
+        mut rejected: Vec<RejectedListing>,
+    ) -> Self {
+        rejected.push(rejected_group(
+            group,
+            nearest,
+            QUORUM_THRESHOLD,
+            problem,
+            false,
+        ));
+        Self {
+            address,
+            listing: None,
+            rejected,
             decided: true,
         }
     }
@@ -4041,20 +4072,16 @@ mod tests {
                     );
                     assert_eq!(mock.lock().unwrap().calls.len(), calls, "{shown:?}");
                 }
-                // The read decides its address with nothing listed, so an
-                // entry an earlier read published for it is dropped.
-                let checked = check_group(&groups[0], &envelope, &nearest, 4, &knowing, now).await;
-                let (chosen, problems) = decide_address(&groups, vec![checked], &nearest, 7);
-                let decision = Decision::from_groups(
-                    listing.address,
-                    &groups,
-                    &nearest,
-                    chosen,
-                    problems,
-                    envelope.clone(),
-                    Vec::new(),
-                );
+                // The read then decides its address with nothing listed, as
+                // whenever the listing a quorum serves is refused for good
+                // and no other is left, so an entry an earlier read
+                // published for it is dropped.
+                let decision =
+                    Decision::refused(listing.address, &groups[0], &nearest, problem, Vec::new());
                 assert!(decision.decided, "{shown:?}");
+                assert!(decision.listing.is_none(), "{shown:?}");
+                assert_eq!(decision.rejected.len(), 1, "{shown:?}");
+                assert_eq!(decision.rejected[0].nodes, 7, "{shown:?}");
                 assert!(!decision.rejected[0].again, "{shown:?}");
                 let mut index = ListingsIndex::default();
                 index.settle(vec![decision]);
@@ -4064,16 +4091,44 @@ mod tests {
                     Carry::Decided,
                     "{shown:?}"
                 );
+                // Served by fewer than a quorum, and checked once the other
+                // nearest nodes have answered, it is rejected for good too.
+                let few = merge_copies(nearest[..3].iter().map(|peer| (*peer, listing.clone())));
+                let checked = check_group(&few[0], &envelope, &nearest, 4, &knowing, now).await;
+                let (chosen, problems) = decide_address(&few, vec![checked], &nearest, 7);
+                let decision = Decision::from_groups(
+                    listing.address,
+                    &few,
+                    &nearest,
+                    chosen,
+                    problems,
+                    envelope.clone(),
+                    Vec::new(),
+                );
+                assert!(decision.decided, "{shown:?}");
+                assert!(decision.listing.is_none(), "{shown:?}");
+                assert!(!decision.rejected[0].again, "{shown:?}");
             } else if shows(PaymentField::Quote) {
                 // Only its quote locates it: no payment of the quote to the
                 // vault is found, so it never counts.
                 let checked =
                     check_quorum_group(&groups[0], &envelope, &nearest, &knowing, now).await;
                 assert!(matches!(checked, Err(GroupProblem::Again(_))), "{shown:?}");
+            } else {
+                // Showing none of its transaction, quote and block, nothing
+                // ties it to a vault: it rests on its nearest nodes, as every
+                // listing that hides its quote does, and a quorum of them
+                // gets it listed. Refusing it would take a new rule, such as
+                // one refusing a block timestamp it shows, or a date its
+                // nearest nodes give it plus the two-hour margin, earlier
+                // than when the vault was deployed.
+                let checked =
+                    check_quorum_group(&groups[0], &envelope, &nearest, &knowing, now).await;
+                let Ok((_, check)) = checked else {
+                    panic!("{shown:?} is refused");
+                };
+                assert_eq!(check.level, CheckLevel::Reported, "{shown:?}");
             }
-            // A listing showing none of its transaction, quote and block
-            // can't be told apart by any check: it rests on its nearest
-            // nodes, as every listing that hides its quote does.
         }
     }
 
