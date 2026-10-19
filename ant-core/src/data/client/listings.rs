@@ -287,6 +287,49 @@ pub struct RejectedListing {
     pub again: bool,
 }
 
+/// One node's copy of the listing for an address fewer than a quorum of its
+/// nearest nodes serve yet ([`ListingsIndex::pending_copies`]): what it
+/// shows of when the listing was paid.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingCopy {
+    /// The node, one of those nearest the address.
+    pub node: PeerId,
+    /// The payment's block, if the copy shows it.
+    pub block_number: Option<u64>,
+    /// The payment's block timestamp, if the copy shows it.
+    pub block_timestamp: Option<u64>,
+    /// When the node first saw the listing, rounded down to the hour: for a
+    /// listing in the index that hides its block timestamp.
+    pub first_seen: Option<u64>,
+    /// Whether the block it shows is earlier than the one the payment vault
+    /// was deployed in ([`ListingChain::before_vault_deployment`]): nothing
+    /// in it paid the vault, so the copy can never check out.
+    pub before_vault_deployment: bool,
+}
+
+impl PendingCopy {
+    /// `node`'s copy `listing`, its block checked against `chain`'s vault.
+    fn new(node: PeerId, listing: &Listing, chain: &ListingChain) -> Self {
+        let payment = &listing.payment;
+        Self {
+            node,
+            block_number: payment.block_number,
+            block_timestamp: payment.block_timestamp,
+            first_seen: listing.first_seen,
+            before_vault_deployment: payment
+                .block_number
+                .is_some_and(|block| chain.before_vault_deployment(block)),
+        }
+    }
+
+    /// The time the copy sorts by, as [`Listing::key`] takes it: the block
+    /// timestamp, else `first_seen`, else 0.
+    #[must_use]
+    pub fn time(&self) -> u64 {
+        self.block_timestamp.or(self.first_seen).unwrap_or(0)
+    }
+}
+
 /// The index as read from the network.
 #[derive(Debug, Clone, Default)]
 pub struct ListingsIndex {
@@ -305,6 +348,10 @@ pub struct ListingsIndex {
     /// nearest nodes served them, or something couldn't be read. A later
     /// read decides them.
     pub deferred: usize,
+    /// For each address fewer than a quorum of its nearest nodes served,
+    /// every copy those nodes served, nearest node first. Each such address
+    /// has its entry in `rejected`, to try again.
+    pub pending_copies: BTreeMap<XorName, Vec<PendingCopy>>,
     /// Whether the read found too few nodes to trust its view of the network
     /// (fewer than [`NEAREST_NODES`], or under three quarters as many as
     /// recent reads found), and so decided nothing.
@@ -352,6 +399,23 @@ impl ListingsIndex {
             Carry::NoLongerServed
         } else {
             Carry::Keep
+        }
+    }
+
+    /// Leave `pending`, addresses fewer than a quorum of their nearest nodes
+    /// serve, for a later read. Each is shown in `rejected`, to try again,
+    /// with every copy those nodes served in `pending_copies`, its block
+    /// checked against `chain`'s vault: an address a single node serves can
+    /// be as stuck as one three serve, and the copies show what keeps it
+    /// from counting.
+    fn defer_pending(&mut self, pending: &[AddressWalk<PeerId>], chain: &ListingChain) {
+        self.deferred += pending.len();
+        for found in pending {
+            if let Some(shown) = pending_listing(found) {
+                self.rejected.push(shown);
+                self.pending_copies
+                    .insert(found.address, pending_copies(found, chain));
+            }
         }
     }
 }
@@ -725,13 +789,7 @@ impl Client {
             .addresses
             .into_iter()
             .partition(|found| found.support >= QUORUM_THRESHOLD);
-        index.deferred = pending.len();
-        index.rejected.extend(
-            pending
-                .iter()
-                .filter(|found| found.support > 1)
-                .filter_map(pending_listing),
-        );
+        index.defer_pending(&pending, chain);
         let context = &context;
         let requests = &requests;
         let decisions: Vec<Decision> = stream::iter(backed)
@@ -751,9 +809,14 @@ impl Client {
         index
             .listings
             .retain(|checked| checked.listing.key().time >= since);
-        index
-            .rejected
-            .retain(|rejected| since == 0 || rejected.listing.key().time >= since);
+        let pending_copies = &mut index.pending_copies;
+        index.rejected.retain(|rejected| {
+            let kept = since == 0 || rejected.listing.key().time >= since;
+            if !kept {
+                pending_copies.remove(&rejected.listing.address);
+            }
+            kept
+        });
         index.listings.sort_by_key(|checked| checked.listing.key());
         index
             .rejected
@@ -1602,6 +1665,19 @@ fn pending_listing(found: &AddressWalk<PeerId>) -> Option<RejectedListing> {
         problem,
         true,
     ))
+}
+
+/// Every copy the nearest nodes served for an address too few of them serve
+/// to decide yet, nearest node first, each with its block checked against
+/// `chain`'s vault.
+fn pending_copies(found: &AddressWalk<PeerId>, chain: &ListingChain) -> Vec<PendingCopy> {
+    let rank = |node: &PeerId| found.nearest.iter().position(|peer| peer == node);
+    let mut copies: Vec<&(PeerId, Listing)> = found.copies.iter().collect();
+    copies.sort_by_key(|(node, _)| rank(node));
+    copies
+        .into_iter()
+        .map(|(node, listing)| PendingCopy::new(*node, listing, chain))
+        .collect()
 }
 
 /// `group`, rejected for `problem`; `needed` dates it as [`group_listing`]
@@ -3398,6 +3474,79 @@ mod tests {
         assert_eq!((shown.nodes, shown.nearest), (2, 7));
         assert_eq!(shown.listing, listing);
         assert!(shown.problem.contains("3 of the 7"), "{}", shown.problem);
+    }
+
+    #[test]
+    fn every_address_too_few_serve_is_shown_with_each_copy() {
+        let nearest: Vec<PeerId> = (1..=7).map(peer).collect();
+        // The vault was deployed in block 102.
+        let chain = reader("http://127.0.0.1:9".into()).with_vault_deployment_block(102);
+        // One node alone serves a listing paid in block 101, hiding its time.
+        let first_seen = 1_790_996_400;
+        let early = dated_verified_listing(first_seen);
+        let alone = AddressWalk {
+            address: early.address,
+            nearest: nearest.clone(),
+            copies: vec![(peer(3), early)],
+            support: 1,
+        };
+        // Two serve one paid in block 102, the farther one's copy first.
+        let mut later = verified_listing(2);
+        later.address = [8; 32];
+        let pair = AddressWalk {
+            address: later.address,
+            nearest,
+            copies: vec![(peer(2), later.clone()), (peer(1), later.clone())],
+            support: 2,
+        };
+        let mut index = ListingsIndex::default();
+        index.defer_pending(&[alone, pair], &chain);
+
+        // Both are left for a later read and shown, the one a single node
+        // serves too.
+        assert_eq!(index.deferred, 2);
+        let shown: Vec<(XorName, usize, bool)> = index
+            .rejected
+            .iter()
+            .map(|rejected| (rejected.listing.address, rejected.nodes, rejected.again))
+            .collect();
+        assert_eq!(shown, [([7; 32], 1, true), ([8; 32], 2, true)]);
+        // With each copy: its node, nearest first, what it shows of its
+        // payment, and whether its block is before the vault was deployed.
+        assert_eq!(
+            index.pending_copies[&[7; 32]],
+            [PendingCopy {
+                node: peer(3),
+                block_number: Some(101),
+                block_timestamp: None,
+                first_seen: Some(first_seen),
+                before_vault_deployment: true,
+            }]
+        );
+        let copy = |node| PendingCopy {
+            node,
+            block_number: later.payment.block_number,
+            block_timestamp: later.payment.block_timestamp,
+            first_seen: None,
+            before_vault_deployment: false,
+        };
+        assert_eq!(
+            index.pending_copies[&[8; 32]],
+            [copy(peer(1)), copy(peer(2))]
+        );
+        assert_eq!(index.pending_copies[&[7; 32]][0].time(), first_seen);
+        assert_eq!(index.pending_copies[&[8; 32]][0].time(), 1_790_996_402);
+
+        // Where the block the vault was deployed in isn't known, no copy is
+        // marked.
+        let found = AddressWalk {
+            address: [7; 32],
+            nearest: (1..=7).map(peer).collect(),
+            copies: vec![(peer(3), dated_verified_listing(first_seen))],
+            support: 1,
+        };
+        let unknown = reader("http://127.0.0.1:9".into());
+        assert!(!pending_copies(&found, &unknown)[0].before_vault_deployment);
     }
 
     #[test]

@@ -7,8 +7,8 @@ use std::path::{Path, PathBuf};
 
 use ant_core::ant_listings::{CheckLevel, Listing, ListingKey, PaymentField, QUORUM_THRESHOLD};
 use ant_core::data::{
-    paid_quote_hash, Carry, CheckedListing, Client, ListingChain, ListingLookup, RejectedListing,
-    WalkOutcome, WalkState, XorName, NEAREST_NODES,
+    paid_quote_hash, Carry, CheckedListing, Client, ListingChain, ListingLookup, PendingCopy,
+    RejectedListing, WalkOutcome, WalkState, XorName, NEAREST_NODES,
 };
 use clap::Args;
 use serde::Serialize;
@@ -115,6 +115,43 @@ struct ListingJson {
     /// ([`merge_carried`]); absent otherwise.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     carried: bool,
+    /// For a listing too few of the nodes nearest its address serve yet,
+    /// each of those nodes' copies; absent otherwise.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    copies: Vec<CopyJson>,
+}
+
+/// One node's copy of a listing too few of the nodes nearest its address
+/// serve yet, as `--json` prints it in the entry's `copies`.
+#[derive(Serialize)]
+struct CopyJson {
+    /// The node's id, hex-encoded.
+    node: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    block_number: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    block_timestamp: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    first_seen: Option<u64>,
+    /// The time the copy sorts by: the block timestamp, else `first_seen`.
+    time: u64,
+    /// True when the block it shows is earlier than the one the payment
+    /// vault was deployed in, so it paid something else; absent otherwise.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    before_vault_deployment: bool,
+}
+
+impl From<&PendingCopy> for CopyJson {
+    fn from(copy: &PendingCopy) -> Self {
+        Self {
+            node: hex::encode(copy.node.as_bytes()),
+            block_number: copy.block_number,
+            block_timestamp: copy.block_timestamp,
+            first_seen: copy.first_seen,
+            time: copy.time(),
+            before_vault_deployment: copy.before_vault_deployment,
+        }
+    }
 }
 
 impl ListingJson {
@@ -154,6 +191,7 @@ impl ListingJson {
             valid: false,
             problem: None,
             carried: false,
+            copies: Vec::new(),
         }
     }
 
@@ -171,6 +209,15 @@ impl ListingJson {
         Self {
             problem: Some(rejected.problem.clone()),
             ..Self::new(&rejected.listing, rejected.nodes, rejected.nearest)
+        }
+    }
+
+    /// This entry with `copies`, those of the listing's nearest nodes that
+    /// serve it, for a listing too few of them serve yet.
+    fn with_copies(self, copies: &[PendingCopy]) -> Self {
+        Self {
+            copies: copies.iter().map(CopyJson::from).collect(),
+            ..self
         }
     }
 }
@@ -259,17 +306,23 @@ impl ListingsArgs {
         } else {
             &[]
         };
+        // The copies of a listing too few of its nearest nodes serve yet.
+        let copies = |rejected: &RejectedListing| {
+            index
+                .pending_copies
+                .get(&rejected.listing.address)
+                .map_or(&[][..], Vec::as_slice)
+        };
 
         if json {
             let entries = index
                 .listings
                 .iter()
                 .map(|checked| (checked.listing.key(), ListingJson::checked(checked)))
-                .chain(
-                    rejected
-                        .iter()
-                        .map(|rejected| (rejected.listing.key(), ListingJson::rejected(rejected))),
-                )
+                .chain(rejected.iter().map(|rejected| {
+                    let entry = ListingJson::rejected(rejected).with_copies(copies(rejected));
+                    (rejected.listing.key(), entry)
+                }))
                 .collect();
             let out = merge_carried(entries, previous, |address, key| {
                 // The read covers listings from `since` on: it says nothing
@@ -297,6 +350,9 @@ impl ListingsArgs {
         for rejected in rejected {
             print_row(&rejected.listing, rejected_text(rejected));
             println!("    {}", printable(&rejected.problem));
+            for copy in copies(rejected) {
+                println!("    {}", copy_text(copy, chain.vault_deployment_block()));
+            }
         }
         Ok(())
     }
@@ -557,11 +613,39 @@ fn rejected_text(rejected: &RejectedListing) -> &'static str {
 /// When a listing was paid, as far as it shows: the block time to the
 /// second, or `~` and the hour it was first seen, or `-`.
 fn time_text(listing: &Listing) -> String {
-    match (listing.payment.block_timestamp, listing.first_seen) {
+    shown_time_text(listing.payment.block_timestamp, listing.first_seen)
+}
+
+/// The block time to the second, or `~` and the hour first seen, or `-`.
+fn shown_time_text(block_timestamp: Option<u64>, first_seen: Option<u64>) -> String {
+    match (block_timestamp, first_seen) {
         (Some(timestamp), _) => utc(timestamp),
         (None, Some(first_seen)) => format!("~{}", &utc(first_seen)[..16]),
         (None, None) => "-".into(),
     }
+}
+
+/// One node's copy of a listing too few of the nodes nearest its address
+/// serve, for a line under the listing's row: the node, the block the copy
+/// shows and its time as the row shows one, and whether that block is before
+/// the payment vault was deployed (in block `vault_deployment_block`).
+fn copy_text(copy: &PendingCopy, vault_deployment_block: Option<u64>) -> String {
+    let block = copy
+        .block_number
+        .map_or_else(|| "block hidden".to_string(), |n| format!("block {n}"));
+    let mut text = format!(
+        "copy from {}: {block}, {}",
+        hex::encode(copy.node.as_bytes()),
+        shown_time_text(copy.block_timestamp, copy.first_seen)
+    );
+    if copy.before_vault_deployment {
+        text.push_str(", before the payment vault was deployed");
+        if let Some(deployed) = vault_deployment_block {
+            text.push_str(&format!(" in block {deployed}"));
+        }
+        text.push_str(": it can't have paid the vault");
+    }
+    text
 }
 
 /// The payment fields a listing hides, for its row: `-` when it shows all.
@@ -716,6 +800,7 @@ pub(crate) fn utc(unix_seconds: u64) -> String {
 mod tests {
     use super::*;
     use ant_core::ant_listings::{Flags, ListingPayment, Metadata, ShownFields};
+    use ant_core::data::PeerId;
 
     #[test]
     fn formats_utc_times() {
@@ -769,6 +854,7 @@ mod tests {
             "check",
             "carried",
             "served",
+            "copies",
         ] {
             assert!(!object.contains_key(absent), "{absent} should be absent");
         }
@@ -821,6 +907,73 @@ mod tests {
             ..rejected
         };
         assert_eq!(rejected_text(&again), "undecided (try again)");
+    }
+
+    #[test]
+    fn each_copy_of_a_listing_too_few_serve_is_shown() {
+        let pending = RejectedListing {
+            listing: listing(ShownFields::ALL, true),
+            problem: "served by 2 of the 7 nodes nearest its address so far, needs 4; try again"
+                .into(),
+            nodes: 2,
+            nearest: 7,
+            again: true,
+        };
+        // One copy paid before the vault was deployed, one hiding its time.
+        let early = PendingCopy {
+            node: PeerId::from_bytes([3; 32]),
+            block_number: Some(80_204_042),
+            block_timestamp: Some(1_791_144_080),
+            first_seen: None,
+            before_vault_deployment: true,
+        };
+        let hidden = PendingCopy {
+            node: PeerId::from_bytes([5; 32]),
+            block_number: None,
+            block_timestamp: None,
+            first_seen: Some(1_786_312_800),
+            before_vault_deployment: false,
+        };
+        let entry = ListingJson::rejected(&pending).with_copies(&[early.clone(), hidden.clone()]);
+        let json = serde_json::to_value(entry).unwrap();
+        assert_eq!(json["problem"], pending.problem.as_str());
+        assert_eq!(
+            json["copies"],
+            serde_json::json!([
+                {
+                    "node": "03".repeat(32),
+                    "block_number": 80_204_042,
+                    "block_timestamp": 1_791_144_080,
+                    "time": 1_791_144_080,
+                    "before_vault_deployment": true,
+                },
+                {
+                    "node": "05".repeat(32),
+                    "first_seen": 1_786_312_800,
+                    "time": 1_786_312_800,
+                },
+            ])
+        );
+        // Without copies, as before.
+        let json = serde_json::to_value(ListingJson::rejected(&pending).with_copies(&[])).unwrap();
+        assert!(json.get("copies").is_none());
+
+        // In text, a line each under the listing's row.
+        assert_eq!(
+            copy_text(&early, Some(81_897_121)),
+            format!(
+                "copy from {}: block 80204042, 2026-10-04 20:01:20, before the payment vault was \
+                 deployed in block 81897121: it can't have paid the vault",
+                "03".repeat(32)
+            )
+        );
+        assert_eq!(
+            copy_text(&hidden, Some(81_897_121)),
+            format!(
+                "copy from {}: block hidden, ~2026-08-09 22:00",
+                "05".repeat(32)
+            )
+        );
     }
 
     #[test]

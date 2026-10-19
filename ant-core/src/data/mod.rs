@@ -16,7 +16,8 @@ pub use client::cache::ChunkCache;
 #[cfg(feature = "native")]
 pub use client::listings::{
     expected_nearest, paid_quote_hash, walk_start, Carry, CheckedListing, ListingChain,
-    ListingLookup, ListingsIndex, RejectedListing, WalkReport, WalkState, NEAREST_NODES,
+    ListingLookup, ListingsIndex, PendingCopy, RejectedListing, WalkReport, WalkState,
+    NEAREST_NODES,
 };
 pub use client::{Client, ClientConfig};
 pub use error::{Error, Result};
@@ -118,7 +119,7 @@ pub use crate::datamap_file::{
 // regardless of the `devnet` feature.
 #[cfg(feature = "native")]
 pub use ant_protocol::transport::{
-    CoreNodeConfig, IPDiversityConfig, MultiAddr, NodeMode, P2PNode,
+    CoreNodeConfig, IPDiversityConfig, MultiAddr, NodeMode, P2PNode, PeerId,
 };
 pub use ant_protocol::{DevnetManifest, MAX_CHUNK_SIZE, MAX_WIRE_MESSAGE_SIZE};
 
