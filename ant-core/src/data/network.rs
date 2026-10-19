@@ -537,6 +537,14 @@ impl Network {
         self.node.connected_peers().await
     }
 
+    /// The user agent `peer` gave when it connected, such as
+    /// `node/0.23.0+ds.15`, if this node has exchanged identities with it.
+    /// It is the peer's own word.
+    #[cfg(feature = "native")]
+    pub async fn peer_user_agent(&self, peer: &PeerId) -> Option<String> {
+        self.node.transport().peer_user_agent(peer).await
+    }
+
     /// Compute the live network-participation snapshot.
     ///
     /// Both node reads are in-memory, so this is cheap enough to call per

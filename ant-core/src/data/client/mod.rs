@@ -21,6 +21,14 @@ pub mod file;
 #[cfg(feature = "native")]
 pub mod listings;
 #[cfg(feature = "native")]
+pub mod listings_census;
+#[cfg(feature = "native")]
+pub mod listings_publish;
+#[cfg(feature = "native")]
+pub mod listings_serve;
+#[cfg(feature = "native")]
+pub mod listings_store;
+#[cfg(feature = "native")]
 pub mod listings_v1;
 pub mod merkle;
 #[cfg(feature = "native")]

@@ -41,6 +41,8 @@
 //! stopped early carries on in the next read ([`WalkState`]), and a read
 //! never says a listing it didn't decide is gone ([`ListingsIndex::carry`]).
 
+use crate::data::client::listings_store::ListingsStore;
+use crate::data::client::listings_v1::RpcCalls;
 use crate::data::client::occupied::VaultRecord;
 use crate::data::client::Client;
 use crate::data::error::{Error, Result};
@@ -57,13 +59,15 @@ use ant_listings::{
 };
 use ant_protocol::evm::{Amount, Network as EvmNetwork, QuoteHash};
 use ant_protocol::transport::{MultiAddr, P2PEvent, P2PNode, PeerId};
-use ant_protocol::{XorName, CLOSE_GROUP_SIZE};
+use ant_protocol::{compute_address, XorName, CLOSE_GROUP_SIZE};
 use futures::stream::{self, FuturesUnordered, StreamExt};
+use heed::types::Bytes;
+use heed::Database;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::broadcast::error::RecvError;
@@ -509,7 +513,7 @@ pub fn paid_quote_hash(quote: &[u8]) -> Option<[u8; 32]> {
 }
 
 /// Unix seconds now.
-fn unix_now() -> u64 {
+pub(crate) fn unix_now() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|elapsed| elapsed.as_secs())
@@ -927,7 +931,7 @@ impl Client {
     }
 
     /// Decide an address at least a quorum of its nearest nodes serve.
-    async fn decide_backed(
+    pub(crate) async fn decide_backed(
         &self,
         found: AddressWalk<PeerId>,
         context: &ReadContext,
@@ -946,7 +950,10 @@ impl Client {
             .copied()
             .filter(|peer| copies.iter().any(|(sender, _)| sender == peer))
             .collect();
-        let envelope = match self.fetch_envelope(&address, &senders, context).await {
+        let envelope = match self
+            .fetch_envelope(&address, &senders, context, chain)
+            .await
+        {
             Ok(Some(envelope)) => envelope,
             Ok(None) => {
                 return Decision::again(
@@ -1084,11 +1091,13 @@ impl Client {
         )
     }
 
-    /// The envelope at `address`, from the nodes that served its listing
-    /// (`senders`, nearest first), never through a DHT lookup. One node is
-    /// asked at a time, and the next as well whenever none has answered
-    /// within [`ENVELOPE_HEDGE`]. A node that fails, hands over nothing, or
-    /// is beaten by another is demoted: asked last for the rest of the read.
+    /// The envelope at `address`: the one `chain` keeps for it
+    /// ([`ListingChain::kept_envelope`]), else from the nodes that served its
+    /// listing (`senders`, nearest first), never through a DHT lookup, and
+    /// then kept ([`ListingChain::keep_envelope`]). One node is asked at a
+    /// time, and the next as well whenever none has answered within
+    /// [`ENVELOPE_HEDGE`]. A node that fails, hands over nothing, or is
+    /// beaten by another is demoted: asked last for the rest of the read.
     ///
     /// `Ok(None)` if none of them handed it over.
     ///
@@ -1096,12 +1105,16 @@ impl Client {
     ///
     /// Returns why the chunk at the address, which hashes to it, isn't an
     /// envelope.
-    async fn fetch_envelope(
+    pub(crate) async fn fetch_envelope(
         &self,
         address: &XorName,
         senders: &[PeerId],
         context: &ReadContext,
+        chain: &ListingChain,
     ) -> std::result::Result<Option<Envelope>, String> {
+        if let Some(envelope) = chain.kept_envelope(address) {
+            return Ok(Some(envelope));
+        }
         let mut order = senders.to_vec();
         order.sort_by_key(|peer| context.is_demoted(peer));
         let fetch = |peer: PeerId| {
@@ -1146,9 +1159,10 @@ impl Client {
                     for beaten in started.iter().filter(|peer| !finished.contains(peer)) {
                         context.demote(*beaten);
                     }
-                    return Envelope::from_bytes(&chunk.content)
-                        .map(Some)
-                        .map_err(|e| format!("bad envelope: {e}"));
+                    let envelope = Envelope::from_bytes(&chunk.content)
+                        .map_err(|e| format!("bad envelope: {e}"))?;
+                    chain.keep_envelope(address, &chunk.content);
+                    return Ok(Some(envelope));
                 }
                 Ok(None) | Err(_) => context.demote(peer),
             }
@@ -1289,11 +1303,21 @@ impl Client {
                 })
                 .collect::<Vec<_>>()
         };
-        let envelope = match self.chunk_get(&address).await {
-            Ok(Some(chunk)) => match Envelope::from_bytes(&chunk.content) {
-                Ok(envelope) => envelope,
-                Err(e) => return (None, reject_all(format!("bad envelope: {e}"), false)),
-            },
+        let fetched = match chain.kept_envelope(&address) {
+            Some(envelope) => Ok(Some(Ok(envelope))),
+            None => self.chunk_get(&address).await.map(|chunk| {
+                chunk.map(|chunk| {
+                    let envelope = Envelope::from_bytes(&chunk.content);
+                    if envelope.is_ok() {
+                        chain.keep_envelope(&address, &chunk.content);
+                    }
+                    envelope
+                })
+            }),
+        };
+        let envelope = match fetched {
+            Ok(Some(Ok(envelope))) => envelope,
+            Ok(Some(Err(e))) => return (None, reject_all(format!("bad envelope: {e}"), false)),
             Ok(None) => {
                 return (
                     None,
@@ -1359,7 +1383,7 @@ impl Client {
     /// Ask each of `peers` for its listing of `address`. `None`: no answer;
     /// `Some(None)`: the node has no listing for it (or sent one that
     /// [`check_get_response`] refuses).
-    async fn ask_for_listing(
+    pub(crate) async fn ask_for_listing(
         &self,
         requests: &ListingsRequests,
         address: &XorName,
@@ -1523,7 +1547,7 @@ impl Routes {
 /// push from a node's watch goes to the push sink, if there is one. A
 /// message that doesn't decode, such as an answer of a kind this client
 /// doesn't know, is dropped: the request it answers times out.
-struct ListingsRequests {
+pub(crate) struct ListingsRequests {
     node: Arc<P2PNode>,
     routes: Arc<Mutex<Routes>>,
     /// Whether pushes have somewhere to go.
@@ -1535,7 +1559,7 @@ impl ListingsRequests {
     /// Start routing answers, and pushes to `pushes` if given. Without a
     /// sink, a `ChangesRequest` that sets a watch is still answered, but the
     /// node's pushes are dropped.
-    fn start(node: &Arc<P2PNode>, pushes: Option<PushSink>) -> Self {
+    pub(crate) fn start(node: &Arc<P2PNode>, pushes: Option<PushSink>) -> Self {
         let routes: Arc<Mutex<Routes>> = Arc::default();
         let take_pushes = pushes.is_some();
         // Subscribe before anything is sent, so no answer can be missed.
@@ -1591,7 +1615,7 @@ impl ListingsRequests {
     /// Send `body` to `peer` and wait for its answer, at most
     /// [`REQUEST_TIMEOUT`]. An [`Error`](ListingsBody::Error) is returned
     /// as the answer it is: the node refused the request.
-    async fn ask(&self, peer: &PeerId, body: ListingsBody) -> Option<ListingsBody> {
+    pub(crate) async fn ask(&self, peer: &PeerId, body: ListingsBody) -> Option<ListingsBody> {
         let request_id = new_request_id();
         let receiver = self
             .routes
@@ -1632,26 +1656,29 @@ impl Drop for ListingsRequests {
 }
 
 /// What deciding an address needs from its read's walks.
-struct ReadContext {
+pub(crate) struct ReadContext {
     /// When each node's walk began, for walks of its whole index, from the
     /// start ([`ListingKey::MIN`]) to the end: such a walk returned every
     /// listing the node held as it passed it. A walk from a later key, as in
     /// a read from a time ([`walk_start`]), doesn't count: a node keys a
     /// listing that hides its time by its own date, which can be well before
     /// the date the nearest nodes give it.
-    full_walks: HashMap<PeerId, u64>,
+    pub(crate) full_walks: HashMap<PeerId, u64>,
     /// Nodes that answered no page: not asked anything more this read.
-    silent: HashSet<PeerId>,
+    pub(crate) silent: HashSet<PeerId>,
     /// Each node's addresses, to fetch from it.
-    addresses: HashMap<PeerId, Vec<MultiAddr>>,
+    pub(crate) addresses: HashMap<PeerId, Vec<MultiAddr>>,
     /// Nodes that failed a request while deciding: asked last, or not
     /// again, for the rest of the read.
-    demoted: Mutex<HashSet<PeerId>>,
+    pub(crate) demoted: Mutex<HashSet<PeerId>>,
 }
 
 impl ReadContext {
     /// The context of a read whose nodes' walks went as `walks`.
-    fn new(walks: &[NodeReport<PeerId>], addresses: HashMap<PeerId, Vec<MultiAddr>>) -> Self {
+    pub(crate) fn new(
+        walks: &[NodeReport<PeerId>],
+        addresses: HashMap<PeerId, Vec<MultiAddr>>,
+    ) -> Self {
         let full_walks = walks
             .iter()
             .filter(|walk| walk.outcome == WalkOutcome::Complete && walk.from == ListingKey::MIN)
@@ -1670,13 +1697,13 @@ impl ReadContext {
         }
     }
 
-    fn demote(&self, peer: PeerId) {
+    pub(crate) fn demote(&self, peer: PeerId) {
         if let Ok(mut demoted) = self.demoted.lock() {
             demoted.insert(peer);
         }
     }
 
-    fn is_demoted(&self, peer: &PeerId) -> bool {
+    pub(crate) fn is_demoted(&self, peer: &PeerId) -> bool {
         self.demoted
             .lock()
             .is_ok_and(|demoted| demoted.contains(peer))
@@ -1684,18 +1711,18 @@ impl ReadContext {
 }
 
 /// What a read decided for one address it worked on.
-struct Decision {
-    address: XorName,
-    listing: Option<CheckedListing>,
-    rejected: Vec<RejectedListing>,
+pub(crate) struct Decision {
+    pub(crate) address: XorName,
+    pub(crate) listing: Option<CheckedListing>,
+    pub(crate) rejected: Vec<RejectedListing>,
     /// False if nothing final was decided, to try again in a later read.
-    decided: bool,
+    pub(crate) decided: bool,
 }
 
 impl Decision {
     /// Nothing decided, for `problem`: each group is rejected to try again,
     /// after `rejected`.
-    fn again(
+    pub(crate) fn again(
         address: XorName,
         groups: &[MergedListing<PeerId>],
         nearest: &[PeerId],
@@ -1716,7 +1743,7 @@ impl Decision {
     }
 
     /// Every group rejected for good, for `problem`.
-    fn rejected(
+    pub(crate) fn rejected(
         address: XorName,
         groups: &[MergedListing<PeerId>],
         nearest: &[PeerId],
@@ -1740,7 +1767,7 @@ impl Decision {
     /// left: nothing is listed, and `group` is rejected after `rejected`.
     /// The address is decided, so an entry an earlier read published for it
     /// is dropped ([`ListingsIndex::carry`]), however many nodes serve it.
-    fn refused(
+    pub(crate) fn refused(
         address: XorName,
         group: &MergedListing<PeerId>,
         nearest: &[PeerId],
@@ -1763,7 +1790,7 @@ impl Decision {
     }
 
     /// What [`decide_address`] decided for `groups`, after `rejected`.
-    fn from_groups(
+    pub(crate) fn from_groups(
         address: XorName,
         groups: &[MergedListing<PeerId>],
         nearest: &[PeerId],
@@ -1803,7 +1830,7 @@ impl Decision {
 }
 
 /// Why the group a quorum serves didn't check out.
-enum GroupProblem {
+pub(crate) enum GroupProblem {
     /// Nothing final: the chain couldn't be read, or doesn't have the
     /// payment yet.
     Again(String),
@@ -1815,7 +1842,7 @@ enum GroupProblem {
 /// saying whether a failure is final. A quorum of nodes checked its payment
 /// on chain when they stored it, so a chain that couldn't be read, or that
 /// doesn't have the payment (yet), is worth trying again.
-async fn check_quorum_group(
+pub(crate) async fn check_quorum_group(
     group: &MergedListing<PeerId>,
     envelope: &Envelope,
     nearest: &[PeerId],
@@ -1847,7 +1874,7 @@ async fn check_quorum_group(
 
 /// The listing to show for an address too few of its nearest nodes serve
 /// to decide yet: the one most of them serve.
-fn pending_listing(found: &AddressWalk<PeerId>) -> Option<RejectedListing> {
+pub(crate) fn pending_listing(found: &AddressWalk<PeerId>) -> Option<RejectedListing> {
     let groups = merge_copies(found.copies.clone());
     let group = groups
         .iter()
@@ -1870,7 +1897,10 @@ fn pending_listing(found: &AddressWalk<PeerId>) -> Option<RejectedListing> {
 /// Every copy the nearest nodes served for an address too few of them serve
 /// to decide yet, nearest node first, each with its block and block
 /// timestamp checked against `chain`'s vault.
-fn pending_copies(found: &AddressWalk<PeerId>, chain: &ListingChain) -> Vec<PendingCopy> {
+pub(crate) fn pending_copies(
+    found: &AddressWalk<PeerId>,
+    chain: &ListingChain,
+) -> Vec<PendingCopy> {
     let rank = |node: &PeerId| found.nearest.iter().position(|peer| peer == node);
     let mut copies: Vec<&(PeerId, Listing)> = found.copies.iter().collect();
     copies.sort_by_key(|(node, _)| rank(node));
@@ -1882,7 +1912,7 @@ fn pending_copies(found: &AddressWalk<PeerId>, chain: &ListingChain) -> Vec<Pend
 
 /// `group`, rejected for `problem`; `needed` dates it as [`group_listing`]
 /// does.
-fn rejected_group(
+pub(crate) fn rejected_group(
     group: &MergedListing<PeerId>,
     nearest: &[PeerId],
     needed: usize,
@@ -1908,13 +1938,17 @@ fn same_listing(group: &MergedListing<PeerId>, listing: &Listing) -> bool {
 }
 
 /// Whether a rejection is worth trying again: the checks say so.
-fn is_again(problem: &str) -> bool {
+pub(crate) fn is_again(problem: &str) -> bool {
     problem.ends_with("try again")
 }
 
 /// A group's listing for showing: as the nearest nodes give it
 /// ([`listing_to_check`]), or as any node sent it.
-fn group_listing(group: &MergedListing<PeerId>, nearest: &[PeerId], needed: usize) -> Listing {
+pub(crate) fn group_listing(
+    group: &MergedListing<PeerId>,
+    nearest: &[PeerId],
+    needed: usize,
+) -> Listing {
     listing_to_check(group, nearest, needed).unwrap_or_else(|| Listing {
         address: group.address(),
         flags: group.flags(),
@@ -1928,7 +1962,7 @@ fn group_listing(group: &MergedListing<PeerId>, nearest: &[PeerId], needed: usiz
 /// Check one group of copies against the chain, as a node checks its close
 /// group's copies: offline first, then fetch once for
 /// [`listing_to_check`], then [`check_copies`].
-async fn check_group<P: PartialEq>(
+pub(crate) async fn check_group<P: PartialEq>(
     group: &MergedListing<P>,
     envelope: &Envelope,
     nearest: &[P],
@@ -2062,7 +2096,30 @@ pub struct ListingChain {
     /// The timestamp (Unix seconds) of the block of the vault's first
     /// payment, where known.
     vault_first_payment_time: Option<u64>,
+    /// The calls made to each RPC in `rpc_urls`, in the same order, since
+    /// the reader was made.
+    rpc_counts: Vec<RpcCount>,
+    /// Where what this reader reads once and keeps is kept, if anywhere
+    /// ([`Self::with_store`]).
+    kept: Option<Kept>,
 }
+
+/// The calls made to one RPC, and how many of them failed.
+#[derive(Debug, Default)]
+struct RpcCount {
+    calls: AtomicU64,
+    errors: AtomicU64,
+}
+
+/// What a [`ListingChain`] keeps in a [`ListingsStore`].
+struct Kept {
+    store: ListingsStore,
+    /// Envelopes, by address: the chunk's bytes, as fetched.
+    envelopes: Database<Bytes, Bytes>,
+}
+
+/// The database of a [`ListingsStore`] holding envelopes, by address.
+const ENVELOPES_DB: &str = "facts_envelopes";
 
 /// A vault `DataPaymentMade` log, located.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2132,6 +2189,7 @@ impl ListingChain {
             .timeout(RPC_TIMEOUT)
             .build()
             .map_err(|e| Error::Network(format!("payment chain client: {e}")))?;
+        let rpc_counts = rpc_urls.iter().map(|_| RpcCount::default()).collect();
         Ok(Self {
             http,
             rpc_urls,
@@ -2140,7 +2198,115 @@ impl ListingChain {
             vault_deployment_block: None,
             vault_deployment_time: None,
             vault_first_payment_time: None,
+            rpc_counts,
+            kept: None,
         })
+    }
+
+    /// This reader, keeping in `store` what never changes once read, so a
+    /// restart reads it no more: the envelopes it is given
+    /// ([`Self::keep_envelope`]), in the database `facts_envelopes`.
+    ///
+    /// # Errors
+    ///
+    /// If the store's databases can't be opened.
+    pub fn with_store(mut self, store: &ListingsStore) -> Result<Self> {
+        let envelopes = store.database(ENVELOPES_DB)?;
+        self.kept = Some(Kept {
+            store: store.clone(),
+            envelopes,
+        });
+        Ok(self)
+    }
+
+    /// The envelope kept for `address` ([`Self::keep_envelope`]), if any.
+    /// It is content-addressed: bytes that don't hash to `address`, or don't
+    /// decode, are not returned. `None` without a store.
+    #[must_use]
+    pub fn kept_envelope(&self, address: &XorName) -> Option<Envelope> {
+        let kept = self.kept.as_ref()?;
+        let read = || -> std::result::Result<Option<Envelope>, String> {
+            let txn = kept.store.env().read_txn().map_err(|e| e.to_string())?;
+            let Some(bytes) = kept
+                .envelopes
+                .get(&txn, address.as_slice())
+                .map_err(|e| e.to_string())?
+            else {
+                return Ok(None);
+            };
+            if compute_address(bytes) != *address {
+                return Err("the kept bytes don't hash to its address".into());
+            }
+            Envelope::from_bytes(bytes)
+                .map(Some)
+                .map_err(|e| e.to_string())
+        };
+        read().unwrap_or_else(|e| {
+            debug!(
+                "Could not read the envelope kept for {}: {e}",
+                hex::encode(address)
+            );
+            None
+        })
+    }
+
+    /// Keep `chunk`, the envelope chunk fetched for `address`, for good, if
+    /// this reader has a store ([`Self::with_store`]) and the chunk hashes
+    /// to `address`. A failure to keep it is logged, not returned: the
+    /// envelope is fetched again when next needed.
+    pub fn keep_envelope(&self, address: &XorName, chunk: &[u8]) {
+        let Some(kept) = &self.kept else {
+            return;
+        };
+        if compute_address(chunk) != *address {
+            debug!(
+                "Not keeping an envelope for {}: it doesn't hash to its address",
+                hex::encode(address)
+            );
+            return;
+        }
+        let write = || -> heed::Result<()> {
+            let mut txn = kept.store.env().write_txn()?;
+            kept.envelopes.put(&mut txn, address.as_slice(), chunk)?;
+            txn.commit()
+        };
+        if let Err(e) = write() {
+            debug!(
+                "Could not keep the envelope for {}: {e}",
+                hex::encode(address)
+            );
+        }
+    }
+
+    /// The calls this reader has made to each RPC provider since it was
+    /// made, and how many failed: each provider by its host name alone,
+    /// never its full URL, which can hold a key.
+    #[must_use]
+    pub fn rpc_calls(&self) -> Vec<RpcCalls> {
+        let mut providers: Vec<RpcCalls> = Vec::new();
+        for (url, count) in self.rpc_urls.iter().zip(&self.rpc_counts) {
+            let provider = url::Url::parse(url)
+                .ok()
+                .and_then(|url| url.host_str().map(str::to_string))
+                .unwrap_or_else(|| "unknown".into());
+            let calls = count.calls.load(Ordering::Relaxed);
+            let errors = count.errors.load(Ordering::Relaxed);
+            match providers
+                .iter_mut()
+                .find(|known| known.provider == provider)
+            {
+                Some(known) => {
+                    known.calls += calls;
+                    known.errors += errors;
+                }
+                None => providers.push(RpcCalls {
+                    provider,
+                    calls,
+                    errors,
+                }),
+            }
+        }
+        providers
     }
 
     /// This reader, knowing that the vault was deployed in block `block`:
@@ -2619,12 +2785,15 @@ impl ListingChain {
         let first = self.answered.load(Ordering::Relaxed) % count;
         let mut errors = Vec::new();
         for index in (0..count).map(|offset| (first + offset) % count) {
+            let counts = &self.rpc_counts[index];
+            counts.calls.fetch_add(1, Ordering::Relaxed);
             match self.call_rpc(&self.rpc_urls[index], method, &params).await {
                 Ok(result) => {
                     self.answered.store(index, Ordering::Relaxed);
                     return Ok(result);
                 }
                 Err(e) => {
+                    counts.errors.fetch_add(1, Ordering::Relaxed);
                     if count > 1 {
                         debug!("{e} (RPC {index} of {count})");
                     }
@@ -4911,6 +5080,77 @@ mod tests {
             payment_vault_address: *bundled.payment_vault_address(),
         });
         assert!(crate::config::fallback_rpc_urls(&local).is_empty());
+    }
+
+    #[tokio::test]
+    async fn calls_are_counted_by_provider_host_alone() {
+        let mut refusing = MockChain::with_blocks(10, 1_800_000_000);
+        refusing.refused = vec!["eth_blockNumber"];
+        let refusing = serve(Arc::new(Mutex::new(refusing))).await;
+        let answering = serve(Arc::new(Mutex::new(MockChain::with_blocks(
+            10,
+            1_800_000_000,
+        ))))
+        .await;
+        // A key in a URL's path never shows.
+        let chain =
+            ListingChain::with_rpcs(vec![format!("{refusing}/a-key"), answering], VAULT).unwrap();
+        let counted = |calls, errors| {
+            vec![RpcCalls {
+                provider: "127.0.0.1".into(),
+                calls,
+                errors,
+            }]
+        };
+        assert_eq!(chain.rpc_calls(), counted(0, 0));
+        chain.latest_block().await.unwrap();
+        assert_eq!(chain.rpc_calls(), counted(2, 1));
+        // Later calls start at the RPC that answered.
+        chain.latest_block().await.unwrap();
+        assert_eq!(chain.rpc_calls(), counted(3, 1));
+    }
+
+    #[test]
+    fn envelopes_are_kept_by_address_and_checked_when_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let open = || ListingsStore::open_with_map_size(dir.path(), 16 * 1024 * 1024).unwrap();
+        let envelope = envelope_showing(ShownFields::NONE, true);
+        let bytes = envelope.to_bytes();
+        let address = compute_address(&bytes);
+        assert_eq!(address, envelope.address());
+        {
+            let store = open();
+            let chain = reader("http://127.0.0.1:9".into())
+                .with_store(&store)
+                .unwrap();
+            assert!(chain.kept_envelope(&address).is_none());
+            chain.keep_envelope(&address, &bytes);
+            assert_eq!(
+                chain.kept_envelope(&address).map(|kept| kept.to_bytes()),
+                Some(bytes.clone())
+            );
+            // Bytes that don't hash to the address are never kept.
+            chain.keep_envelope(&[1; 32], &bytes);
+            assert!(chain.kept_envelope(&[1; 32]).is_none());
+        }
+        // Kept across a restart, and checked when read: bytes changed in the
+        // store are not taken for the envelope.
+        let store = open();
+        let chain = reader("http://127.0.0.1:9".into())
+            .with_store(&store)
+            .unwrap();
+        assert!(chain.kept_envelope(&address).is_some());
+        let envelopes: Database<Bytes, Bytes> = store.database(ENVELOPES_DB).unwrap();
+        let mut txn = store.env().write_txn().unwrap();
+        envelopes
+            .put(&mut txn, address.as_slice(), &bytes[1..])
+            .unwrap();
+        txn.commit().unwrap();
+        assert!(chain.kept_envelope(&address).is_none());
+        // Without a store, nothing is kept.
+        let bare = reader("http://127.0.0.1:9".into());
+        bare.keep_envelope(&address, &bytes);
+        assert!(bare.kept_envelope(&address).is_none());
     }
 
     #[test]

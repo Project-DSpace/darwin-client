@@ -441,3 +441,67 @@ mod bootstrap_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod listings_tests {
+    use super::*;
+    use crate::commands::data::listings::ListingsCommand;
+
+    fn listings(cli: Cli) -> ListingsArgs {
+        match cli.command {
+            Commands::Listings(args) => args,
+            _ => panic!("not `darwin listings`"),
+        }
+    }
+
+    #[test]
+    fn serve_takes_its_directories_and_a_read_still_parses_as_before() {
+        let args = listings(
+            Cli::try_parse_from([
+                "darwin",
+                "listings",
+                "serve",
+                "--state-dir",
+                "/var/lib/listings",
+                "--out-dir",
+                "/var/www/listings/v1",
+            ])
+            .unwrap(),
+        );
+        match args.command {
+            Some(ListingsCommand::Serve(serve)) => {
+                assert_eq!(serve.state_dir, PathBuf::from("/var/lib/listings"));
+                assert_eq!(serve.out_dir, PathBuf::from("/var/www/listings/v1"));
+                assert_eq!(serve.carry, None);
+            }
+            None => panic!("no serve"),
+        }
+        let args = listings(
+            Cli::try_parse_from([
+                "darwin", "--json", "listings", "--all", "--state", "s", "--carry", "c",
+            ])
+            .unwrap(),
+        );
+        assert!(args.command.is_none());
+        assert!(args.all);
+        assert_eq!(args.carry, Some(PathBuf::from("c")));
+        // Both directories are needed, and a read's flags don't go with it.
+        for argv in [
+            &["darwin", "listings", "serve", "--state-dir", "s"][..],
+            &["darwin", "listings", "serve", "--out-dir", "o"][..],
+            &[
+                "darwin",
+                "listings",
+                "--since",
+                "5",
+                "serve",
+                "--state-dir",
+                "s",
+                "--out-dir",
+                "o",
+            ][..],
+        ] {
+            assert!(Cli::try_parse_from(argv).is_err(), "{argv:?}");
+        }
+    }
+}

@@ -42,6 +42,9 @@ futures-core = { version = "0.3" }
 futures-channel = { version = "0.3", optional = true }
 futures-util = { version = "0.3" }
 self-replace = { version = "1", optional = true }
+# LMDB for the listings producer's store (data::client::listings_store): the
+# version darwin-node keeps its listing store in.
+heed = { version = "0.22", optional = true }
 semver = { version = "1", optional = true }
 reqwest = { version = "0.12", features = ["json", "stream"], optional = true }
 tar = { version = "0.4", optional = true }
@@ -51,6 +54,9 @@ tokio = { version = "1", features = ["sync", "macros"] }
 tokio-util = { version = "0.7", features = ["rt"], optional = true }
 utoipa = { version = "5", features = ["axum_extras"], optional = true }
 zip = { version = "2", optional = true }
+# The `.zst` copies of the listings index files (data::client::listings_publish);
+# zip already builds it.
+zstd = { version = "0.13", optional = true }
 tower-http = { version = "0.6.8", features = ["cors"], optional = true }
 
 # Data operations
@@ -145,6 +151,7 @@ native = [
     "dep:axum",
     "dep:flate2",
     "dep:fs2",
+    "dep:heed",
     "dep:reqwest",
     "dep:self-replace",
     "dep:semver",
@@ -157,6 +164,7 @@ native = [
     "dep:tracing-subscriber",
     "dep:utoipa",
     "dep:zip",
+    "dep:zstd",
 ]
 browser-wasm = [
     "dep:console_error_panic_hook",

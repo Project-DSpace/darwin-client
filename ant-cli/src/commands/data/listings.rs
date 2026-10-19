@@ -8,17 +8,22 @@ use std::path::{Path, PathBuf};
 use ant_core::ant_listings::{CheckLevel, Listing, ListingKey, PaymentField, QUORUM_THRESHOLD};
 use ant_core::data::{
     paid_quote_hash, Carry, CheckedListing, Client, ListingChain, ListingLookup, PendingCopy,
-    RejectedListing, WalkOutcome, WalkState, XorName, NEAREST_NODES,
+    Producer, RejectedListing, WalkOutcome, WalkState, XorName, NEAREST_NODES,
 };
-use clap::Args;
+use clap::{Args, Subcommand};
 use serde::Serialize;
 use serde_json::{Map, Value};
+use tokio_util::sync::CancellationToken;
 
 use super::chunk::parse_address;
 
 /// Arguments of `darwin listings`.
 #[derive(Args)]
+#[command(args_conflicts_with_subcommands = true)]
 pub struct ListingsArgs {
+    /// Instead of reading the index once, keep it published (`serve`).
+    #[command(subcommand)]
+    pub command: Option<ListingsCommand>,
     /// Only listings from this time on, in Unix seconds: the block timestamp,
     /// or for a listing that hides it, when it was first seen (to the hour).
     #[arg(long, default_value_t = 0)]
@@ -37,6 +42,86 @@ pub struct ListingsArgs {
     /// `--json`; a missing file carries nothing.
     #[arg(long, value_name = "FILE")]
     pub carry: Option<PathBuf>,
+}
+
+/// What `darwin listings` does instead of reading the index once.
+#[derive(Subcommand)]
+pub enum ListingsCommand {
+    /// Follow what the nodes serve and keep the index published as the
+    /// static files of listings/v1/ (docs/listings-v1.md), until stopped
+    Serve(ServeArgs),
+}
+
+/// Arguments of `darwin listings serve`.
+#[derive(Args)]
+pub struct ServeArgs {
+    /// Where the producer keeps its state, created if missing: the census of
+    /// nodes, each node's mirror, chain facts, envelopes and the published
+    /// index. One process uses it at a time.
+    #[arg(long, value_name = "DIR")]
+    pub state_dir: PathBuf,
+    /// The directory to publish the files of listings/v1/ in, created if
+    /// missing.
+    #[arg(long, value_name = "DIR")]
+    pub out_dir: PathBuf,
+    /// On a first start, publish the entries of this earlier `--json` output
+    /// of `darwin listings` (such as the listings.json it replaces) as
+    /// carried, until cycles decide their addresses. Ignored once the state
+    /// holds an index.
+    #[arg(long, value_name = "FILE")]
+    pub carry: Option<PathBuf>,
+}
+
+impl ServeArgs {
+    /// Run the producer on `client` (which must have an EVM network) until
+    /// SIGINT, or SIGTERM where there is one.
+    pub async fn execute(&self, client: Client) -> anyhow::Result<()> {
+        let mut producer = Producer::open(&self.state_dir, &self.out_dir, client)?;
+        if let Some(previous) = &self.carry {
+            let taken = producer.carry_from(previous)?;
+            if taken > 0 {
+                eprintln!("Carried {taken} entries from {}", previous.display());
+            }
+        }
+        let cancel = CancellationToken::new();
+        let stop = cancel.clone();
+        tokio::spawn(async move {
+            stop_signal().await;
+            stop.cancel();
+        });
+        producer.run(cancel).await?;
+        Ok(())
+    }
+}
+
+/// When the producer is asked to stop: SIGINT, or SIGTERM (how a service
+/// manager stops it). A signal that can't be listened for never comes.
+async fn stop_signal() {
+    let interrupt = async {
+        if tokio::signal::ctrl_c().await.is_err() {
+            std::future::pending::<()>().await;
+        }
+    };
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        let terminate = async {
+            match signal(SignalKind::terminate()) {
+                Ok(mut terminate) => {
+                    if terminate.recv().await.is_none() {
+                        std::future::pending::<()>().await;
+                    }
+                }
+                Err(_) => std::future::pending::<()>().await,
+            }
+        };
+        tokio::select! {
+            () = interrupt => {}
+            () = terminate => {}
+        }
+    }
+    #[cfg(not(unix))]
+    interrupt.await;
 }
 
 /// Arguments of `darwin listing`.
@@ -1228,6 +1313,7 @@ mod tests {
         let state_path = dir.path().join("walks.json");
         let carry_path = dir.path().join("listings.json");
         let args = |state: Option<&Path>, carry: Option<&Path>| ListingsArgs {
+            command: None,
             since: 0,
             all: true,
             state: state.map(Path::to_path_buf),

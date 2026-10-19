@@ -181,6 +181,13 @@ const COMMANDS: &[Reviewed] = &[
     ("pointer get", NoPayment, &["address"]),
     ("pointer resolve", NoPayment, &["address"]),
     ("listings", NoPayment, &["since", "all", "state", "carry"]),
+    // Reads nodes and the payment chain, and writes files on this machine
+    // only: it stores nothing on the network.
+    (
+        "listings serve",
+        NoPayment,
+        &["state_dir", "out_dir", "carry"],
+    ),
     ("listing", NoPayment, &["address"]),
     ("manifest", NoPayment, &[]),
     (

@@ -19,6 +19,14 @@ pub use client::listings::{
     ListingLookup, ListingsIndex, PendingCopy, RejectedListing, WalkReport, WalkState,
     NEAREST_NODES,
 };
+#[cfg(feature = "native")]
+pub use client::listings_census::{Census, CensusNode};
+#[cfg(feature = "native")]
+pub use client::listings_publish::{Publication, Published, Publisher};
+#[cfg(feature = "native")]
+pub use client::listings_serve::{CycleReport, Producer};
+#[cfg(feature = "native")]
+pub use client::listings_store::ListingsStore;
 pub use client::{Client, ClientConfig};
 pub use error::{Error, Result};
 pub use network::{Network, NetworkHealth, REBOOTSTRAP_THRESHOLD};
