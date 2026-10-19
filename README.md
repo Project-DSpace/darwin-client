@@ -427,6 +427,29 @@ A read has no cap on how many listings the index holds, and a node can't make it
 
 With `--json`, hidden payment fields are absent, and each listing carries `check` (`verified` or `reported`), `nodes` and `nearest`, `first_seen` where it has one, and for a readable listing its `data_map` (hex), which is enough to read the file without fetching the envelope. A listing too few of its nearest nodes serve yet also carries `copies`: for each of those nodes' copies, the `node` (hex), the `block_number`, `block_timestamp` and `first_seen` it shows, its `time`, and `"before_vault_deployment": true` where its block or block timestamp is earlier than the vault's deployment. Download a listed file with `darwin file download <ADDRESS>`.
 
+### `darwin listings serve` — Publishing the Index
+
+```
+$ darwin listings serve --state-dir /var/lib/listings --out-dir /var/www/listings/v1 --carry listings.json
+```
+
+Runs until SIGINT or SIGTERM (the cycle in hand finishes writing first) and keeps the listings index published as the static files of `listings/v1/`: the newest entries (`head.json`), shards by address, name and content type, pages of the whole index in key order, a feed of every change, `status.json` (how the producer is doing, rewritten every cycle) and `rejected.json`. [docs/listings-v1.md](docs/listings-v1.md) specifies them for readers in any language. Each file is replaced whole, and only when its bytes change, with `.gz` and `.zst` copies of the same bytes beside it, so any static file server can serve the directory and a reader polling with conditional requests gets a `304` while nothing changed. Time pages and full feed segments never change. `darwin listings` without `serve` reads the index once, as above.
+
+| Flag | Description |
+|------|-------------|
+| `--state-dir <DIR>` | Where the producer keeps its state, created if missing. One process uses it at a time. |
+| `--out-dir <DIR>` | Where it publishes the files of `listings/v1/`, created if missing. |
+| `--carry <FILE>` | On a first start, an earlier `--json` output of `darwin listings` (such as a `listings.json` the producer takes over from), whose entries are published as carried until cycles decide their addresses, so nothing in it is lost meanwhile. Ignored once the state holds an index. |
+
+**Its state** is one store, `listings.mdb` in the state directory: the nodes the producer knows, its copy of what each of them serves, chain facts, envelopes and the published index. Back it up like other server state. Without it the producer starts cold: it reads every listing again, and starts a new feed under a new `epoch`, which tells readers to read the index afresh.
+
+**Each minute** (a cycle) it sends one request to every node it knows, 64 at a time, and decides again only the addresses whose copies, nearest nodes or chain facts changed, with the same rules as `darwin listings`. An address is decided once at least 4 of its 7 nearest nodes answered in that cycle and serve a listing for it. A cycle in which fewer than 7 nodes answered, or under three quarters of those it knows, decides and removes nothing.
+
+- **Nodes with change feeds** (a user agent of `node/<version>+ds.15` or a later `ds.` number, such as `node/0.23.0+ds.15`) are asked only what changed, since their last answer, in their own part of the address space: one digest per changed listing, and the full listing only for addresses being decided. Each answer also carries a count and a hash of everything the node serves there, which must match the producer's copy. When they don't, or the node's feed starts over, the node is read again in pages of digests and counts as not answering until that is done. Such a node also pushes new listings to the producer as it stores them, so they need not wait for the next cycle.
+- **Nodes without them** are read with `listings.v2`, one request each per cycle: the next page of a full pass of their index (a new pass starts at most once an hour), or, between passes, the listings after the newest one seen from them. Their copies count from their latest pass while they keep answering; one that doesn't answer counts for nothing until it does. Where 4 or more of an address's 7 nearest nodes lack change feeds, a new listing there can wait up to one pass.
+- **Removals.** An entry is removed only when deciding its address again rejects it, or when, in one cycle, all 7 of its nearest nodes answered and none serves a copy, a lookup that hears from every node it returns finds the same 7, each of them answers a request for the address with none (asked at least 2 hours after the listing's time), and the nodes that served it when it was last decided don't serve it either. Otherwise it stays, marked `carried` in its support file.
+- **Chain facts** (a transaction's receipt, a block's time, a quote's payments) are used as soon as they are read, and kept for good only once their block is at or below the RPC's `finalized` block and a second provider returns the same. A fact not found, an error, or a time in the future is never kept.
+
 ### `darwin listing <ADDRESS>` — One Listing
 
 ```
