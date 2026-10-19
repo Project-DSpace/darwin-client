@@ -17,6 +17,10 @@ told apart by the commit `darwin --version` prints. Upstream's entries follow.
 - Listings v2: envelopes on every visibility, optional payment fields, upload records and proofs
   (`darwin file prove`, `darwin file verify`), and the listings index (`darwin listings`,
   `darwin listing`) read with quorum checks.
+- darwin-listings is vendored at 0.3.0, which adds nodes' change feeds (digest entries, set hashes,
+  address ranges, pushes to watchers and `FeedSync`); the client routes their answers and pushes by
+  request id. The index as small static files, `listings/v1/`, is specified in
+  `docs/listings-v1.md`, with its types in `ant_core::data::client::listings_v1`.
 - Envelopes are darwin's default: `darwin file upload`, `darwin manifest create` and the
   library's file upload shortcuts store each upload in an envelope, with its payment record, a
   listing when listed, and a `.record`. The other ways of using the network remain, with no

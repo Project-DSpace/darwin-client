@@ -20,6 +20,8 @@ pub mod envelope;
 pub mod file;
 #[cfg(feature = "native")]
 pub mod listings;
+#[cfg(feature = "native")]
+pub mod listings_v1;
 pub mod merkle;
 #[cfg(feature = "native")]
 mod native_payment;
