@@ -1,6 +1,6 @@
 [package]
 name = "ant-listings"
-version = "0.2.1"
+version = "0.3.0"
 edition = "2021"
 rust-version = "1.91"
 description = "Envelopes and listings for storage networks built on Autonomi's protocol: the envelope format, listing records, payment checks, upload proofs and the listings protocol"

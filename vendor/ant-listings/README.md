@@ -246,8 +246,13 @@ Messages travel on the topic `listings.v2`, encoded with postcard:
 | `GetRequest { address }` | the listing for one address, in the index or not |
 | `GetResponse { listing }` | the listing, if the node holds it |
 | `Error { message }` | the request was refused |
+| `ChangesRequest { epoch, after, prefix, bits, limit, want_peers, watch }` | the records of the node's change feed after record `after`, for the addresses whose first `bits` bits are those of `prefix` |
+| `ChangesResponse { epoch, head, next, count, set_hash, changes, more, view, peers }` | at most 256 records, in order, up to `next`; the count and set hash of what the node serves in the range at `head`; a hash of its nearest peers, and their list if asked for. Also a push to a watcher |
+| `RangeListRequest { prefix, bits, after, limit }` | the digest entries the node serves in the range, in address order, after `after` |
+| `RangeListResponse { entries, more }` | at most 256 entries; `more` if the node serves later ones in the range |
 
-A response with more than 256 listings doesn't decode. A client checks each
+A decoder reads one whole message and ignores any bytes after it. A response
+with more than 256 listings doesn't decode. A client checks each
 page against its request: no more listings than asked for, each in the index,
 with keys from `from` onwards and strictly increasing. The next page starts
 just after the last key, and paging stops when the node has no more, a page is
@@ -295,6 +300,117 @@ Before deciding an address that no listing has a quorum for yet, ask the
 nearest nodes not yet heard from (`MergedListing::unheard_among`). A walk of a
 node's whole index answers for a listing only if the listing is in the index
 and the walk began at least two hours after the listing's time.
+
+### Following each node's changes
+
+Instead of reading every node's whole index again, a reader can follow each
+node's change feed and keep a mirror of what the node serves in one part of
+the address space.
+
+A node numbers every change to the listings it serves in the index. It keeps
+one record per address, the latest change to it, so a removal needs no
+expiry: the listing's digest entry, or the address's removal. Records are
+numbered from 1 within an epoch, a random number other than 0 that the node
+chooses when it first numbers its listings and again whenever it numbers them
+afresh. Its head is the number of its latest record, 0 if it has none.
+
+A digest entry stands for one copy of a listing: the address; the key's time,
+block number and log index; the `first_seen` the node recorded; and the
+digest, `blake3` of the listing's wire bytes (as a `GetResponse` carries it)
+with `first_seen` set to none. Two copies have the same digest exactly when
+they are equal apart from `first_seen`, so copies grouped by digest are the
+groups merging forms, and each keeps its own `first_seen`. An entry takes
+about 80 bytes on the wire.
+
+An address range is the addresses whose first `bits` bits (0 to 255) are
+those of `prefix`; the rest of `prefix` doesn't matter.
+
+A node answers a `ChangesRequest`:
+
+- if `epoch` is not its feed's, or `after` is beyond its head, with no
+  records, `next` at its head and `more` false. The reader reads the range
+  afresh with `RangeListRequest`s, then follows the feed after that head;
+- otherwise with its records in the range after `after`, in order, at most
+  `min(limit, 256)`. It may stop sooner, once it has read as many records as
+  it reads for one request. `next` is the number of the last record it read,
+  and `more` says whether it has records after `next`.
+
+Every answer gives the node's epoch and head, the count and set hash of
+everything it serves in the range at its head, and `view`: `blake3` of its
+nearest peers' ids, sorted, without repeats, one after another. With
+`want_peers` it also lists those peers, at most 20.
+
+The set hash of a set of entries is the sum, modulo 2^256, of `blake3` of each
+entry's wire bytes read as a little-endian number, and travels as 32 bytes,
+little-endian. It doesn't depend on the order of the entries, is updated by
+adding and subtracting as they come and go, and adds up over ranges, so a node
+can keep one for each address prefix. With the count, it tells a reader
+whether its mirror holds what the node reports serving.
+
+A client checks each answer against its request: an epoch other than 0, and
+peers only if asked for, the ones the view hashes; then either an answer from
+another feed, with no records and stopping at the head, or records in the
+range, one per address, numbered in increasing order after `after` and up to
+`next`, where `next` lies from `after` to `head`, `more` is set exactly when
+`next` is before `head`, and an answer with `more` moves past `after`. A
+range page holds entries in the range after `after`, in strictly increasing
+address order. A response with more than 256 records or entries, or more than
+20 peers, doesn't decode.
+
+A `ChangesRequest` with `watch` set asks the node to send the range's new
+records as it makes them, each as a `ChangesResponse` whose request id is the
+bitwise complement of the request's (`push_request_id`), a push: `next` at its
+head, `more` false, no peers, and the range's count and set hash at that head.
+The answer to the request has the request's own id. Messages can overtake one
+another on the way, so a push can arrive before the answer: a requester tells
+them apart by id alone, never by the order they arrive in. No id a requester
+uses with a node should be the complement of another it uses with the node,
+which ids chosen at random almost never are. A watch lasts until the
+requester's next `ChangesRequest` to the node, which sets a new one if it asks
+for one, or for three minutes if none comes: the minute until its next poll,
+and two more. A node keeps at most four watches at once. Once it has four, it
+refuses a new one, so a requester that already watches is never pushed out;
+the request is still answered, and the requester can't tell. Pushes are never
+acknowledged: the next request catches up on a missed one.
+
+`FeedSync`, a state machine that does no I/O, keeps a reader's mirror of one
+node's range. Each round it asks for the changes after the last record it has,
+pages on while the node has more, and once it has reached the node's head
+checks the count and set hash. While they match, the mirror is exact, and once
+the node has answered in the round its copies count; a push alone doesn't
+stand in for that answer, so each round asks the node at least once, which
+also renews its watch. When they don't match, or the node's feed is new to it,
+it reads the range afresh, over several rounds if need be, then follows the
+feed again from the head the node gave when the reading began. It takes a push
+that brings the mirror exactly to the node's new head, and leaves any other to
+the next request, so a push that comes before the answer, after it or not at
+all costs at most one more request.
+
+A node can make up entries without end, so each node is read within the same
+allowance as a walk: 2,048 entries' worth of pages a round, and two more for
+each entry in its mirror whose address at least four of the seven nodes
+nearest it serve, counted where the node is among the twenty nearest the
+address, from what the mirrors hold whether or not they are in sync. Each
+answer counts as a full page, and each push as one too. Until the node has
+answered in a round, pushes leave a page for its answer, and the round's
+first request is sent whatever they have used. A mirror never grows past its
+allowance: each request after a round's first needs room in it for a full
+page of new addresses. If the round's first request finds no room, the
+mirror starts again from nothing: it is emptied when the answer comes, and
+the range is read afresh. Only the node's answers can shrink its
+mirror, so they are never held back for want of room: a mirror holding entries
+the node no longer serves is put right as the node answers, even when nobody
+serves them any more and they earn it nothing. A node holding real listings
+earns as it goes; one serving entries nobody else serves is read for eight
+pages a round, as a walk reads it, and its mirror stays within 2,048 entries.
+
+`leaves` splits the address space for a reader that knows the nodes' ids: from
+the whole space down, a range is split into its halves only while both hold at
+least seven of the ids. Every leaf then holds at least seven nodes, and the
+seven nodes nearest any address are in its leaf, so a reader asks each node
+about its own leaf only.
+
+A node that doesn't know these requests drops them unanswered.
 
 Version 1 (`listings.v1`) is no longer served.
 

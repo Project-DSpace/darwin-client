@@ -49,11 +49,11 @@ use ant_listings::choose_verified;
 pub use ant_listings::{check_copies, listing_to_check, quorum_listing};
 use ant_listings::{
     check_get_response, check_offline, merge_copies, nearest_by_distance, payment_lookup,
-    quorum_needed, verify_listing_receipts, AddressWalk, CheckLevel, Envelope, EnvelopeProof,
-    IndexWalk, Listing, ListingCheck, ListingKey, ListingPayment, ListingsBody, ListingsMessage,
-    Lookup, MergedListing, NodeReport, PaidAt, PaymentError, PaymentLog, PaymentReceipt,
-    ProvenUpload, WalkOutcome, WalkResult, CLOCK_MARGIN, DATA_PAYMENT_MADE_TOPIC,
-    FIRST_SEEN_ROUNDING, MAX_LIST_LIMIT, QUORUM_THRESHOLD, TOPIC,
+    push_request_id, quorum_needed, verify_listing_receipts, AddressWalk, ChangesResponse,
+    CheckLevel, Envelope, EnvelopeProof, IndexWalk, Listing, ListingCheck, ListingKey,
+    ListingPayment, ListingsBody, ListingsMessage, Lookup, MergedListing, NodeReport, PaidAt,
+    PaymentError, PaymentLog, PaymentReceipt, ProvenUpload, WalkOutcome, WalkResult, CLOCK_MARGIN,
+    DATA_PAYMENT_MADE_TOPIC, FIRST_SEEN_ROUNDING, MAX_LIST_LIMIT, QUORUM_THRESHOLD, TOPIC,
 };
 use ant_protocol::evm::{Amount, Network as EvmNetwork, QuoteHash};
 use ant_protocol::transport::{MultiAddr, P2PEvent, P2PNode, PeerId};
@@ -817,7 +817,7 @@ impl Client {
                 .unwrap_or(base);
             (*peer, *peer.as_bytes(), from)
         }));
-        let requests = ListingsRequests::start(self.network().node());
+        let requests = ListingsRequests::start(self.network().node(), None);
         let found = self.run_walk(walk, &requests).await;
         let walks: Vec<WalkReport> = found.nodes.iter().map(WalkReport::from).collect();
         state.record(nodes.len(), &walks);
@@ -1206,7 +1206,7 @@ impl Client {
                 hex::encode(address)
             )));
         }
-        let requests = ListingsRequests::start(self.network().node());
+        let requests = ListingsRequests::start(self.network().node(), None);
         let answers = self.ask_for_listing(&requests, address, &nearest).await;
         let answered = answers
             .iter()
@@ -1428,25 +1428,119 @@ impl Client {
     }
 }
 
-/// Requests waiting for their answers, by node and request id.
-type Waiting = Arc<Mutex<HashMap<(PeerId, u64), oneshot::Sender<ListingsBody>>>>;
+/// Where pushes from nodes' watches go: each with the node it came from.
+/// The router never waits for room: a push that doesn't fit is dropped, as
+/// pushes may be, and the next `ChangesRequest` to the node catches up.
+pub(crate) type PushSink = tokio::sync::mpsc::Sender<(PeerId, ChangesResponse)>;
 
-/// Listings requests in flight for one read. One subscriber decodes each
-/// answer once and hands it to the request waiting for it, by node and
-/// request id, rather than each request reading every message the client
-/// receives.
+/// A request id for a listings request: random, with the top bit clear. The
+/// id a node's pushes come with ([`push_request_id`], the bitwise
+/// complement) then always has the top bit set, so no request's id is ever
+/// the complement of another's, and a push is never taken for an answer.
+fn new_request_id() -> u64 {
+    rand::random::<u64>() >> 1
+}
+
+/// Where answers and pushes go, by node and request id.
+#[derive(Default)]
+struct Routes {
+    /// Requests waiting for their answers.
+    waiting: HashMap<(PeerId, u64), oneshot::Sender<ListingsBody>>,
+    /// Each node's watch: the request id its pushes come with,
+    /// [`push_request_id`] of the id of the latest `ChangesRequest` sent to
+    /// it, when that one set a watch.
+    watches: HashMap<PeerId, u64>,
+}
+
+/// What a message received on the listings topic is for.
+#[derive(Debug)]
+enum Route {
+    /// The answer to the request waiting for it, to hand over. An
+    /// [`Error`](ListingsBody::Error) is an answer too: the node refused the
+    /// request, as one does a kind of request it doesn't know (`unsupported`),
+    /// so it costs no timeout.
+    Answer(oneshot::Sender<ListingsBody>, ListingsBody),
+    /// A push from the node's watch.
+    Push(ChangesResponse),
+    /// Nothing waits for it: a late answer, a push from a watch that has
+    /// ended, or a message that is neither.
+    Drop,
+}
+
+impl Routes {
+    /// Wait for `peer`'s answer to `body`, sent as request `request_id`. A
+    /// `ChangesRequest` replaces the node's watch, as the node does: one that
+    /// sets a watch routes the node's pushes from now on, if `take_pushes`
+    /// (there is a sink for them), and one that doesn't ends the routing of
+    /// the node's earlier watch.
+    fn expect(
+        &mut self,
+        peer: PeerId,
+        request_id: u64,
+        body: &ListingsBody,
+        take_pushes: bool,
+    ) -> oneshot::Receiver<ListingsBody> {
+        let (sender, receiver) = oneshot::channel();
+        self.waiting.insert((peer, request_id), sender);
+        if let ListingsBody::ChangesRequest(request) = body {
+            if request.watch && take_pushes {
+                self.watches.insert(peer, push_request_id(request_id));
+            } else {
+                self.watches.remove(&peer);
+            }
+        }
+        receiver
+    }
+
+    /// Stop waiting for `peer`'s answer to request `request_id`.
+    fn forget(&mut self, peer: &PeerId, request_id: u64) {
+        self.waiting.remove(&(*peer, request_id));
+    }
+
+    /// Where `message`, received from `source`, goes: a
+    /// [`ChangesResponse`] with the id of the node's watch is a push, and
+    /// any message with the id of a request waiting for the node's answer is
+    /// that answer. Pushes and answers are told apart by id alone, never by
+    /// the order they arrive in, since a push can overtake the answer.
+    fn route(&mut self, source: PeerId, message: ListingsMessage) -> Route {
+        let ListingsMessage { request_id, body } = message;
+        if self.watches.get(&source) == Some(&request_id) {
+            return match body {
+                ListingsBody::ChangesResponse(push) => Route::Push(push),
+                _ => Route::Drop,
+            };
+        }
+        match self.waiting.remove(&(source, request_id)) {
+            Some(sender) => Route::Answer(sender, body),
+            None => Route::Drop,
+        }
+    }
+}
+
+/// Listings requests in flight. One subscriber decodes each message once
+/// and hands it to the request waiting for it, by node and request id,
+/// rather than each request reading every message the client receives; a
+/// push from a node's watch goes to the push sink, if there is one. A
+/// message that doesn't decode, such as an answer of a kind this client
+/// doesn't know, is dropped: the request it answers times out.
 struct ListingsRequests {
     node: Arc<P2PNode>,
-    waiting: Waiting,
+    routes: Arc<Mutex<Routes>>,
+    /// Whether pushes have somewhere to go.
+    take_pushes: bool,
     router: tokio::task::JoinHandle<()>,
 }
 
 impl ListingsRequests {
-    fn start(node: &Arc<P2PNode>) -> Self {
-        let waiting: Waiting = Arc::default();
+    /// Start routing answers, and pushes to `pushes` if given. Without a
+    /// sink, a `ChangesRequest` that sets a watch is still answered, but the
+    /// node's pushes are dropped.
+    fn start(node: &Arc<P2PNode>, pushes: Option<PushSink>) -> Self {
+        let routes: Arc<Mutex<Routes>> = Arc::default();
+        let take_pushes = pushes.is_some();
         // Subscribe before anything is sent, so no answer can be missed.
         let mut events = node.subscribe_events();
-        let routes = Arc::clone(&waiting);
+        let router_routes = Arc::clone(&routes);
         let router = tokio::spawn(async move {
             loop {
                 match events.recv().await {
@@ -1459,12 +1553,23 @@ impl ListingsRequests {
                         let Ok(message) = ListingsMessage::decode(&data) else {
                             continue;
                         };
-                        let waiting = routes
-                            .lock()
-                            .ok()
-                            .and_then(|mut waiting| waiting.remove(&(source, message.request_id)));
-                        if let Some(waiting) = waiting {
-                            let _ = waiting.send(message.body);
+                        let route = match router_routes.lock() {
+                            Ok(mut routes) => routes.route(source, message),
+                            Err(_) => Route::Drop,
+                        };
+                        match route {
+                            Route::Answer(waiting, body) => {
+                                let _ = waiting.send(body);
+                            }
+                            Route::Push(push) => {
+                                let full = pushes
+                                    .as_ref()
+                                    .is_some_and(|sink| sink.try_send((source, push)).is_err());
+                                if full {
+                                    debug!("Dropped a listings push from {source}");
+                                }
+                            }
+                            Route::Drop => {}
                         }
                     }
                     Ok(_) => {}
@@ -1477,33 +1582,41 @@ impl ListingsRequests {
         });
         Self {
             node: Arc::clone(node),
-            waiting,
+            routes,
+            take_pushes,
             router,
         }
     }
 
     /// Send `body` to `peer` and wait for its answer, at most
-    /// [`REQUEST_TIMEOUT`].
+    /// [`REQUEST_TIMEOUT`]. An [`Error`](ListingsBody::Error) is returned
+    /// as the answer it is: the node refused the request.
     async fn ask(&self, peer: &PeerId, body: ListingsBody) -> Option<ListingsBody> {
-        let request_id: u64 = rand::random();
-        let request = ListingsMessage { request_id, body }.encode().ok()?;
-        let (sender, receiver) = oneshot::channel();
-        self.waiting
+        let request_id = new_request_id();
+        let receiver = self
+            .routes
             .lock()
             .ok()?
-            .insert((*peer, request_id), sender);
-        let answer = match self.node.send_message(peer, TOPIC, request, &[]).await {
-            Ok(()) => tokio::time::timeout(REQUEST_TIMEOUT, receiver)
-                .await
-                .ok()
-                .and_then(std::result::Result::ok),
+            .expect(*peer, request_id, &body, self.take_pushes);
+        let request = ListingsMessage { request_id, body }.encode();
+        let answer = match request {
+            Ok(request) => match self.node.send_message(peer, TOPIC, request, &[]).await {
+                Ok(()) => tokio::time::timeout(REQUEST_TIMEOUT, receiver)
+                    .await
+                    .ok()
+                    .and_then(std::result::Result::ok),
+                Err(e) => {
+                    debug!("Could not ask {peer} for listings: {e}");
+                    None
+                }
+            },
             Err(e) => {
-                debug!("Could not ask {peer} for listings: {e}");
+                debug!("Could not encode a listings request: {e}");
                 None
             }
         };
-        if let Ok(mut waiting) = self.waiting.lock() {
-            waiting.remove(&(*peer, request_id));
+        if let Ok(mut routes) = self.routes.lock() {
+            routes.forget(peer, request_id);
         }
         if answer.is_none() {
             debug!("{peer} did not answer a listings request");
@@ -5068,5 +5181,225 @@ mod tests {
         // A provider that answers 64 blocks at a time: found all the same.
         mock.lock().unwrap().max_log_range = Some(64);
         assert_eq!(chain.fetch(&lookup, &shown).await.unwrap().len(), 1);
+    }
+
+    /// A `ChangesRequest` for the whole address space after record `after`.
+    fn changes_request(after: u64, watch: bool) -> ListingsBody {
+        ListingsBody::ChangesRequest(ant_listings::ChangesRequest {
+            epoch: 9,
+            after,
+            prefix: [0; 32],
+            bits: 0,
+            limit: MAX_LIST_LIMIT,
+            want_peers: false,
+            watch,
+        })
+    }
+
+    /// A `ChangesResponse` of no changes, at `head`.
+    fn changes_response(head: u64) -> ChangesResponse {
+        ChangesResponse {
+            epoch: 9,
+            head,
+            next: head,
+            count: 0,
+            set_hash: ant_listings::SetHash::EMPTY,
+            changes: Vec::new(),
+            more: false,
+            view: [0; 32],
+            peers: Vec::new(),
+        }
+    }
+
+    fn message(request_id: u64, body: ListingsBody) -> ListingsMessage {
+        ListingsMessage { request_id, body }
+    }
+
+    #[test]
+    fn request_ids_are_never_the_complement_of_another() {
+        for _ in 0..1_000 {
+            let id = new_request_id();
+            assert_eq!(id >> 63, 0, "{id:#x}");
+            assert_eq!(push_request_id(id) >> 63, 1, "{id:#x}");
+        }
+    }
+
+    #[test]
+    fn answers_go_to_the_request_by_node_and_id() {
+        let mut routes = Routes::default();
+        let mut receiver = routes.expect(peer(1), 5, &changes_request(0, false), true);
+        // Another node's message with the same id, or this node's with
+        // another id, isn't the answer.
+        for (source, id) in [(peer(2), 5), (peer(1), 6)] {
+            let routed = routes.route(
+                source,
+                message(id, ListingsBody::ChangesResponse(changes_response(3))),
+            );
+            assert!(matches!(routed, Route::Drop), "{routed:?}");
+        }
+        let routed = routes.route(
+            peer(1),
+            message(5, ListingsBody::ChangesResponse(changes_response(3))),
+        );
+        let Route::Answer(sender, body) = routed else {
+            panic!("{routed:?}");
+        };
+        sender.send(body).unwrap();
+        assert_eq!(
+            receiver.try_recv().unwrap(),
+            ListingsBody::ChangesResponse(changes_response(3))
+        );
+        // Answered once: a second answer is dropped.
+        let again = routes.route(
+            peer(1),
+            message(5, ListingsBody::ChangesResponse(changes_response(4))),
+        );
+        assert!(matches!(again, Route::Drop), "{again:?}");
+    }
+
+    #[test]
+    fn a_refusal_is_the_answer() {
+        // A node that doesn't know a kind of request answers `unsupported`:
+        // that is its answer, not a timeout.
+        let mut routes = Routes::default();
+        let request = ListingsBody::RangeListRequest(ant_listings::RangeListRequest {
+            prefix: [0; 32],
+            bits: 0,
+            after: None,
+            limit: MAX_LIST_LIMIT,
+        });
+        let mut receiver = routes.expect(peer(1), 7, &request, true);
+        let refusal = ListingsBody::Error {
+            message: "unsupported".into(),
+        };
+        let Route::Answer(sender, body) = routes.route(peer(1), message(7, refusal.clone())) else {
+            panic!("a refusal is an answer");
+        };
+        sender.send(body).unwrap();
+        assert_eq!(receiver.try_recv().unwrap(), refusal);
+    }
+
+    #[test]
+    fn pushes_go_by_the_complement_of_the_watching_request() {
+        let mut routes = Routes::default();
+        let mut answer = routes.expect(peer(1), 5, &changes_request(0, true), true);
+        let push_id = push_request_id(5);
+        // A push can come before the answer, and leaves the request waiting.
+        let push = routes.route(
+            peer(1),
+            message(push_id, ListingsBody::ChangesResponse(changes_response(1))),
+        );
+        assert!(
+            matches!(&push, Route::Push(push) if push.head == 1),
+            "{push:?}"
+        );
+        // Others' messages with the push id aren't pushes, and nor is any
+        // other kind of message from the node with it.
+        let other = routes.route(
+            peer(2),
+            message(push_id, ListingsBody::ChangesResponse(changes_response(1))),
+        );
+        assert!(matches!(other, Route::Drop), "{other:?}");
+        let not_a_push = routes.route(
+            peer(1),
+            message(push_id, ListingsBody::GetResponse { listing: None }),
+        );
+        assert!(matches!(not_a_push, Route::Drop), "{not_a_push:?}");
+        // The answer, by the request's own id.
+        let Route::Answer(sender, body) = routes.route(
+            peer(1),
+            message(5, ListingsBody::ChangesResponse(changes_response(1))),
+        ) else {
+            panic!("the answer");
+        };
+        sender.send(body).unwrap();
+        assert!(answer.try_recv().is_ok());
+        // Pushes keep coming after the answer, while the watch lasts.
+        let later = routes.route(
+            peer(1),
+            message(push_id, ListingsBody::ChangesResponse(changes_response(2))),
+        );
+        assert!(matches!(later, Route::Push(_)), "{later:?}");
+    }
+
+    #[test]
+    fn the_next_changes_request_replaces_the_watch() {
+        let mut routes = Routes::default();
+        let _first = routes.expect(peer(1), 5, &changes_request(0, true), true);
+        // A new watch: pushes from the old one are dropped (the next
+        // answer covers what they carried), the new one's are taken.
+        let _second = routes.expect(peer(1), 6, &changes_request(3, true), true);
+        let old = routes.route(
+            peer(1),
+            message(
+                push_request_id(5),
+                ListingsBody::ChangesResponse(changes_response(4)),
+            ),
+        );
+        assert!(matches!(old, Route::Drop), "{old:?}");
+        let new = routes.route(
+            peer(1),
+            message(
+                push_request_id(6),
+                ListingsBody::ChangesResponse(changes_response(4)),
+            ),
+        );
+        assert!(matches!(new, Route::Push(_)), "{new:?}");
+        // Other requests leave the watch alone.
+        let _get = routes.expect(
+            peer(1),
+            8,
+            &ListingsBody::GetRequest { address: [1; 32] },
+            true,
+        );
+        let still = routes.route(
+            peer(1),
+            message(
+                push_request_id(6),
+                ListingsBody::ChangesResponse(changes_response(5)),
+            ),
+        );
+        assert!(matches!(still, Route::Push(_)), "{still:?}");
+        // A ChangesRequest without a watch ends it, as it does on the node.
+        let _third = routes.expect(peer(1), 9, &changes_request(5, false), true);
+        let ended = routes.route(
+            peer(1),
+            message(
+                push_request_id(6),
+                ListingsBody::ChangesResponse(changes_response(6)),
+            ),
+        );
+        assert!(matches!(ended, Route::Drop), "{ended:?}");
+    }
+
+    #[test]
+    fn without_a_sink_pushes_are_dropped() {
+        let mut routes = Routes::default();
+        let _answer = routes.expect(peer(1), 5, &changes_request(0, true), false);
+        let push = routes.route(
+            peer(1),
+            message(
+                push_request_id(5),
+                ListingsBody::ChangesResponse(changes_response(1)),
+            ),
+        );
+        assert!(matches!(push, Route::Drop), "{push:?}");
+    }
+
+    #[test]
+    fn a_forgotten_request_takes_no_late_answer() {
+        let mut routes = Routes::default();
+        let _answer = routes.expect(
+            peer(1),
+            5,
+            &ListingsBody::GetRequest { address: [1; 32] },
+            true,
+        );
+        routes.forget(&peer(1), 5);
+        let late = routes.route(
+            peer(1),
+            message(5, ListingsBody::GetResponse { listing: None }),
+        );
+        assert!(matches!(late, Route::Drop), "{late:?}");
     }
 }

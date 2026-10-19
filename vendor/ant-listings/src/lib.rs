@@ -39,12 +39,22 @@
 //! listings fewer nodes serve cost it nothing, with no ceiling on how many
 //! real listings the index holds.
 //!
+//! A reader can instead follow each node's change feed ([`feed`]): a node
+//! numbers every change to what it serves in the index, and answers for an
+//! address range with the changes after a given record, as
+//! [`DigestEntry`]s, along with the count and [`SetHash`] of what it serves
+//! there. [`FeedSync`] keeps a mirror of one node's range, read within the
+//! walk's earned allowance, and [`leaves`] splits the address space into the
+//! ranges to ask each node about.
+//!
 //! Nothing here does I/O: callers fetch chunks, receipts and block times
 //! themselves and pass them in.
 
 #![forbid(unsafe_code)]
 
 pub mod envelope;
+pub mod feed;
+pub mod feed_sync;
 pub mod flags;
 pub mod listing;
 pub mod message;
@@ -54,6 +64,7 @@ pub mod walk;
 
 #[cfg(test)]
 mod test_support;
+mod wire;
 
 /// The `self_encryption` version envelopes are built with, re-exported so
 /// callers build data maps with the same one.
@@ -64,6 +75,10 @@ pub use envelope::{
     Salt, ENVELOPE_VERSION, ENVELOPE_VERSION_1, MAGIC, MAX_CONTENT_TYPE_LEN, MAX_NAME_LEN,
     SALTED_HASH_LEN, SALT_LEN,
 };
+pub use feed::{
+    leaf_index, leaves, view_hash, AddressRange, DigestEntry, FeedChange, Leaf, SetHash,
+};
+pub use feed_sync::{FeedOutcome, FeedSync, Pushed};
 pub use flags::{Flags, PaymentField, ShownFields};
 pub use listing::{
     check_copies, first_seen_at, listing_to_check, median_first_seen, merge_copies, quorum_listing,
@@ -71,8 +86,10 @@ pub use listing::{
     Payment, PaymentV1, CLOCK_MARGIN, FIRST_SEEN_ROUNDING, LISTING_KEY_LEN,
 };
 pub use message::{
-    check_get_response, check_list_page, ListingsBody, ListingsMessage, MessageError, PageError,
-    MAX_LIST_LIMIT, TOPIC,
+    check_changes_page, check_get_response, check_list_page, check_push, check_range_page,
+    push_request_id, ChangesPage, ChangesRequest, ChangesResponse, FeedError, ListingsBody,
+    ListingsMessage, MessageError, PageError, RangeListRequest, RangeListResponse, MAX_LIST_LIMIT,
+    MAX_WATCHERS, TOPIC, VIEW_PEERS, WATCH_LEASE,
 };
 pub use payment::{
     check_offline, choose_verified, find_payment, payment_lookup, quorum_needed, verify_listing,

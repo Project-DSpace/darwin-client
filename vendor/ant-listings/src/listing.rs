@@ -12,7 +12,8 @@
 use crate::envelope::{Envelope, EnvelopeError, Metadata};
 use crate::flags::{Flags, PaymentField, ShownFields};
 use crate::payment::{canonical_quote, ListingCheck, PaymentError};
-use ant_protocol::XorName;
+use crate::wire::{put_option_array, put_option_bytes, put_option_varint};
+use ant_protocol::{compute_address, XorName};
 use serde::{Deserialize, Serialize};
 use std::collections::hash_map::Entry;
 use std::collections::HashMap;
@@ -326,6 +327,54 @@ impl Listing {
             && *metadata == other.metadata
             && *size == other.size
             && *payment == other.payment
+    }
+
+    /// A BLAKE3 hash of the listing with `first_seen` left out: of its wire
+    /// bytes, as a [`GetResponse`](crate::ListingsBody::GetResponse) carries
+    /// it, with `first_seen` set to none. Two listings have the same digest
+    /// exactly when they are [equal apart from
+    /// `first_seen`](Self::eq_apart_from_first_seen), so copies grouped by
+    /// digest are the groups [`merge_copies`] forms. A node's change feed
+    /// carries it in place of the listing
+    /// ([`DigestEntry`](crate::DigestEntry)).
+    #[must_use]
+    pub fn digest(&self) -> [u8; 32] {
+        compute_address(&self.bytes_without_first_seen())
+    }
+
+    /// The listing's postcard encoding with `first_seen` set to none,
+    /// written out so that it can't fail.
+    fn bytes_without_first_seen(&self) -> Vec<u8> {
+        let Self {
+            address,
+            flags,
+            metadata,
+            size,
+            payment,
+            first_seen: _,
+        } = self;
+        let Metadata { content_type, name } = metadata;
+        let ListingPayment {
+            tx_hash,
+            block_number,
+            block_timestamp,
+            log_index,
+            quote,
+        } = payment;
+        let mut out = Vec::with_capacity(128 + quote.as_ref().map_or(0, Vec::len));
+        out.extend_from_slice(address);
+        out.push(flags.to_byte());
+        put_option_bytes(&mut out, content_type.as_deref().map(str::as_bytes));
+        put_option_bytes(&mut out, name.as_deref().map(str::as_bytes));
+        put_option_varint(&mut out, *size);
+        put_option_array(&mut out, tx_hash.as_ref());
+        put_option_varint(&mut out, *block_number);
+        put_option_varint(&mut out, *block_timestamp);
+        put_option_varint(&mut out, *log_index);
+        put_option_bytes(&mut out, quote.as_deref());
+        // No first_seen.
+        out.push(0);
+        out
     }
 }
 
@@ -948,6 +997,7 @@ mod tests {
     use super::*;
     use crate::envelope::Salt;
     use crate::test_support::{data_map, metadata};
+    use std::collections::HashSet;
 
     const SALT: Salt = [9; 32];
     const NOW: u64 = 1_790_001_234;
@@ -1326,6 +1376,202 @@ mod tests {
         let mut f = a.clone();
         f.address[0] ^= 1;
         assert!(!a.eq_apart_from_first_seen(&f));
+    }
+
+    /// splitmix64, for the digest's property tests.
+    struct Mix(u64);
+
+    impl Mix {
+        fn next(&mut self) -> u64 {
+            self.0 = self.0.wrapping_add(0x9e37_79b9_7f4a_7c15);
+            let mut z = self.0;
+            z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+            z ^ (z >> 31)
+        }
+
+        fn pick<T: Clone>(&mut self, options: &[T]) -> T {
+            let len = u64::try_from(options.len()).unwrap();
+            options[usize::try_from(self.next() % len).unwrap()].clone()
+        }
+    }
+
+    /// A listing with any flags and fields, valid or not, drawn from small
+    /// sets of values.
+    fn varied(mix: &mut Mix) -> Listing {
+        let text = |value: &str| Some(value.to_string());
+        Listing {
+            address: mix.pick(&[[1; 32], [2; 32], [0xff; 32]]),
+            flags: Flags::from_byte(mix.pick(&[0x00, 0x1f, 0x20, 0x3f, 0x60, 0x7f])).unwrap(),
+            metadata: Metadata {
+                content_type: mix.pick(&[None, text("text/plain"), text(""), text("a/b")]),
+                name: mix.pick(&[None, text("a.txt"), text("b.txt"), text("é")]),
+            },
+            size: mix.pick(&[None, Some(0), Some(60), Some(u64::MAX)]),
+            payment: ListingPayment {
+                tx_hash: mix.pick(&[None, Some([7; 32]), Some([8; 32])]),
+                block_number: mix.pick(&[None, Some(0), Some(42), Some(u64::MAX)]),
+                block_timestamp: mix.pick(&[None, Some(1_790_000_000), Some(1_790_000_001)]),
+                log_index: mix.pick(&[None, Some(0), Some(3), Some(128)]),
+                quote: mix.pick(&[None, Some(vec![]), Some(vec![1, 2, 3]), Some(vec![1, 2, 4])]),
+            },
+            first_seen: mix.pick(&[None, Some(0), Some(3_600), Some(1_789_999_200), Some(1)]),
+        }
+    }
+
+    /// `listing` with one field other than `first_seen` changed, by `which`.
+    fn changed(listing: &Listing, which: u64) -> Listing {
+        let mut other = listing.clone();
+        match which % 10 {
+            0 => other.address[31] ^= 1,
+            1 => other.flags = Flags::from_byte(other.flags.to_byte() ^ 0x20).unwrap(),
+            2 => other.metadata.content_type = Some("text/html".into()),
+            3 => other.metadata.name = Some("c.txt".into()),
+            4 => other.size = Some(other.size.map_or(1, |size| size ^ 1)),
+            5 => other.payment.tx_hash = Some([9; 32]),
+            6 => other.payment.block_number = Some(other.payment.block_number.map_or(1, |n| n ^ 1)),
+            7 => other.payment.block_timestamp = Some(7),
+            8 => other.payment.log_index = Some(other.payment.log_index.map_or(5, |n| n ^ 4)),
+            _ => other.payment.quote = Some(vec![0xee]),
+        }
+        other
+    }
+
+    #[test]
+    fn the_digest_hashes_the_wire_bytes_without_first_seen() {
+        // The listing showing everything from message.rs's wire layout test:
+        // its bytes are the digest's input. The digest was worked out with
+        // an implementation of BLAKE3 apart from this crate's.
+        let shown = Listing {
+            address: [0x11; 32],
+            flags: Flags::V1,
+            metadata: Metadata {
+                content_type: Some("text/plain".into()),
+                name: Some("a.txt".into()),
+            },
+            size: Some(20_480),
+            payment: ListingPayment {
+                tx_hash: Some([0x22; 32]),
+                block_number: Some(70_000_001),
+                block_timestamp: Some(1_790_000_000),
+                log_index: Some(7),
+                quote: Some(vec![0x93, 1, 2, 3]),
+            },
+            first_seen: None,
+        };
+        let digest = crate::proof::decode_hex(
+            "ff7382a741884769cfe1ed0093aaff1fe383981a87b6cd3e04128a6eb1d0a087",
+        )
+        .unwrap();
+        assert_eq!(shown.digest().to_vec(), digest);
+        assert_eq!(
+            shown.digest(),
+            compute_address(&postcard::to_stdvec(&shown).unwrap())
+        );
+        // first_seen is left out, valid or not.
+        for first_seen in [Some(0), Some(1_789_999_200), Some(1), Some(u64::MAX)] {
+            let dated = Listing {
+                first_seen,
+                ..shown.clone()
+            };
+            assert_eq!(dated.digest(), shown.digest());
+        }
+    }
+
+    #[test]
+    fn the_digest_input_is_postcards_encoding() {
+        let mut mix = Mix(1);
+        let mut listings: Vec<Listing> = (0..2_000).map(|_| varied(&mut mix)).collect();
+        // The largest listing a node can record, from the message tests.
+        let mut largest = varied(&mut mix);
+        largest.metadata.name = Some("é".repeat(127));
+        largest.payment.quote = Some(vec![0xff; 5_261]);
+        listings.push(largest);
+        for listing in listings {
+            let unseen = Listing {
+                first_seen: None,
+                ..listing.clone()
+            };
+            assert_eq!(
+                listing.bytes_without_first_seen(),
+                postcard::to_stdvec(&unseen).unwrap(),
+                "{listing:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn listings_share_a_digest_exactly_when_equal_apart_from_first_seen() {
+        let mut mix = Mix(2);
+        let mut pool = Vec::new();
+        for n in 0..60 {
+            let base = varied(&mut mix);
+            for first_seen in [None, Some(0), Some(3_600), Some(1)] {
+                pool.push(Listing {
+                    first_seen,
+                    ..base.clone()
+                });
+            }
+            for which in 0..10 {
+                pool.push(changed(&base, which + n));
+            }
+            pool.push(base);
+        }
+        pool.extend((0..300).map(|_| varied(&mut mix)));
+        let digests: Vec<[u8; 32]> = pool.iter().map(Listing::digest).collect();
+        let mut equal_pairs = 0;
+        for (i, a) in pool.iter().enumerate() {
+            for (j, b) in pool.iter().enumerate().skip(i) {
+                let equal = a.eq_apart_from_first_seen(b);
+                assert_eq!(digests[i] == digests[j], equal, "{a:?}\n{b:?}");
+                equal_pairs += usize::from(equal && i != j);
+            }
+        }
+        assert!(equal_pairs > 300, "{equal_pairs}");
+    }
+
+    #[test]
+    fn grouping_by_digest_is_grouping_by_merge_copies() {
+        // Valid copies of valid listings, each from a peer of its own: some
+        // equal apart from first_seen, some differing elsewhere for the same
+        // address.
+        let mut mix = Mix(3);
+        let mut copies: Vec<(usize, Listing)> = Vec::new();
+        for n in 0..200 {
+            let shown = mix.pick(&[
+                ShownFields::ALL,
+                ShownFields::NONE,
+                ShownFields::ALL.without(PaymentField::BlockTimestamp),
+                ShownFields::NONE.with(PaymentField::TxHash),
+            ]);
+            let in_index = mix.pick(&[true, false]);
+            let withheld = mix.pick(&[true, false]);
+            let base = Listing::new(&envelope(shown, in_index, withheld), &full_payment(), NOW);
+            let base = if n % 3 == 0 { changed(&base, 3) } else { base };
+            for _ in 0..mix.pick(&[1, 2, 4, 7]) {
+                let mut copy = base.clone();
+                if copy.first_seen.is_some() {
+                    copy.first_seen = Some(mix.pick(&[0, 3_600, 1_789_999_200]));
+                }
+                assert_eq!(copy.validate(), Ok(()));
+                copies.push((copies.len(), copy));
+            }
+        }
+        let by_merging: HashSet<Vec<usize>> = merge_copies(copies.clone())
+            .iter()
+            .map(|group| {
+                let mut peers: Vec<usize> = group.peers().iter().map(|(peer, _)| *peer).collect();
+                peers.sort_unstable();
+                peers
+            })
+            .collect();
+        let mut by_digest: HashMap<[u8; 32], Vec<usize>> = HashMap::new();
+        for (peer, copy) in &copies {
+            by_digest.entry(copy.digest()).or_default().push(*peer);
+        }
+        let by_digest: HashSet<Vec<usize>> = by_digest.into_values().collect();
+        assert!(by_merging.len() > 1 && by_merging.len() < copies.len());
+        assert_eq!(by_digest, by_merging);
     }
 
     #[test]

@@ -110,8 +110,8 @@ version = "5.0.0"
 note = "a modified copy of the crates.io release, kept in vendor/ant-protocol of the repository this build is made from; its Source above is that copy. The one change is PRICE_MULTIPLIER in src/payment/pricing.rs (see vendor/ant-protocol/VENDORED.md)."
 
 [remark.ant-listings]
-version = "0.2.1"
-note = "a copy of Project-DSpace/darwin-listings v0.2.1 (commit 381d7c180f7c241bdd76619797d7aba40126c762), which is not published on crates.io, kept in vendor/ant-listings of the repository this build is made from; its Source above is that copy. Its files are those of that commit, without the .github folder, plus a VENDORED.md saying where they come from."
+version = "0.3.0"
+note = "a copy of Project-DSpace/darwin-listings 0.3.0 (commit 88abb624b286e25cb6d7e6ceb194d255976c602b), which is not published on crates.io, kept in vendor/ant-listings of the repository this build is made from; its Source above is that copy. Its files are those of that commit, without the .github folder, plus a VENDORED.md saying where they come from."
 
 # Crates whose published files and repository contain no text of any licence
 # they are offered under. Each entry is for one reviewed version; it supplies
