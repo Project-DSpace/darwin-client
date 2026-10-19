@@ -1644,6 +1644,7 @@ async fn check_quorum_group(
     })?;
     check_offline(&listing, envelope, chain.vault())
         .map_err(|e| GroupProblem::Invalid(e.to_string()))?;
+    check_vault_block(&listing, chain).map_err(GroupProblem::Invalid)?;
     let lookup = payment_lookup(&listing).map_err(|e| GroupProblem::Invalid(e.to_string()))?;
     let fetched = chain
         .fetch(&lookup, &listing.payment)
@@ -1756,6 +1757,7 @@ async fn check_group<P: PartialEq>(
     })?;
     // A copy that can't check out is never looked up.
     check_offline(&listing, envelope, chain.vault())?;
+    check_vault_block(&listing, chain).map_err(CheckProblem::Invalid)?;
     let lookup = payment_lookup(&listing)?;
     let fetched = chain
         .fetch(&lookup, &listing.payment)
@@ -1764,6 +1766,19 @@ async fn check_group<P: PartialEq>(
     Ok(check_copies(group, nearest, needed, |listing| {
         verify_listing_receipts(listing, envelope, &fetched, chain.vault(), now)
     })?)
+}
+
+/// Why `listing` can't have paid `chain`'s vault whatever the chain says:
+/// the block it shows is earlier than the one the vault was deployed in.
+/// Where that block isn't known, nothing is refused.
+fn check_vault_block(listing: &Listing, chain: &ListingChain) -> std::result::Result<(), String> {
+    match (listing.payment.block_number, chain.vault_deployment_block()) {
+        (Some(block), Some(deployed)) if block < deployed => Err(format!(
+            "paid in block {block}, before the payment vault was deployed in block {deployed}: \
+             not a payment to the vault"
+        )),
+        _ => Ok(()),
+    }
 }
 
 /// Reads payments from the payment chain, for checking listings and upload
@@ -2446,6 +2461,8 @@ pub(crate) mod test_chain {
                         .and_then(parse_u64)
                         .unwrap_or(0);
                     let to = filter["toBlock"].as_str().and_then(parse_u64).unwrap_or(0);
+                    // Only the contract asked about, as a chain answers.
+                    let address = filter["address"].as_str().and_then(parse_bytes::<20>);
                     let topics: Vec<Option<[u8; 32]>> = filter["topics"]
                         .as_array()
                         .map(|topics| {
@@ -2461,9 +2478,10 @@ pub(crate) mod test_chain {
                             continue;
                         }
                         for log in &receipt.logs {
-                            let matches = topics.iter().enumerate().all(|(i, topic)| {
-                                topic.is_none_or(|topic| log.topics.get(i) == Some(&topic))
-                            });
+                            let matches = address.is_none_or(|address| log.address == address)
+                                && topics.iter().enumerate().all(|(i, topic)| {
+                                    topic.is_none_or(|topic| log.topics.get(i) == Some(&topic))
+                                });
                             if matches {
                                 logs.push(json!({
                                     "transactionHash": format!("0x{}", hex::encode(receipt.tx_hash)),
@@ -3857,6 +3875,99 @@ mod tests {
             );
         }
         assert!(mock.lock().unwrap().calls.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_payment_to_another_vault_never_counts_however_many_nodes_serve_it() {
+        // Each of the seven nodes nearest the address serves the listing.
+        // Its payment, in block 150, went to another vault; the reader's
+        // vault was deployed later, in block 160.
+        let other_vault = [0x70; 20];
+        let nearest: Vec<PeerId> = (1..=7).map(peer).collect();
+        let now = BLOCK_TIME + 3_600;
+        let mock = Arc::new(Mutex::new(MockChain::with_blocks(200, 1_800_000_000)));
+        let url = serve(Arc::clone(&mock)).await;
+        let vault_only = reader(url.clone());
+        let knowing = reader(url).with_vault_deployment_block(160);
+        for shown in ShownFields::every() {
+            let envelope = envelope_showing(shown, true);
+            let payment = upload_payment(&envelope);
+            let quote: ant_protocol::evm::PaymentQuote =
+                rmp_serde::from_slice(&payment.quote).unwrap();
+            mock.lock().unwrap().add_receipt(PaymentReceipt {
+                tx_hash: payment.tx_hash,
+                success: true,
+                block_number: payment.block_number,
+                logs: vec![PaymentLog {
+                    address: other_vault,
+                    ..paying_log(&quote, payment.log_index)
+                }],
+            });
+            let listing = Listing::new(&envelope, &payment, BLOCK_TIME);
+            let groups = merge_copies(nearest.iter().map(|peer| (*peer, listing.clone())));
+            let shows = |field| shown.contains(field);
+
+            if shows(PaymentField::TxHash) {
+                // The vault check alone refuses it: the transaction paid
+                // another vault.
+                let checked =
+                    check_quorum_group(&groups[0], &envelope, &nearest, &vault_only, now).await;
+                assert!(
+                    matches!(checked, Err(GroupProblem::Invalid(_))),
+                    "{shown:?}"
+                );
+            }
+            if shows(PaymentField::TxHash) || shows(PaymentField::BlockNumber) {
+                // Knowing when the vault was deployed, a reader refuses every
+                // one that shows its transaction or its block, for good; one
+                // showing its block, without reading the chain.
+                let calls = mock.lock().unwrap().calls.len();
+                let checked =
+                    check_quorum_group(&groups[0], &envelope, &nearest, &knowing, now).await;
+                let Err(GroupProblem::Invalid(problem)) = checked else {
+                    panic!("{shown:?} is not refused for good");
+                };
+                if shows(PaymentField::BlockNumber) {
+                    assert!(
+                        problem.contains("before the payment vault was deployed in block 160"),
+                        "{shown:?}: {problem}"
+                    );
+                    assert_eq!(mock.lock().unwrap().calls.len(), calls, "{shown:?}");
+                }
+                // The read decides its address with nothing listed, so an
+                // entry an earlier read published for it is dropped.
+                let checked = check_group(&groups[0], &envelope, &nearest, 4, &knowing, now).await;
+                let (chosen, problems) = decide_address(&groups, vec![checked], &nearest, 7);
+                let decision = Decision::from_groups(
+                    listing.address,
+                    &groups,
+                    &nearest,
+                    chosen,
+                    problems,
+                    envelope.clone(),
+                    Vec::new(),
+                );
+                assert!(decision.decided, "{shown:?}");
+                assert!(!decision.rejected[0].again, "{shown:?}");
+                let mut index = ListingsIndex::default();
+                index.settle(vec![decision], 0);
+                assert!(index.listings.is_empty(), "{shown:?}");
+                assert_eq!(
+                    index.carry(&listing.address, &listing.key()),
+                    Carry::Decided,
+                    "{shown:?}"
+                );
+            } else if shows(PaymentField::Quote) {
+                // Only its quote locates it: no payment of the quote to the
+                // vault is found, so it never counts.
+                let checked =
+                    check_quorum_group(&groups[0], &envelope, &nearest, &knowing, now).await;
+                assert!(matches!(checked, Err(GroupProblem::Again(_))), "{shown:?}");
+            }
+            // A listing showing none of its transaction, quote and block
+            // can't be told apart by any check: it rests on its nearest
+            // nodes, as every listing that hides its quote does.
+        }
     }
 
     #[tokio::test]
