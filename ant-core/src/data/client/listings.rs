@@ -555,6 +555,18 @@ pub fn expected_nearest(network_size: usize) -> usize {
     NEAREST_NODES.min(network_size)
 }
 
+/// How many nodes nearest an address there should be on a network of
+/// `network_size` nodes, as a caller of [`Client::listing_with`] gives it:
+/// [`NEAREST_NODES`], for a size of at least that. A smaller size, or none,
+/// is `None`, and the size is then found as [`Client::listing`] finds it: a
+/// size given too small would let a lookup of the address that comes back
+/// short lower the quorum.
+fn expected_nearest_given(network_size: Option<usize>) -> Option<usize> {
+    network_size
+        .filter(|size| *size >= NEAREST_NODES)
+        .map(expected_nearest)
+}
+
 /// Decide which groups of copies for one address count, from each group's
 /// check against the chain (`checked`, in the same order as `groups`; see
 /// [`check_copies`]).
@@ -1145,11 +1157,13 @@ impl Client {
     }
 
     /// The listing for `address`, as [`Self::listing`] reads it, on a
-    /// network of `network_size` nodes: only the nodes nearest the address
-    /// are looked up. Take the size from a recent index read that decided
-    /// ([`ListingsIndex::nodes_asked`], not [`ListingsIndex::too_few_nodes`]):
-    /// a size below the network's lets a lookup that comes back short lower
-    /// the quorum. `None` finds the size as [`Self::listing`] does.
+    /// network of `network_size` nodes, such as a recent index read's
+    /// [`ListingsIndex::nodes_asked`]. A size of at least [`NEAREST_NODES`]
+    /// saves finding it: only the nodes nearest the address are looked up,
+    /// and all [`NEAREST_NODES`] of them are expected however few the lookup
+    /// finds. A smaller size, or `None`, is found as [`Self::listing`] finds
+    /// it, so no size given lowers the quorum below what [`Self::listing`]
+    /// needs.
     ///
     /// # Errors
     ///
@@ -1160,17 +1174,17 @@ impl Client {
         chain: &ListingChain,
         network_size: Option<usize>,
     ) -> Result<ListingLookup> {
-        let (nearest, network_size) = match network_size {
-            Some(size) => (self.nearest_nodes(address).await, size),
+        let (nearest, expected) = match expected_nearest_given(network_size) {
+            Some(expected) => (self.nearest_nodes(address).await, expected),
             None => {
                 // How many nodes the network has, to know how many nearest
                 // nodes there should be when the lookup comes back short.
                 let (nearest, nodes) =
                     futures::join!(self.nearest_nodes(address), self.walk_nodes());
-                (nearest, nodes.len())
+                let expected = expected_nearest(nodes.len().max(nearest.len()));
+                (nearest, expected)
             }
         };
-        let expected = expected_nearest(network_size.max(nearest.len()));
         if nearest.is_empty() {
             return Err(Error::InsufficientPeers(format!(
                 "no nodes found near {}",
@@ -2887,6 +2901,37 @@ mod tests {
         let (chosen, rejected) = decide_reported_among(served_by(&[1, 2]), &NEAREST, 2);
         assert!(chosen.is_none());
         assert!(rejected[0].1.contains("reported by 2 of the 7"));
+    }
+
+    #[test]
+    fn a_network_size_given_never_lowers_the_quorum() {
+        // A size under the close group's, or none, is found as
+        // `Client::listing` finds it.
+        assert_eq!(expected_nearest_given(None), None);
+        for size in 0..NEAREST_NODES {
+            assert_eq!(expected_nearest_given(Some(size)), None, "size {size}");
+        }
+        // Any other: all 7 nearest nodes are expected, and 4 of them are a
+        // quorum.
+        for size in [NEAREST_NODES, 20, usize::MAX] {
+            let expected = expected_nearest_given(Some(size));
+            assert_eq!(expected, Some(7), "size {size}");
+            assert_eq!(expected.map(quorum_needed), Some(4), "size {size}");
+        }
+        // So on a network of 20 nodes, a lookup that finds a single node,
+        // serving a listing that hides its quote, is no quorum whatever size
+        // is given (one under 7 is found again, as the network's 20): the
+        // listing is left out, to try again.
+        for given in [Some(1), Some(NEAREST_NODES), Some(20), None] {
+            let expected = expected_nearest_given(given).unwrap_or_else(|| expected_nearest(20));
+            let (chosen, rejected) = decide_reported_among(served_by(&[1]), &[1], expected);
+            assert!(chosen.is_none(), "{given:?}");
+            assert!(
+                rejected[0].1.contains("too few nearest nodes found"),
+                "{given:?}: {}",
+                rejected[0].1
+            );
+        }
     }
 
     #[test]
