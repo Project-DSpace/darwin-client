@@ -89,7 +89,7 @@ impl ServeArgs {
             stop_signal().await;
             stop.cancel();
         });
-        producer.run(cancel).await?;
+        Box::pin(producer.run(cancel)).await?;
         Ok(())
     }
 }

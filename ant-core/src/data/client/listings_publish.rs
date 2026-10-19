@@ -410,6 +410,41 @@ impl Publisher {
             .transpose()
     }
 
+    /// The keys of every listed entry, in key order.
+    ///
+    /// # Errors
+    ///
+    /// If the store can't be read.
+    pub fn keys(&self) -> Result<Vec<ListingKey>> {
+        let txn = self.store.env().read_txn().map_err(store_error)?;
+        let keys = self
+            .dbs
+            .order
+            .prefix_iter(&txn, &[KEY_TAG])
+            .map_err(store_error)?
+            .map(|row| listing_key(&row_key(&row.map_err(store_error)?.0[1..])?))
+            .collect();
+        keys
+    }
+
+    /// Every address's latest rejection or deferral, as `rejected.json`
+    /// lists them (in no set order).
+    ///
+    /// # Errors
+    ///
+    /// If the store can't be read.
+    pub fn rejected_entries(&self) -> Result<Vec<RejectedEntry>> {
+        let txn = self.store.env().read_txn().map_err(store_error)?;
+        let entries = self
+            .dbs
+            .side
+            .prefix_iter(&txn, &[REJECTED_TAG])
+            .map_err(store_error)?
+            .map(|row| parse(row.map_err(store_error)?.1))
+            .collect();
+        entries
+    }
+
     /// The directory the files are published in.
     #[must_use]
     pub fn out_dir(&self) -> &Path {

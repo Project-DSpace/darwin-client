@@ -67,6 +67,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 use tokio::sync::broadcast::error::RecvError;
@@ -1448,6 +1449,23 @@ impl Client {
     }
 }
 
+/// Bytes of listings requests this process has sent to nodes.
+static LISTINGS_BYTES_SENT: AtomicU64 = AtomicU64::new(0);
+
+/// Bytes of listings answers and pushes this process has received from
+/// nodes, counting each message once: the one router it is routed to.
+static LISTINGS_BYTES_RECEIVED: AtomicU64 = AtomicU64::new(0);
+
+/// The bytes of listings messages this process has received from nodes and
+/// sent to them so far: each message's payload, without the transport's
+/// signature and framing, and without DHT lookups.
+pub(crate) fn listings_traffic() -> (u64, u64) {
+    (
+        LISTINGS_BYTES_RECEIVED.load(Ordering::Relaxed),
+        LISTINGS_BYTES_SENT.load(Ordering::Relaxed),
+    )
+}
+
 /// Where pushes from nodes' watches go: each with the node it came from.
 /// The router never waits for room: a push that doesn't fit is dropped, as
 /// pushes may be, and the next `ChangesRequest` to the node catches up.
@@ -1577,6 +1595,9 @@ impl ListingsRequests {
                             Ok(mut routes) => routes.route(source, message),
                             Err(_) => Route::Drop,
                         };
+                        if !matches!(route, Route::Drop) {
+                            LISTINGS_BYTES_RECEIVED.fetch_add(data.len() as u64, Ordering::Relaxed);
+                        }
                         match route {
                             Route::Answer(waiting, body) => {
                                 let _ = waiting.send(body);
@@ -1620,16 +1641,19 @@ impl ListingsRequests {
             .expect(*peer, request_id, &body, self.take_pushes);
         let request = ListingsMessage { request_id, body }.encode();
         let answer = match request {
-            Ok(request) => match self.node.send_message(peer, TOPIC, request, &[]).await {
-                Ok(()) => tokio::time::timeout(REQUEST_TIMEOUT, receiver)
-                    .await
-                    .ok()
-                    .and_then(std::result::Result::ok),
-                Err(e) => {
-                    debug!("Could not ask {peer} for listings: {e}");
-                    None
+            Ok(request) => {
+                LISTINGS_BYTES_SENT.fetch_add(request.len() as u64, Ordering::Relaxed);
+                match self.node.send_message(peer, TOPIC, request, &[]).await {
+                    Ok(()) => tokio::time::timeout(REQUEST_TIMEOUT, receiver)
+                        .await
+                        .ok()
+                        .and_then(std::result::Result::ok),
+                    Err(e) => {
+                        debug!("Could not ask {peer} for listings: {e}");
+                        None
+                    }
                 }
-            },
+            }
             Err(e) => {
                 debug!("Could not encode a listings request: {e}");
                 None
