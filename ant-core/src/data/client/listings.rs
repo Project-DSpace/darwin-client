@@ -421,6 +421,12 @@ impl ListingsIndex {
 
     /// Take in what this read decided for each address it worked on, then
     /// keep the listings and rejections from `since` on, in index order.
+    ///
+    /// A listing this read dated before `since` is left out, and so its
+    /// address doesn't count as decided ([`Self::carry`]): the read says
+    /// nothing about listings before `since`, so an entry an earlier read
+    /// published for the address is kept, not dropped for one this read
+    /// leaves out. An address rejected for good stays decided.
     fn settle(&mut self, decisions: Vec<Decision>, since: u64) {
         for decision in decisions {
             if decision.decided {
@@ -431,8 +437,14 @@ impl ListingsIndex {
             self.listings.extend(decision.listing);
             self.rejected.extend(decision.rejected);
         }
-        self.listings
-            .retain(|checked| checked.listing.key().time >= since);
+        let decided = &mut self.coverage.decided;
+        self.listings.retain(|checked| {
+            let kept = checked.listing.key().time >= since;
+            if !kept {
+                decided.remove(&checked.listing.address);
+            }
+            kept
+        });
         let pending_copies = &mut self.pending_copies;
         self.rejected.retain(|rejected| {
             let kept = since == 0 || rejected.listing.key().time >= since;
@@ -3456,6 +3468,99 @@ mod tests {
             carry(&index_with(full(late_enough)[..6].to_vec(), false, false)),
             Carry::Keep
         );
+    }
+
+    #[test]
+    fn a_listing_dated_before_since_leaves_the_earlier_entry_carried() {
+        // An earlier read published a listing at `since`. This read, from
+        // `since`, decides its address but dates it an hour earlier, as
+        // another set of its nearest nodes can.
+        let since = 1_800_000_000;
+        let envelope = envelope_showing(ShownFields::NONE, true);
+        let mut redated = Listing::new(&envelope, &upload_payment(&envelope), BLOCK_TIME);
+        redated.first_seen = Some(since - FIRST_SEEN_ROUNDING);
+        let address = redated.address;
+        let published = ListingKey {
+            time: since,
+            block_number: 0,
+            log_index: 0,
+            address,
+        };
+        let listed = Decision {
+            address,
+            listing: Some(CheckedListing {
+                listing: redated.clone(),
+                envelope: envelope.clone(),
+                level: CheckLevel::Reported,
+                nodes: 4,
+                nearest: 7,
+                quorum: true,
+            }),
+            rejected: Vec::new(),
+            decided: true,
+        };
+        // Every node walked, from the start of the read, and four of the
+        // nearest served the address.
+        let read = || {
+            let walks: Vec<NodeReport<PeerId>> = (1..=8)
+                .map(|n| walk_of(peer(n), walk_start(since), None, since + 3_600))
+                .collect();
+            ListingsIndex {
+                coverage: Coverage {
+                    ids: walks.iter().map(|walk| *walk.peer.as_bytes()).collect(),
+                    walks,
+                    served: HashSet::from([address]),
+                    decided: HashSet::new(),
+                },
+                ..ListingsIndex::default()
+            }
+        };
+
+        // Read from `since`: the listing is left out, and the earlier entry
+        // kept as it was, since the read says nothing about listings
+        // before `since`. It isn't lost.
+        let mut index = read();
+        index.settle(vec![listed], since);
+        assert!(index.listings.is_empty());
+        assert_eq!(index.carry(&address, &published), Carry::Keep);
+
+        // Read from the start: it is listed, and replaces the earlier entry.
+        let listed = Decision {
+            address,
+            listing: Some(CheckedListing {
+                listing: redated.clone(),
+                envelope,
+                level: CheckLevel::Reported,
+                nodes: 4,
+                nearest: 7,
+                quorum: true,
+            }),
+            rejected: Vec::new(),
+            decided: true,
+        };
+        let mut index = read();
+        index.settle(vec![listed], 0);
+        assert_eq!(index.listings.len(), 1);
+        assert_eq!(index.carry(&address, &published), Carry::Decided);
+
+        // An address rejected for good stays decided whatever the date of
+        // what was rejected: the earlier entry goes.
+        let rejected = Decision {
+            address,
+            listing: None,
+            rejected: vec![RejectedListing {
+                listing: redated,
+                problem: "the payment is not on chain".into(),
+                nodes: 4,
+                nearest: 7,
+                again: false,
+            }],
+            decided: true,
+        };
+        let mut index = read();
+        index.settle(vec![rejected], since);
+        assert!(index.rejected.is_empty());
+        assert_eq!(index.carry(&address, &published), Carry::Decided);
     }
 
     #[test]
