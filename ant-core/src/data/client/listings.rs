@@ -1036,14 +1036,46 @@ impl Client {
     /// The listing for `address`, in the index or not, from the nodes
     /// nearest it, checked on `chain`.
     ///
+    /// Alongside the lookup of the nodes nearest the address, it finds how
+    /// many nodes the network has, as an index read finds the nodes to walk,
+    /// to know how many nearest nodes there should be when the lookup comes
+    /// back short. A caller that already knows passes it to
+    /// [`Self::listing_with`] instead.
+    ///
     /// # Errors
     ///
     /// Returns an error if no node near the address can be found.
     pub async fn listing(&self, address: &XorName, chain: &ListingChain) -> Result<ListingLookup> {
-        // How many nodes the network has, to know how many nearest nodes
-        // there should be when the lookup comes back short.
-        let (nearest, nodes) = futures::join!(self.nearest_nodes(address), self.walk_nodes());
-        let expected = expected_nearest(nodes.len().max(nearest.len()));
+        self.listing_with(address, chain, None).await
+    }
+
+    /// The listing for `address`, as [`Self::listing`] reads it, on a
+    /// network of `network_size` nodes: only the nodes nearest the address
+    /// are looked up. Take the size from a recent index read that decided
+    /// ([`ListingsIndex::nodes_asked`], not [`ListingsIndex::too_few_nodes`]):
+    /// a size below the network's lets a lookup that comes back short lower
+    /// the quorum. `None` finds the size as [`Self::listing`] does.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if no node near the address can be found.
+    pub async fn listing_with(
+        &self,
+        address: &XorName,
+        chain: &ListingChain,
+        network_size: Option<usize>,
+    ) -> Result<ListingLookup> {
+        let (nearest, network_size) = match network_size {
+            Some(size) => (self.nearest_nodes(address).await, size),
+            None => {
+                // How many nodes the network has, to know how many nearest
+                // nodes there should be when the lookup comes back short.
+                let (nearest, nodes) =
+                    futures::join!(self.nearest_nodes(address), self.walk_nodes());
+                (nearest, nodes.len())
+            }
+        };
+        let expected = expected_nearest(network_size.max(nearest.len()));
         if nearest.is_empty() {
             return Err(Error::InsufficientPeers(format!(
                 "no nodes found near {}",
