@@ -10,6 +10,12 @@
 //!   checked against the chain, and it counts only when a quorum of the
 //!   nodes nearest its address serve it.
 //!
+//! Either way, where the reader knows when the payment vault was deployed,
+//! a listing showing a block or block timestamp from before then is refused
+//! without reading the chain, and so is one showing none of those and its
+//! transaction that a quorum of those nodes date long enough before then
+//! ([`ListingChain::with_vault_deployment_time`]).
+//!
 //! Each node records its own `first_seen` for a listing in the index that
 //! hides its time, so copies are merged across nodes
 //! ([`ant_listings::merge_copies`]) and dated as the nodes date them: only
@@ -1700,7 +1706,7 @@ async fn check_quorum_group(
     })?;
     check_offline(&listing, envelope, chain.vault())
         .map_err(|e| GroupProblem::Invalid(e.to_string()))?;
-    check_vault_block(&listing, chain).map_err(GroupProblem::Invalid)?;
+    check_vault_deployment(group, nearest, needed, chain).map_err(GroupProblem::Invalid)?;
     let lookup = payment_lookup(&listing).map_err(|e| GroupProblem::Invalid(e.to_string()))?;
     let fetched = chain
         .fetch(&lookup, &listing.payment)
@@ -1813,7 +1819,7 @@ async fn check_group<P: PartialEq>(
     })?;
     // A copy that can't check out is never looked up.
     check_offline(&listing, envelope, chain.vault())?;
-    check_vault_block(&listing, chain).map_err(CheckProblem::Invalid)?;
+    check_vault_deployment(group, nearest, needed, chain).map_err(CheckProblem::Invalid)?;
     let lookup = payment_lookup(&listing)?;
     let fetched = chain
         .fetch(&lookup, &listing.payment)
@@ -1824,13 +1830,84 @@ async fn check_group<P: PartialEq>(
     })?)
 }
 
-/// Why `listing` can't have paid `chain`'s vault whatever the chain says:
-/// the block it shows is earlier than the one the vault was deployed in.
-/// Where that block isn't known, nothing is refused.
-fn check_vault_block(listing: &Listing, chain: &ListingChain) -> std::result::Result<(), String> {
-    match (listing.payment.block_number, chain.vault_deployment_block()) {
-        (Some(block), Some(deployed)) if block < deployed => Err(format!(
-            "paid in block {block}, before the payment vault was deployed in block {deployed}: \
+/// Why the listing `group` holds can't have paid `chain`'s vault, whatever
+/// the chain says: it was paid, or first stored, before the vault was
+/// deployed. Only what `chain` knows of the deployment is used (the bundled
+/// network's: [`crate::config::vault_deployment_block`] and
+/// [`crate::config::vault_deployment_time`]); where it knows nothing,
+/// nothing is refused. It is refused when:
+///
+/// - the block it shows is earlier than the block the vault was deployed
+///   in;
+/// - the block timestamp it shows is earlier than that block's: block
+///   timestamps never go back, so no payment to the vault is in a block
+///   timed earlier. A payment at the deployment's second or later is never
+///   refused;
+/// - showing none of its block, block timestamp and transaction, its date
+///   is too early: the hour its nodes first stored it, as `needed` of the
+///   `nearest` nodes date it then or earlier ([`quorum_listing`]). A node
+///   records a listing only once its payment is in a block, so the payment
+///   is no later than that hour plus [`FIRST_SEEN_ROUNDING`] and
+///   [`CLOCK_MARGIN`] ([`Listing::latest_payment_time`]), and it is refused
+///   when that is still before the deployment. So a payment made just after
+///   the deployment, and first stored in the same hour, is never refused.
+///   Only the quorum's date counts: fewer than `needed` nodes dating it
+///   early can't move it before the date another gives, so they can't get
+///   a listing refused, and a listing fewer than `needed` of them serve is
+///   not refused by its date.
+///
+/// A listing that shows its transaction, but neither its block nor its
+/// block timestamp, is left to the chain: the transaction shows which vault
+/// it paid, for good, whatever dates its nodes give. A listing outside the
+/// index has no date, so one that hides its block, block timestamp and
+/// transaction isn't refused here: if it hides its quote too, it rests on
+/// its nearest nodes.
+///
+/// What this can't refuse: a payment to another vault that hides its block,
+/// block timestamp and transaction, and that its nodes date within the
+/// margin, two hours, before the deployment, as they date one they first
+/// stored then. Its date plus the margin isn't before the deployment, so it
+/// is checked as any other listing: one that hides its quote too rests on
+/// its nearest nodes. On the bundled network, the vault in use before this
+/// one took its last payment in block 81,871,668, 43 minutes before the
+/// deployment: inside that window.
+fn check_vault_deployment<P: PartialEq>(
+    group: &MergedListing<P>,
+    nearest: &[P],
+    needed: usize,
+    chain: &ListingChain,
+) -> std::result::Result<(), String> {
+    let payment = group.payment();
+    if let (Some(block), Some(deployed)) = (payment.block_number, chain.vault_deployment_block) {
+        if block < deployed {
+            return Err(format!(
+                "paid in block {block}, before the payment vault was deployed in block \
+                 {deployed}: not a payment to the vault"
+            ));
+        }
+    }
+    let Some(deployed_at) = chain.vault_deployment_time else {
+        return Ok(());
+    };
+    if let Some(time) = payment.block_timestamp {
+        if time < deployed_at {
+            return Err(format!(
+                "paid in a block timed {time}, before the payment vault was deployed at \
+                 {deployed_at} (Unix seconds): not a payment to the vault"
+            ));
+        }
+        return Ok(());
+    }
+    if payment.block_number.is_some() || payment.tx_hash.is_some() {
+        return Ok(());
+    }
+    let Some(dated) = quorum_listing(group, nearest, needed) else {
+        return Ok(());
+    };
+    match (dated.first_seen, dated.latest_payment_time()) {
+        (Some(date), Some(latest)) if latest < deployed_at => Err(format!(
+            "dated {date} or earlier by {needed} of the nodes nearest its address, so paid by \
+             {latest}, before the payment vault was deployed at {deployed_at} (Unix seconds): \
              not a payment to the vault"
         )),
         _ => Ok(()),
@@ -1851,6 +1928,8 @@ pub struct ListingChain {
     vault: [u8; 20],
     /// The block the vault was deployed in, where known.
     vault_deployment_block: Option<u64>,
+    /// That block's timestamp (Unix seconds), where known.
+    vault_deployment_time: Option<u64>,
 }
 
 /// A vault `DataPaymentMade` log, located.
@@ -1864,8 +1943,9 @@ impl ListingChain {
     /// A reader for `network`'s chain and payment vault, through its RPC
     /// and then the RPCs it falls back to
     /// ([`crate::config::fallback_rpc_urls`]), knowing the block the vault
-    /// was deployed in where the network gives it
-    /// ([`crate::config::vault_deployment_block`]).
+    /// was deployed in and its timestamp where the network gives them
+    /// ([`crate::config::vault_deployment_block`],
+    /// [`crate::config::vault_deployment_time`]).
     ///
     /// # Errors
     ///
@@ -1875,11 +1955,14 @@ impl ListingChain {
         vault.copy_from_slice(network.payment_vault_address().as_slice());
         let mut rpc_urls = vec![network.rpc_url().to_string()];
         rpc_urls.extend(crate::config::fallback_rpc_urls(network));
-        let reader = Self::with_rpcs(rpc_urls, vault)?;
-        Ok(match crate::config::vault_deployment_block(network) {
-            Some(block) => reader.with_vault_deployment_block(block),
-            None => reader,
-        })
+        let mut reader = Self::with_rpcs(rpc_urls, vault)?;
+        if let Some(block) = crate::config::vault_deployment_block(network) {
+            reader = reader.with_vault_deployment_block(block);
+        }
+        if let Some(time) = crate::config::vault_deployment_time(network) {
+            reader = reader.with_vault_deployment_time(time);
+        }
+        Ok(reader)
     }
 
     /// The RPCs this reader reads through, first to last.
@@ -1918,6 +2001,7 @@ impl ListingChain {
             answered: AtomicUsize::new(0),
             vault,
             vault_deployment_block: None,
+            vault_deployment_time: None,
         })
     }
 
@@ -1927,6 +2011,19 @@ impl ListingChain {
     #[must_use]
     pub fn with_vault_deployment_block(mut self, block: u64) -> Self {
         self.vault_deployment_block = Some(block);
+        self
+    }
+
+    /// This reader, knowing that the block the vault was deployed in is
+    /// timed `time` (Unix seconds): block timestamps never go back, so no
+    /// payment to the vault is in a block timed earlier. A listing showing
+    /// an earlier block timestamp, or, showing none of its block, block
+    /// timestamp and transaction, one a quorum of its nearest nodes date
+    /// more than [`FIRST_SEEN_ROUNDING`] plus [`CLOCK_MARGIN`] before then,
+    /// fails its check without a call to the chain.
+    #[must_use]
+    pub fn with_vault_deployment_time(mut self, time: u64) -> Self {
+        self.vault_deployment_time = Some(time);
         self
     }
 
@@ -1940,6 +2037,13 @@ impl ListingChain {
     #[must_use]
     pub fn vault_deployment_block(&self) -> Option<u64> {
         self.vault_deployment_block
+    }
+
+    /// The timestamp (Unix seconds) of the block the payment vault was
+    /// deployed in, where known.
+    #[must_use]
+    pub fn vault_deployment_time(&self) -> Option<u64> {
+        self.vault_deployment_time
     }
 
     /// Whether block `block` is earlier than the one the payment vault was
@@ -4062,16 +4166,21 @@ mod tests {
 
     #[tokio::test]
     async fn a_payment_to_another_vault_never_counts_however_many_nodes_serve_it() {
-        // Each of the seven nodes nearest the address serves the listing.
-        // Its payment, in block 150, went to another vault; the reader's
-        // vault was deployed later, in block 160.
+        // Each of the seven nodes nearest the address serves the listing,
+        // first stored in the hour of its payment. The payment, in block
+        // 150, went to another vault; the reader's vault was deployed nearly
+        // three hours later, in block 5,000.
         let other_vault = [0x70; 20];
         let nearest: Vec<PeerId> = (1..=7).map(peer).collect();
-        let now = BLOCK_TIME + 3_600;
-        let mock = Arc::new(Mutex::new(MockChain::with_blocks(200, 1_800_000_000)));
+        let (deployed, deployed_at) = (5_000, 1_800_010_000);
+        let mock = Arc::new(Mutex::new(MockChain::with_blocks(5_200, 1_800_000_000)));
+        assert_eq!(mock.lock().unwrap().blocks[&deployed], deployed_at);
+        let now = deployed_at + 3_600;
         let url = serve(Arc::clone(&mock)).await;
         let vault_only = reader(url.clone());
-        let knowing = reader(url).with_vault_deployment_block(160);
+        let knowing = reader(url)
+            .with_vault_deployment_block(deployed)
+            .with_vault_deployment_time(deployed_at);
         for shown in ShownFields::every() {
             let envelope = envelope_showing(shown, true);
             let payment = upload_payment(&envelope);
@@ -4100,81 +4209,361 @@ mod tests {
                     "{shown:?}"
                 );
             }
-            if shows(PaymentField::TxHash) || shows(PaymentField::BlockNumber) {
-                // Knowing when the vault was deployed, a reader refuses every
-                // one that shows its transaction or its block, for good; one
-                // showing its block, without reading the chain.
-                let calls = mock.lock().unwrap().calls.len();
-                let checked =
-                    check_quorum_group(&groups[0], &envelope, &nearest, &knowing, now).await;
-                let Err(GroupProblem::Invalid(problem)) = checked else {
-                    panic!("{shown:?} is not refused for good");
-                };
-                if shows(PaymentField::BlockNumber) {
-                    assert!(
-                        problem.contains("before the payment vault was deployed in block 160"),
-                        "{shown:?}: {problem}"
-                    );
-                    assert_eq!(mock.lock().unwrap().calls.len(), calls, "{shown:?}");
-                }
-                // The read then decides its address with nothing listed, as
-                // whenever the listing a quorum serves is refused for good
-                // and no other is left, so an entry an earlier read
-                // published for it is dropped.
-                let decision =
-                    Decision::refused(listing.address, &groups[0], &nearest, problem, Vec::new());
-                assert!(decision.decided, "{shown:?}");
-                assert!(decision.listing.is_none(), "{shown:?}");
-                assert_eq!(decision.rejected.len(), 1, "{shown:?}");
-                assert_eq!(decision.rejected[0].nodes, 7, "{shown:?}");
-                assert!(!decision.rejected[0].again, "{shown:?}");
-                let mut index = ListingsIndex::default();
-                index.settle(vec![decision]);
-                assert!(index.listings.is_empty(), "{shown:?}");
-                assert_eq!(
-                    index.carry(&listing.address, &listing.key()),
-                    Carry::Decided,
-                    "{shown:?}"
-                );
-                // Served by fewer than a quorum, and checked once the other
-                // nearest nodes have answered, it is rejected for good too.
-                let few = merge_copies(nearest[..3].iter().map(|peer| (*peer, listing.clone())));
-                let checked = check_group(&few[0], &envelope, &nearest, 4, &knowing, now).await;
-                let (chosen, problems) = decide_address(&few, vec![checked], &nearest, 7);
-                let decision = Decision::from_groups(
-                    listing.address,
-                    &few,
-                    &nearest,
-                    chosen,
-                    problems,
-                    envelope.clone(),
-                    Vec::new(),
-                );
-                assert!(decision.decided, "{shown:?}");
-                assert!(decision.listing.is_none(), "{shown:?}");
-                assert!(!decision.rejected[0].again, "{shown:?}");
-            } else if shows(PaymentField::Quote) {
-                // Only its quote locates it: no payment of the quote to the
-                // vault is found, so it never counts.
-                let checked =
-                    check_quorum_group(&groups[0], &envelope, &nearest, &knowing, now).await;
-                assert!(matches!(checked, Err(GroupProblem::Again(_))), "{shown:?}");
+            // Knowing when the vault was deployed, a reader refuses every
+            // one, for good: by the block or the block timestamp it shows,
+            // or, showing none of those and its transaction, by the date its
+            // nearest nodes give it, without reading the chain; one showing
+            // its transaction but neither of the others, by the
+            // transaction, which paid another vault.
+            let calls = mock.lock().unwrap().calls.len();
+            let checked = check_quorum_group(&groups[0], &envelope, &nearest, &knowing, now).await;
+            let Err(GroupProblem::Invalid(problem)) = checked else {
+                panic!("{shown:?} is not refused for good");
+            };
+            let (refused_by, offline) = if shows(PaymentField::BlockNumber) {
+                (
+                    "before the payment vault was deployed in block 5000".into(),
+                    true,
+                )
+            } else if shows(PaymentField::BlockTimestamp) {
+                (
+                    format!(
+                        "paid in a block timed {BLOCK_TIME}, before the payment vault was \
+                         deployed at {deployed_at}"
+                    ),
+                    true,
+                )
+            } else if shows(PaymentField::TxHash) {
+                ("no payment to the vault".to_string(), false)
             } else {
-                // Showing none of its transaction, quote and block, nothing
-                // ties it to a vault: it rests on its nearest nodes, as every
-                // listing that hides its quote does, and a quorum of them
-                // gets it listed. Refusing it would take a new rule, such as
-                // one refusing a block timestamp it shows, or a date its
-                // nearest nodes give it plus the two-hour margin, earlier
-                // than when the vault was deployed.
-                let checked =
-                    check_quorum_group(&groups[0], &envelope, &nearest, &knowing, now).await;
-                let Ok((_, check)) = checked else {
-                    panic!("{shown:?} is refused");
-                };
-                assert_eq!(check.level, CheckLevel::Reported, "{shown:?}");
+                let date = first_seen_at(BLOCK_TIME);
+                (
+                    format!(
+                        "dated {date} or earlier by 4 of the nodes nearest its address, so \
+                         paid by {}, before the payment vault was deployed at {deployed_at}",
+                        date + FIRST_SEEN_ROUNDING + CLOCK_MARGIN
+                    ),
+                    true,
+                )
+            };
+            assert!(problem.contains(&refused_by), "{shown:?}: {problem}");
+            if offline {
+                assert_eq!(mock.lock().unwrap().calls.len(), calls, "{shown:?}");
+            }
+            // The read then decides its address with nothing listed, as
+            // whenever the listing a quorum serves is refused for good and
+            // no other is left, so an entry an earlier read published for it
+            // is dropped.
+            let decision =
+                Decision::refused(listing.address, &groups[0], &nearest, problem, Vec::new());
+            assert!(decision.decided, "{shown:?}");
+            assert!(decision.listing.is_none(), "{shown:?}");
+            assert_eq!(decision.rejected.len(), 1, "{shown:?}");
+            assert_eq!(decision.rejected[0].nodes, 7, "{shown:?}");
+            assert!(!decision.rejected[0].again, "{shown:?}");
+            let mut index = ListingsIndex::default();
+            index.settle(vec![decision]);
+            assert!(index.listings.is_empty(), "{shown:?}");
+            assert_eq!(
+                index.carry(&listing.address, &listing.key()),
+                Carry::Decided,
+                "{shown:?}"
+            );
+            // Served by fewer than a quorum, and checked once the other
+            // nearest nodes have answered, it is rejected for good too.
+            let few = merge_copies(nearest[..3].iter().map(|peer| (*peer, listing.clone())));
+            let checked = check_group(&few[0], &envelope, &nearest, 4, &knowing, now).await;
+            let (chosen, problems) = decide_address(&few, vec![checked], &nearest, 7);
+            let decision = Decision::from_groups(
+                listing.address,
+                &few,
+                &nearest,
+                chosen,
+                problems,
+                envelope.clone(),
+                Vec::new(),
+            );
+            assert!(decision.decided, "{shown:?}");
+            assert!(decision.listing.is_none(), "{shown:?}");
+            assert!(!decision.rejected[0].again, "{shown:?}");
+        }
+    }
+
+    /// A chain on which `payment` (as [`upload_payment`] makes it, in block
+    /// 150) paid the vault: two seconds a block from 1,800,000,000.
+    fn chain_paid_by(payment: &Payment) -> MockChain {
+        let quote: ant_protocol::evm::PaymentQuote = rmp_serde::from_slice(&payment.quote).unwrap();
+        let mut chain = MockChain::with_blocks(200, 1_800_000_000);
+        chain.add_receipt(PaymentReceipt {
+            tx_hash: payment.tx_hash,
+            success: true,
+            block_number: payment.block_number,
+            logs: vec![paying_log(&quote, payment.log_index)],
+        });
+        chain
+    }
+
+    /// What [`check_quorum_group`] gave for a listing showing `shown`, which
+    /// must have checked out.
+    fn checked_out(
+        checked: std::result::Result<(Listing, ListingCheck), GroupProblem>,
+        shown: ShownFields,
+    ) -> (Listing, ListingCheck) {
+        match checked {
+            Ok(checked) => checked,
+            Err(GroupProblem::Again(problem) | GroupProblem::Invalid(problem)) => {
+                panic!("{shown:?}: {problem}")
             }
         }
+    }
+
+    /// `listing` as each of `nearest`, in turn, serves it, with the date
+    /// each gives: one copy per date.
+    fn served_dated(
+        listing: &Listing,
+        nearest: &[PeerId],
+        dates: &[u64],
+    ) -> Vec<MergedListing<PeerId>> {
+        merge_copies(nearest.iter().zip(dates).map(|(peer, date)| {
+            let mut copy = listing.clone();
+            copy.first_seen = Some(*date);
+            (*peer, copy)
+        }))
+    }
+
+    /// The payment fields a listing dated by its nodes alone shows: none of
+    /// its block, block timestamp and transaction.
+    fn dated_by_its_nodes(shown: &ShownFields) -> bool {
+        [
+            PaymentField::BlockNumber,
+            PaymentField::BlockTimestamp,
+            PaymentField::TxHash,
+        ]
+        .into_iter()
+        .all(|field| !shown.contains(field))
+    }
+
+    #[tokio::test]
+    async fn a_listing_first_seen_in_the_hour_the_vault_was_deployed_is_never_refused() {
+        // The vault was deployed in block 140, 20 seconds before the upload
+        // paid it in block 150, and the nodes nearest the address first
+        // stored the listing in the hour of both.
+        let nearest: Vec<PeerId> = (1..=7).map(peer).collect();
+        let deployed_at = 1_800_000_280;
+        let hour = first_seen_at(deployed_at);
+        assert_eq!(first_seen_at(BLOCK_TIME), hour);
+        let h = FIRST_SEEN_ROUNDING;
+        let now = BLOCK_TIME + 3_600;
+        for shown in ShownFields::every().filter(dated_by_its_nodes) {
+            let envelope = envelope_showing(shown, true);
+            let payment = upload_payment(&envelope);
+            let mock = Arc::new(Mutex::new(chain_paid_by(&payment)));
+            assert_eq!(mock.lock().unwrap().blocks[&140], deployed_at);
+            let chain = reader(serve(Arc::clone(&mock)).await)
+                .with_vault_deployment_block(140)
+                .with_vault_deployment_time(deployed_at);
+            let listing = Listing::new(&envelope, &payment, BLOCK_TIME);
+            assert_eq!(listing.first_seen, Some(hour), "{shown:?}");
+            let level = if shown.contains(PaymentField::Quote) {
+                CheckLevel::Verified
+            } else {
+                CheckLevel::Reported
+            };
+            let check_dated = |date: u64| {
+                let groups = served_dated(&listing, &nearest, &[date; 7]);
+                let (envelope, nearest, chain) = (&envelope, &nearest, &chain);
+                async move { check_quorum_group(&groups[0], envelope, nearest, chain, now).await }
+            };
+
+            // It checks out, dated that hour.
+            let (dated, check) = checked_out(check_dated(hour).await, shown);
+            assert_eq!(dated.first_seen, Some(hour), "{shown:?}");
+            assert_eq!(check.level, level, "{shown:?}");
+            // So does one dated an hour earlier: a payment can come up to
+            // two hours after the date a node gives it, the hour's rounding
+            // and an hour for clocks.
+            let (dated, _) = checked_out(check_dated(hour - h).await, shown);
+            assert_eq!(dated.first_seen, Some(hour - h), "{shown:?}");
+            // Dated two hours earlier, it was paid before the deployment.
+            let calls = mock.lock().unwrap().calls.len();
+            let Err(GroupProblem::Invalid(problem)) = check_dated(hour - 2 * h).await else {
+                panic!("{shown:?} is not refused for good");
+            };
+            assert!(
+                problem.contains("before the payment vault was deployed"),
+                "{shown:?}: {problem}"
+            );
+            assert_eq!(mock.lock().unwrap().calls.len(), calls, "{shown:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_block_timestamp_at_or_after_the_deployment_is_never_refused() {
+        // The upload paid the vault in block 150, timed BLOCK_TIME; its
+        // listing shows that time, but not the block.
+        let nearest: Vec<PeerId> = (1..=7).map(peer).collect();
+        let now = BLOCK_TIME + 3_600;
+        let timed = ShownFields::NONE.with(PaymentField::BlockTimestamp);
+        for (shown, level) in [
+            (timed, CheckLevel::Reported),
+            (
+                timed.with(PaymentField::Quote).with(PaymentField::LogIndex),
+                CheckLevel::Verified,
+            ),
+        ] {
+            let envelope = envelope_showing(shown, true);
+            let payment = upload_payment(&envelope);
+            let mock = Arc::new(Mutex::new(chain_paid_by(&payment)));
+            let url = serve(Arc::clone(&mock)).await;
+            let listing = Listing::new(&envelope, &payment, BLOCK_TIME);
+            assert_eq!(listing.payment.block_timestamp, Some(BLOCK_TIME));
+            let groups = merge_copies(nearest.iter().map(|peer| (*peer, listing.clone())));
+            // The vault deployed a second before the payment, or in the same
+            // second: it checks out.
+            for deployed_at in [BLOCK_TIME - 1, BLOCK_TIME] {
+                let chain = reader(url.clone()).with_vault_deployment_time(deployed_at);
+                let checked =
+                    check_quorum_group(&groups[0], &envelope, &nearest, &chain, now).await;
+                let (_, check) = checked_out(checked, shown);
+                assert_eq!(check.level, level, "{shown:?}");
+            }
+            // Deployed a second after it: the payment was to something else.
+            let chain = reader(url).with_vault_deployment_time(BLOCK_TIME + 1);
+            let calls = mock.lock().unwrap().calls.len();
+            let checked = check_quorum_group(&groups[0], &envelope, &nearest, &chain, now).await;
+            let Err(GroupProblem::Invalid(problem)) = checked else {
+                panic!("{shown:?} is not refused for good");
+            };
+            assert!(
+                problem.contains(&format!(
+                    "paid in a block timed {BLOCK_TIME}, before the payment vault was deployed \
+                     at {}",
+                    BLOCK_TIME + 1
+                )),
+                "{shown:?}: {problem}"
+            );
+            assert_eq!(mock.lock().unwrap().calls.len(), calls, "{shown:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn nodes_fewer_than_a_quorum_dating_a_listing_early_never_get_it_refused() {
+        // The vault was deployed in block 140 and the upload paid it in
+        // block 150, 20 seconds later; honest nodes first stored the listing
+        // in that hour. Some of the nodes nearest its address date it in
+        // 1970 instead.
+        let nearest: Vec<PeerId> = (1..=7).map(peer).collect();
+        let hour = first_seen_at(BLOCK_TIME);
+        let early = 0;
+        let now = BLOCK_TIME + 3_600;
+        let reader_of = |payment: &Payment| {
+            let mock = Arc::new(Mutex::new(chain_paid_by(payment)));
+            async move {
+                reader(serve(mock).await)
+                    .with_vault_deployment_block(140)
+                    .with_vault_deployment_time(1_800_000_280)
+            }
+        };
+        // Resting on its nodes alone, or checked on chain by its quote.
+        let resting = ShownFields::NONE;
+        let quoted = ShownFields::NONE
+            .with(PaymentField::Quote)
+            .with(PaymentField::LogIndex);
+        for shown in [resting, quoted] {
+            let envelope = envelope_showing(shown, true);
+            let payment = upload_payment(&envelope);
+            let chain = reader_of(&payment).await;
+            let listing = Listing::new(&envelope, &payment, BLOCK_TIME);
+            let check = |dates: &[u64]| {
+                let groups = served_dated(&listing, &nearest, dates);
+                let (envelope, nearest, chain) = (&envelope, &nearest, &chain);
+                async move { check_quorum_group(&groups[0], envelope, nearest, chain, now).await }
+            };
+            // Three of the seven, or three of the four serving it: the date
+            // the others give stands, and it checks out.
+            for dates in [
+                &[early, early, early, hour, hour, hour, hour][..],
+                &[early, early, early, hour],
+            ] {
+                let (dated, _) = checked_out(check(dates).await, shown);
+                assert_eq!(dated.first_seen, Some(hour), "{shown:?} {dates:?}");
+            }
+            // Four, a quorum, can: a quorum of the nearest nodes dates every
+            // listing that hides its time.
+            let four = [early, early, early, early, hour, hour, hour];
+            assert!(
+                matches!(check(&four).await, Err(GroupProblem::Invalid(_))),
+                "{shown:?}"
+            );
+        }
+        // A listing that shows its transaction is left to the chain, which
+        // shows it paid the vault: four dating it early don't get it
+        // refused, and their dates, before its payment, are dropped.
+        let shown = ShownFields::NONE.with(PaymentField::TxHash);
+        let envelope = envelope_showing(shown, true);
+        let payment = upload_payment(&envelope);
+        let chain = reader_of(&payment).await;
+        let listing = Listing::new(&envelope, &payment, BLOCK_TIME);
+        let groups = served_dated(
+            &listing,
+            &nearest,
+            &[early, early, early, early, hour, hour, hour],
+        );
+        let checked = check_quorum_group(&groups[0], &envelope, &nearest, &chain, now).await;
+        let (dated, check) = checked_out(checked, shown);
+        assert_eq!(dated.first_seen, Some(hour));
+        assert_eq!(check.level, CheckLevel::Reported);
+    }
+
+    #[test]
+    fn a_reader_of_the_bundled_network_refuses_what_was_paid_before_its_vault() {
+        // The vault was deployed in block 81,897,121, timed 2026-10-06
+        // 20:01:56 UTC; block 81,897,120 is timed the same second.
+        let bundled = crate::config::bundled_payment_network().unwrap();
+        let chain = ListingChain::new(&bundled).unwrap();
+        let deployed_at = 1_791_316_916;
+        assert_eq!(chain.vault_deployment_time(), Some(deployed_at));
+        let nearest: Vec<PeerId> = (1..=7).map(peer).collect();
+        let refused = |shown: ShownFields, payment: &Payment, date: u64| {
+            let envelope = envelope_showing(shown, true);
+            let mut listing = Listing::new(&envelope, payment, payment.block_timestamp);
+            if listing.first_seen.is_some() {
+                listing.first_seen = Some(date);
+            }
+            let groups = merge_copies(nearest.iter().map(|peer| (*peer, listing.clone())));
+            check_vault_deployment(&groups[0], &nearest, QUORUM_THRESHOLD, &chain).is_err()
+        };
+        let paid = |block_number: u64, block_timestamp: u64| Payment {
+            block_number,
+            block_timestamp,
+            ..upload_payment(&envelope_showing(ShownFields::ALL, true))
+        };
+        let at_deployment = paid(81_897_121, deployed_at);
+        let block = ShownFields::NONE.with(PaymentField::BlockNumber);
+        let timed = ShownFields::NONE.with(PaymentField::BlockTimestamp);
+        assert!(refused(block, &paid(81_897_120, deployed_at), 0));
+        assert!(!refused(block, &at_deployment, 0));
+        assert!(refused(timed, &paid(81_897_120, deployed_at - 1), 0));
+        assert!(!refused(timed, &at_deployment, 0));
+        // Dated by its nodes alone: refused when 4 of the 7 nearest date it
+        // 18:00 UTC or earlier, two hours before the deployment's hour. One
+        // they date 19:00, as a payment made at 19:18:41 and stored then
+        // would be, can't be told from one paid just after the deployment:
+        // the window the date leaves open.
+        let eighteen = 1_791_309_600;
+        assert_eq!(eighteen + 2 * FIRST_SEEN_ROUNDING + 116, deployed_at);
+        let dated = ShownFields::NONE;
+        assert!(refused(dated, &at_deployment, eighteen));
+        assert!(!refused(
+            dated,
+            &at_deployment,
+            eighteen + FIRST_SEEN_ROUNDING
+        ));
+        assert!(!refused(
+            dated,
+            &at_deployment,
+            eighteen + 2 * FIRST_SEEN_ROUNDING
+        ));
     }
 
     #[tokio::test]
@@ -4256,15 +4645,20 @@ mod tests {
         let bundled = crate::config::bundled_payment_network().unwrap();
         let chain = ListingChain::new(&bundled).unwrap();
         assert_eq!(chain.vault_deployment_block(), Some(81_897_121));
+        assert_eq!(chain.vault_deployment_time(), Some(1_791_316_916));
         assert!(chain.before_vault_deployment(81_897_120));
         assert!(!chain.before_vault_deployment(81_897_121));
         // Any other vault's isn't known, so no block is before it.
         let other = reader("http://127.0.0.1:9".into());
         assert_eq!(other.vault_deployment_block(), None);
+        assert_eq!(other.vault_deployment_time(), None);
         assert!(!other.before_vault_deployment(0));
-        let other = other.with_vault_deployment_block(160);
+        let other = other
+            .with_vault_deployment_block(160)
+            .with_vault_deployment_time(1_800_000_320);
         assert!(other.before_vault_deployment(159));
         assert!(!other.before_vault_deployment(160));
+        assert_eq!(other.vault_deployment_time(), Some(1_800_000_320));
     }
 
     #[tokio::test]

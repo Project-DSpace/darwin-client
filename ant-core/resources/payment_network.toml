@@ -1,7 +1,8 @@
 # The payment chain the client uses by default (and as --evm-network
 # robinhood). Switching tokens means changing the two addresses, the vault's
-# deployment block and the symbol here and rebuilding; switching chains, the
-# RPC URLs and chain_id too. The nodes take the addresses from their node.env.
+# deployment block and time and the symbol here and rebuilding; switching
+# chains, the RPC URLs and chain_id too. The nodes take the addresses from
+# their node.env.
 #
 # Robinhood Chain mainnet (chain ID 4663), through PublicNode's free RPC. Robinhood's
 # own public RPC load-balances over servers at different heights and failed
@@ -21,9 +22,13 @@ chain_id = 4663
 fallback_rpc_urls = ["https://rpc.ordofi.network", "https://rpc.mainnet.chain.robinhood.com"]
 payment_token_address = "0x511f76a3de41f000ec11ea4fd212fb3587c6cef3"
 payment_vault_address = "0xE0f627986c0438De0E314B644f3C8aA21D3f4f6B"
-# The block the payment vault was deployed in (2026-10-06 20:01:56 UTC). No
-# payment to it is in an earlier block, so a listing showing an earlier block
+# The block the payment vault was deployed in, and that block's timestamp in
+# Unix seconds (2026-10-06 20:01:56 UTC), as the chain records them. No
+# payment to the vault is in an earlier block, or in a block timed earlier,
+# so a listing showing an earlier block or block timestamp, or one its nodes
+# date (by the hour they first stored it) more than two hours before then,
 # paid something else, which readers can tell without reading the chain.
 payment_vault_deployment_block = 81897121
+payment_vault_deployment_time = 1791316916
 # The symbol costs are shown in.
 token_symbol = "DARWIN"

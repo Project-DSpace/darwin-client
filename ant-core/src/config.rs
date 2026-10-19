@@ -187,6 +187,7 @@ struct PaymentNetworkConfig {
     payment_token_address: String,
     payment_vault_address: String,
     payment_vault_deployment_block: Option<u64>,
+    payment_vault_deployment_time: Option<u64>,
     token_symbol: String,
 }
 
@@ -239,6 +240,21 @@ pub fn vault_deployment_block(network: &EvmNetwork) -> Option<u64> {
         bundled_payment_network(),
     ) {
         (Ok(config), Ok(bundled)) if &bundled == network => config.payment_vault_deployment_block,
+        _ => None,
+    }
+}
+
+/// The timestamp, in Unix seconds, of the block `network`'s payment vault
+/// was deployed in: the bundled network's `payment_vault_deployment_time`,
+/// and none for any other network. No payment to the vault is in a block
+/// timed earlier.
+#[must_use]
+pub fn vault_deployment_time(network: &EvmNetwork) -> Option<u64> {
+    match (
+        toml::from_str::<PaymentNetworkConfig>(BUNDLED_PAYMENT_NETWORK),
+        bundled_payment_network(),
+    ) {
+        (Ok(config), Ok(bundled)) if &bundled == network => config.payment_vault_deployment_time,
         _ => None,
     }
 }
@@ -521,6 +537,23 @@ mod tests {
         assert_eq!(vault_deployment_block(&EvmNetwork::ArbitrumOne), None);
         let local = resolve_evm_network(Some("local"), Some(&manifest_with_evm())).unwrap();
         assert_eq!(vault_deployment_block(&local), None);
+    }
+
+    #[test]
+    fn only_the_bundled_vault_has_a_known_deployment_time() {
+        // The timestamp of the block the bundled vault was deployed in, as
+        // the chain records it: 2026-10-06 20:01:56 UTC.
+        assert_eq!(
+            vault_deployment_time(&bundled_payment_network().unwrap()),
+            Some(1_791_316_916)
+        );
+        assert_eq!(vault_deployment_time(&EvmNetwork::ArbitrumOne), None);
+        assert_eq!(
+            vault_deployment_time(&EvmNetwork::ArbitrumSepoliaTest),
+            None
+        );
+        let local = resolve_evm_network(Some("local"), Some(&manifest_with_evm())).unwrap();
+        assert_eq!(vault_deployment_time(&local), None);
     }
 
     #[test]
