@@ -188,6 +188,7 @@ struct PaymentNetworkConfig {
     payment_vault_address: String,
     payment_vault_deployment_block: Option<u64>,
     payment_vault_deployment_time: Option<u64>,
+    payment_vault_first_payment_time: Option<u64>,
     token_symbol: String,
 }
 
@@ -255,6 +256,21 @@ pub fn vault_deployment_time(network: &EvmNetwork) -> Option<u64> {
         bundled_payment_network(),
     ) {
         (Ok(config), Ok(bundled)) if &bundled == network => config.payment_vault_deployment_time,
+        _ => None,
+    }
+}
+
+/// The timestamp, in Unix seconds, of the block of `network`'s payment
+/// vault's first payment: the bundled network's
+/// `payment_vault_first_payment_time`, and none for any other network. No
+/// payment to the vault is in a block timed earlier.
+#[must_use]
+pub fn vault_first_payment_time(network: &EvmNetwork) -> Option<u64> {
+    match (
+        toml::from_str::<PaymentNetworkConfig>(BUNDLED_PAYMENT_NETWORK),
+        bundled_payment_network(),
+    ) {
+        (Ok(config), Ok(bundled)) if &bundled == network => config.payment_vault_first_payment_time,
         _ => None,
     }
 }
@@ -554,6 +570,23 @@ mod tests {
         );
         let local = resolve_evm_network(Some("local"), Some(&manifest_with_evm())).unwrap();
         assert_eq!(vault_deployment_time(&local), None);
+    }
+
+    #[test]
+    fn only_the_bundled_vault_has_a_known_first_payment_time() {
+        // The timestamp of the block of the bundled vault's first payment,
+        // block 81942857, as the chain records it: 2026-10-06 21:20:03 UTC,
+        // after the deployment.
+        let bundled = bundled_payment_network().unwrap();
+        assert_eq!(vault_first_payment_time(&bundled), Some(1_791_321_603));
+        assert!(vault_first_payment_time(&bundled) > vault_deployment_time(&bundled));
+        assert_eq!(vault_first_payment_time(&EvmNetwork::ArbitrumOne), None);
+        assert_eq!(
+            vault_first_payment_time(&EvmNetwork::ArbitrumSepoliaTest),
+            None
+        );
+        let local = resolve_evm_network(Some("local"), Some(&manifest_with_evm())).unwrap();
+        assert_eq!(vault_first_payment_time(&local), None);
     }
 
     #[test]

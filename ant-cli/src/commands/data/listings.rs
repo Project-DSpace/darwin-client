@@ -136,7 +136,8 @@ struct CopyJson {
     /// The time the copy sorts by: the block timestamp, else `first_seen`.
     time: u64,
     /// True when the block it shows is earlier than the one the payment
-    /// vault was deployed in, so it paid something else; absent otherwise.
+    /// vault was deployed in, or the block timestamp it shows earlier than
+    /// that block's, so it paid something else; absent otherwise.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     before_vault_deployment: bool,
 }
@@ -627,8 +628,9 @@ fn shown_time_text(block_timestamp: Option<u64>, first_seen: Option<u64>) -> Str
 
 /// One node's copy of a listing too few of the nodes nearest its address
 /// serve, for a line under the listing's row: the node, the block the copy
-/// shows and its time as the row shows one, and whether that block is before
-/// the payment vault was deployed (in block `vault_deployment_block`).
+/// shows and its time as the row shows one, and whether that block or block
+/// timestamp is before the payment vault was deployed (in block
+/// `vault_deployment_block`).
 fn copy_text(copy: &PendingCopy, vault_deployment_block: Option<u64>) -> String {
     let block = copy
         .block_number
@@ -972,6 +974,19 @@ mod tests {
             format!(
                 "copy from {}: block hidden, ~2026-08-09 22:00",
                 "05".repeat(32)
+            )
+        );
+        // One marked by the block timestamp it shows, hiding its block.
+        let timed = PendingCopy {
+            block_number: None,
+            ..early.clone()
+        };
+        assert_eq!(
+            copy_text(&timed, Some(81_897_121)),
+            format!(
+                "copy from {}: block hidden, 2026-10-04 20:01:20, before the payment vault was \
+                 deployed in block 81897121: it can't have paid the vault",
+                "03".repeat(32)
             )
         );
     }

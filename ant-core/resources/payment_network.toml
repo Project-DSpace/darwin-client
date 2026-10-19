@@ -1,8 +1,8 @@
 # The payment chain the client uses by default (and as --evm-network
 # robinhood). Switching tokens means changing the two addresses, the vault's
-# deployment block and time and the symbol here and rebuilding; switching
-# chains, the RPC URLs and chain_id too. The nodes take the addresses from
-# their node.env.
+# deployment block and time, the time of its first payment and the symbol
+# here and rebuilding; switching chains, the RPC URLs and chain_id too. The
+# nodes take the addresses from their node.env.
 #
 # Robinhood Chain mainnet (chain ID 4663), through PublicNode's free RPC. Robinhood's
 # own public RPC load-balances over servers at different heights and failed
@@ -25,10 +25,16 @@ payment_vault_address = "0xE0f627986c0438De0E314B644f3C8aA21D3f4f6B"
 # The block the payment vault was deployed in, and that block's timestamp in
 # Unix seconds (2026-10-06 20:01:56 UTC), as the chain records them. No
 # payment to the vault is in an earlier block, or in a block timed earlier,
-# so a listing showing an earlier block or block timestamp, or one its nodes
-# date (by the hour they first stored it) more than two hours before then,
-# paid something else, which readers can tell without reading the chain.
+# so a listing showing an earlier block or block timestamp paid something
+# else, which readers can tell without reading the chain.
 payment_vault_deployment_block = 81897121
 payment_vault_deployment_time = 1791316916
+# The timestamp, in Unix seconds, of the block of the vault's first payment:
+# block 81942857, at 2026-10-06 21:20:03 UTC, as the chain records it. The
+# chain holds no log of the vault's from its deployment block until then, so
+# a listing showing none of its block, block timestamp and transaction that
+# its nodes date (by the hour they first stored it) more than two hours
+# before then paid something else.
+payment_vault_first_payment_time = 1791321603
 # The symbol costs are shown in.
 token_symbol = "DARWIN"
