@@ -235,6 +235,9 @@ pub enum Carry {
 /// What a read covered, for [`ListingsIndex::carry`].
 #[derive(Debug, Clone, Default)]
 struct Coverage {
+    /// The time the read took listings from (Unix seconds, 0 for the whole
+    /// index): its walks began at [`walk_start`] of it.
+    since: u64,
     /// Each node walked, as [`IndexWalk`] gave them.
     walks: Vec<NodeReport<PeerId>>,
     /// The nodes' ids, in the same order.
@@ -363,24 +366,31 @@ impl ListingsIndex {
     /// What to do with a listing at `address`, with index key `key`,
     /// published from an earlier read: replace it with what this read
     /// decided, keep it, or drop it because the network no longer stores its
-    /// file. Only the whole close group, walked past it, says a listing is
-    /// gone; a read that didn't decide an address otherwise keeps it, however
-    /// few nodes answered, so publishing what it decided over what was
-    /// published loses nothing.
+    /// file. Only the whole close group, walked past it in a read of the
+    /// whole index, says a listing is gone; a read that didn't decide an
+    /// address otherwise keeps it, however few nodes answered, so publishing
+    /// what it decided over what was published loses nothing.
     #[must_use]
     pub fn carry(&self, address: &XorName, key: &ListingKey) -> Carry {
         let coverage = &self.coverage;
         if coverage.decided.contains(address) {
             return Carry::Decided;
         }
+        // A read from a time walked no node's index before `walk_start` of
+        // it, and a node keys a listing that hides its time by its own date:
+        // up to three of the nearest can date it well before the one
+        // published, the latest of the earliest four. Such a read can't tell
+        // a node that keys the listing earlier from one that doesn't serve
+        // it.
         if self.too_few_nodes
+            || coverage.since > 0
             || coverage.served.contains(address)
             || coverage.ids.len() < NEAREST_NODES
         {
             return Carry::Keep;
         }
-        // Each node keys a listing that hides its time by its own date, which
-        // can be up to this much earlier than the one published.
+        // A node that stored the listing when the quorum did keys it by its
+        // own date, up to this much earlier than the one published.
         let lookback = FIRST_SEEN_ROUNDING + CLOCK_MARGIN;
         let earliest = ListingKey {
             time: key.time.saturating_sub(lookback),
@@ -420,14 +430,16 @@ impl ListingsIndex {
     }
 
     /// Take in what this read decided for each address it worked on, then
-    /// keep the listings and rejections from `since` on, in index order.
+    /// keep the listings and rejections from the read's `since` on, in index
+    /// order.
     ///
     /// A listing this read dated before `since` is left out, and so its
     /// address doesn't count as decided ([`Self::carry`]): the read says
     /// nothing about listings before `since`, so an entry an earlier read
     /// published for the address is kept, not dropped for one this read
     /// leaves out. An address rejected for good stays decided.
-    fn settle(&mut self, decisions: Vec<Decision>, since: u64) {
+    fn settle(&mut self, decisions: Vec<Decision>) {
+        let since = self.coverage.since;
         for decision in decisions {
             if decision.decided {
                 self.coverage.decided.insert(decision.address);
@@ -797,6 +809,7 @@ impl Client {
             walks,
             too_few_nodes,
             coverage: Coverage {
+                since,
                 walks: found.nodes.clone(),
                 ids: found
                     .nodes
@@ -822,7 +835,7 @@ impl Client {
             return Ok(index);
         }
 
-        let context = ReadContext::new(&found, base, nodes.into_iter().collect());
+        let context = ReadContext::new(&found.nodes, nodes.into_iter().collect());
         let (backed, pending): (Vec<_>, Vec<_>) = found
             .addresses
             .into_iter()
@@ -835,7 +848,7 @@ impl Client {
             .buffer_unordered(CHECK_CONCURRENCY)
             .collect()
             .await;
-        index.settle(decisions, since);
+        index.settle(decisions);
         Ok(index)
     }
 
@@ -1474,9 +1487,12 @@ impl Drop for ListingsRequests {
 
 /// What deciding an address needs from its read's walks.
 struct ReadContext {
-    /// When each node's walk began, for walks that ran from the read's start
-    /// to the end: such a walk returned every listing the node held as it
-    /// passed it.
+    /// When each node's walk began, for walks of its whole index, from the
+    /// start ([`ListingKey::MIN`]) to the end: such a walk returned every
+    /// listing the node held as it passed it. A walk from a later key, as in
+    /// a read from a time ([`walk_start`]), doesn't count: a node keys a
+    /// listing that hides its time by its own date, which can be well before
+    /// the date the nearest nodes give it.
     full_walks: HashMap<PeerId, u64>,
     /// Nodes that answered no page: not asked anything more this read.
     silent: HashSet<PeerId>,
@@ -1488,19 +1504,14 @@ struct ReadContext {
 }
 
 impl ReadContext {
-    fn new(
-        found: &WalkResult<PeerId>,
-        base: ListingKey,
-        addresses: HashMap<PeerId, Vec<MultiAddr>>,
-    ) -> Self {
-        let full_walks = found
-            .nodes
+    /// The context of a read whose nodes' walks went as `walks`.
+    fn new(walks: &[NodeReport<PeerId>], addresses: HashMap<PeerId, Vec<MultiAddr>>) -> Self {
+        let full_walks = walks
             .iter()
-            .filter(|walk| walk.outcome == WalkOutcome::Complete && walk.from == base)
+            .filter(|walk| walk.outcome == WalkOutcome::Complete && walk.from == ListingKey::MIN)
             .filter_map(|walk| walk.began.map(|began| (walk.peer, began)))
             .collect();
-        let silent = found
-            .nodes
+        let silent = walks
             .iter()
             .filter(|walk| walk.pages == 0)
             .map(|walk| walk.peer)
@@ -3426,6 +3437,7 @@ mod tests {
             };
             ListingsIndex {
                 coverage: Coverage {
+                    since: 0,
                     ids: walks.iter().map(|walk| *walk.peer.as_bytes()).collect(),
                     walks,
                     served: only(served),
@@ -3517,14 +3529,15 @@ mod tests {
             rejected: Vec::new(),
             decided: true,
         };
-        // Every node walked, from the start of the read, and four of the
-        // nearest served the address.
-        let read = || {
+        // A read from `from`: every node walked, from the start of the read,
+        // and four of the nearest served the address.
+        let read = |from: u64| {
             let walks: Vec<NodeReport<PeerId>> = (1..=8)
-                .map(|n| walk_of(peer(n), walk_start(since), None, since + 3_600))
+                .map(|n| walk_of(peer(n), walk_start(from), None, since + 3_600))
                 .collect();
             ListingsIndex {
                 coverage: Coverage {
+                    since: from,
                     ids: walks.iter().map(|walk| *walk.peer.as_bytes()).collect(),
                     walks,
                     served: HashSet::from([address]),
@@ -3537,8 +3550,8 @@ mod tests {
         // Read from `since`: the listing is left out, and the earlier entry
         // kept as it was, since the read says nothing about listings
         // before `since`. It isn't lost.
-        let mut index = read();
-        index.settle(vec![listed], since);
+        let mut index = read(since);
+        index.settle(vec![listed]);
         assert!(index.listings.is_empty());
         assert_eq!(index.carry(&address, &published), Carry::Keep);
 
@@ -3556,8 +3569,8 @@ mod tests {
             rejected: Vec::new(),
             decided: true,
         };
-        let mut index = read();
-        index.settle(vec![listed], 0);
+        let mut index = read(0);
+        index.settle(vec![listed]);
         assert_eq!(index.listings.len(), 1);
         assert_eq!(index.carry(&address, &published), Carry::Decided);
 
@@ -3575,10 +3588,104 @@ mod tests {
             }],
             decided: true,
         };
-        let mut index = read();
-        index.settle(vec![rejected], since);
+        let mut index = read(since);
+        index.settle(vec![rejected]);
         assert!(index.rejected.is_empty());
         assert_eq!(index.carry(&address, &published), Carry::Decided);
+    }
+
+    #[test]
+    fn a_read_from_a_time_never_says_a_listing_is_gone() {
+        // Three of the nearest nodes stored a listing that hides its time in
+        // hour `stored`; four more were given it six hours later, so it was
+        // published dated then, the latest of the earliest four. Those four
+        // have since gone, and the first three still key it at `stored`.
+        let stored = 1_790_996_400;
+        let published = ListingKey {
+            time: stored + 6 * FIRST_SEEN_ROUNDING,
+            block_number: 0,
+            log_index: 0,
+            address: [0x42; 32],
+        };
+        let began = published.time + 3 * FIRST_SEEN_ROUNDING;
+        let read = |since: u64| {
+            let walks: Vec<NodeReport<PeerId>> = (1..=8)
+                .map(|n| walk_of(peer(n), walk_start(since), None, began))
+                .collect();
+            ListingsIndex {
+                coverage: Coverage {
+                    since,
+                    ids: walks.iter().map(|walk| *walk.peer.as_bytes()).collect(),
+                    walks,
+                    served: HashSet::new(),
+                    decided: HashSet::new(),
+                },
+                ..ListingsIndex::default()
+            }
+        };
+
+        // A read from the published time walks every node from two hours
+        // before it, past the listing's place, late enough, and none sends
+        // it: the three still serving it key it earlier. The read says
+        // nothing about that, so the entry is kept.
+        assert!(walk_start(published.time).time > stored);
+        assert_eq!(
+            read(published.time).carry(&published.address, &published),
+            Carry::Keep
+        );
+        // A read of the whole index walks past every key a node can give
+        // it: there, every nearest node walked late enough without a copy
+        // still says it is gone.
+        assert_eq!(
+            read(0).carry(&published.address, &published),
+            Carry::NoLongerServed
+        );
+    }
+
+    #[test]
+    fn only_a_walk_of_a_whole_index_answers_for_its_node() {
+        // Three of the nearest nodes serve a listing in the index, dated
+        // `hour`; the other four sent nothing for it.
+        let hour = 1_790_996_400;
+        let copies: Vec<(PeerId, Listing)> = (5..=7)
+            .map(|n| (peer(n), reported_listing(100, hour)))
+            .collect();
+        let heard: HashSet<PeerId> = copies.iter().map(|(peer, _)| *peer).collect();
+        let groups = merge_copies(copies);
+        let nearest: Vec<PeerId> = (1..=7).map(peer).collect();
+        let late = hour + 3 * FIRST_SEEN_ROUNDING;
+        let context = ReadContext::new(
+            &[
+                // Node 1's whole index, from the start to the end.
+                walk_of(peer(1), ListingKey::MIN, None, late),
+                // Node 2's from a time, to the end, as a read from that time
+                // walks it: the node may key the listing earlier.
+                walk_of(peer(2), walk_start(hour), None, late),
+                // Node 3's from the start, stopped before the end.
+                walk_of(
+                    peer(3),
+                    ListingKey::MIN,
+                    Some(ListingKey {
+                        time: hour,
+                        ..ListingKey::MIN
+                    }),
+                    late,
+                ),
+            ],
+            HashMap::new(),
+        );
+        assert_eq!(context.full_walks, HashMap::from([(peer(1), late)]));
+        // Only node 1's walk answers for it: the others are asked.
+        assert_eq!(
+            peers_to_ask(
+                &groups,
+                &nearest,
+                QUORUM_THRESHOLD,
+                &heard,
+                &context.full_walks
+            ),
+            [peer(2), peer(3), peer(4)]
+        );
     }
 
     #[test]
@@ -3950,7 +4057,7 @@ mod tests {
                 assert!(decision.decided, "{shown:?}");
                 assert!(!decision.rejected[0].again, "{shown:?}");
                 let mut index = ListingsIndex::default();
-                index.settle(vec![decision], 0);
+                index.settle(vec![decision]);
                 assert!(index.listings.is_empty(), "{shown:?}");
                 assert_eq!(
                     index.carry(&listing.address, &listing.key()),
