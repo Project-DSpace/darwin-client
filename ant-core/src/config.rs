@@ -186,6 +186,7 @@ struct PaymentNetworkConfig {
     fallback_rpc_urls: Vec<String>,
     payment_token_address: String,
     payment_vault_address: String,
+    payment_vault_deployment_block: Option<u64>,
     token_symbol: String,
 }
 
@@ -225,6 +226,20 @@ pub fn token_symbol(network: &EvmNetwork) -> String {
     ) {
         (Ok(config), Ok(bundled)) if &bundled == network => config.token_symbol,
         _ => "tokens".to_string(),
+    }
+}
+
+/// The block `network`'s payment vault was deployed in: the bundled
+/// network's `payment_vault_deployment_block`, and none for any other
+/// network. No payment to the vault is in an earlier block.
+#[must_use]
+pub fn vault_deployment_block(network: &EvmNetwork) -> Option<u64> {
+    match (
+        toml::from_str::<PaymentNetworkConfig>(BUNDLED_PAYMENT_NETWORK),
+        bundled_payment_network(),
+    ) {
+        (Ok(config), Ok(bundled)) if &bundled == network => config.payment_vault_deployment_block,
+        _ => None,
     }
 }
 
@@ -494,6 +509,18 @@ mod tests {
         assert_eq!(token_symbol(&EvmNetwork::ArbitrumSepoliaTest), "tokens");
         let local = resolve_evm_network(Some("local"), Some(&manifest_with_evm())).unwrap();
         assert_eq!(token_symbol(&local), "tokens");
+    }
+
+    #[test]
+    fn only_the_bundled_vault_has_a_known_deployment_block() {
+        // The block the bundled vault was deployed in, as the chain records it.
+        assert_eq!(
+            vault_deployment_block(&bundled_payment_network().unwrap()),
+            Some(81_897_121)
+        );
+        assert_eq!(vault_deployment_block(&EvmNetwork::ArbitrumOne), None);
+        let local = resolve_evm_network(Some("local"), Some(&manifest_with_evm())).unwrap();
+        assert_eq!(vault_deployment_block(&local), None);
     }
 
     #[test]

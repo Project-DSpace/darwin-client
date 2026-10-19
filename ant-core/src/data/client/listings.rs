@@ -1687,6 +1687,8 @@ pub struct ListingChain {
     /// Index in `rpc_urls` of the last RPC that answered.
     answered: AtomicUsize,
     vault: [u8; 20],
+    /// The block the vault was deployed in, where known.
+    vault_deployment_block: Option<u64>,
 }
 
 /// A vault `DataPaymentMade` log, located.
@@ -1699,7 +1701,9 @@ struct VaultLog {
 impl ListingChain {
     /// A reader for `network`'s chain and payment vault, through its RPC
     /// and then the RPCs it falls back to
-    /// ([`crate::config::fallback_rpc_urls`]).
+    /// ([`crate::config::fallback_rpc_urls`]), knowing the block the vault
+    /// was deployed in where the network gives it
+    /// ([`crate::config::vault_deployment_block`]).
     ///
     /// # Errors
     ///
@@ -1709,7 +1713,11 @@ impl ListingChain {
         vault.copy_from_slice(network.payment_vault_address().as_slice());
         let mut rpc_urls = vec![network.rpc_url().to_string()];
         rpc_urls.extend(crate::config::fallback_rpc_urls(network));
-        Self::with_rpcs(rpc_urls, vault)
+        let reader = Self::with_rpcs(rpc_urls, vault)?;
+        Ok(match crate::config::vault_deployment_block(network) {
+            Some(block) => reader.with_vault_deployment_block(block),
+            None => reader,
+        })
     }
 
     /// The RPCs this reader reads through, first to last.
@@ -1747,13 +1755,38 @@ impl ListingChain {
             rpc_urls,
             answered: AtomicUsize::new(0),
             vault,
+            vault_deployment_block: None,
         })
+    }
+
+    /// This reader, knowing that the vault was deployed in block `block`:
+    /// no payment to it is earlier, so a listing showing an earlier block
+    /// fails its check without a call to the chain.
+    #[must_use]
+    pub fn with_vault_deployment_block(mut self, block: u64) -> Self {
+        self.vault_deployment_block = Some(block);
+        self
     }
 
     /// The payment vault's address.
     #[must_use]
     pub fn vault(&self) -> &[u8; 20] {
         &self.vault
+    }
+
+    /// The block the payment vault was deployed in, where known.
+    #[must_use]
+    pub fn vault_deployment_block(&self) -> Option<u64> {
+        self.vault_deployment_block
+    }
+
+    /// Whether block `block` is earlier than the one the payment vault was
+    /// deployed in, so that nothing in it can be a payment to the vault.
+    /// False where that block isn't known.
+    #[must_use]
+    pub fn before_vault_deployment(&self, block: u64) -> bool {
+        self.vault_deployment_block
+            .is_some_and(|deployed| block < deployed)
     }
 
     /// Check an upload proof from the chain alone: the receipt of its
@@ -3641,6 +3674,22 @@ mod tests {
             payment_vault_address: *bundled.payment_vault_address(),
         });
         assert!(crate::config::fallback_rpc_urls(&local).is_empty());
+    }
+
+    #[test]
+    fn a_reader_of_the_bundled_network_knows_when_its_vault_was_deployed() {
+        let bundled = crate::config::bundled_payment_network().unwrap();
+        let chain = ListingChain::new(&bundled).unwrap();
+        assert_eq!(chain.vault_deployment_block(), Some(81_897_121));
+        assert!(chain.before_vault_deployment(81_897_120));
+        assert!(!chain.before_vault_deployment(81_897_121));
+        // Any other vault's isn't known, so no block is before it.
+        let other = reader("http://127.0.0.1:9".into());
+        assert_eq!(other.vault_deployment_block(), None);
+        assert!(!other.before_vault_deployment(0));
+        let other = other.with_vault_deployment_block(160);
+        assert!(other.before_vault_deployment(159));
+        assert!(!other.before_vault_deployment(160));
     }
 
     #[tokio::test]
