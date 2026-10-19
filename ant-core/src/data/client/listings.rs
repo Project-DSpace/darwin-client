@@ -418,6 +418,32 @@ impl ListingsIndex {
             }
         }
     }
+
+    /// Take in what this read decided for each address it worked on, then
+    /// keep the listings and rejections from `since` on, in index order.
+    fn settle(&mut self, decisions: Vec<Decision>, since: u64) {
+        for decision in decisions {
+            if decision.decided {
+                self.coverage.decided.insert(decision.address);
+            } else {
+                self.deferred += 1;
+            }
+            self.listings.extend(decision.listing);
+            self.rejected.extend(decision.rejected);
+        }
+        self.listings
+            .retain(|checked| checked.listing.key().time >= since);
+        let pending_copies = &mut self.pending_copies;
+        self.rejected.retain(|rejected| {
+            let kept = since == 0 || rejected.listing.key().time >= since;
+            if !kept {
+                pending_copies.remove(&rejected.listing.address);
+            }
+            kept
+        });
+        self.listings.sort_by_key(|checked| checked.listing.key());
+        self.rejected.sort_by_key(|rejected| rejected.listing.key());
+    }
 }
 
 /// One address's listing, as the nodes nearest it serve it.
@@ -797,30 +823,7 @@ impl Client {
             .buffer_unordered(CHECK_CONCURRENCY)
             .collect()
             .await;
-        for decision in decisions {
-            if decision.decided {
-                index.coverage.decided.insert(decision.address);
-            } else {
-                index.deferred += 1;
-            }
-            index.listings.extend(decision.listing);
-            index.rejected.extend(decision.rejected);
-        }
-        index
-            .listings
-            .retain(|checked| checked.listing.key().time >= since);
-        let pending_copies = &mut index.pending_copies;
-        index.rejected.retain(|rejected| {
-            let kept = since == 0 || rejected.listing.key().time >= since;
-            if !kept {
-                pending_copies.remove(&rejected.listing.address);
-            }
-            kept
-        });
-        index.listings.sort_by_key(|checked| checked.listing.key());
-        index
-            .rejected
-            .sort_by_key(|rejected| rejected.listing.key());
+        index.settle(decisions, since);
         Ok(index)
     }
 
