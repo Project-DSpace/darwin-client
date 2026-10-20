@@ -366,6 +366,122 @@ impl Publisher {
         self.write(publication.at, &publication.status, pending, true)
     }
 
+    /// Apply `publication`'s changes, support and rejections to the
+    /// published index, as [`publish`](Self::publish) does, without writing
+    /// any file: the files they change are left to write, recorded in the
+    /// store with them, until [`write_staged`](Self::write_staged) writes
+    /// them. So a cycle that decides a batch of addresses at a time stages
+    /// each batch and writes the files once. `publication.status` is not
+    /// used.
+    ///
+    /// # Errors
+    ///
+    /// As [`publish`](Self::publish), but for writing files.
+    pub fn stage(&mut self, publication: &Publication) -> Result<()> {
+        self.record(publication).map(|_| ())
+    }
+
+    /// Write every file the publications staged since the last write left
+    /// to write ([`stage`](Self::stage)), then `status.json` with `status`,
+    /// as [`publish`](Self::publish) does; `at` is when the cycle that
+    /// staged them began.
+    ///
+    /// # Errors
+    ///
+    /// If the store can't be read or written, or a file can't be written.
+    pub fn write_staged(&mut self, at: u64, status: &Status) -> Result<Published> {
+        let pending = {
+            let txn = self.store.env().read_txn().map_err(store_error)?;
+            self.dbs.pending(&txn)?
+        };
+        self.write(at, status, pending, false)
+    }
+
+    /// Up to `limit` of the listed addresses after `after` (or from the
+    /// first), in address order.
+    ///
+    /// # Errors
+    ///
+    /// If the store can't be read.
+    pub fn listed_after(&self, after: Option<&XorName>, limit: usize) -> Result<Vec<XorName>> {
+        let txn = self.store.env().read_txn().map_err(store_error)?;
+        let range = match after {
+            Some(after) => (Bound::Excluded(&after[..]), Bound::Unbounded),
+            None => (Bound::Unbounded, Bound::Unbounded),
+        };
+        let mut addresses = Vec::new();
+        for row in self
+            .dbs
+            .entries
+            .remap_data_type::<heed::types::DecodeIgnore>()
+            .range(&txn, &range)
+            .map_err(store_error)?
+        {
+            if addresses.len() == limit {
+                break;
+            }
+            let (key, ()) = row.map_err(store_error)?;
+            if let Ok(address) = XorName::try_from(key) {
+                addresses.push(address);
+            }
+        }
+        Ok(addresses)
+    }
+
+    /// Up to `limit` of the addresses `rejected.json` has a row for, after
+    /// `after` (or from the first), in address order.
+    ///
+    /// # Errors
+    ///
+    /// If the store can't be read.
+    pub fn rejected_after(&self, after: Option<&XorName>, limit: usize) -> Result<Vec<XorName>> {
+        let txn = self.store.env().read_txn().map_err(store_error)?;
+        let from = match after {
+            Some(after) => tagged(REJECTED_TAG, after),
+            None => vec![REJECTED_TAG],
+        };
+        let end = [REJECTED_TAG + 1];
+        let low = if after.is_some() {
+            Bound::Excluded(&from[..])
+        } else {
+            Bound::Included(&from[..])
+        };
+        let range = (low, Bound::Excluded(&end[..]));
+        let mut addresses = Vec::new();
+        for row in self
+            .dbs
+            .side
+            .remap_data_type::<heed::types::DecodeIgnore>()
+            .range(&txn, &range)
+            .map_err(store_error)?
+        {
+            if addresses.len() == limit {
+                break;
+            }
+            let (key, ()) = row.map_err(store_error)?;
+            if let Some(address) = key.get(1..).and_then(|rest| XorName::try_from(rest).ok()) {
+                addresses.push(address);
+            }
+        }
+        Ok(addresses)
+    }
+
+    /// The latest rejection or deferral of `address`, if `rejected.json`
+    /// has a row for it.
+    ///
+    /// # Errors
+    ///
+    /// If the store can't be read.
+    pub fn rejected_entry(&self, address: &XorName) -> Result<Option<RejectedEntry>> {
+        let txn = self.store.env().read_txn().map_err(store_error)?;
+        self.dbs
+            .side
+            .get(&txn, &tagged(REJECTED_TAG, address))
+            .map_err(store_error)?
+            .map(parse)
+            .transpose()
+    }
+
     /// Apply `publication` to the published index in one transaction, with
     /// the files it leaves to write, which this returns.
     fn record(&mut self, publication: &Publication) -> Result<Pending> {

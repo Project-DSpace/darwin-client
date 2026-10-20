@@ -479,6 +479,17 @@ impl ListingsIndex {
         self.coverage.decided.contains(address)
     }
 
+    /// The addresses an index decided outside an index read decided, or
+    /// showed no longer served: those whose earlier entries and rows
+    /// [`Self::carry`] doesn't keep as they are.
+    pub(crate) fn decided_addresses(&self) -> impl Iterator<Item = XorName> + '_ {
+        self.coverage
+            .decided
+            .iter()
+            .chain(&self.coverage.gone)
+            .copied()
+    }
+
     /// The index of a cycle in which too few nodes answered to decide
     /// anything: `deferred` addresses left for later, every earlier entry
     /// kept ([`Self::carry`]).

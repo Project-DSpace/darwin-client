@@ -5,11 +5,13 @@
 //!
 //! **Nodes with the change feed** (the feed release,
 //! [`FEED_RELEASE`](super::listings_census::FEED_RELEASE) on) are followed
-//! with [`FeedSync`], the reader's state machine of `ant-listings`, which
-//! checks every answer and push as that crate defines (sequence numbers,
-//! ranges, one record per address, counts and set hashes, peers against the
-//! view) and bounds what a node can make the reader take. Each node is asked
-//! about its own leaf only ([`FeedNode::range`]):
+//! with [`MirrorSync`], `ant-listings`'s reader state machine
+//! ([`FeedSync`](ant_listings::FeedSync)) with the mirror's entries kept in
+//! the store instead of in memory. It checks every answer and push as that
+//! crate defines (sequence numbers, ranges, one record per address, counts
+//! and set hashes, peers against the view) and bounds what a node can make
+//! the reader take. Each node is asked about its own leaf only
+//! ([`FeedNode::range`]):
 //!
 //! - the first time, it is asked where its feed stands, and the range is read
 //!   afresh with `RangeListRequest`s;
@@ -44,7 +46,7 @@
 //! **What counts.** A node's copies count in a cycle ([`NodeRead::counts`])
 //! when it is in sync: it answered this round, and its mirror is at the head
 //! it reported with the count and set hash it reported
-//! ([`FeedSync::in_sync`]). A node read with v2 requests counts when it
+//! ([`MirrorSync::in_sync`]). A node read with v2 requests counts when it
 //! answered this round's request with a page the checks take; its mirror then
 //! holds what its pages showed. Only entries in the node's own range are
 //! kept, and only listings that pass [`Listing::validate`]
@@ -75,52 +77,62 @@
 //!    a deadline for the round, and the receiver of the pushes its
 //!    `ListingsRequests` routes (pushes that come during the round are taken
 //!    as they come). It reads every node, at most
-//!    [`POLL_CONCURRENCY`] requests at once, and saves the mirrors.
+//!    [`POLL_CONCURRENCY`] requests at once.
 //! 2. For the guard and support: [`Feeds::read`] says how each node's round
 //!    went (answered, counts, complete); [`Feeds::copies`] gives an address's
 //!    copies from those of its nearest nodes whose copies count, as digest
 //!    entries (the full listing comes from a `GetRequest`, checked with
 //!    [`DigestEntry::describes`]); [`Feeds::holders`] every node whose mirror
 //!    holds it, counting or not.
-//! 3. [`Feeds::pending`]: the addresses whose copies changed since they were
-//!    last settled, in any mirror, by an answer, a push, a node leaving or
-//!    changing range or way of reading, or a node's copies starting or
-//!    ceasing to count. Kept in the store until settled.
+//! 3. The addresses whose copies changed since they were last settled, in
+//!    any mirror, by an answer, a push, a node leaving or changing range or
+//!    way of reading, or a node's copies starting or ceasing to count
+//!    ([`Feeds::pending_after`], a batch at a time; [`Feeds::is_pending`]).
 //! 4. Once what it decided from them is published, [`Feeds::settle`] with
 //!    those addresses.
 //!
 //! Between cycles, it passes each push its `ListingsRequests` routes to
-//! [`Feeds::push`]: the addresses a push changes join [`Feeds::pending`], to
-//! be decided at once; it calls [`Feeds::save`] when it has handled them.
+//! [`Feeds::push`]: the addresses a push changes become pending, to be
+//! decided at once.
 //!
-//! The mirrors are kept in the producer's store ([`ListingsStore`],
-//! databases [`NODES_DB`], [`ENTRIES_DB`] and [`CHANGED_DB`]), so a restart
-//! follows each node's feed on from where the mirror stood, and its first
-//! request is a `ChangesRequest`, not a fresh read of the range. A v2 pass in
-//! progress is not kept: after a restart, the next starts once
-//! [`V2_PASS_INTERVAL`] has passed since it began.
+//! **Memory.** Everything that grows with the index is in the producer's
+//! store ([`ListingsStore`]): each node's entries ([`ENTRIES_DB`], and
+//! [`HELD_DB`] by address), the pending addresses ([`CHANGED_DB`]), which
+//! nodes each backed address credits ([`BACKING_DB`]) and what a v2 pass has
+//! seen ([`SEEN_DB`]). In memory are only each node's place in its feed and
+//! round, its count of entries and their set hash, and its count of backed
+//! entries: a few hundred bytes a node, whatever the index holds. Each
+//! answer and push is applied in one write transaction, with the node's
+//! record ([`NODES_DB`]), so the store always holds a mirror and the place
+//! in the feed it reflects: a restart follows each node's feed on from
+//! where the mirror stood, with a `ChangesRequest`, not a fresh read of the
+//! range. A v2 pass in progress is not kept: after a restart, the next
+//! starts once [`V2_PASS_INTERVAL`] has passed since it began.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
+use std::cell::RefCell;
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::future::Future;
+use std::ops::Bound;
 
 use ant_listings::{
-    check_list_page, AddressRange, ChangesResponse, DigestEntry, FeedOutcome, FeedSync, ListingKey,
-    ListingsBody, Pushed, MAX_LIST_LIMIT, NEAREST_NODES, QUORUM_THRESHOLD, WALK_EARNING_RANKS,
-    WALK_FREE_LISTINGS, WALK_PER_BACKED,
+    check_list_page, AddressRange, ChangesResponse, DigestEntry, FeedOutcome, ListingKey,
+    ListingsBody, Pushed, SetHash, MAX_LIST_LIMIT, NEAREST_NODES, QUORUM_THRESHOLD,
+    WALK_EARNING_RANKS, WALK_FREE_LISTINGS, WALK_PER_BACKED,
 };
 use ant_protocol::transport::PeerId;
 use ant_protocol::XorName;
 use futures::stream::{FuturesUnordered, StreamExt};
 use heed::types::Bytes;
-use heed::Database;
+use heed::{Database, RoTxn, RwTxn};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info};
 
 use super::listings::ListingsRequests;
 use super::listings_census::Census;
+use super::listings_mirror::{Entries, MirrorSync};
 use super::listings_serve::{POLL_CONCURRENCY, V2_PASS_INTERVAL};
 use super::listings_store::{store_error, ListingsStore};
-use crate::data::error::Result;
+use crate::data::error::{Error, Result};
 
 /// Each node's way of reading and where its mirror stands, by node id.
 pub const NODES_DB: &str = "serve_feed_nodes";
@@ -128,8 +140,21 @@ pub const NODES_DB: &str = "serve_feed_nodes";
 /// Each node's mirror: the node id and the address, to the entry.
 pub const ENTRIES_DB: &str = "serve_feed_entries";
 
+/// The same mirrors by address: the address and the node id (no value), to
+/// find every node holding an address, and every address held, in address
+/// order.
+pub const HELD_DB: &str = "serve_feed_held";
+
 /// The addresses whose copies changed and that are not settled yet.
 pub const CHANGED_DB: &str = "serve_feed_changed";
+
+/// For each backed address, the nodes among its [`WALK_EARNING_RANKS`]
+/// nearest whose mirrors hold it: the address, to their ids, 32 bytes each.
+pub const BACKING_DB: &str = "serve_feed_backing";
+
+/// The addresses each node read with v2 requests showed in its pass in
+/// progress: the node id and the address (no value).
+pub const SEEN_DB: &str = "serve_feed_seen";
 
 /// What a node answers a request of a kind it doesn't know (darwin-node's
 /// listings service): a node that answers a feed request so doesn't keep a
@@ -138,6 +163,10 @@ const UNSUPPORTED: &str = "unsupported";
 
 /// The entries a full page counts for against a node's allowance.
 const PAGE: usize = MAX_LIST_LIMIT as usize;
+
+/// How many rows are read at a time when a mirror or a table is scanned: a
+/// page's worth.
+const SCAN: usize = PAGE;
 
 /// An entry's bytes in [`ENTRIES_DB`], after the node id and address of the
 /// key: time, block number and log index (8 bytes each, big-endian), whether
@@ -297,18 +326,572 @@ pub struct PollReport {
     pub fell_back: usize,
     /// Pushes applied during the round.
     pub pushes: usize,
-    /// Addresses waiting to be settled after the round ([`Feeds::pending`]).
+    /// Addresses waiting to be settled after the round.
     pub pending: usize,
 }
 
-/// A node's mirror.
+/// The databases [`Feeds`] keeps the mirrors in.
+#[derive(Debug, Clone, Copy)]
+struct Dbs {
+    nodes: Database<Bytes, Bytes>,
+    entries: Database<Bytes, Bytes>,
+    held: Database<Bytes, Bytes>,
+    changed: Database<Bytes, Bytes>,
+    backing: Database<Bytes, Bytes>,
+    seen: Database<Bytes, Bytes>,
+}
+
+impl Dbs {
+    fn open(store: &ListingsStore) -> Result<Self> {
+        Ok(Self {
+            nodes: store.database(NODES_DB)?,
+            entries: store.database(ENTRIES_DB)?,
+            held: store.database(HELD_DB)?,
+            changed: store.database(CHANGED_DB)?,
+            backing: store.database(BACKING_DB)?,
+            seen: store.database(SEEN_DB)?,
+        })
+    }
+
+    /// `peer`'s entry for `address`.
+    fn entry(
+        &self,
+        txn: &RoTxn,
+        peer: &PeerId,
+        address: &XorName,
+    ) -> heed::Result<Option<DigestEntry>> {
+        Ok(self
+            .entries
+            .get(txn, &entry_key(peer, address))?
+            .and_then(|bytes| decode_entry(*address, bytes)))
+    }
+
+    /// Up to `limit` of the addresses `peer`'s mirror holds from `from`
+    /// through `through`, in order.
+    fn scan(
+        &self,
+        txn: &RoTxn,
+        peer: &PeerId,
+        from: Bound<XorName>,
+        through: &XorName,
+        limit: usize,
+    ) -> heed::Result<Vec<XorName>> {
+        let low = match from {
+            Bound::Included(address) => Bound::Included(entry_key(peer, &address)),
+            Bound::Excluded(address) => Bound::Excluded(entry_key(peer, &address)),
+            Bound::Unbounded => Bound::Included(entry_key(peer, &[0; 32])),
+        };
+        let high = entry_key(peer, through);
+        if match &low {
+            Bound::Included(low) => low > &high,
+            Bound::Excluded(low) => low >= &high,
+            Bound::Unbounded => false,
+        } {
+            return Ok(Vec::new());
+        }
+        let low = match &low {
+            Bound::Included(key) => Bound::Included(&key[..]),
+            Bound::Excluded(key) => Bound::Excluded(&key[..]),
+            Bound::Unbounded => Bound::Unbounded,
+        };
+        let range = (low, Bound::Included(&high[..]));
+        let mut addresses = Vec::new();
+        for row in self.entries.range(txn, &range)? {
+            if addresses.len() == limit {
+                break;
+            }
+            let (key, _) = row?;
+            if let Some((_, address)) = split_key(key) {
+                addresses.push(address);
+            }
+        }
+        Ok(addresses)
+    }
+
+    /// Every node whose mirror holds `address`, in id order.
+    fn holders(&self, txn: &RoTxn, address: &XorName) -> heed::Result<Vec<PeerId>> {
+        let mut holders = Vec::new();
+        for row in self.held.prefix_iter(txn, address)? {
+            let (key, _) = row?;
+            if let Some((_, peer)) = split_held(key) {
+                holders.push(peer);
+            }
+        }
+        Ok(holders)
+    }
+
+    /// Up to `limit` of the addresses some mirror holds, after `after` (or
+    /// from the first), each once, in order.
+    fn held_after(
+        &self,
+        txn: &RoTxn,
+        after: Option<&XorName>,
+        limit: usize,
+    ) -> heed::Result<Vec<XorName>> {
+        let mut addresses: Vec<XorName> = Vec::new();
+        // Past every row of an address: its id, then the largest node id.
+        let past = |address: &XorName| held_key(address, &PeerId::from_bytes([0xff; 32]));
+        let mut from: Option<[u8; 64]> = after.map(past);
+        while addresses.len() < limit {
+            let range = match &from {
+                Some(key) => (Bound::Excluded(&key[..]), Bound::Unbounded),
+                None => (Bound::Unbounded, Bound::Unbounded),
+            };
+            let Some(row) = self.held.range(txn, &range)?.next() else {
+                break;
+            };
+            let (key, _) = row?;
+            let Some((address, _)) = split_held(key) else {
+                break;
+            };
+            addresses.push(address);
+            from = Some(past(&address));
+        }
+        Ok(addresses)
+    }
+
+    /// Up to `limit` of the pending addresses after `after` (or from the
+    /// first), in order.
+    fn pending_after(
+        &self,
+        txn: &RoTxn,
+        after: Option<&XorName>,
+        limit: usize,
+    ) -> heed::Result<Vec<XorName>> {
+        let range = match after {
+            Some(after) => (Bound::Excluded(&after[..]), Bound::Unbounded),
+            None => (Bound::Unbounded, Bound::Unbounded),
+        };
+        let mut addresses = Vec::new();
+        for row in self.changed.range(txn, &range)? {
+            if addresses.len() == limit {
+                break;
+            }
+            let (key, _) = row?;
+            if let Ok(address) = XorName::try_from(key) {
+                addresses.push(address);
+            }
+        }
+        Ok(addresses)
+    }
+
+    /// Every node with rows in [`ENTRIES_DB`], in id order.
+    fn entry_peers(&self, txn: &RoTxn) -> heed::Result<Vec<PeerId>> {
+        let mut peers = Vec::new();
+        let mut from = [0u8; 64];
+        let mut first = true;
+        loop {
+            let range = if first {
+                (Bound::Included(&from[..]), Bound::Unbounded)
+            } else {
+                (Bound::Excluded(&from[..]), Bound::Unbounded)
+            };
+            let Some(row) = self.entries.range(txn, &range)?.next() else {
+                break;
+            };
+            let (key, _) = row?;
+            let Some((peer, _)) = split_key(key) else {
+                break;
+            };
+            peers.push(peer);
+            from = entry_key(&peer, &[0xff; 32]);
+            first = false;
+        }
+        Ok(peers)
+    }
+
+    /// The count and set hash of `peer`'s entries in `range`. Any outside
+    /// it are deleted, a chunk at a time, each chunk committed.
+    fn tally(
+        &self,
+        env: &heed::Env<heed::WithoutTls>,
+        peer: &PeerId,
+        range: AddressRange,
+    ) -> heed::Result<(u64, SetHash)> {
+        let mut count = 0;
+        let mut set_hash = SetHash::EMPTY;
+        let mut from = Bound::Unbounded;
+        loop {
+            let mut txn = env.write_txn()?;
+            let chunk = self.scan(&txn, peer, from, &[0xff; 32], SCAN)?;
+            let Some(last) = chunk.last().copied() else {
+                return Ok((count, set_hash));
+            };
+            for address in &chunk {
+                match self.entry(&txn, peer, address)? {
+                    Some(entry) if range.contains(address) => {
+                        count += 1;
+                        set_hash.insert(&entry);
+                    }
+                    _ => {
+                        self.entries.delete(&mut txn, &entry_key(peer, address))?;
+                        self.held.delete(&mut txn, &held_key(address, peer))?;
+                    }
+                }
+            }
+            txn.commit()?;
+            if chunk.len() < SCAN {
+                return Ok((count, set_hash));
+            }
+            from = Bound::Excluded(last);
+        }
+    }
+}
+
+/// Which nodes each backed address credits, and how many backed entries
+/// each node holds: what a node's allowance grows with. The nodes each
+/// address credits are in the store ([`BACKING_DB`]); only the counts, a
+/// number a node, are in memory.
+#[derive(Debug, Default)]
+struct Backing {
+    /// For each node, how many backed addresses credit it.
+    counts: HashMap<PeerId, usize>,
+    /// The nodes whose counts changed since they were last taken.
+    affected: BTreeSet<PeerId>,
+}
+
+impl Backing {
+    fn count(&self, peer: &PeerId) -> usize {
+        self.counts.get(peer).copied().unwrap_or(0)
+    }
+
+    /// Count `address` again from what the mirrors hold: the nodes among
+    /// its [`WALK_EARNING_RANKS`] nearest whose mirrors hold it, if at least
+    /// [`QUORUM_THRESHOLD`] of its [`NEAREST_NODES`] nearest do.
+    fn recount<C: NearestNodes + ?Sized>(
+        &mut self,
+        txn: &mut RwTxn,
+        dbs: Dbs,
+        census: &C,
+        address: &XorName,
+    ) -> heed::Result<()> {
+        let near = census.nearest(address, WALK_EARNING_RANKS);
+        let mut holds = Vec::with_capacity(near.len());
+        for peer in &near {
+            holds.push(dbs.entries.get(txn, &entry_key(peer, address))?.is_some());
+        }
+        let support = holds
+            .iter()
+            .take(NEAREST_NODES)
+            .filter(|held| **held)
+            .count();
+        let credited: Vec<PeerId> = if support >= QUORUM_THRESHOLD {
+            near.iter()
+                .zip(&holds)
+                .filter(|(_, held)| **held)
+                .map(|(peer, _)| *peer)
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let old: Vec<PeerId> = dbs
+            .backing
+            .get(txn, address)?
+            .map(decode_peers)
+            .unwrap_or_default();
+        if old == credited {
+            return Ok(());
+        }
+        for peer in &old {
+            if let Some(count) = self.counts.get_mut(peer) {
+                *count = count.saturating_sub(1);
+            }
+        }
+        for peer in &credited {
+            *self.counts.entry(*peer).or_default() += 1;
+        }
+        self.affected.extend(old.iter().chain(&credited).copied());
+        if credited.is_empty() {
+            dbs.backing.delete(txn, address)?;
+        } else {
+            dbs.backing.put(txn, address, &encode_peers(&credited))?;
+        }
+        Ok(())
+    }
+}
+
+/// One node's mirror in the store, as its [`MirrorSync`] or v2 read reads
+/// and writes it, in a write transaction: each address whose entry changes
+/// becomes pending and has its backing counted again.
+///
+/// Work that touches many addresses, such as emptying a mirror, is
+/// committed a chunk at a time ([`SCAN`] touched addresses), so a write
+/// transaction never holds more than a chunk of changes. The first such
+/// commit deletes the node's record, so a process stopped part way leaves
+/// a mirror without a record, which [`Feeds::open`] drops, and the node is
+/// read afresh; the caller writes the record again with what the work left
+/// ([`Self::finish`]). The first store error stops every later read and
+/// write, and the caller fails.
+struct StoreEntries<'a, C: ?Sized> {
+    env: &'a heed::Env<heed::WithoutTls>,
+    txn: Option<RwTxn<'a>>,
+    dbs: Dbs,
+    peer: PeerId,
+    census: &'a C,
+    backing: &'a mut Backing,
+    error: RefCell<Option<heed::Error>>,
+    /// Whether anything was written: an entry, or what a pass saw.
+    changed: bool,
+    /// Addresses touched since the last commit.
+    touched: usize,
+    /// Whether part of the work was committed, the node's record deleted.
+    checkpointed: bool,
+}
+
+/// What a [`StoreEntries`] did.
+#[derive(Debug, Clone, Copy)]
+struct Done {
+    /// Whether anything was written: an entry, or what a pass saw.
+    changed: bool,
+    /// Whether part of the work was committed, the node's record deleted.
+    checkpointed: bool,
+}
+
+impl<'a, C: NearestNodes + ?Sized> StoreEntries<'a, C> {
+    fn begin(
+        store: &'a ListingsStore,
+        dbs: Dbs,
+        peer: PeerId,
+        census: &'a C,
+        backing: &'a mut Backing,
+    ) -> Result<Self> {
+        let env = store.env();
+        let txn = env.write_txn().map_err(store_error)?;
+        Ok(Self {
+            env,
+            txn: Some(txn),
+            dbs,
+            peer,
+            census,
+            backing,
+            error: RefCell::new(None),
+            changed: false,
+            touched: 0,
+            checkpointed: false,
+        })
+    }
+
+    fn failed(&self) -> bool {
+        self.error.borrow().is_some() || self.txn.is_none()
+    }
+
+    fn fail(&self, error: heed::Error) {
+        let mut slot = self.error.borrow_mut();
+        if slot.is_none() {
+            *slot = Some(error);
+        }
+    }
+
+    /// The transaction, with what this has written in it, and what was
+    /// done; or the first store error, if one stopped this.
+    fn finish(self) -> Result<(RwTxn<'a>, Done)> {
+        if let Some(error) = self.error.into_inner() {
+            return Err(store_error(error));
+        }
+        let done = Done {
+            changed: self.changed,
+            checkpointed: self.checkpointed,
+        };
+        match self.txn {
+            Some(txn) => Ok((txn, done)),
+            None => Err(Error::Storage(
+                "listings store: a mirror's transaction was lost".into(),
+            )),
+        }
+    }
+
+    /// Commit what is written so far and go on in a new transaction, the
+    /// node's record deleted first (see the type's docs).
+    fn checkpoint(&mut self) {
+        let Some(mut txn) = self.txn.take() else {
+            return;
+        };
+        let committed = self
+            .dbs
+            .nodes
+            .delete(&mut txn, self.peer.as_bytes())
+            .and_then(|_| txn.commit());
+        match committed.and_then(|()| self.env.write_txn()) {
+            Ok(txn) => {
+                self.txn = Some(txn);
+                self.touched = 0;
+                self.checkpointed = true;
+            }
+            Err(e) => self.fail(e),
+        }
+    }
+
+    /// Note that a v2 pass in progress saw `address`.
+    fn see(&mut self, address: &XorName) {
+        if self.failed() {
+            return;
+        }
+        let Some(txn) = self.txn.as_mut() else {
+            return;
+        };
+        self.changed = true;
+        if let Err(e) = self.dbs.seen.put(txn, &entry_key(&self.peer, address), &[]) {
+            self.fail(e);
+        }
+    }
+
+    /// Whether the v2 pass in progress saw `address`.
+    fn seen(&self, address: &XorName) -> bool {
+        if self.failed() {
+            return false;
+        }
+        let Some(txn) = self.txn.as_ref() else {
+            return false;
+        };
+        match self.dbs.seen.get(txn, &entry_key(&self.peer, address)) {
+            Ok(seen) => seen.is_some(),
+            Err(e) => {
+                self.fail(e);
+                false
+            }
+        }
+    }
+
+    /// Forget what any pass of this node saw.
+    fn forget_seen(&mut self) {
+        if self.failed() {
+            return;
+        }
+        let Some(txn) = self.txn.as_mut() else {
+            return;
+        };
+        self.changed = true;
+        if let Err(e) = delete_prefix(txn, self.dbs.seen, self.peer.as_bytes()) {
+            self.fail(e);
+        }
+    }
+
+    /// Remove every entry of the mirror, each touched.
+    fn wipe(&mut self) {
+        loop {
+            let chunk = self.scan(Bound::Unbounded, [0xff; 32], SCAN);
+            if chunk.is_empty() || self.failed() {
+                break;
+            }
+            for address in &chunk {
+                self.delete(address);
+                self.touched(*address);
+            }
+        }
+        self.forget_seen();
+    }
+}
+
+impl<C: NearestNodes + ?Sized> Entries for StoreEntries<'_, C> {
+    fn get(&self, address: &XorName) -> Option<DigestEntry> {
+        if self.failed() {
+            return None;
+        }
+        let txn = self.txn.as_ref()?;
+        match self.dbs.entry(txn, &self.peer, address) {
+            Ok(entry) => entry,
+            Err(e) => {
+                self.fail(e);
+                None
+            }
+        }
+    }
+
+    fn insert(&mut self, entry: DigestEntry) {
+        if self.failed() {
+            return;
+        }
+        let Some(txn) = self.txn.as_mut() else {
+            return;
+        };
+        self.changed = true;
+        let key = entry_key(&self.peer, &entry.address);
+        let held = held_key(&entry.address, &self.peer);
+        let result = self
+            .dbs
+            .entries
+            .put(txn, &key, &encode_entry(&entry))
+            .and_then(|()| self.dbs.held.put(txn, &held, &[]));
+        if let Err(e) = result {
+            self.fail(e);
+        }
+    }
+
+    fn delete(&mut self, address: &XorName) {
+        if self.failed() {
+            return;
+        }
+        let Some(txn) = self.txn.as_mut() else {
+            return;
+        };
+        self.changed = true;
+        let key = entry_key(&self.peer, address);
+        let held = held_key(address, &self.peer);
+        let result = self
+            .dbs
+            .entries
+            .delete(txn, &key)
+            .and_then(|_| self.dbs.held.delete(txn, &held));
+        if let Err(e) = result {
+            self.fail(e);
+        }
+    }
+
+    fn scan(&self, from: Bound<XorName>, through: XorName, limit: usize) -> Vec<XorName> {
+        if self.failed() {
+            return Vec::new();
+        }
+        let Some(txn) = self.txn.as_ref() else {
+            return Vec::new();
+        };
+        match self.dbs.scan(txn, &self.peer, from, &through, limit) {
+            Ok(addresses) => addresses,
+            Err(e) => {
+                self.fail(e);
+                Vec::new()
+            }
+        }
+    }
+
+    fn touched(&mut self, address: XorName) {
+        if self.failed() {
+            return;
+        }
+        let Some(txn) = self.txn.as_mut() else {
+            return;
+        };
+        let result = self
+            .dbs
+            .changed
+            .put(txn, &address, &[])
+            .and_then(|()| self.backing.recount(txn, self.dbs, self.census, &address));
+        if let Err(e) = result {
+            self.fail(e);
+            return;
+        }
+        self.touched += 1;
+        if self.touched >= SCAN {
+            self.checkpoint();
+        }
+    }
+}
+
+/// A node's mirror: its place in its feed, or its v2 reads. Its entries are
+/// in the store.
 #[derive(Debug)]
 enum Mirror {
-    Feed(FeedSync),
+    Feed(MirrorSync),
     V2(V2Read),
 }
 
 impl Mirror {
+    fn new(kind: ReadKind, range: AddressRange) -> Self {
+        match kind {
+            ReadKind::Feed => Self::Feed(MirrorSync::new(range)),
+            ReadKind::V2 => Self::V2(V2Read::default()),
+        }
+    }
+
     fn kind(&self) -> ReadKind {
         match self {
             Self::Feed(_) => ReadKind::Feed,
@@ -316,24 +899,11 @@ impl Mirror {
         }
     }
 
-    fn get(&self, address: &XorName) -> Option<&DigestEntry> {
-        match self {
-            Self::Feed(sync) => sync.get(address),
-            Self::V2(read) => read.entries.get(address),
-        }
-    }
-
-    fn addresses(&self) -> Vec<XorName> {
-        match self {
-            Self::Feed(sync) => sync.entries().map(|entry| entry.address).collect(),
-            Self::V2(read) => read.entries.keys().copied().collect(),
-        }
-    }
-
-    fn len(&self) -> usize {
+    /// How many entries it holds.
+    fn len(&self) -> u64 {
         match self {
             Self::Feed(sync) => sync.len(),
-            Self::V2(read) => read.entries.len(),
+            Self::V2(read) => read.count,
         }
     }
 }
@@ -341,8 +911,8 @@ impl Mirror {
 /// A node read with listings v2 requests: one a round.
 #[derive(Debug, Default)]
 struct V2Read {
-    /// What its pages showed in its range, by address.
-    entries: BTreeMap<XorName, DigestEntry>,
+    /// How many entries its pages showed in its range.
+    count: u64,
     /// The newest key seen from it.
     newest: Option<ListingKey>,
     /// The pass in progress.
@@ -367,11 +937,11 @@ struct V2Read {
     problem: Option<String>,
 }
 
-/// A full pass of a node's index in progress.
+/// A full pass of a node's index in progress. What it has seen is in the
+/// store ([`SEEN_DB`]).
 #[derive(Debug)]
 struct Pass {
     cursor: ListingKey,
-    seen: HashSet<XorName>,
     pages: usize,
     /// Whether an entry in the node's range was left out for want of room.
     capped: bool,
@@ -399,7 +969,6 @@ impl V2Read {
         {
             self.pass = Some(Pass {
                 cursor: ListingKey::MIN,
-                seen: HashSet::new(),
                 pages: 0,
                 capped: false,
             });
@@ -420,21 +989,22 @@ impl V2Read {
     }
 
     /// The node's answer to this round's request, for a node asked about
-    /// `range` with `allowance` entries' worth of room. Returns the
-    /// addresses whose entries changed.
-    fn answer(
+    /// `range` with `allowance` entries' worth of room, applied to
+    /// `entries`. Each address whose entry changes is touched.
+    fn answer<C: NearestNodes + ?Sized>(
         &mut self,
         range: AddressRange,
         allowance: usize,
         answer: Option<ListingsBody>,
-    ) -> Vec<XorName> {
+        entries: &mut StoreEntries<'_, C>,
+    ) {
         let Some(from) = self.asked.take() else {
-            return Vec::new();
+            return;
         };
         let Some(ListingsBody::ListResponse { listings, more }) = answer else {
             // No answer, or a refusal: it doesn't count this round. A pass
             // carries on in the next.
-            return Vec::new();
+            return;
         };
         let next = match check_list_page(from, MAX_LIST_LIMIT, &listings, more) {
             Ok(next) => next,
@@ -442,11 +1012,15 @@ impl V2Read {
                 self.problem = Some(e.to_string());
                 // Its pass can't be trusted to have seen everything.
                 self.pass = None;
-                return Vec::new();
+                return;
             }
         };
         self.answered = true;
-        let mut touched = Vec::new();
+        if self.pass.as_ref().is_some_and(|pass| pass.pages == 0) {
+            // A new pass: what an earlier one saw doesn't count.
+            entries.forget_seen();
+        }
+        let room = u64::try_from(allowance).unwrap_or(u64::MAX);
         let mut capped = false;
         for listing in &listings {
             let key = listing.key();
@@ -455,16 +1029,21 @@ impl V2Read {
                 continue;
             }
             let address = listing.address;
-            if let Some(pass) = self.pass.as_mut() {
-                pass.seen.insert(address);
+            if self.pass.is_some() {
+                entries.see(&address);
             }
-            if !self.entries.contains_key(&address) && self.entries.len() >= allowance {
+            let held = entries.get(&address);
+            if held.is_none() && self.count >= room {
                 capped = true;
                 continue;
             }
             let entry = DigestEntry::new(listing);
-            if self.entries.insert(address, entry) != Some(entry) {
-                touched.push(address);
+            if held != Some(entry) {
+                if held.is_none() {
+                    self.count += 1;
+                }
+                entries.insert(entry);
+                entries.touched(address);
             }
         }
         match self.pass.as_mut() {
@@ -474,18 +1053,10 @@ impl V2Read {
                 match next {
                     None => {
                         let Some(pass) = self.pass.take() else {
-                            return touched;
+                            return;
                         };
-                        let gone: Vec<XorName> = self
-                            .entries
-                            .keys()
-                            .filter(|address| !pass.seen.contains(*address))
-                            .copied()
-                            .collect();
-                        for address in gone {
-                            self.entries.remove(&address);
-                            touched.push(address);
-                        }
+                        self.drop_unseen(entries);
+                        entries.forget_seen();
                         self.complete = !pass.capped;
                         self.finished_began = self.pass_began;
                         self.cursor = None;
@@ -505,30 +1076,63 @@ impl V2Read {
                 self.cursor = next;
             }
         }
-        touched
     }
 
-    /// Follow `range` instead of `old`: entries outside it leave, and if it
-    /// reaches outside `old`, the mirror is complete again only after a
-    /// pass. Returns the addresses that left.
-    fn rescope(&mut self, old: AddressRange, range: AddressRange) -> Vec<XorName> {
+    /// At the end of a pass that reached the end of the node's index: every
+    /// entry the pass didn't see leaves, touched.
+    fn drop_unseen<C: NearestNodes + ?Sized>(&mut self, entries: &mut StoreEntries<'_, C>) {
+        let mut from = Bound::Unbounded;
+        loop {
+            let chunk = entries.scan(from, [0xff; 32], SCAN);
+            let Some(&last) = chunk.last() else {
+                break;
+            };
+            for address in &chunk {
+                if !entries.seen(address) {
+                    entries.delete(address);
+                    entries.touched(*address);
+                    self.count = self.count.saturating_sub(1);
+                }
+            }
+            if chunk.len() < SCAN || entries.failed() {
+                break;
+            }
+            from = Bound::Excluded(last);
+        }
+    }
+
+    /// Follow `range` instead of `old`: entries outside it leave, touched,
+    /// and if it reaches outside `old`, the mirror is complete again only
+    /// after a pass.
+    fn rescope<C: NearestNodes + ?Sized>(
+        &mut self,
+        old: AddressRange,
+        range: AddressRange,
+        entries: &mut StoreEntries<'_, C>,
+    ) {
         if !old.covers(&range) {
             self.complete = false;
         }
-        let outside: Vec<XorName> = self
-            .entries
-            .keys()
-            .filter(|address| !range.contains(address))
-            .copied()
-            .collect();
-        for address in &outside {
-            self.entries.remove(address);
+        let mut from = Bound::Unbounded;
+        loop {
+            let chunk = entries.scan(from, [0xff; 32], SCAN);
+            let Some(&last) = chunk.last() else {
+                break;
+            };
+            for address in chunk.iter().filter(|address| !range.contains(address)) {
+                entries.delete(address);
+                entries.touched(*address);
+                self.count = self.count.saturating_sub(1);
+            }
+            if chunk.len() < SCAN || entries.failed() {
+                break;
+            }
+            from = Bound::Excluded(last);
         }
-        outside
     }
 }
 
-/// One census node's state.
+/// One census node's state. Its entries are in the store.
 #[derive(Debug)]
 struct NodeState {
     range: AddressRange,
@@ -546,21 +1150,15 @@ struct NodeState {
     answered: bool,
     /// Whether it has answered a feed request since this process began.
     feed_answered: bool,
-    /// Addresses whose entries changed since the last save.
-    dirty: BTreeSet<XorName>,
-    /// Whether its record changed since the last save.
-    meta_dirty: bool,
+    /// Its record as the store holds it, if known.
+    written: Option<NodeRecord>,
 }
 
 impl NodeState {
     fn new(range: AddressRange, kind: ReadKind) -> Self {
-        let mirror = match kind {
-            ReadKind::Feed => Mirror::Feed(FeedSync::new(range)),
-            ReadKind::V2 => Mirror::V2(V2Read::default()),
-        };
         Self {
             range,
-            mirror,
+            mirror: Mirror::new(kind, range),
             want_peers: false,
             claims_feed: kind == ReadKind::Feed,
             feed_refused_at: None,
@@ -568,8 +1166,7 @@ impl NodeState {
             read: NodeRead::new(kind),
             answered: false,
             feed_answered: false,
-            dirty: BTreeSet::new(),
-            meta_dirty: true,
+            written: None,
         }
     }
 
@@ -582,30 +1179,29 @@ impl NodeState {
             .is_none_or(|at| now >= at.saturating_add(V2_PASS_INTERVAL.as_secs()))
     }
 
-    /// Read it the `kind` way from now on, with an empty mirror. Returns the
-    /// addresses its old mirror held.
-    fn switch(&mut self, kind: ReadKind) -> Vec<XorName> {
-        let touched = self.mirror.addresses();
-        self.mirror = match kind {
-            ReadKind::Feed => Mirror::Feed(FeedSync::new(self.range)),
-            ReadKind::V2 => Mirror::V2(V2Read::default()),
-        };
-        self.dirty.extend(touched.iter().copied());
-        self.meta_dirty = true;
-        touched
+    /// Read it the `kind` way from now on, with an empty mirror: every
+    /// entry its old mirror held leaves, touched.
+    fn switch<C: NearestNodes + ?Sized>(
+        &mut self,
+        kind: ReadKind,
+        entries: &mut StoreEntries<'_, C>,
+    ) {
+        entries.wipe();
+        self.mirror = Mirror::new(kind, self.range);
     }
 
-    /// Follow `range` instead. Returns the addresses whose entries left.
-    fn rescope(&mut self, range: AddressRange) -> Vec<XorName> {
+    /// Follow `range` instead: the entries outside it leave, touched.
+    fn rescope<C: NearestNodes + ?Sized>(
+        &mut self,
+        range: AddressRange,
+        entries: &mut StoreEntries<'_, C>,
+    ) {
         let old = self.range;
         self.range = range;
-        self.meta_dirty = true;
-        let touched = match &mut self.mirror {
-            Mirror::Feed(sync) => sync.rescope(range),
-            Mirror::V2(read) => read.rescope(old, range),
-        };
-        self.dirty.extend(touched.iter().copied());
-        touched
+        match &mut self.mirror {
+            Mirror::Feed(sync) => sync.rescope(range, entries),
+            Mirror::V2(read) => read.rescope(old, range, entries),
+        }
     }
 
     fn set_backed(&mut self, backed: usize) {
@@ -634,15 +1230,15 @@ impl NodeState {
         }
     }
 
-    /// Take the node's answer (`None`: it didn't answer in time). Returns
-    /// the addresses whose entries changed, and whether it has another
-    /// request to send this round.
-    fn take_answer(
+    /// Take the node's answer (`None`: it didn't answer in time), applied to
+    /// `entries`. Returns whether it has another request to send this round.
+    fn take_answer<C: NearestNodes + ?Sized>(
         &mut self,
         answer: Option<ListingsBody>,
         now: u64,
         allowance: usize,
-    ) -> (Vec<XorName>, bool) {
+        entries: &mut StoreEntries<'_, C>,
+    ) -> bool {
         if matches!(
             &answer,
             Some(body) if !matches!(body, ListingsBody::Error { .. })
@@ -657,49 +1253,41 @@ impl NodeState {
                     Some(ListingsBody::Error { message }) if message == UNSUPPORTED
                 );
                 self.feed_answered |= self.answered;
-                let touched = match answer {
-                    Some(body) if !refused => sync.answer(body),
-                    _ => {
-                        sync.no_answer();
-                        Vec::new()
-                    }
-                };
-                self.meta_dirty = true;
-                self.dirty.extend(touched.iter().copied());
+                match answer {
+                    Some(body) if !refused => sync.answer(body, entries),
+                    _ => sync.no_answer(),
+                }
                 // A node never heard from through its feed, with nothing
                 // kept of it, may not keep one: older nodes drop a request
                 // they don't know.
                 let never_followed = !self.feed_answered && sync.epoch() == 0 && sync.is_empty();
                 let silent = sync.outcome() == Some(FeedOutcome::NoAnswer) && never_followed;
                 if refused || silent {
-                    let mut touched = touched;
-                    touched.extend(self.fall_back(now));
-                    return (touched, true);
+                    self.fall_back(now, entries);
+                    return true;
                 }
-                (touched, !sync.idle())
+                !sync.idle()
             }
             Mirror::V2(read) => {
-                let touched = read.answer(range, allowance, answer);
-                self.meta_dirty = true;
-                self.dirty.extend(touched.iter().copied());
-                (touched, false)
+                read.answer(range, allowance, answer, entries);
+                false
             }
         }
     }
 
     /// Read it with v2 requests from now on, as one that doesn't keep a
-    /// feed, until [`V2_PASS_INTERVAL`] has passed. Returns the addresses its
-    /// feed mirror held.
-    fn fall_back(&mut self, now: u64) -> Vec<XorName> {
+    /// feed, until [`V2_PASS_INTERVAL`] has passed: its feed mirror's
+    /// entries leave, touched.
+    fn fall_back<C: NearestNodes + ?Sized>(&mut self, now: u64, entries: &mut StoreEntries<'_, C>) {
         debug!("Reading a node that claims the feed release with listings v2 requests");
         self.feed_refused_at = Some(now);
-        self.switch(ReadKind::V2)
+        self.switch(ReadKind::V2, entries);
     }
 
     /// End the round: how it went.
     fn end_round(&mut self) {
         let fell_back = self.claims_feed && self.mirror.kind() == ReadKind::V2;
-        let entries = self.mirror.len();
+        let entries = usize::try_from(self.mirror.len()).unwrap_or(usize::MAX);
         self.read = match &mut self.mirror {
             Mirror::Feed(sync) => {
                 sync.stop();
@@ -736,9 +1324,13 @@ impl NodeState {
     }
 
     fn record(&self) -> NodeRecord {
-        let (epoch, head) = match &self.mirror {
-            Mirror::Feed(sync) => (sync.epoch(), sync.head()),
-            Mirror::V2(_) => (0, 0),
+        let (epoch, head, set_hash) = match &self.mirror {
+            Mirror::Feed(sync) => (
+                sync.epoch(),
+                sync.head(),
+                Some(hex::encode(sync.set_hash().to_bytes())),
+            ),
+            Mirror::V2(_) => (0, 0, None),
         };
         let v2 = match &self.mirror {
             Mirror::V2(read) => Some(V2Record {
@@ -758,6 +1350,8 @@ impl NodeState {
             head,
             feed_refused_at: self.feed_refused_at,
             v2,
+            count: Some(self.mirror.len()),
+            set_hash,
         }
     }
 }
@@ -777,6 +1371,15 @@ struct NodeRecord {
     /// For a node read with v2 requests.
     #[serde(default)]
     v2: Option<V2Record>,
+    /// How many entries the mirror holds, as written with them. A record
+    /// without it (or, for a feed mirror, without `set_hash`) is counted
+    /// again from the entries when the store opens.
+    #[serde(default)]
+    count: Option<u64>,
+    /// For a node read through its feed, the set hash of its entries, in
+    /// hex.
+    #[serde(default)]
+    set_hash: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -791,11 +1394,29 @@ struct V2Record {
 }
 
 impl NodeRecord {
-    /// The node's state, with `entries` as its mirror. `None` if the record
-    /// can't be read.
-    fn state(&self, entries: Vec<DigestEntry>) -> Option<NodeState> {
+    /// Its range, if the record can be read.
+    fn range(&self) -> Option<AddressRange> {
         let prefix: XorName = hex::decode(&self.prefix).ok()?.try_into().ok()?;
-        let range = AddressRange::new(prefix, self.bits);
+        Some(AddressRange::new(prefix, self.bits))
+    }
+
+    /// Its count and set hash, if the record has them.
+    fn totals(&self) -> Option<(u64, SetHash)> {
+        let count = self.count?;
+        let set_hash = match self.kind {
+            ReadKind::Feed => {
+                let bytes: [u8; 32] = hex::decode(self.set_hash.as_ref()?).ok()?.try_into().ok()?;
+                SetHash::from_bytes(bytes)
+            }
+            ReadKind::V2 => SetHash::EMPTY,
+        };
+        Some((count, set_hash))
+    }
+
+    /// The node's state, with a mirror of `count` entries with `set_hash`.
+    /// `None` if the record can't be read.
+    fn state(&self, count: u64, set_hash: SetHash) -> Option<NodeState> {
+        let range = self.range()?;
         let key = |hex_key: &Option<String>| -> Option<Option<ListingKey>> {
             match hex_key {
                 None => Some(None),
@@ -803,15 +1424,13 @@ impl NodeRecord {
             }
         };
         let mirror = match self.kind {
-            ReadKind::Feed => Mirror::Feed(FeedSync::resume(range, self.epoch, self.head, entries)),
+            ReadKind::Feed => Mirror::Feed(MirrorSync::resume(
+                range, self.epoch, self.head, count, set_hash,
+            )),
             ReadKind::V2 => {
                 let record = self.v2.clone()?;
                 Mirror::V2(V2Read {
-                    entries: entries
-                        .into_iter()
-                        .filter(|entry| range.contains(&entry.address))
-                        .map(|entry| (entry.address, entry))
-                        .collect(),
+                    count,
                     newest: key(&record.newest)?,
                     pass_began: record.pass_began,
                     finished_began: record.finished_began,
@@ -833,74 +1452,8 @@ impl NodeRecord {
             counted: false,
             answered: false,
             feed_answered: false,
-            dirty: BTreeSet::new(),
-            meta_dirty: false,
+            written: Some(self.clone()),
         })
-    }
-}
-
-/// Which nodes each backed address credits, and how many backed entries
-/// each node holds: what a node's allowance grows with.
-#[derive(Debug, Default)]
-struct Backing {
-    /// For each backed address, the nodes among its
-    /// [`WALK_EARNING_RANKS`] nearest whose mirrors hold it.
-    credited: HashMap<XorName, Vec<PeerId>>,
-    /// For each node, how many backed addresses credit it.
-    counts: HashMap<PeerId, usize>,
-}
-
-impl Backing {
-    fn count(&self, peer: &PeerId) -> usize {
-        self.counts.get(peer).copied().unwrap_or(0)
-    }
-
-    /// Count `address` again from what the mirrors in `nodes` hold. Returns
-    /// the nodes whose counts changed.
-    fn recount<C: NearestNodes + ?Sized>(
-        &mut self,
-        census: &C,
-        nodes: &BTreeMap<PeerId, NodeState>,
-        address: &XorName,
-    ) -> Vec<PeerId> {
-        let near = census.nearest(address, WALK_EARNING_RANKS);
-        let holds = |peer: &PeerId| {
-            nodes
-                .get(peer)
-                .is_some_and(|node| node.mirror.get(address).is_some())
-        };
-        let support = near
-            .iter()
-            .take(NEAREST_NODES)
-            .filter(|&peer| holds(peer))
-            .count();
-        let credited: Vec<PeerId> = if support >= QUORUM_THRESHOLD {
-            near.iter().filter(|&peer| holds(peer)).copied().collect()
-        } else {
-            Vec::new()
-        };
-        let old = self.credited.remove(address).unwrap_or_default();
-        if old == credited {
-            if !credited.is_empty() {
-                self.credited.insert(*address, credited);
-            }
-            return Vec::new();
-        }
-        for peer in &old {
-            if let Some(count) = self.counts.get_mut(peer) {
-                *count = count.saturating_sub(1);
-            }
-        }
-        for peer in &credited {
-            *self.counts.entry(*peer).or_default() += 1;
-        }
-        let mut changed: Vec<PeerId> = old.into_iter().chain(credited.iter().copied()).collect();
-        changed.sort_unstable();
-        changed.dedup();
-        if !credited.is_empty() {
-            self.credited.insert(*address, credited);
-        }
-        changed
     }
 }
 
@@ -913,16 +1466,8 @@ fn allowance(backed: usize) -> usize {
 /// The mirrors of every census node. See the module docs.
 pub struct Feeds {
     store: ListingsStore,
-    nodes_db: Database<Bytes, Bytes>,
-    entries_db: Database<Bytes, Bytes>,
-    changed_db: Database<Bytes, Bytes>,
+    dbs: Dbs,
     nodes: BTreeMap<PeerId, NodeState>,
-    /// Nodes whose rows go at the next save.
-    removed: BTreeSet<PeerId>,
-    /// Addresses whose copies changed and that are not settled yet.
-    pending: BTreeSet<XorName>,
-    /// Those added since the last save.
-    pending_new: BTreeSet<XorName>,
     backing: Backing,
     /// The nodes the backing was counted with, in id order.
     members: Option<Vec<PeerId>>,
@@ -935,88 +1480,103 @@ impl std::fmt::Debug for Feeds {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Feeds")
             .field("nodes", &self.nodes.len())
-            .field("pending", &self.pending.len())
             .finish_non_exhaustive()
     }
 }
 
 impl Feeds {
-    /// The mirrors kept in `store`: none the first time.
+    /// The mirrors kept in `store`: none the first time. A node's record
+    /// this version can't read is dropped with its entries, and the node
+    /// read afresh; one without its count and set hash has them counted
+    /// again from its entries.
     ///
     /// # Errors
     ///
-    /// If its databases can't be opened or read. A row this version can't
-    /// read is dropped, and that node read afresh.
+    /// If its databases can't be opened, read or written.
     pub fn open(store: &ListingsStore) -> Result<Self> {
-        let nodes_db: Database<Bytes, Bytes> = store.database(NODES_DB)?;
-        let entries_db: Database<Bytes, Bytes> = store.database(ENTRIES_DB)?;
-        let changed_db: Database<Bytes, Bytes> = store.database(CHANGED_DB)?;
-        let txn = store.env().read_txn().map_err(store_error)?;
+        let dbs = Dbs::open(store)?;
+        let env = store.env();
         let mut records: BTreeMap<PeerId, NodeRecord> = BTreeMap::new();
-        let mut removed = BTreeSet::new();
-        for row in nodes_db.iter(&txn).map_err(store_error)? {
-            let (key, value) = row.map_err(store_error)?;
-            let Ok(id) = <[u8; 32]>::try_from(key) else {
-                continue;
-            };
-            let peer = PeerId::from_bytes(id);
-            match serde_json::from_slice::<NodeRecord>(value) {
-                Ok(record) => {
-                    records.insert(peer, record);
+        let mut dropped: Vec<PeerId> = Vec::new();
+        {
+            let txn = env.read_txn().map_err(store_error)?;
+            for row in dbs.nodes.iter(&txn).map_err(store_error)? {
+                let (key, value) = row.map_err(store_error)?;
+                let Ok(id) = <[u8; 32]>::try_from(key) else {
+                    continue;
+                };
+                let peer = PeerId::from_bytes(id);
+                match serde_json::from_slice::<NodeRecord>(value) {
+                    Ok(record) if record.range().is_some() => {
+                        records.insert(peer, record);
+                    }
+                    Ok(_) => dropped.push(peer),
+                    Err(e) => {
+                        debug!("Dropping an unreadable mirror record for {peer}: {e}");
+                        dropped.push(peer);
+                    }
                 }
-                Err(e) => {
-                    debug!("Dropping an unreadable mirror record for {peer}: {e}");
-                    removed.insert(peer);
+            }
+            // Entries of nodes without a record go.
+            for peer in dbs.entry_peers(&txn).map_err(store_error)? {
+                if !records.contains_key(&peer) && !dropped.contains(&peer) {
+                    dropped.push(peer);
                 }
             }
         }
-        let mut entries: HashMap<PeerId, Vec<DigestEntry>> = HashMap::new();
-        for row in entries_db.iter(&txn).map_err(store_error)? {
-            let (key, value) = row.map_err(store_error)?;
-            let Some((peer, address)) = split_key(key) else {
-                continue;
-            };
-            if !records.contains_key(&peer) {
-                removed.insert(peer);
-                continue;
-            }
-            if let Some(entry) = decode_entry(address, value) {
-                entries.entry(peer).or_default().push(entry);
-            }
+        for peer in &dropped {
+            let mut txn = env.write_txn().map_err(store_error)?;
+            dbs.nodes
+                .delete(&mut txn, peer.as_bytes())
+                .map_err(store_error)?;
+            txn.commit().map_err(store_error)?;
+            drop_entries(env, dbs, peer).map_err(store_error)?;
         }
-        let mut pending = BTreeSet::new();
-        for row in changed_db.iter(&txn).map_err(store_error)? {
-            let (key, _) = row.map_err(store_error)?;
-            if let Ok(address) = XorName::try_from(key) {
-                pending.insert(address);
-            }
-        }
-        drop(txn);
+        index_held(env, dbs).map_err(store_error)?;
         let mut nodes = BTreeMap::new();
         for (peer, record) in records {
-            let held = entries.remove(&peer).unwrap_or_default();
-            match record.state(held) {
-                Some(state) => {
+            let (totals, recounted) = match record.totals() {
+                Some(totals) => (totals, false),
+                None => {
+                    let Some(range) = record.range() else {
+                        continue;
+                    };
+                    debug!("Counting the kept mirror of {peer} again");
+                    (dbs.tally(env, &peer, range).map_err(store_error)?, true)
+                }
+            };
+            match record.state(totals.0, totals.1) {
+                Some(mut state) => {
+                    if recounted {
+                        // Written again, with its count and set hash.
+                        state.written = None;
+                    }
                     nodes.insert(peer, state);
                 }
                 None => {
-                    removed.insert(peer);
+                    let mut txn = env.write_txn().map_err(store_error)?;
+                    dbs.nodes
+                        .delete(&mut txn, peer.as_bytes())
+                        .map_err(store_error)?;
+                    txn.commit().map_err(store_error)?;
+                    drop_entries(env, dbs, &peer).map_err(store_error)?;
                 }
             }
         }
-        Ok(Self {
+        // Each node's backing is counted again at the first poll.
+        let mut txn = env.write_txn().map_err(store_error)?;
+        dbs.backing.clear(&mut txn).map_err(store_error)?;
+        txn.commit().map_err(store_error)?;
+        let mut feeds = Self {
             store: store.clone(),
-            nodes_db,
-            entries_db,
-            changed_db,
+            dbs,
             nodes,
-            removed,
-            pending,
-            pending_new: BTreeSet::new(),
             backing: Backing::default(),
             members: None,
             round_at: 0,
-        })
+        };
+        feeds.save()?;
+        Ok(feeds)
     }
 
     /// Read every node of `nodes` once, as the cycle's poll: see the module
@@ -1026,12 +1586,12 @@ impl Feeds {
     /// come. Nodes not in `nodes` leave, with their mirrors; `census` says
     /// which nodes are nearest an address, for the nodes' allowances. Pass
     /// every census node: a change in who is passed counts every address's
-    /// backing again. `now` is the cycle's time (Unix seconds). The mirrors
-    /// are saved at the end.
+    /// backing again. `now` is the cycle's time (Unix seconds). Each answer
+    /// is written to the store as it is taken.
     ///
     /// # Errors
     ///
-    /// If the store can't be written. Nodes that fail are no error.
+    /// If the store can't be read or written. Nodes that fail are no error.
     pub async fn poll<I, C>(
         &mut self,
         io: &I,
@@ -1046,7 +1606,7 @@ impl Feeds {
         C: NearestNodes + ?Sized,
     {
         self.round_at = now;
-        self.reconcile(census, nodes, now);
+        self.reconcile(census, nodes, now)?;
         let peers: Vec<PeerId> = self.nodes.keys().copied().collect();
         for peer in &peers {
             let backed = self.backing.count(peer);
@@ -1085,13 +1645,13 @@ impl Feeds {
                     break;
                 }
                 Some((peer, answer)) = running.next() => {
-                    if self.take_answer(census, &peer, answer, now) {
+                    if self.take_answer(census, &peer, answer, now)? {
                         ready.push_back(peer);
                     }
                 }
                 push = next_push(&mut pushes), if pushes_open => match push {
                     Some((source, push)) => {
-                        if matches!(self.push(census, &source, &push), Pushed::Applied(_)) {
+                        if matches!(self.push(census, &source, &push)?, Pushed::Applied(_)) {
                             pushed += 1;
                         }
                     }
@@ -1100,7 +1660,7 @@ impl Feeds {
             }
         }
         drop(running);
-        let report = self.end_round(pushed);
+        let report = self.end_round(pushed)?;
         self.save()?;
         Ok(report)
     }
@@ -1108,124 +1668,151 @@ impl Feeds {
     /// Take a push from `peer`'s watch, routed between polls: applied if
     /// `peer` is read through its feed and the push brings its mirror
     /// exactly to the push's head, within its allowance (see
-    /// [`FeedSync::push`]). The addresses it changes join
-    /// [`Self::pending`]. `peer` must be the node the push came from, as the
-    /// transport gives it. Call [`Self::save`] once the pushes at hand are
-    /// handled.
+    /// [`MirrorSync::push`]). The addresses it changes become pending, in
+    /// the store at once. `peer` must be the node the push came from, as the
+    /// transport gives it.
+    ///
+    /// # Errors
+    ///
+    /// If the store can't be read or written.
     pub fn push<C: NearestNodes + ?Sized>(
         &mut self,
         census: &C,
         peer: &PeerId,
         push: &ChangesResponse,
-    ) -> Pushed {
-        let Some(node) = self.nodes.get_mut(peer) else {
-            return Pushed::Ignored;
+    ) -> Result<Pushed> {
+        let Self {
+            store,
+            dbs,
+            nodes,
+            backing,
+            ..
+        } = self;
+        let Some(node) = nodes.get_mut(peer) else {
+            return Ok(Pushed::Ignored);
         };
         let Mirror::Feed(sync) = &mut node.mirror else {
-            return Pushed::Ignored;
+            return Ok(Pushed::Ignored);
         };
-        let pushed = sync.push(push);
-        if let Pushed::Applied(touched) = &pushed {
-            node.meta_dirty = true;
-            node.dirty.extend(touched.iter().copied());
-            self.note_touched(census, touched);
-        }
-        pushed
+        let mut entries = StoreEntries::begin(store, *dbs, *peer, census, backing)?;
+        let pushed = sync.push(push, &mut entries);
+        let (txn, done) = entries.finish()?;
+        commit_node(txn, done, *dbs, peer, node)?;
+        self.apply_backing();
+        Ok(pushed)
     }
 
-    /// Write what changed since the last save, in one transaction.
+    /// Write the records of the nodes that changed since they were last
+    /// written, in one transaction. Each answer and push already wrote its
+    /// node's; this writes what changed without one, such as the start of a
+    /// v2 pass.
     ///
     /// # Errors
     ///
-    /// If the store can't be written; what changed is kept for the next
+    /// If the store can't be written; what changed is written at the next
     /// save.
     pub fn save(&mut self) -> Result<()> {
+        if self
+            .nodes
+            .values()
+            .all(|node| node.written.as_ref() == Some(&node.record()))
+        {
+            return Ok(());
+        }
         let mut txn = self.store.env().write_txn().map_err(store_error)?;
-        for peer in &self.removed {
-            self.nodes_db
-                .delete(&mut txn, peer.as_bytes())
-                .map_err(store_error)?;
-            let keys: Vec<Vec<u8>> = self
-                .entries_db
-                .prefix_iter(&txn, peer.as_bytes())
-                .map_err(store_error)?
-                .map(|row| row.map(|(key, _)| key.to_vec()))
-                .collect::<std::result::Result<_, _>>()
-                .map_err(store_error)?;
-            for key in keys {
-                self.entries_db
-                    .delete(&mut txn, &key)
-                    .map_err(store_error)?;
-            }
-        }
+        let mut written = Vec::new();
         for (peer, node) in &self.nodes {
-            if node.meta_dirty {
-                let record = serde_json::to_vec(&node.record()).map_err(|e| {
-                    crate::data::error::Error::Serialization(format!("mirror record: {e}"))
-                })?;
-                self.nodes_db
-                    .put(&mut txn, peer.as_bytes(), &record)
-                    .map_err(store_error)?;
+            let record = node.record();
+            if node.written.as_ref() != Some(&record) {
+                put_record(&mut txn, self.dbs, peer, &record)?;
+                written.push((*peer, record));
             }
-            for address in &node.dirty {
-                let key = entry_key(peer, address);
-                match node.mirror.get(address) {
-                    Some(entry) => self
-                        .entries_db
-                        .put(&mut txn, &key, &encode_entry(entry))
-                        .map_err(store_error)?,
-                    None => {
-                        self.entries_db
-                            .delete(&mut txn, &key)
-                            .map_err(store_error)?;
-                    }
-                }
-            }
-        }
-        for address in &self.pending_new {
-            self.changed_db
-                .put(&mut txn, address, &[])
-                .map_err(store_error)?;
         }
         txn.commit().map_err(store_error)?;
-        self.removed.clear();
-        self.pending_new.clear();
-        for node in self.nodes.values_mut() {
-            node.meta_dirty = false;
-            node.dirty.clear();
+        for (peer, record) in written {
+            if let Some(node) = self.nodes.get_mut(&peer) {
+                node.written = Some(record);
+            }
         }
         Ok(())
     }
 
-    /// The addresses whose copies changed since they were last settled: in
-    /// a node's mirror, or by a node's copies starting or ceasing to count.
-    /// Decide these, and settle them once published ([`Self::settle`]).
-    #[must_use]
-    pub fn pending(&self) -> &BTreeSet<XorName> {
-        &self.pending
+    /// Up to `limit` of the addresses whose copies changed since they were
+    /// last settled, after `after` (or from the first), in address order: in
+    /// a node's mirror, by a node's copies starting or ceasing to count, or
+    /// marked ([`Self::mark_pending`]). Decide these, and settle them once
+    /// published ([`Self::settle`]).
+    ///
+    /// # Errors
+    ///
+    /// If the store can't be read.
+    pub fn pending_after(&self, after: Option<&XorName>, limit: usize) -> Result<Vec<XorName>> {
+        let txn = self.store.env().read_txn().map_err(store_error)?;
+        self.dbs
+            .pending_after(&txn, after, limit)
+            .map_err(store_error)
     }
 
-    /// Note that what was decided from `addresses` is published: they leave
-    /// [`Self::pending`] until their copies change again.
+    /// Whether `address` is pending ([`Self::pending_after`]).
+    ///
+    /// # Errors
+    ///
+    /// If the store can't be read.
+    pub fn is_pending(&self, address: &XorName) -> Result<bool> {
+        let txn = self.store.env().read_txn().map_err(store_error)?;
+        Ok(self
+            .dbs
+            .changed
+            .get(&txn, address)
+            .map_err(store_error)?
+            .is_some())
+    }
+
+    /// How many addresses are pending.
+    ///
+    /// # Errors
+    ///
+    /// If the store can't be read.
+    pub fn pending_count(&self) -> Result<u64> {
+        let txn = self.store.env().read_txn().map_err(store_error)?;
+        self.dbs.changed.len(&txn).map_err(store_error)
+    }
+
+    /// Make `addresses` pending, to be decided, as when the nodes nearest
+    /// them changed.
+    ///
+    /// # Errors
+    ///
+    /// If the store can't be written.
+    pub fn mark_pending<'a>(
+        &mut self,
+        addresses: impl IntoIterator<Item = &'a XorName>,
+    ) -> Result<()> {
+        let mut txn = self.store.env().write_txn().map_err(store_error)?;
+        for address in addresses {
+            self.dbs
+                .changed
+                .put(&mut txn, address, &[])
+                .map_err(store_error)?;
+        }
+        txn.commit().map_err(store_error)
+    }
+
+    /// Note that what was decided from `addresses` is published: they stop
+    /// being pending until their copies change again.
     ///
     /// # Errors
     ///
     /// If the store can't be written.
     pub fn settle<'a>(&mut self, addresses: impl IntoIterator<Item = &'a XorName>) -> Result<()> {
         let mut txn = self.store.env().write_txn().map_err(store_error)?;
-        let mut settled = Vec::new();
         for address in addresses {
-            self.changed_db
+            self.dbs
+                .changed
                 .delete(&mut txn, address)
                 .map_err(store_error)?;
-            settled.push(*address);
         }
-        txn.commit().map_err(store_error)?;
-        for address in settled {
-            self.pending.remove(&address);
-            self.pending_new.remove(&address);
-        }
-        Ok(())
+        txn.commit().map_err(store_error)
     }
 
     /// How `peer`'s latest round went, if it is followed.
@@ -1235,36 +1822,78 @@ impl Feeds {
     }
 
     /// The entry `peer`'s mirror holds for `address`, counting or not.
-    #[must_use]
-    pub fn entry(&self, peer: &PeerId, address: &XorName) -> Option<&DigestEntry> {
-        self.nodes.get(peer)?.mirror.get(address)
+    ///
+    /// # Errors
+    ///
+    /// If the store can't be read.
+    pub fn entry(&self, peer: &PeerId, address: &XorName) -> Result<Option<DigestEntry>> {
+        let txn = self.store.env().read_txn().map_err(store_error)?;
+        self.dbs.entry(&txn, peer, address).map_err(store_error)
     }
 
     /// The copies of `address` held by those of `nearest` whose copies count
     /// this cycle ([`NodeRead::counts`]), in the order of `nearest`.
-    #[must_use]
-    pub fn copies(&self, address: &XorName, nearest: &[PeerId]) -> Vec<(PeerId, DigestEntry)> {
-        nearest
-            .iter()
-            .filter_map(|peer| {
-                let node = self.nodes.get(peer)?;
-                if !node.read.counts {
-                    return None;
-                }
-                node.mirror.get(address).map(|entry| (*peer, *entry))
-            })
-            .collect()
+    ///
+    /// # Errors
+    ///
+    /// If the store can't be read.
+    pub fn copies(
+        &self,
+        address: &XorName,
+        nearest: &[PeerId],
+    ) -> Result<Vec<(PeerId, DigestEntry)>> {
+        let txn = self.store.env().read_txn().map_err(store_error)?;
+        let mut copies = Vec::new();
+        for peer in nearest {
+            if !self.nodes.get(peer).is_some_and(|node| node.read.counts) {
+                continue;
+            }
+            if let Some(entry) = self.dbs.entry(&txn, peer, address).map_err(store_error)? {
+                copies.push((*peer, entry));
+            }
+        }
+        Ok(copies)
     }
 
     /// Every node whose mirror holds `address`, counting or not, in id
     /// order.
-    #[must_use]
-    pub fn holders(&self, address: &XorName) -> Vec<PeerId> {
-        self.nodes
-            .iter()
-            .filter(|(_, node)| node.mirror.get(address).is_some())
-            .map(|(peer, _)| *peer)
-            .collect()
+    ///
+    /// # Errors
+    ///
+    /// If the store can't be read.
+    pub fn holders(&self, address: &XorName) -> Result<Vec<PeerId>> {
+        let txn = self.store.env().read_txn().map_err(store_error)?;
+        self.dbs.holders(&txn, address).map_err(store_error)
+    }
+
+    /// Up to `limit` of the addresses some node's mirror holds, counting or
+    /// not, after `after` (or from the first), each once, in address order.
+    ///
+    /// # Errors
+    ///
+    /// If the store can't be read.
+    pub fn held_after(&self, after: Option<&XorName>, limit: usize) -> Result<Vec<XorName>> {
+        let txn = self.store.env().read_txn().map_err(store_error)?;
+        self.dbs.held_after(&txn, after, limit).map_err(store_error)
+    }
+
+    /// How many addresses some node's mirror holds, counting or not: a scan
+    /// of them, a batch at a time.
+    ///
+    /// # Errors
+    ///
+    /// If the store can't be read.
+    pub fn held_count(&self) -> Result<u64> {
+        let mut count = 0;
+        let mut after: Option<XorName> = None;
+        loop {
+            let batch = self.held_after(after.as_ref(), SCAN)?;
+            count += batch.len() as u64;
+            match batch.last() {
+                Some(last) if batch.len() == SCAN => after = Some(*last),
+                _ => return Ok(count),
+            }
+        }
     }
 
     /// `peer`'s latest view hash, from its last answer or push, for a node
@@ -1313,13 +1942,10 @@ impl Feeds {
         allowance(self.backing.count(peer)).div_ceil(PAGE)
     }
 
-    /// Every address some node's mirror holds, counting or not.
+    /// How many entries `peer`'s mirror holds, if it is followed.
     #[must_use]
-    pub fn addresses(&self) -> BTreeSet<XorName> {
-        self.nodes
-            .values()
-            .flat_map(|node| node.mirror.addresses())
-            .collect()
+    pub fn mirror_len(&self, peer: &PeerId) -> Option<u64> {
+        self.nodes.get(peer).map(|node| node.mirror.len())
     }
 
     /// The nodes followed, in id order.
@@ -1339,10 +1965,27 @@ impl Feeds {
         self.nodes.is_empty()
     }
 
+    /// Give the nodes whose counts of backed entries changed their new
+    /// counts.
+    fn apply_backing(&mut self) {
+        for peer in std::mem::take(&mut self.backing.affected) {
+            let backed = self.backing.count(&peer);
+            if let Some(node) = self.nodes.get_mut(&peer) {
+                node.set_backed(backed);
+            }
+        }
+    }
+
     /// Bring the nodes followed in line with `nodes`: drop those not in it,
     /// take in new ones, switch the way a node is read, and follow its new
-    /// range. Counts the backing again if who is followed changed.
-    fn reconcile<C: NearestNodes + ?Sized>(&mut self, census: &C, nodes: &[FeedNode], now: u64) {
+    /// range, each in a transaction of its own. Counts the backing again if
+    /// who is followed changed.
+    fn reconcile<C: NearestNodes + ?Sized>(
+        &mut self,
+        census: &C,
+        nodes: &[FeedNode],
+        now: u64,
+    ) -> Result<()> {
         let wanted: BTreeMap<PeerId, &FeedNode> =
             nodes.iter().map(|node| (node.peer, node)).collect();
         let leaving: Vec<PeerId> = self
@@ -1351,15 +1994,27 @@ impl Feeds {
             .filter(|peer| !wanted.contains_key(peer))
             .copied()
             .collect();
-        let mut touched = Vec::new();
         for peer in leaving {
-            if let Some(node) = self.nodes.remove(&peer) {
-                touched.extend(node.mirror.addresses());
-                self.removed.insert(peer);
-            }
+            self.nodes.remove(&peer);
+            let mut entries =
+                StoreEntries::begin(&self.store, self.dbs, peer, census, &mut self.backing)?;
+            entries.wipe();
+            let (mut txn, _) = entries.finish()?;
+            self.dbs
+                .nodes
+                .delete(&mut txn, peer.as_bytes())
+                .map_err(store_error)?;
+            txn.commit().map_err(store_error)?;
         }
         for (peer, wanted) in &wanted {
-            let node = self.nodes.entry(*peer).or_insert_with(|| {
+            let Self {
+                store,
+                dbs,
+                nodes,
+                backing,
+                ..
+            } = self;
+            let node = nodes.entry(*peer).or_insert_with(|| {
                 let kind = if wanted.feed {
                     ReadKind::Feed
                 } else {
@@ -1374,7 +2029,13 @@ impl Feeds {
             } else {
                 ReadKind::V2
             };
-            if node.mirror.kind() != kind {
+            let switch = node.mirror.kind() != kind;
+            let rescope = node.range != wanted.range;
+            if !switch && !rescope {
+                continue;
+            }
+            let mut entries = StoreEntries::begin(store, *dbs, *peer, census, backing)?;
+            if switch {
                 info!(
                     "Reading {peer} {} from now on",
                     match kind {
@@ -1382,82 +2043,102 @@ impl Feeds {
                         ReadKind::V2 => "with listings v2 requests",
                     }
                 );
-                touched.extend(node.switch(kind));
+                node.switch(kind, &mut entries);
             }
-            if node.range != wanted.range {
-                touched.extend(node.rescope(wanted.range));
+            if rescope {
+                node.rescope(wanted.range, &mut entries);
             }
+            let (txn, done) = entries.finish()?;
+            commit_node(txn, done, *dbs, peer, node)?;
         }
         let members: Vec<PeerId> = self.nodes.keys().copied().collect();
         if self.members.as_ref() != Some(&members) {
             self.members = Some(members);
-            self.recount_all(census);
+            self.recount_all(census)?;
         }
-        self.note_touched(census, &touched);
+        self.apply_backing();
+        Ok(())
     }
 
     /// Count every address's backing again, as after a change in who is
-    /// followed.
-    fn recount_all<C: NearestNodes + ?Sized>(&mut self, census: &C) {
+    /// followed: a batch of addresses at a time, each in a transaction of
+    /// its own.
+    fn recount_all<C: NearestNodes + ?Sized>(&mut self, census: &C) -> Result<()> {
         self.backing = Backing::default();
-        let addresses: BTreeSet<XorName> = self
-            .nodes
-            .values()
-            .flat_map(|node| node.mirror.addresses())
-            .collect();
-        for address in &addresses {
-            self.backing.recount(census, &self.nodes, address);
-        }
-        for (peer, node) in &mut self.nodes {
-            node.set_backed(self.backing.count(peer));
-        }
-    }
-
-    /// Note that `touched`'s entries changed in some mirror: they wait to be
-    /// settled, and their backing is counted again.
-    fn note_touched<C: NearestNodes + ?Sized>(&mut self, census: &C, touched: &[XorName]) {
-        let mut affected = BTreeSet::new();
-        for address in touched {
-            if self.pending.insert(*address) {
-                self.pending_new.insert(*address);
+        let env = self.store.env();
+        let mut txn = env.write_txn().map_err(store_error)?;
+        self.dbs.backing.clear(&mut txn).map_err(store_error)?;
+        txn.commit().map_err(store_error)?;
+        let mut after: Option<XorName> = None;
+        loop {
+            let mut txn = env.write_txn().map_err(store_error)?;
+            let batch = self
+                .dbs
+                .held_after(&txn, after.as_ref(), SCAN)
+                .map_err(store_error)?;
+            for address in &batch {
+                self.backing
+                    .recount(&mut txn, self.dbs, census, address)
+                    .map_err(store_error)?;
             }
-            affected.extend(self.backing.recount(census, &self.nodes, address));
+            txn.commit().map_err(store_error)?;
+            match batch.last() {
+                Some(last) if batch.len() == SCAN => after = Some(*last),
+                _ => break,
+            }
         }
-        for peer in affected {
-            let backed = self.backing.count(&peer);
+        let counts: Vec<(PeerId, usize)> = self
+            .nodes
+            .keys()
+            .map(|peer| (*peer, self.backing.count(peer)))
+            .collect();
+        for (peer, backed) in counts {
             if let Some(node) = self.nodes.get_mut(&peer) {
                 node.set_backed(backed);
             }
         }
+        self.backing.affected.clear();
+        Ok(())
     }
 
-    /// Take `peer`'s answer. Returns whether it has another request to send
-    /// this round.
+    /// Take `peer`'s answer, in a write transaction of its own. Returns
+    /// whether it has another request to send this round.
     fn take_answer<C: NearestNodes + ?Sized>(
         &mut self,
         census: &C,
         peer: &PeerId,
         answer: Option<ListingsBody>,
         now: u64,
-    ) -> bool {
+    ) -> Result<bool> {
         let room = allowance(self.backing.count(peer));
-        let Some(node) = self.nodes.get_mut(peer) else {
-            return false;
+        let Self {
+            store,
+            dbs,
+            nodes,
+            backing,
+            ..
+        } = self;
+        let Some(node) = nodes.get_mut(peer) else {
+            return Ok(false);
         };
-        let (touched, again) = node.take_answer(answer, now, room);
-        self.note_touched(census, &touched);
-        again
+        let mut entries = StoreEntries::begin(store, *dbs, *peer, census, backing)?;
+        let again = node.take_answer(answer, now, room, &mut entries);
+        let (txn, done) = entries.finish()?;
+        commit_node(txn, done, *dbs, peer, node)?;
+        self.apply_backing();
+        Ok(again)
     }
 
-    /// End the round for every node, and say how it went.
-    fn end_round(&mut self, pushes: usize) -> PollReport {
+    /// End the round for every node, and say how it went. The addresses of a
+    /// node whose copies start or cease to count become pending.
+    fn end_round(&mut self, pushes: usize) -> Result<PollReport> {
         let mut report = PollReport {
             nodes: self.nodes.len(),
             pushes,
             ..PollReport::default()
         };
         let mut flipped = Vec::new();
-        for node in self.nodes.values_mut() {
+        for (peer, node) in &mut self.nodes {
             node.end_round();
             let read = &node.read;
             match read.kind {
@@ -1471,17 +2152,224 @@ impl Feeds {
             if read.counts != node.counted {
                 // Its copies start or cease to count: every address it holds
                 // has other inputs now.
-                flipped.extend(node.mirror.addresses());
+                flipped.push(*peer);
                 node.counted = read.counts;
             }
         }
-        for address in flipped {
-            if self.pending.insert(address) {
-                self.pending_new.insert(address);
+        for peer in flipped {
+            self.mark_held(&peer)?;
+        }
+        report.pending = usize::try_from(self.pending_count()?).unwrap_or(usize::MAX);
+        Ok(report)
+    }
+
+    /// Make every address `peer`'s mirror holds pending, a chunk at a time,
+    /// each in a transaction of its own.
+    fn mark_held(&mut self, peer: &PeerId) -> Result<()> {
+        let env = self.store.env();
+        let mut from = Bound::Unbounded;
+        loop {
+            let mut txn = env.write_txn().map_err(store_error)?;
+            let chunk = self
+                .dbs
+                .scan(&txn, peer, from, &[0xff; 32], SCAN)
+                .map_err(store_error)?;
+            for address in &chunk {
+                self.dbs
+                    .changed
+                    .put(&mut txn, address, &[])
+                    .map_err(store_error)?;
+            }
+            txn.commit().map_err(store_error)?;
+            match chunk.last() {
+                Some(last) if chunk.len() == SCAN => from = Bound::Excluded(*last),
+                _ => return Ok(()),
             }
         }
-        report.pending = self.pending.len();
-        report
+    }
+
+    /// Follow `peer` through its feed in `range`, its mirror holding
+    /// `entries` and in sync this round, as if it had just been read: for
+    /// tests of what is decided from the mirrors.
+    #[cfg(test)]
+    pub(crate) fn seed(&mut self, peer: PeerId, range: AddressRange, entries: &[DigestEntry]) {
+        let mut txn = self.store.env().write_txn().unwrap();
+        let mut set_hash = SetHash::EMPTY;
+        for entry in entries {
+            self.dbs
+                .entries
+                .put(
+                    &mut txn,
+                    &entry_key(&peer, &entry.address),
+                    &encode_entry(entry),
+                )
+                .unwrap();
+            self.dbs
+                .held
+                .put(&mut txn, &held_key(&entry.address, &peer), &[])
+                .unwrap();
+            set_hash.insert(entry);
+        }
+        let count = entries.len() as u64;
+        let mut node = NodeState::new(range, ReadKind::Feed);
+        node.mirror = Mirror::Feed(MirrorSync::resume(range, 7, 1, count, set_hash));
+        node.read = NodeRead {
+            answered: true,
+            replied: true,
+            counts: true,
+            complete: true,
+            outcome: Some(FeedOutcome::Synced),
+            entries: entries.len(),
+            ..NodeRead::new(ReadKind::Feed)
+        };
+        node.counted = true;
+        let record = node.record();
+        put_record(&mut txn, self.dbs, &peer, &record).unwrap();
+        txn.commit().unwrap();
+        node.written = Some(record);
+        self.nodes.insert(peer, node);
+    }
+
+    /// The addresses pending, all of them: for tests.
+    #[cfg(test)]
+    fn pending_set(&self) -> BTreeSet<XorName> {
+        let mut all = BTreeSet::new();
+        let mut after = None;
+        loop {
+            let batch = self.pending_after(after.as_ref(), SCAN).unwrap();
+            all.extend(batch.iter().copied());
+            match batch.last() {
+                Some(last) if batch.len() == SCAN => after = Some(*last),
+                _ => return all,
+            }
+        }
+    }
+
+    /// The entries `peer`'s mirror holds, in address order: for tests.
+    #[cfg(test)]
+    fn mirrored(&self, peer: &PeerId) -> Vec<DigestEntry> {
+        let txn = self.store.env().read_txn().unwrap();
+        self.dbs
+            .entries
+            .prefix_iter(&txn, peer.as_bytes())
+            .unwrap()
+            .map(|row| {
+                let (key, value) = row.unwrap();
+                let (_, address) = split_key(key).unwrap();
+                decode_entry(address, value).unwrap()
+            })
+            .collect()
+    }
+}
+
+/// Write `record`, `peer`'s.
+fn put_record(txn: &mut RwTxn, dbs: Dbs, peer: &PeerId, record: &NodeRecord) -> Result<()> {
+    let bytes = serde_json::to_vec(record)
+        .map_err(|e| Error::Serialization(format!("mirror record: {e}")))?;
+    dbs.nodes
+        .put(txn, peer.as_bytes(), &bytes)
+        .map_err(store_error)
+}
+
+/// Finish the work `done` on `peer`'s mirror in `txn`: its record written
+/// where it changed (or where part of the work was committed without it),
+/// and the transaction committed if anything was written; otherwise it is
+/// dropped, and nothing was.
+fn commit_node(
+    mut txn: RwTxn,
+    done: Done,
+    dbs: Dbs,
+    peer: &PeerId,
+    node: &mut NodeState,
+) -> Result<()> {
+    if done.checkpointed {
+        node.written = None;
+    }
+    let record = node.record();
+    let rewrite = node.written.as_ref() != Some(&record);
+    if rewrite {
+        put_record(&mut txn, dbs, peer, &record)?;
+    }
+    if rewrite || done.changed {
+        txn.commit().map_err(store_error)?;
+    }
+    if rewrite {
+        node.written = Some(record);
+    }
+    Ok(())
+}
+
+/// Delete every row of `peer`'s mirror, its rows by address and what its
+/// pass saw, a chunk at a time, each committed. The addresses aren't
+/// touched: for a node whose record is gone.
+fn drop_entries(env: &heed::Env<heed::WithoutTls>, dbs: Dbs, peer: &PeerId) -> heed::Result<()> {
+    loop {
+        let mut txn = env.write_txn()?;
+        let chunk = dbs.scan(&txn, peer, Bound::Unbounded, &[0xff; 32], SCAN)?;
+        for address in &chunk {
+            dbs.entries.delete(&mut txn, &entry_key(peer, address))?;
+            dbs.held.delete(&mut txn, &held_key(address, peer))?;
+        }
+        if chunk.is_empty() {
+            delete_prefix(&mut txn, dbs.seen, peer.as_bytes())?;
+            return txn.commit();
+        }
+        txn.commit()?;
+    }
+}
+
+/// Index the kept mirrors by address ([`HELD_DB`]), for a store from before
+/// they were: a chunk at a time, each committed. Nothing to do once the
+/// index holds anything, or there are no mirrors.
+fn index_held(env: &heed::Env<heed::WithoutTls>, dbs: Dbs) -> heed::Result<()> {
+    {
+        let txn = env.read_txn()?;
+        if !dbs.held.is_empty(&txn)? || dbs.entries.is_empty(&txn)? {
+            return Ok(());
+        }
+    }
+    info!("Indexing the kept mirrors by address");
+    let mut from: Option<[u8; 64]> = None;
+    loop {
+        let mut txn = env.write_txn()?;
+        let range = match &from {
+            Some(key) => (Bound::Excluded(&key[..]), Bound::Unbounded),
+            None => (Bound::Unbounded, Bound::Unbounded),
+        };
+        let keys: Vec<[u8; 64]> = dbs
+            .entries
+            .range(&txn, &range)?
+            .take(SCAN)
+            .filter_map(|row| row.ok().and_then(|(key, _)| key.try_into().ok()))
+            .collect();
+        for key in &keys {
+            if let Some((peer, address)) = split_key(key) {
+                dbs.held.put(&mut txn, &held_key(&address, &peer), &[])?;
+            }
+        }
+        txn.commit()?;
+        match keys.last() {
+            Some(last) if keys.len() == SCAN => from = Some(*last),
+            _ => return Ok(()),
+        }
+    }
+}
+
+/// Delete every row of `db` whose key starts with `prefix`, a chunk at a
+/// time.
+fn delete_prefix(txn: &mut RwTxn, db: Database<Bytes, Bytes>, prefix: &[u8]) -> heed::Result<()> {
+    loop {
+        let keys: Vec<Vec<u8>> = db
+            .prefix_iter(txn, prefix)?
+            .take(SCAN)
+            .map(|row| row.map(|(key, _)| key.to_vec()))
+            .collect::<heed::Result<_>>()?;
+        if keys.is_empty() {
+            return Ok(());
+        }
+        for key in keys {
+            db.delete(txn, &key)?;
+        }
     }
 }
 
@@ -1505,6 +2393,31 @@ fn entry_key(peer: &PeerId, address: &XorName) -> [u8; 64] {
 fn split_key(key: &[u8]) -> Option<(PeerId, XorName)> {
     let (peer, address) = key.split_first_chunk::<32>()?;
     Some((PeerId::from_bytes(*peer), address.try_into().ok()?))
+}
+
+/// `address`, then `peer`'s id: a row's key in [`HELD_DB`].
+fn held_key(address: &XorName, peer: &PeerId) -> [u8; 64] {
+    let mut key = [0u8; 64];
+    key[..32].copy_from_slice(address);
+    key[32..].copy_from_slice(peer.as_bytes());
+    key
+}
+
+/// [`held_key`] read back.
+fn split_held(key: &[u8]) -> Option<(XorName, PeerId)> {
+    let (address, peer) = key.split_first_chunk::<32>()?;
+    Some((*address, PeerId::from_bytes(peer.try_into().ok()?)))
+}
+
+/// Node ids, 32 bytes each.
+fn encode_peers(peers: &[PeerId]) -> Vec<u8> {
+    peers.iter().flat_map(|peer| *peer.as_bytes()).collect()
+}
+
+/// [`encode_peers`] read back.
+fn decode_peers(bytes: &[u8]) -> Vec<PeerId> {
+    let (ids, _) = bytes.as_chunks::<32>();
+    ids.iter().map(|id| PeerId::from_bytes(*id)).collect()
 }
 
 /// `entry`'s bytes in [`ENTRIES_DB`]: see [`ENTRY_LEN`].
@@ -1904,17 +2817,19 @@ mod tests {
             to_peer.into_iter().map(|(_, body)| body).collect()
         }
 
-        /// Whether the node serves exactly what `feeds` mirrors of it.
+        /// Whether the node serves exactly what `feeds` mirrors of it, by
+        /// node and by address.
         fn mirrored(&self, feeds: &Feeds, peer: &PeerId) -> bool {
-            self.node(peer, |node| {
-                let mirrored: Vec<DigestEntry> = feeds.nodes[peer]
-                    .mirror
-                    .addresses()
-                    .iter()
-                    .filter_map(|address| feeds.entry(peer, address).copied())
-                    .collect();
-                mirrored == node.served.values().copied().collect::<Vec<_>>()
-            })
+            let mirrored = feeds.mirrored(peer);
+            let by_address = mirrored
+                .iter()
+                .all(|entry| feeds.holders(&entry.address).unwrap().contains(peer));
+            let counted = feeds.mirror_len(peer) == Some(mirrored.len() as u64);
+            by_address
+                && counted
+                && self.node(peer, |node| {
+                    mirrored == node.served.values().copied().collect::<Vec<_>>()
+                })
         }
     }
 
@@ -1963,7 +2878,7 @@ mod tests {
     }
 
     fn settle_all(feeds: &mut Feeds) {
-        let settled: Vec<XorName> = feeds.pending().iter().copied().collect();
+        let settled: Vec<XorName> = feeds.pending_set().iter().copied().collect();
         feeds.settle(&settled).unwrap();
     }
 
@@ -2000,14 +2915,17 @@ mod tests {
         let read = feeds.read(&a).unwrap();
         assert!(read.counts && read.complete && read.answered);
         assert_eq!(read.entries, 300);
-        assert_eq!(feeds.pending().len(), 300);
+        assert_eq!(feeds.pending_set().len(), 300);
         let first = address(0);
-        assert_eq!(feeds.copies(&first, &[a]), vec![(a, entry(first, 1))]);
-        assert_eq!(feeds.holders(&first), vec![a]);
+        assert_eq!(
+            feeds.copies(&first, &[a]).unwrap(),
+            vec![(a, entry(first, 1))]
+        );
+        assert_eq!(feeds.holders(&first).unwrap(), vec![a]);
 
         // Once settled, only what changes next is pending.
         settle_all(&mut feeds);
-        assert!(feeds.pending().is_empty());
+        assert!(feeds.pending_set().is_empty());
         net.node(&a, |node| {
             node.put(entry(address(1_000), 1));
             node.put(entry(address(1), 2));
@@ -2022,7 +2940,7 @@ mod tests {
             .all(|body| matches!(body, ListingsBody::ChangesRequest(r) if r.watch)));
         assert!(net.mirrored(&feeds, &a));
         let expected = BTreeSet::from([address(1_000), address(1), address(2)]);
-        assert_eq!(feeds.pending(), &expected);
+        assert_eq!(feeds.pending_set(), expected);
         assert!(feeds.read(&a).unwrap().counts);
     }
 
@@ -2039,7 +2957,7 @@ mod tests {
             let store = store(dir.path());
             let mut feeds = Feeds::open(&store).unwrap();
             poll(&mut feeds, &net, &nodes, NOW).await;
-            let settled: Vec<XorName> = feeds.pending().iter().take(100).copied().collect();
+            let settled: Vec<XorName> = feeds.pending_set().iter().take(100).copied().collect();
             feeds.settle(&settled).unwrap();
             net.node(&a, |node| node.head)
         };
@@ -2049,8 +2967,8 @@ mod tests {
         let store = store(dir.path());
         let mut feeds = Feeds::open(&store).unwrap();
         // What wasn't settled is still pending.
-        assert_eq!(feeds.pending().len(), 200);
-        assert_eq!(feeds.nodes[&a].mirror.len(), 300);
+        assert_eq!(feeds.pending_set().len(), 200);
+        assert_eq!(feeds.mirror_len(&a), Some(300));
         poll(&mut feeds, &net, &nodes, NOW + 60).await;
         let asked = net.take_asked(&a);
         assert_eq!(kinds(&asked), ["changes"]);
@@ -2062,7 +2980,7 @@ mod tests {
         assert!(feeds.read(&a).unwrap().counts);
         // Its copies count again after the restart: every address it holds
         // is pending, to be decided afresh.
-        assert_eq!(feeds.pending().len(), 301);
+        assert_eq!(feeds.pending_set().len(), 301);
     }
 
     #[tokio::test]
@@ -2090,7 +3008,7 @@ mod tests {
         assert_eq!(kinds(&net.take_asked(&a)), ["changes", "range"]);
         assert!(net.mirrored(&feeds, &a));
         assert!(feeds.read(&a).unwrap().counts);
-        assert_eq!(feeds.nodes[&a].mirror.len(), 41);
+        assert_eq!(feeds.mirror_len(&a), Some(41));
     }
 
     #[tokio::test]
@@ -2111,15 +3029,15 @@ mod tests {
         // A new listing is pushed, and taken at once, from its node only.
         net.node(&a, |node| node.put(entry(address(500), 1)));
         let push = net.node(&a, |node| node.pushes.pop().unwrap());
-        assert_eq!(feeds.push(&ids, &stranger, &push), Pushed::Ignored);
+        assert_eq!(feeds.push(&ids, &stranger, &push).unwrap(), Pushed::Ignored);
         assert_eq!(
-            feeds.push(&ids, &a, &push),
+            feeds.push(&ids, &a, &push).unwrap(),
             Pushed::Applied(vec![address(500)])
         );
         assert!(feeds.read(&a).unwrap().counts);
-        assert_eq!(feeds.pending(), &BTreeSet::from([address(500)]));
+        assert_eq!(feeds.pending_set(), BTreeSet::from([address(500)]));
         // The same push again changes nothing.
-        assert_eq!(feeds.push(&ids, &a, &push), Pushed::Ignored);
+        assert_eq!(feeds.push(&ids, &a, &push).unwrap(), Pushed::Ignored);
 
         // A push that skips a record is left for the next poll.
         net.node(&a, |node| {
@@ -2127,15 +3045,15 @@ mod tests {
             node.put(entry(address(502), 1));
         });
         let pushes = net.node(&a, |node| std::mem::take(&mut node.pushes));
-        assert_eq!(feeds.push(&ids, &a, &pushes[1]), Pushed::Behind);
-        assert!(feeds.entry(&a, &address(502)).is_none());
+        assert_eq!(feeds.push(&ids, &a, &pushes[1]).unwrap(), Pushed::Behind);
+        assert!(feeds.entry(&a, &address(502)).unwrap().is_none());
         // One from another epoch, or with peers, is left alone.
         let mut other_epoch = pushes[0].clone();
         other_epoch.epoch = 99;
-        assert_eq!(feeds.push(&ids, &a, &other_epoch), Pushed::Ignored);
+        assert_eq!(feeds.push(&ids, &a, &other_epoch).unwrap(), Pushed::Ignored);
         let mut with_peers = pushes[0].clone();
         with_peers.peers = vec![[3; 32]];
-        assert_eq!(feeds.push(&ids, &a, &with_peers), Pushed::Ignored);
+        assert_eq!(feeds.push(&ids, &a, &with_peers).unwrap(), Pushed::Ignored);
         feeds.save().unwrap();
 
         poll(&mut feeds, &net, &nodes, NOW + 60).await;
@@ -2167,7 +3085,7 @@ mod tests {
             .await
             .unwrap();
         assert!(report.pushes <= 1);
-        assert!(feeds.entry(&a, &address(500)).is_some());
+        assert!(feeds.entry(&a, &address(500)).unwrap().is_some());
         assert!(feeds.read(&a).unwrap().counts);
     }
 
@@ -2191,7 +3109,7 @@ mod tests {
             assert!(feeds.read(&b).unwrap().counts);
         }
         assert_eq!(
-            feeds.copies(&address(0), &[a, b]),
+            feeds.copies(&address(0), &[a, b]).unwrap(),
             vec![(b, entry(address(0), 1))]
         );
     }
@@ -2222,7 +3140,7 @@ mod tests {
         assert!(read.replied && !read.answered);
         assert_eq!(report.answered, 1);
         assert_eq!(read.entries, 0);
-        assert!(feeds.pending().is_empty());
+        assert!(feeds.pending_set().is_empty());
     }
 
     #[tokio::test]
@@ -2248,10 +3166,10 @@ mod tests {
             for peer in [flood, endless] {
                 let asked = net.take_asked(&peer).len();
                 assert!(asked <= FREE_PAGES + 1, "{asked} requests in a round");
-                assert!(feeds.nodes[&peer].mirror.len() <= WALK_FREE_LISTINGS);
+                assert!(feeds.mirror_len(&peer).unwrap() <= WALK_FREE_LISTINGS as u64);
             }
             assert_eq!(net.take_asked(&v2_flood).len(), 1);
-            assert!(feeds.nodes[&v2_flood].mirror.len() <= WALK_FREE_LISTINGS);
+            assert!(feeds.mirror_len(&v2_flood).unwrap() <= WALK_FREE_LISTINGS as u64);
         }
         // The v2 node's passes stop at its allowance, so it never seems
         // complete.
@@ -2326,7 +3244,7 @@ mod tests {
         assert!(read.counts && read.complete);
         // The listing that fails its checks is left out.
         assert_eq!(read.entries, 600);
-        assert_eq!(feeds.pending().len(), 600);
+        assert_eq!(feeds.pending_set().len(), 600);
 
         // Between passes, a read from after the newest key finds a new
         // listing; one removed stays until the next pass.
@@ -2340,7 +3258,7 @@ mod tests {
         poll(&mut feeds, &net, &nodes, now).await;
         let asked = from_of(net.take_asked(&a));
         assert!(asked[0] > ListingKey::MIN, "{asked:?}");
-        assert!(feeds.entry(&a, &address(9_000)).is_some());
+        assert!(feeds.entry(&a, &address(9_000)).unwrap().is_some());
         assert_eq!(feeds.read(&a).unwrap().entries, 601);
 
         // No new pass before the interval; one at it, which drops the
@@ -2364,7 +3282,7 @@ mod tests {
         poll(&mut feeds, &net, &nodes, now + 60).await;
         let read = feeds.read(&a).unwrap();
         assert!(!read.counts && !read.answered);
-        assert!(feeds.copies(&address(1), &[a]).is_empty());
+        assert!(feeds.copies(&address(1), &[a]).unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -2422,9 +3340,9 @@ mod tests {
         assert!(!read.counts && !read.fell_back);
         assert_eq!(read.outcome, Some(FeedOutcome::NoAnswer));
         // Its copies no longer count: every address it holds is pending.
-        assert_eq!(feeds.pending().len(), 20);
-        assert!(feeds.copies(&address(0), &[known]).is_empty());
-        assert_eq!(feeds.holders(&address(0)), vec![known]);
+        assert_eq!(feeds.pending_set().len(), 20);
+        assert!(feeds.copies(&address(0), &[known]).unwrap().is_empty());
+        assert_eq!(feeds.holders(&address(0)).unwrap(), vec![known]);
     }
 
     #[tokio::test]
@@ -2442,8 +3360,8 @@ mod tests {
         let nodes = [feed_node(a)];
         poll(&mut feeds, &net, &nodes, NOW).await;
         assert!(!feeds.read(&a).unwrap().counts);
-        let held = feeds.nodes[&a].mirror.len();
-        assert!(held > 0 && held <= WALK_FREE_LISTINGS, "{held}");
+        let held = feeds.mirror_len(&a).unwrap();
+        assert!(held > 0 && held <= WALK_FREE_LISTINGS as u64, "{held}");
 
         net.node(&a, |node| node.behaviour = Behaviour::Silent);
         poll(&mut feeds, &net, &nodes, NOW + 60).await;
@@ -2507,15 +3425,16 @@ mod tests {
             assert!(feeds.read(&a).unwrap().counts);
             // Every address either node held is pending: b's left with b,
             // and a's outside its new range left its mirror.
-            assert_eq!(feeds.pending().len(), 100);
+            assert_eq!(feeds.pending_set().len(), 100);
         }
         let store = store(dir.path());
         let feeds = Feeds::open(&store).unwrap();
         assert_eq!(feeds.len(), 1);
         assert_eq!(feeds.nodes[&a].range, half);
-        assert_eq!(feeds.nodes[&a].mirror.len(), inside);
+        assert_eq!(feeds.mirror_len(&a), Some(inside as u64));
         let txn = store.env().read_txn().unwrap();
-        assert_eq!(feeds.entries_db.len(&txn).unwrap(), inside as u64);
+        assert_eq!(feeds.dbs.entries.len(&txn).unwrap(), inside as u64);
+        assert_eq!(feeds.dbs.held.len(&txn).unwrap(), inside as u64);
     }
 
     #[tokio::test]
@@ -2536,6 +3455,159 @@ mod tests {
         assert_eq!(feeds.view(&a), Some(view_hash(&[[0x42; 32], [0x43; 32]])));
         assert_eq!(feeds.len(), 1);
         assert!(feeds.read(&a).unwrap().counts);
+    }
+
+    #[tokio::test]
+    async fn a_long_change_is_committed_a_chunk_at_a_time() {
+        // A node whose mirror holds more than a chunk stops answering
+        // through its feed: its mirror is emptied as it is read the old
+        // way, a chunk at a time.
+        let dir = tempfile::tempdir().unwrap();
+        let a = peer(1);
+        let net = FakeNet::with(vec![(
+            a,
+            FakeNode::serving(Behaviour::Honest, entries(0, 700)),
+        )]);
+        let nodes = [feed_node(a)];
+        {
+            let store = store(dir.path());
+            let mut feeds = Feeds::open(&store).unwrap();
+            for round in 0..2 {
+                poll(&mut feeds, &net, &nodes, NOW + 60 * round).await;
+            }
+            assert!(feeds.read(&a).unwrap().counts);
+            assert_eq!(feeds.mirror_len(&a), Some(700));
+            settle_all(&mut feeds);
+            let listings: Vec<Listing> =
+                (0..3).map(|n| listing(address(n), 1_791_324_000)).collect();
+            net.node(&a, |node| {
+                node.behaviour = Behaviour::Unsupported;
+                for listing in listings {
+                    node.listings.insert(listing.key(), listing);
+                }
+            });
+            poll(&mut feeds, &net, &nodes, NOW + 120).await;
+            let read = feeds.read(&a).unwrap();
+            assert!(read.fell_back && read.counts);
+            assert_eq!(read.entries, 3);
+            // Every address it held is pending, and its record says what
+            // the store holds.
+            assert_eq!(feeds.pending_set().len(), 700);
+            assert_eq!(feeds.mirrored(&a).len(), 3);
+        }
+        let store = store(dir.path());
+        let feeds = Feeds::open(&store).unwrap();
+        assert_eq!(feeds.mirror_len(&a), Some(3));
+        assert_eq!(feeds.read(&a).unwrap().kind, ReadKind::V2);
+    }
+
+    #[tokio::test]
+    async fn a_mirror_left_part_changed_is_read_afresh() {
+        // A process stopped while emptying a mirror, after a chunk was
+        // committed: the node's record is gone, so the next start drops what
+        // is left of its mirror, and the node is read afresh.
+        let dir = tempfile::tempdir().unwrap();
+        let a = peer(1);
+        let net = FakeNet::with(vec![(
+            a,
+            FakeNode::serving(Behaviour::Honest, entries(0, 700)),
+        )]);
+        let nodes = [feed_node(a)];
+        let ids = Ids(vec![a]);
+        {
+            let store = store(dir.path());
+            let mut feeds = Feeds::open(&store).unwrap();
+            for round in 0..2 {
+                poll(&mut feeds, &net, &nodes, NOW + 60 * round).await;
+            }
+            assert_eq!(feeds.mirror_len(&a), Some(700));
+            let mut entries =
+                StoreEntries::begin(&store, feeds.dbs, a, &ids, &mut feeds.backing).unwrap();
+            let doomed = entries.scan(Bound::Unbounded, [0xff; 32], 300);
+            for address in &doomed {
+                entries.delete(address);
+                entries.touched(*address);
+            }
+            // Stopped here: the first chunk was committed, the rest not.
+            drop(entries);
+        }
+        let store = store(dir.path());
+        let mut feeds = Feeds::open(&store).unwrap();
+        assert!(feeds.is_empty());
+        {
+            let txn = store.env().read_txn().unwrap();
+            assert!(feeds.dbs.entries.is_empty(&txn).unwrap());
+            assert!(feeds.dbs.held.is_empty(&txn).unwrap());
+        }
+        poll(&mut feeds, &net, &nodes, NOW + 120).await;
+        poll(&mut feeds, &net, &nodes, NOW + 180).await;
+        assert!(net.mirrored(&feeds, &a));
+        assert!(feeds.read(&a).unwrap().counts);
+    }
+
+    #[tokio::test]
+    async fn a_record_without_its_totals_is_counted_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = peer(1);
+        let net = FakeNet::with(vec![(
+            a,
+            FakeNode::serving(Behaviour::Honest, entries(0, 50)),
+        )]);
+        let nodes = [feed_node(a)];
+        {
+            let store = store(dir.path());
+            let mut feeds = Feeds::open(&store).unwrap();
+            poll(&mut feeds, &net, &nodes, NOW).await;
+            // As an earlier version wrote it: no count or set hash.
+            let mut record = feeds.nodes[&a].record();
+            record.count = None;
+            record.set_hash = None;
+            let mut txn = store.env().write_txn().unwrap();
+            put_record(&mut txn, feeds.dbs, &a, &record).unwrap();
+            txn.commit().unwrap();
+        }
+        let store = store(dir.path());
+        let mut feeds = Feeds::open(&store).unwrap();
+        assert_eq!(feeds.mirror_len(&a), Some(50));
+        let written = feeds.nodes[&a].written.clone().unwrap();
+        assert_eq!(written.count, Some(50));
+        net.take_asked(&a);
+        poll(&mut feeds, &net, &nodes, NOW + 60).await;
+        // Followed on from where it stood, and in sync at once.
+        assert_eq!(kinds(&net.take_asked(&a)), ["changes"]);
+        assert!(feeds.read(&a).unwrap().counts);
+    }
+
+    #[tokio::test]
+    async fn every_address_held_is_found_once_a_batch_at_a_time() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        let mut feeds = Feeds::open(&store).unwrap();
+        let (a, b) = (peer(1), peer(2));
+        let net = FakeNet::with(vec![
+            (a, FakeNode::serving(Behaviour::Honest, entries(0, 600))),
+            (b, FakeNode::serving(Behaviour::Honest, entries(300, 600))),
+        ]);
+        let nodes = [feed_node(a), feed_node(b)];
+        for round in 0..2 {
+            poll(&mut feeds, &net, &nodes, NOW + 60 * round).await;
+        }
+        let mut found = Vec::new();
+        let mut after = None;
+        loop {
+            let batch = feeds.held_after(after.as_ref(), 100).unwrap();
+            found.extend(batch.iter().copied());
+            match batch.last() {
+                Some(last) if batch.len() == 100 => after = Some(*last),
+                _ => break,
+            }
+        }
+        let mut expected: Vec<XorName> = (0..900).map(address).collect();
+        expected.sort_unstable();
+        assert_eq!(found, expected);
+        assert_eq!(feeds.held_count().unwrap(), 900);
+        assert_eq!(feeds.holders(&address(450)).unwrap(), vec![a, b]);
+        assert_eq!(feeds.holders(&address(800)).unwrap(), vec![b]);
     }
 
     #[test]

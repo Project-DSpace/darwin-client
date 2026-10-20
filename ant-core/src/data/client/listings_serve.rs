@@ -19,9 +19,9 @@
 //!    time ([`Feeds::poll`]). A node whose user agent shows the feed
 //!    release ([`Census::supports_feed`]) is sent a `ChangesRequest` for its
 //!    leaf ([`Census::leaf_of`]), with a watch, and its answer is applied to
-//!    its mirror ([`ant_listings::FeedSync`]). The mirror's count and set
-//!    hash must equal the node's; otherwise, as after a new epoch, the node
-//!    is read afresh with `RangeListRequest`s and its copies don't count
+//!    its mirror ([`ant_listings::FeedSync`]'s rules). The mirror's count and
+//!    set hash must equal the node's; otherwise, as after a new epoch, the
+//!    node is read afresh with `RangeListRequest`s and its copies don't count
 //!    until that is done. A node without the release is sent one listings v2
 //!    request: the next page of a full pass of its index (a new pass starts
 //!    at most once every [`V2_PASS_INTERVAL`]), or between passes a read
@@ -78,9 +78,22 @@
 //!    [`RETRY_INTERVAL`] unless its nearest nodes, its copies or its
 //!    last holders change, and drops are checked within the cycle's time,
 //!    at least one a cycle. One decided and rejected is removed as
-//!    `rejected`.
-//! 8. **Publishing** what changed ([`Publisher::publish`]), and
-//!    `status.json` after every other file.
+//!    `rejected`, as is one every copy of which shows a payment from before
+//!    the payment vault was deployed.
+//! 8. **Publishing.** Each batch's decisions are staged in the publisher's
+//!    store as they are made ([`Publisher::stage`]), and once every batch
+//!    is decided, the files they changed are written, then `status.json`
+//!    after every other file ([`Publisher::write_staged`]).
+//!
+//! **Sizes.** The listing of a file whose data map is shrunk into a child
+//! map gives no size. The producer reads such a file's root map once, as a
+//! download does, and keeps the size it gives for good: an entry is
+//! published with its size once known, and until then without, and an
+//! entry published without it has it filled in once it is read (a put).
+//! The reading never holds up a cycle or a push: after each cycle, a task
+//! of its own reads at most [`SIZES_PER_CYCLE`] root maps, until the next
+//! cycle is due; one that can't be read is tried again after
+//! [`RETRY_INTERVAL`].
 //!
 //! Between cycles, nodes push the new records of the leaves they are asked
 //! about: a push that brings a mirror to the node's new head is applied
@@ -95,18 +108,27 @@
 //! server that tags files by their time to the second and their size then
 //! tags every version differently.
 //!
-//! What this process knows of each address (its nearest nodes when last
-//! decided, whether it is to be decided again, and whether its decision
-//! stands) is kept in memory: a restart decides every address again in its
-//! first cycle, as an index read does every cycle, from the kept mirrors,
+//! **Memory.** What grows with the index is in the store, not in memory:
+//! the mirrors ([`Feeds`]), the full listings fetched, what is known of
+//! each address decided (its nearest nodes when last decided, whether to
+//! decide it again, whether its decision stands), the drops the evidence
+//! refused, the full listings a node failed to hand over, and the sizes to
+//! read. Addresses are worked on a batch at a time, read from the store in
+//! address order, and each batch's decisions are staged and let go before
+//! the next batch's are made; fetching takes the addresses a batch at a
+//! time too. So the producer holds a batch's work at a time, whatever the
+//! index holds. What is known of each address is this process's own: it is
+//! cleared at each start, which decides every address again in its first
+//! cycle, as an index read does every cycle, from the kept mirrors,
 //! listings, facts and envelopes, fetching nothing it fetched before. The
-//! nodes whose copies counted when an address was last decided are kept in
-//! the store, for drops.
+//! nodes whose copies counted when an address was last decided are kept
+//! across starts, for drops.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::hash::{DefaultHasher, Hash, Hasher};
+use std::ops::Bound;
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use ant_listings::{
@@ -117,9 +139,8 @@ use ant_protocol::transport::PeerId;
 use ant_protocol::XorName;
 use futures::stream::{self, StreamExt};
 use heed::byteorder::BigEndian;
-use heed::types::{Bytes, U64};
-use heed::Database;
-use heed::RoTxn;
+use heed::types::{Bytes, DecodeIgnore, U64};
+use heed::{Database, RoTxn};
 use self_encryption::DataMap;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -163,18 +184,22 @@ pub const REDECIDE_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
 /// catches up.
 pub const PUSH_CAPACITY: usize = 1_024;
 
-/// How many addresses are decided at a time: the copies of a batch are built,
-/// decided and let go before the next batch's, so deciding every address at
-/// once holds the copies of at most this many. A page's worth
-/// ([`MAX_LIST_LIMIT`]).
+/// How many addresses are worked on at a time: read from the store, their
+/// copies built, decided, staged for publishing and let go before the next
+/// batch's. A page's worth ([`MAX_LIST_LIMIT`]).
 pub const DECIDE_BATCH: usize = MAX_LIST_LIMIT as usize;
 
 /// A check that failed is made again no sooner than this, unless what it
 /// rests on changes first: a drop the evidence refused
 /// ([`Census::confirm_drop`]), unless its nearest nodes, its copies in a
 /// mirror or the nodes that last served it change; a node that failed to
-/// hand over the full listing behind its entry, unless its entry changes.
+/// hand over the full listing behind its entry, unless its entry changes;
+/// a root map that couldn't be read.
 pub const RETRY_INTERVAL: Duration = Duration::from_secs(60 * 60);
+
+/// How many root maps of shrunk data maps are read a cycle, all at once: as
+/// many as addresses are decided at once ([`CHECK_CONCURRENCY`]).
+pub const SIZES_PER_CYCLE: usize = CHECK_CONCURRENCY;
 
 /// The store's directory inside the state directory.
 pub const STORE_DIR: &str = "listings.mdb";
@@ -198,12 +223,39 @@ const LISTINGS_DB: &str = "serve_listings";
 /// envelope's address fixes its data map.
 const SIZES_DB: &str = "serve_sizes";
 
+/// What this process knows of the addresses it works on, by a tag and the
+/// address ([`KNOWN_TAG`], [`AGAIN_TAG`], [`BACKOFF_TAG`], [`FAILED_TAG`],
+/// [`SIZE_WANTED_TAG`]). Cleared at each start.
+const KNOWN_DB: &str = "serve_known";
+
 /// [`SINCE_DB`]: an address deferred since then.
 const DEFERRED_TAG: u8 = b'd';
 
 /// [`SINCE_DB`]: a listed address fewer than all of its nearest nodes have
 /// served since then.
 const BELOW_FULL_TAG: u8 = b'b';
+
+/// [`KNOWN_DB`]: an address decided, to what is known of it ([`Known`]).
+const KNOWN_TAG: u8 = b'k';
+
+/// [`KNOWN_DB`]: an address to decide again next cycle, whatever changes
+/// (no value).
+const AGAIN_TAG: u8 = b'a';
+
+/// [`KNOWN_DB`]: an address whose drop the evidence refused, to the
+/// [`DropBackoff`].
+const BACKOFF_TAG: u8 = b'r';
+
+/// [`KNOWN_DB`]: an address, a node and the digest of its entry, to when the
+/// node may be asked again for the full listing it failed to hand over
+/// (Unix seconds). It isn't asked before then while its entry stays the
+/// same.
+const FAILED_TAG: u8 = b'f';
+
+/// [`KNOWN_DB`]: a listed address whose data map is shrunk and whose size
+/// isn't known yet, to when its root map may be read (Unix seconds, 0 at
+/// once) and the data map, in MessagePack.
+const SIZE_WANTED_TAG: u8 = b'w';
 
 /// How [`Client::decide_backed`] begins the problem of a listing it rejects
 /// without looking it up, because another one a quorum serves counts: its
@@ -241,7 +293,10 @@ type DigestCopies = Vec<(PeerId, DigestEntry)>;
 /// those whose copies count.
 type Work = (XorName, Vec<PeerId>, DigestCopies);
 
-/// What the producer keeps of an address between cycles, in memory.
+/// A full listing to fetch, and the nodes whose entries name it.
+type Wanted = (ListingId, DigestCopies);
+
+/// What the producer keeps of an address between cycles ([`KNOWN_TAG`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Known {
     /// The census's nodes nearest it when it was last decided
@@ -251,6 +306,24 @@ struct Known {
     again: bool,
     /// Whether its decision stands: listed, or rejected for good.
     decided: bool,
+}
+
+impl Known {
+    fn encode(self) -> [u8; 9] {
+        let mut bytes = [0u8; 9];
+        bytes[..8].copy_from_slice(&self.nearest.to_be_bytes());
+        bytes[8] = u8::from(self.again) | (u8::from(self.decided) << 1);
+        bytes
+    }
+
+    fn decode(bytes: &[u8]) -> Option<Self> {
+        let bytes: &[u8; 9] = bytes.try_into().ok()?;
+        Some(Self {
+            nearest: u64::from_be_bytes(bytes[..8].try_into().ok()?),
+            again: bytes[8] & 1 != 0,
+            decided: bytes[8] & 2 != 0,
+        })
+    }
 }
 
 /// What deciding an address keeps of its copies, once they are decided.
@@ -266,7 +339,7 @@ struct Seen {
 }
 
 /// A drop the evidence refused: checked again once its inputs change, or
-/// at `retry_at`.
+/// at `retry_at` ([`BACKOFF_TAG`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct DropBackoff {
     /// [`drop_inputs`] when it was refused.
@@ -275,9 +348,51 @@ struct DropBackoff {
     retry_at: u64,
 }
 
-/// What deciding a set of addresses gave, to publish and then keep
+impl DropBackoff {
+    fn encode(self) -> [u8; 16] {
+        let mut bytes = [0u8; 16];
+        bytes[..8].copy_from_slice(&self.inputs.to_be_bytes());
+        bytes[8..].copy_from_slice(&self.retry_at.to_be_bytes());
+        bytes
+    }
+
+    fn decode(bytes: &[u8]) -> Option<Self> {
+        let bytes: &[u8; 16] = bytes.try_into().ok()?;
+        Some(Self {
+            inputs: u64::from_be_bytes(bytes[..8].try_into().ok()?),
+            retry_at: u64::from_be_bytes(bytes[8..].try_into().ok()?),
+        })
+    }
+}
+
+/// Which addresses a cycle, or what pushes changed, works on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Source {
+    /// Every address a mirror holds, that is published, has a row in
+    /// `rejected.json`, is deferred, pending or to decide again.
+    All,
+    /// The addresses whose copies changed ([`Feeds::pending_after`]), and
+    /// with `again` those to decide again whatever changes.
+    Pending {
+        /// Whether those to decide again come too.
+        again: bool,
+    },
+}
+
+/// The drop checks of a cycle: at least one, then while there is time.
+#[derive(Debug)]
+struct DropCheck {
+    /// Whether one was checked this cycle.
+    checked: bool,
+    /// When the cycle's time is out.
+    deadline: Instant,
+}
+
+/// What deciding a batch of addresses gave, to publish and then keep
 /// ([`Producer::keep`]).
 struct Decided {
+    /// The addresses of the batch.
+    addresses: Vec<XorName>,
     /// What was decided, as an index read gives it.
     index: ListingsIndex,
     /// Each published entry of an address decided and not listed, with why
@@ -290,20 +405,31 @@ struct Decided {
     /// Addresses no node nearest them serves any more, and that nothing is
     /// published for: their kept holders and listings go.
     forget: Vec<XorName>,
-    /// Every address decided: settled in the mirrors once published.
+    /// Every address decided: settled in the mirrors once staged.
     settle: Vec<XorName>,
     /// Addresses left for later because none of their copies could be had,
     /// each with its deferral's reason: shown in no row of `rejected.json`,
     /// as there is no listing to show, but counted as deferred.
     waiting: Vec<(XorName, &'static str)>,
-    /// The size of each file listed whose data map is shrunk, where its
-    /// root map could be read ([`Producer::shrunk_sizes`]).
-    sizes: HashMap<XorName, u64>,
+}
+
+/// The root maps being read, by a task of their own ([`SIZES_PER_CYCLE`]).
+struct SizeJob {
+    /// Each address read, with the size its root map gave, or `None` if it
+    /// couldn't be read. Those not read by the deadline aren't in it.
+    results: tokio::sync::oneshot::Receiver<Vec<(XorName, Option<u64>)>>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for SizeJob {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
 }
 
 /// The listings producer. See the module docs.
 pub struct Producer {
-    client: Client,
+    client: Arc<Client>,
     chain: ListingChain,
     store: ListingsStore,
     census: Census,
@@ -316,24 +442,20 @@ pub struct Producer {
     /// The size of each listed file whose data map is shrunk
     /// ([`SIZES_DB`]).
     sizes: Database<Bytes, U64<BigEndian>>,
+    /// What is known of each address ([`KNOWN_DB`]).
+    known: Database<Bytes, Bytes>,
     /// Routes the answers to listings requests, and the nodes' pushes to
     /// `pushes`: started at the first cycle.
     requests: Option<ListingsRequests>,
     /// Where `requests` sends pushes, until it starts.
     sink: Option<PushSink>,
     pushes: PushReceiver,
-    /// What this process knows of each address it has decided.
-    known: HashMap<XorName, Known>,
-    /// The full listings a node failed to hand over: the node, and the
-    /// address and digest of its entry, to when it may be asked again (Unix
-    /// seconds). It isn't asked before then while its entry stays the same.
-    failed: HashMap<(PeerId, ListingId), u64>,
+    /// How many addresses' decisions stand: listed, or rejected for good.
+    standing: u64,
     /// How many more `GetRequest`s for full listings each node may be sent
     /// this cycle: its allowance in pages ([`Feeds::page_allowance`]) at
     /// the cycle's start.
     fetch_budget: FetchBudget,
-    /// Drops the evidence refused, by address.
-    drop_backoff: HashMap<XorName, DropBackoff>,
     /// Nodes to ask for their nearest peers at the next poll.
     want_peers: BTreeSet<PeerId>,
     /// When this process last decided every address (Unix seconds).
@@ -350,6 +472,8 @@ pub struct Producer {
     pushes_between: u64,
     /// Publications made between cycles since the latest one.
     published_between: u64,
+    /// The root maps being read, if any.
+    size_job: Option<SizeJob>,
     /// When this process started, in Unix seconds.
     started_at: u64,
     /// Counts since then.
@@ -377,10 +501,16 @@ impl Producer {
         let holders: Database<Bytes, Bytes> = store.database(HOLDERS_DB)?;
         let listings: Database<Bytes, Bytes> = store.database(LISTINGS_DB)?;
         let sizes: Database<Bytes, U64<BigEndian>> = store.database(SIZES_DB)?;
+        let known: Database<Bytes, Bytes> = store.database(KNOWN_DB)?;
+        // What an earlier process knew of each address is its own: this
+        // one decides every address again in its first cycle.
+        let mut txn = store.env().write_txn().map_err(store_error)?;
+        known.clear(&mut txn).map_err(store_error)?;
+        txn.commit().map_err(store_error)?;
         let (sink, pushes) = push_channel(PUSH_CAPACITY);
         let now = unix_now();
         Ok(Self {
-            client,
+            client: Arc::new(client),
             chain,
             store,
             census,
@@ -390,13 +520,12 @@ impl Producer {
             holders,
             listings,
             sizes,
+            known,
             requests: None,
             sink: Some(sink),
             pushes,
-            known: HashMap::new(),
-            failed: HashMap::new(),
+            standing: 0,
             fetch_budget: FetchBudget::default(),
-            drop_backoff: HashMap::new(),
             want_peers: BTreeSet::new(),
             decided_all_at: None,
             guard_ok: false,
@@ -405,6 +534,7 @@ impl Producer {
             published_second: now,
             pushes_between: 0,
             published_between: 0,
+            size_job: None,
             started_at: now,
             totals: Totals::default(),
         })
@@ -440,12 +570,14 @@ impl Producer {
 
     /// Run cycles until `cancel` fires: one every [`CYCLE`], the first at
     /// once, and between them, the pushes of the nodes' watches as they
-    /// come. A cycle that fails is logged and the next one runs on time. On
-    /// `cancel`, a cycle still reading the network is abandoned before it
-    /// has written anything; one writing its changes finishes first. After
-    /// each cycle, and once it stops, the client's peer cache and adaptive
-    /// snapshot are saved ([`Client::save_peer_cache`]), so a restart, even
-    /// after the process was killed, joins through the peers it knew.
+    /// come, and the sizes read. A cycle that fails is logged and the next
+    /// one runs on time. On `cancel`, a cycle still reading the network is
+    /// abandoned where it stands: the batches it staged stay staged, and
+    /// the next start's first publication writes their files; one writing
+    /// its files finishes first. After each cycle, and once it stops, the
+    /// client's peer cache and adaptive snapshot are saved
+    /// ([`Client::save_peer_cache`]), so a restart, even after the process
+    /// was killed, joins through the peers it knew.
     ///
     /// # Errors
     ///
@@ -453,6 +585,7 @@ impl Producer {
     /// read or written.
     pub async fn run(&mut self, cancel: CancellationToken) -> Result<()> {
         let result = self.run_cycles(&cancel).await;
+        self.size_job = None;
         self.save_client_state().await;
         result
     }
@@ -472,28 +605,55 @@ impl Producer {
                 },
             }
             self.save_client_state().await;
+            if let Err(e) = self.start_sizes(next) {
+                if matches!(e, Error::Storage(_)) {
+                    return Err(e);
+                }
+                warn!("Could not start reading sizes: {e}");
+            }
             loop {
-                let push = tokio::select! {
+                let event = tokio::select! {
                     () = cancel.cancelled() => return Ok(()),
                     () = tokio::time::sleep_until(next) => break,
-                    push = self.pushes.recv() => push,
+                    push = self.pushes.recv() => Between::Push(push),
+                    sizes = sizes_read(&mut self.size_job) => Between::Sizes(sizes),
                 };
-                let Some(push) = push else {
-                    // No sender is left: wait for the next cycle.
-                    tokio::select! {
-                        () = cancel.cancelled() => return Ok(()),
-                        () = tokio::time::sleep_until(next) => break,
+                let event = match event {
+                    Between::Push(None) => {
+                        // No sender is left: wait for the next cycle, and
+                        // the sizes being read.
+                        tokio::select! {
+                            () = cancel.cancelled() => return Ok(()),
+                            () = tokio::time::sleep_until(next) => break,
+                            sizes = sizes_read(&mut self.size_job) => Between::Sizes(sizes),
+                        }
+                    }
+                    event => event,
+                };
+                let handled = match event {
+                    Between::Push(None) => Ok(()),
+                    Between::Push(Some(push)) => {
+                        // What pushes change is fetched until the next cycle
+                        // is due.
+                        let taken = Box::pin(self.take_pushes(push, next));
+                        tokio::select! {
+                            () = cancel.cancelled() => return Ok(()),
+                            result = taken => result,
+                        }
+                    }
+                    Between::Sizes(sizes) => {
+                        self.size_job = None;
+                        let taken = Box::pin(self.take_sizes(sizes));
+                        tokio::select! {
+                            () = cancel.cancelled() => return Ok(()),
+                            result = taken => result,
+                        }
                     }
                 };
-                // What pushes change is fetched until the next cycle is due.
-                let taken = Box::pin(self.take_pushes(push, next));
-                tokio::select! {
-                    () = cancel.cancelled() => return Ok(()),
-                    result = taken => match result {
-                        Ok(()) => {}
-                        Err(e @ Error::Storage(_)) => return Err(e),
-                        Err(e) => warn!("Deciding what a push changed failed: {e}"),
-                    },
+                match handled {
+                    Ok(()) => {}
+                    Err(e @ Error::Storage(_)) => return Err(e),
+                    Err(e) => warn!("Publishing between cycles failed: {e}"),
                 }
             }
         }
@@ -572,64 +732,56 @@ impl Producer {
 
         // Nothing below reads the network but fetching listings, deciding
         // and confirming drops: a cancelled cycle has written nothing but the
-        // mirrors, the census and the listings fetched.
+        // mirrors, the census, the listings fetched and the batches staged,
+        // which the next cycle finds as they were.
         let mut tally = Tally::default();
         let mut considered = 0;
-        let (mut publication, decided, standing) = if guard_ok {
+        if guard_ok {
             let full = self
                 .decided_all_at
                 .is_none_or(|all| at.saturating_sub(all) >= REDECIDE_INTERVAL.as_secs());
-            let (addresses, explained) = self.to_decide(full, !change.is_empty())?;
-            considered = addresses.len() as u64;
+            // Deciding every address again after a start, nothing needs
+            // explaining.
+            let alert = full && self.decided_all_at.is_some();
+            if !change.is_empty() && (alert || !full) {
+                self.mark_moved()?;
+            }
+            let source = if full {
+                Source::All
+            } else {
+                Source::Pending { again: true }
+            };
             // However long the poll took, fetching gets as long as a poll
             // may take; drops get the rest of the cycle's time, and at least
             // one check.
             let fetch_deadline = Instant::now() + CYCLE;
-            let mut decided =
-                Box::pin(self.decide(addresses, true, fetch_deadline, deadline)).await?;
-            let publication = self.publication(&mut decided, at, false, &mut tally)?;
+            Box::pin(self.fetch_for(source, fetch_deadline)).await?;
+            let mut drops = DropCheck {
+                checked: false,
+                deadline,
+            };
+            let (decided, _) =
+                Box::pin(self.decide_all(source, at, Some(&mut drops), alert, &mut tally)).await?;
+            considered = decided;
             if full {
-                if self.decided_all_at.is_some() {
-                    alert_unexplained(&publication, &explained);
-                }
                 self.decided_all_at = Some(at);
             }
-            let standing = self.standing(&decided);
-            (publication, Some(decided), standing)
         } else {
             // As an index read that finds too few nodes: nothing is decided
             // or dropped, and every entry is kept, carried, until a cycle
             // decides every address again.
-            let index = ListingsIndex::too_few(self.feeds.addresses().len());
-            let unlisted: Vec<(ListingKey, Option<RemoveReason>)> = self
-                .publisher
-                .keys()?
-                .into_iter()
-                .map(|key| (key, None))
-                .collect();
-            let listed = BTreeMap::new();
-            let publication = read_publication(
-                &self.publisher,
-                &index,
-                &listed,
-                &unlisted,
-                &HashMap::new(),
-                at,
-                &mut tally,
-            )?;
-            self.update_since(&index, &listed, &publication, at, false, &mut tally)?;
+            self.carry_all(at, &mut tally)?;
             self.decided_all_at = None;
-            (publication, None, 0)
-        };
-        publication.status = self.status(at, clock, before, !guard_ok, standing, &tally);
-        self.publish_spaced(&publication).await?;
-        if let Some(decided) = decided {
-            self.keep(decided)?;
         }
+        // A cycle that decides nothing counts no decision, as an index read
+        // that finds too few nodes counts none.
+        let decided = if guard_ok { self.standing } else { 0 };
+        let status = self.status(at, clock, before, !guard_ok, decided, &tally)?;
+        self.write_spaced(at, &status).await?;
         self.census.save()?;
-        self.last_status = Some(publication.status.clone());
+        self.last_status = Some(status.clone());
         Ok(CycleReport {
-            status: self.published_status(publication.status),
+            status: self.published_status(status),
             put: tally.put,
             poll,
             considered,
@@ -679,56 +831,200 @@ impl Producer {
         answered
     }
 
-    /// The addresses to decide this cycle: those whose copies changed
-    /// ([`Feeds::pending`]), those to decide again whatever changes, and
-    /// those whose nearest nodes changed if the census did (`census_changed`);
-    /// or, when `all`, every address a mirror holds, published or in
-    /// `rejected.json` too. Also returns the first three alone: what
-    /// explains a change.
-    fn to_decide(
-        &self,
-        all: bool,
-        census_changed: bool,
-    ) -> Result<(BTreeSet<XorName>, BTreeSet<XorName>)> {
-        let mut addresses: BTreeSet<XorName> = self.feeds.pending().clone();
-        addresses.extend(
-            self.known
-                .iter()
-                .filter(|(_, known)| known.again)
-                .map(|(address, _)| *address),
-        );
-        if census_changed {
-            let held = self.feeds.addresses();
-            for address in held.iter().chain(self.known.keys()) {
-                let nearest = nearest_hash(&self.census.nearest(address, NEAREST_NODES));
-                if self
-                    .known
-                    .get(address)
-                    .is_none_or(|known| known.nearest != nearest)
-                {
-                    addresses.insert(*address);
+    /// Make pending every address whose nearest nodes changed since it was
+    /// last decided, as after the census changed: those a mirror holds and
+    /// those decided, a batch at a time.
+    ///
+    /// # Errors
+    ///
+    /// If the store can't be read or written.
+    fn mark_moved(&mut self) -> Result<()> {
+        for held in [true, false] {
+            let mut after: Option<XorName> = None;
+            loop {
+                let batch = if held {
+                    self.feeds.held_after(after.as_ref(), DECIDE_BATCH)?
+                } else {
+                    let txn = self.store.env().read_txn().map_err(store_error)?;
+                    tagged_after(self.known, &txn, KNOWN_TAG, after.as_ref(), DECIDE_BATCH)?
+                };
+                let moved: Vec<XorName> = {
+                    let txn = self.store.env().read_txn().map_err(store_error)?;
+                    let mut moved = Vec::new();
+                    for address in &batch {
+                        let nearest = nearest_hash(&self.census.nearest(address, NEAREST_NODES));
+                        if self
+                            .known_of(&txn, address)?
+                            .is_none_or(|known| known.nearest != nearest)
+                        {
+                            moved.push(*address);
+                        }
+                    }
+                    moved
+                };
+                self.feeds.mark_pending(&moved)?;
+                match batch.last() {
+                    Some(last) if batch.len() == DECIDE_BATCH => after = Some(*last),
+                    _ => break,
                 }
             }
         }
-        let explained = addresses.clone();
-        if all {
-            addresses.extend(self.feeds.addresses());
-            addresses.extend(self.publisher.keys()?.into_iter().map(|key| key.address));
-            addresses.extend(
-                self.publisher
-                    .rejected_entries()?
-                    .iter()
-                    .filter_map(|row| row.listing.address()),
-            );
-        }
-        Ok((addresses, explained))
+        Ok(())
     }
 
-    /// Decide `addresses` (see the module docs), fetching the full listings
-    /// behind their copies until `fetch_deadline`. With `drops`, an address
-    /// none of whose nearest nodes serves a copy is looked at too: its
-    /// published entry is dropped on the evidence [`Census::confirm_drop`]
-    /// finds, checked until `drop_deadline` (at least one), and its row in
+    /// What is known of `address`, if it was decided ([`KNOWN_TAG`]).
+    fn known_of(&self, txn: &RoTxn, address: &XorName) -> Result<Option<Known>> {
+        Ok(self
+            .known
+            .get(txn, &tagged(KNOWN_TAG, address))
+            .map_err(store_error)?
+            .and_then(Known::decode))
+    }
+
+    /// The next batch of addresses from `source` after `after` (or from the
+    /// first): up to [`DECIDE_BATCH`] of them, in address order, each with
+    /// whether a change of its inputs explains deciding it (it is pending,
+    /// or to decide again).
+    ///
+    /// # Errors
+    ///
+    /// If the store can't be read.
+    fn next_batch(&self, source: Source, after: Option<&XorName>) -> Result<Vec<(XorName, bool)>> {
+        let limit = DECIDE_BATCH;
+        let pending = self.feeds.pending_after(after, limit)?;
+        let again = match source {
+            Source::All | Source::Pending { again: true } => {
+                let txn = self.store.env().read_txn().map_err(store_error)?;
+                tagged_after(self.known, &txn, AGAIN_TAG, after, limit)?
+            }
+            Source::Pending { again: false } => Vec::new(),
+        };
+        let explained: HashSet<XorName> = pending.iter().chain(&again).copied().collect();
+        let mut addresses: BTreeSet<XorName> = explained.iter().copied().collect();
+        if source == Source::All {
+            addresses.extend(self.feeds.held_after(after, limit)?);
+            addresses.extend(self.publisher.listed_after(after, limit)?);
+            addresses.extend(self.publisher.rejected_after(after, limit)?);
+            let txn = self.store.env().read_txn().map_err(store_error)?;
+            addresses.extend(tagged_after(self.since, &txn, DEFERRED_TAG, after, limit)?);
+        }
+        Ok(addresses
+            .into_iter()
+            .take(limit)
+            .map(|address| (address, explained.contains(&address)))
+            .collect())
+    }
+
+    /// Decide every address of `source`, a batch at a time: each batch
+    /// decided ([`Self::decide`]), its publication staged at `at`
+    /// ([`Publisher::stage`]) and what it decided kept ([`Self::keep`])
+    /// before the next. With `drops`, published addresses no node serves
+    /// any more are checked for dropping, within its time. With `alert`, a
+    /// change no input explains is logged. What is published is counted into
+    /// `tally`. Returns how many addresses were decided, and whether any
+    /// batch staged a change.
+    ///
+    /// # Errors
+    ///
+    /// If the store can't be read or written.
+    async fn decide_all(
+        &mut self,
+        source: Source,
+        at: u64,
+        mut drops: Option<&mut DropCheck>,
+        alert: bool,
+        tally: &mut Tally,
+    ) -> Result<(u64, bool)> {
+        let mut decided_count = 0;
+        let mut staged = false;
+        let mut after: Option<XorName> = None;
+        loop {
+            let batch = self.next_batch(source, after.as_ref())?;
+            let Some(&(last, _)) = batch.last() else {
+                break;
+            };
+            decided_count += batch.len() as u64;
+            let explained: BTreeSet<XorName> = batch
+                .iter()
+                .filter(|(_, explained)| *explained)
+                .map(|(address, _)| *address)
+                .collect();
+            let addresses: Vec<XorName> = batch.iter().map(|(address, _)| *address).collect();
+            let full = batch.len() == DECIDE_BATCH;
+            let mut decided = Box::pin(self.decide(addresses, drops.as_deref_mut())).await?;
+            let publication = self.publication(&mut decided, at, tally)?;
+            if alert {
+                alert_unexplained(&publication, &explained);
+            }
+            if !publication.changes.is_empty()
+                || !publication.support.is_empty()
+                || !publication.rejected.is_empty()
+            {
+                self.publisher.stage(&publication)?;
+                staged = true;
+            }
+            drop(publication);
+            self.keep(decided)?;
+            if !full {
+                break;
+            }
+            after = Some(last);
+        }
+        Ok((decided_count, staged))
+    }
+
+    /// As an index read that finds too few nodes: every published entry is
+    /// kept, marked carried, staged a batch at a time, and every address a
+    /// mirror holds counts as left for later.
+    ///
+    /// # Errors
+    ///
+    /// If the store can't be read or written.
+    fn carry_all(&mut self, at: u64, tally: &mut Tally) -> Result<()> {
+        let held = self.feeds.held_count()?;
+        let index = ListingsIndex::too_few(usize::try_from(held).unwrap_or(usize::MAX));
+        let listed = BTreeMap::new();
+        let mut after: Option<XorName> = None;
+        loop {
+            let batch = self.publisher.listed_after(after.as_ref(), DECIDE_BATCH)?;
+            let mut unlisted = Vec::with_capacity(batch.len());
+            for address in &batch {
+                if let Some(key) = self
+                    .publisher
+                    .entry(address)?
+                    .and_then(|entry| entry.entry.key())
+                {
+                    unlisted.push((key, None));
+                }
+            }
+            let publication = read_publication(
+                &self.publisher,
+                &index,
+                &listed,
+                &unlisted,
+                |_| None,
+                at,
+                tally,
+            )?;
+            if !publication.support.is_empty() {
+                self.publisher.stage(&publication)?;
+            }
+            match batch.last() {
+                Some(last) if batch.len() == DECIDE_BATCH => after = Some(*last),
+                _ => break,
+            }
+        }
+        if held > 0 {
+            tally.groups.insert("nodes_unanswered", (held, at));
+        }
+        Ok(())
+    }
+
+    /// Decide `addresses`, a batch (see the module docs), from the full
+    /// listings fetched for them. With `drops`, an address none of whose
+    /// nearest nodes serves a copy is looked at too: its published entry is
+    /// dropped on the evidence [`Census::confirm_drop`] finds, checked while
+    /// the cycle has time (at least one a cycle), and its row in
     /// `rejected.json` cleared once every node nearest it has been read in
     /// full long enough after its time. Without, such an address is left for
     /// the next cycle.
@@ -738,109 +1034,86 @@ impl Producer {
     /// If the store can't be read or written.
     async fn decide(
         &mut self,
-        addresses: BTreeSet<XorName>,
-        drops: bool,
-        fetch_deadline: Instant,
-        drop_deadline: Instant,
+        addresses: Vec<XorName>,
+        mut drops: Option<&mut DropCheck>,
     ) -> Result<Decided> {
-        let changed: HashSet<XorName> = addresses
-            .iter()
-            .filter(|address| self.feeds.pending().contains(*address))
-            .copied()
-            .collect();
-        let work: Vec<Work> = addresses
-            .into_iter()
-            .map(|address| {
-                let nearest = self.census.nearest(&address, NEAREST_NODES);
-                let copies = self.feeds.copies(&address, &nearest);
-                (address, nearest, copies)
-            })
-            .collect();
-        Box::pin(self.fetch_listings(&work, fetch_deadline)).await?;
-
         let mut index = ListingsIndex::default();
-        let mut decisions: Vec<Decision> = Vec::new();
-        let mut pending_seen: Vec<Seen> = Vec::new();
-        let mut backed_seen: Vec<Seen> = Vec::new();
+        let mut pending: Vec<AddressWalk<PeerId>> = Vec::new();
+        let mut backed: Vec<(AddressWalk<PeerId>, Vec<PeerId>)> = Vec::new();
         let mut waiting: Vec<(XorName, Vec<PeerId>, &'static str)> = Vec::new();
         let mut empty: Vec<(XorName, Vec<PeerId>)> = Vec::new();
         let mut unheard_addresses = 0usize;
-        let context = self.read_context();
-        let mut work = work.into_iter().peekable();
-        while work.peek().is_some() {
-            let batch: Vec<Work> = work.by_ref().take(DECIDE_BATCH).collect();
-            let mut pending: Vec<AddressWalk<PeerId>> = Vec::new();
-            let mut backed: Vec<(AddressWalk<PeerId>, Vec<PeerId>)> = Vec::new();
-            {
-                let txn = self.store.env().read_txn().map_err(store_error)?;
-                for (address, nearest, copies) in batch {
-                    if copies.is_empty() {
-                        empty.push((address, nearest));
-                        continue;
-                    }
-                    self.drop_backoff.remove(&address);
-                    let (taken, unheard) = copies_from(
-                        |digest| self.stored_listing(&txn, &address, digest),
-                        &copies,
-                    );
-                    if !unheard.is_empty() {
-                        unheard_addresses += 1;
-                    }
-                    if taken.is_empty() && unheard.is_empty() {
-                        empty.push((address, nearest));
-                        continue;
-                    }
-                    if taken.is_empty() {
-                        // Nothing to show of it: it waits, as a read waits
-                        // for nodes that haven't answered.
-                        let reason = if unheard.len() < QUORUM_THRESHOLD {
-                            "below_quorum"
-                        } else {
-                            "nodes_unanswered"
-                        };
-                        waiting.push((address, nearest, reason));
-                        continue;
-                    }
-                    let found = AddressWalk {
-                        address,
-                        support: taken.len(),
-                        nearest,
-                        copies: taken,
-                    };
-                    if found.support + unheard.len() < QUORUM_THRESHOLD {
-                        pending.push(found);
-                    } else {
-                        backed.push((found, unheard));
-                    }
-                }
+        let mut with_copies: Vec<XorName> = Vec::new();
+        for address in &addresses {
+            let nearest = self.census.nearest(address, NEAREST_NODES);
+            let copies = self.feeds.copies(address, &nearest)?;
+            if copies.is_empty() {
+                empty.push((*address, nearest));
+                continue;
             }
-            index.defer(&pending, &self.chain);
-            pending_seen.extend(pending.iter().map(|found| Seen::of(found, false)));
-            backed_seen.extend(
-                backed
-                    .iter()
-                    .map(|(found, unheard)| Seen::of(found, !unheard.is_empty())),
-            );
-            drop(pending);
-            if !backed.is_empty() {
-                let Some(requests) = self.requests.as_ref() else {
-                    return Err(Error::Network("listings requests are not routed".into()));
+            with_copies.push(*address);
+            let (taken, unheard) = {
+                let txn = self.store.env().read_txn().map_err(store_error)?;
+                copies_from(|digest| self.stored_listing(&txn, address, digest), &copies)
+            };
+            if !unheard.is_empty() {
+                unheard_addresses += 1;
+            }
+            if taken.is_empty() && unheard.is_empty() {
+                empty.push((*address, nearest));
+                continue;
+            }
+            if taken.is_empty() {
+                // Nothing to show of it: it waits, as a read waits for nodes
+                // that haven't answered.
+                let reason = if unheard.len() < QUORUM_THRESHOLD {
+                    "below_quorum"
+                } else {
+                    "nodes_unanswered"
                 };
-                let (client, chain, context) = (&self.client, &self.chain, &context);
-                let decided: Vec<Decision> = stream::iter(backed)
-                    .map(|(found, unheard)| async move {
-                        client
-                            .decide_backed(found, context, requests, chain, &unheard)
-                            .await
-                    })
-                    .buffer_unordered(CHECK_CONCURRENCY)
-                    .collect()
-                    .await;
-                decisions.extend(decided);
+                waiting.push((*address, nearest, reason));
+                continue;
+            }
+            let found = AddressWalk {
+                address: *address,
+                support: taken.len(),
+                nearest,
+                copies: taken,
+            };
+            if found.support + unheard.len() < QUORUM_THRESHOLD {
+                pending.push(found);
+            } else {
+                backed.push((found, unheard));
             }
         }
         if unheard_addresses > 0 {
             debug!("{unheard_addresses} addresses have copies whose full listings couldn't be had");
+        }
+        // Some node serves a copy: no drop to back off from.
+        self.forget_backoffs(with_copies.iter())?;
+        index.defer(&pending, &self.chain);
+        let pending_seen: Vec<Seen> = pending.iter().map(|found| Seen::of(found, false)).collect();
+        let backed_seen: Vec<Seen> = backed
+            .iter()
+            .map(|(found, unheard)| Seen::of(found, !unheard.is_empty()))
+            .collect();
+        drop(pending);
+        let mut decisions: Vec<Decision> = Vec::new();
+        if !backed.is_empty() {
+            let Some(requests) = self.requests.as_ref() else {
+                return Err(Error::Network("listings requests are not routed".into()));
+            };
+            let context = self.read_context();
+            let (client, chain, context) = (&self.client, &self.chain, &context);
+            decisions = stream::iter(backed)
+                .map(|(found, unheard)| async move {
+                    client
+                        .decide_backed(found, context, requests, chain, &unheard)
+                        .await
+                })
+                .buffer_unordered(CHECK_CONCURRENCY)
+                .collect()
+                .await;
         }
 
         // Addresses none of whose nearest nodes serves a copy.
@@ -848,96 +1121,16 @@ impl Producer {
         let mut removed: HashSet<XorName> = HashSet::new();
         let mut kept: HashSet<XorName> = HashSet::new();
         let mut forget: Vec<XorName> = Vec::new();
-        if drops && !empty.is_empty() {
-            let rows: HashMap<XorName, ListingKey> = self
-                .publisher
-                .rejected_entries()?
-                .into_iter()
-                .filter_map(|row| Some((row.listing.address()?, row.listing.key()?)))
-                .collect();
-            let now = unix_now();
-            let mut checked = false;
-            for (address, nearest) in &empty {
-                let read_whole = nearest.len() >= NEAREST_NODES
-                    && nearest.iter().all(|peer| {
-                        self.feeds
-                            .read(peer)
-                            .is_some_and(|read| read.counts && read.complete)
-                    });
-                let published = self
-                    .publisher
-                    .entry(address)?
-                    .and_then(|entry| entry.entry.key());
-                if let Some(key) = published {
-                    if !read_whole {
-                        kept.insert(*address);
-                        continue;
-                    }
-                    let last = self.last_holders(address)?;
-                    let inputs = drop_inputs(nearest, &last);
-                    let backing_off = !changed.contains(address)
-                        && self.drop_backoff.get(address).is_some_and(|backoff| {
-                            backoff.inputs == inputs && now < backoff.retry_at
-                        });
-                    let out_of_time = checked && Instant::now() >= drop_deadline;
-                    if backing_off || out_of_time {
-                        kept.insert(*address);
-                        continue;
-                    }
-                    checked = true;
-                    let Some(requests) = self.requests.as_ref() else {
-                        kept.insert(*address);
-                        continue;
-                    };
-                    match Box::pin(self.census.confirm_drop(
-                        &self.client,
-                        requests,
-                        address,
-                        key.time,
-                        nearest,
-                        &last,
-                    ))
-                    .await
-                    {
-                        Ok(()) => {
-                            removed.insert(*address);
-                            gone.insert(*address);
-                            forget.push(*address);
-                        }
-                        Err(why) => {
-                            info!(
-                                "Keeping {}, which its nearest nodes no longer serve: {why}",
-                                hex::encode(address)
-                            );
-                            kept.insert(*address);
-                            self.drop_backoff.insert(
-                                *address,
-                                DropBackoff {
-                                    inputs,
-                                    retry_at: now.saturating_add(RETRY_INTERVAL.as_secs()),
-                                },
-                            );
-                        }
-                    }
-                } else if let Some(key) = rows.get(address) {
-                    // As an index read clears it: every node nearest it read in
-                    // full long enough after its time to have stored it.
-                    let read_since = nearest
-                        .iter()
-                        .map(|peer| self.feeds.complete_since(peer))
-                        .collect::<Option<Vec<u64>>>()
-                        .and_then(|since| since.into_iter().min());
-                    let stored_by = key.time.saturating_add(FIRST_SEEN_ROUNDING + CLOCK_MARGIN);
-                    if read_whole && read_since.is_some_and(|since| since >= stored_by) {
-                        gone.insert(*address);
-                        forget.push(*address);
-                    } else {
-                        kept.insert(*address);
-                    }
-                } else {
-                    forget.push(*address);
-                }
-            }
+        if let Some(drops) = drops.as_deref_mut() {
+            Box::pin(self.check_drops(
+                &empty,
+                drops,
+                &mut gone,
+                &mut removed,
+                &mut kept,
+                &mut forget,
+            ))
+            .await?;
         }
 
         index.finish_decided(decisions, gone);
@@ -955,6 +1148,7 @@ impl Producer {
             .map(|row| row.listing.address)
             .collect();
         let mut decided = Decided {
+            addresses,
             index: ListingsIndex::default(),
             unlisted: Vec::new(),
             known: Vec::new(),
@@ -962,7 +1156,6 @@ impl Producer {
             forget,
             settle: Vec::new(),
             waiting: Vec::new(),
-            sizes: HashMap::new(),
         };
         let mut considered: Vec<(XorName, u64, bool)> = Vec::new();
         for seen in pending_seen {
@@ -984,7 +1177,7 @@ impl Producer {
             considered.push((address, nearest_hash(&nearest), true));
             decided.waiting.push((address, reason));
         }
-        if drops {
+        if drops.is_some() {
             for (address, nearest) in empty {
                 if kept.contains(&address) {
                     considered.push((address, nearest_hash(&nearest), true));
@@ -1030,9 +1223,150 @@ impl Producer {
             }
         }
         drop(listed);
-        decided.sizes = Box::pin(self.shrunk_sizes(&index)).await?;
         decided.index = index;
         Ok(decided)
+    }
+
+    /// The drop checks of `empty`, addresses none of whose nearest nodes
+    /// serves a copy, each with its nearest nodes, within `drops`' time:
+    /// what goes, what is removed from the index, what is kept, and what is
+    /// forgotten, noted in the sets given.
+    ///
+    /// # Errors
+    ///
+    /// If the store can't be read or written.
+    async fn check_drops(
+        &mut self,
+        empty: &[(XorName, Vec<PeerId>)],
+        drops: &mut DropCheck,
+        gone: &mut HashSet<XorName>,
+        removed: &mut HashSet<XorName>,
+        kept: &mut HashSet<XorName>,
+        forget: &mut Vec<XorName>,
+    ) -> Result<()> {
+        let now = unix_now();
+        for (address, nearest) in empty {
+            let read_whole = nearest.len() >= NEAREST_NODES
+                && nearest.iter().all(|peer| {
+                    self.feeds
+                        .read(peer)
+                        .is_some_and(|read| read.counts && read.complete)
+                });
+            let published = self
+                .publisher
+                .entry(address)?
+                .and_then(|entry| entry.entry.key());
+            if let Some(key) = published {
+                if !read_whole {
+                    kept.insert(*address);
+                    continue;
+                }
+                let last = self.last_holders(address)?;
+                let inputs = drop_inputs(nearest, &last);
+                let changed = self.feeds.is_pending(address)?;
+                let backoff = self.backoff_of(address)?;
+                let backing_off = !changed
+                    && backoff
+                        .is_some_and(|backoff| backoff.inputs == inputs && now < backoff.retry_at);
+                let out_of_time = drops.checked && Instant::now() >= drops.deadline;
+                if backing_off || out_of_time {
+                    kept.insert(*address);
+                    continue;
+                }
+                drops.checked = true;
+                let Some(requests) = self.requests.as_ref() else {
+                    kept.insert(*address);
+                    continue;
+                };
+                match Box::pin(self.census.confirm_drop(
+                    &self.client,
+                    requests,
+                    address,
+                    key.time,
+                    nearest,
+                    &last,
+                ))
+                .await
+                {
+                    Ok(()) => {
+                        removed.insert(*address);
+                        gone.insert(*address);
+                        forget.push(*address);
+                    }
+                    Err(why) => {
+                        info!(
+                            "Keeping {}, which its nearest nodes no longer serve: {why}",
+                            hex::encode(address)
+                        );
+                        kept.insert(*address);
+                        self.set_backoff(
+                            address,
+                            DropBackoff {
+                                inputs,
+                                retry_at: now.saturating_add(RETRY_INTERVAL.as_secs()),
+                            },
+                        )?;
+                    }
+                }
+            } else if let Some(row) = self.publisher.rejected_entry(address)? {
+                let Some(key) = row.listing.key() else {
+                    forget.push(*address);
+                    continue;
+                };
+                // As an index read clears it: every node nearest it read in
+                // full long enough after its time to have stored it.
+                let read_since = nearest
+                    .iter()
+                    .map(|peer| self.feeds.complete_since(peer))
+                    .collect::<Option<Vec<u64>>>()
+                    .and_then(|since| since.into_iter().min());
+                let stored_by = key.time.saturating_add(FIRST_SEEN_ROUNDING + CLOCK_MARGIN);
+                if read_whole && read_since.is_some_and(|since| since >= stored_by) {
+                    gone.insert(*address);
+                    forget.push(*address);
+                } else {
+                    kept.insert(*address);
+                }
+            } else {
+                forget.push(*address);
+            }
+        }
+        Ok(())
+    }
+
+    /// The drop of `address` the evidence refused, if one was.
+    fn backoff_of(&self, address: &XorName) -> Result<Option<DropBackoff>> {
+        let txn = self.store.env().read_txn().map_err(store_error)?;
+        Ok(self
+            .known
+            .get(&txn, &tagged(BACKOFF_TAG, address))
+            .map_err(store_error)?
+            .and_then(DropBackoff::decode))
+    }
+
+    /// Note that the evidence refused the drop of `address`.
+    fn set_backoff(&self, address: &XorName, backoff: DropBackoff) -> Result<()> {
+        let mut txn = self.store.env().write_txn().map_err(store_error)?;
+        self.known
+            .put(&mut txn, &tagged(BACKOFF_TAG, address), &backoff.encode())
+            .map_err(store_error)?;
+        txn.commit().map_err(store_error)
+    }
+
+    /// Forget the refused drops of `addresses`, which have copies to show.
+    fn forget_backoffs<'a>(&self, addresses: impl Iterator<Item = &'a XorName>) -> Result<()> {
+        let mut txn = self.store.env().write_txn().map_err(store_error)?;
+        let mut any = false;
+        for address in addresses {
+            any |= self
+                .known
+                .delete(&mut txn, &tagged(BACKOFF_TAG, address))
+                .map_err(store_error)?;
+        }
+        if any {
+            txn.commit().map_err(store_error)?;
+        }
+        Ok(())
     }
 
     /// The full listing behind the entry of `address` with `digest`, as
@@ -1052,103 +1386,26 @@ impl Producer {
         rmp_serde::from_slice(bytes).ok()
     }
 
-    /// The size of each file `index` lists whose data map is shrunk, so that
-    /// its listing gives none: the sum of its root map's chunk sizes, as the
-    /// uploader gave them. The root map is fetched once, as a download
-    /// fetches it, and the size kept for good; one that can't be read now is
-    /// left out, and read again the next time its address is decided.
-    ///
-    /// # Errors
-    ///
-    /// If the store can't be read or written.
-    async fn shrunk_sizes(&self, index: &ListingsIndex) -> Result<HashMap<XorName, u64>> {
-        let mut sizes = HashMap::new();
-        let mut unread: Vec<(XorName, &DataMap)> = Vec::new();
-        {
-            let txn = self.store.env().read_txn().map_err(store_error)?;
-            for checked in &index.listings {
-                let Some(map) = shrunk_map(checked) else {
-                    continue;
-                };
-                let address = checked.listing.address;
-                match self.sizes.get(&txn, &address).map_err(store_error)? {
-                    Some(size) => {
-                        sizes.insert(address, size);
-                    }
-                    None => unread.push((address, map)),
-                }
-            }
-        }
-        if unread.is_empty() {
-            return Ok(sizes);
-        }
-        let client = &self.client;
-        let read: Vec<(XorName, Option<u64>)> = stream::iter(unread)
-            .map(|(address, map)| async move {
-                match client.data_map_resolve_root(map).await {
-                    Ok(root) => (address, root_size(&root)),
-                    Err(error) => {
-                        debug!(
-                            "Could not read the root map of {}: {error}",
-                            hex::encode(address)
-                        );
-                        (address, None)
-                    }
-                }
-            })
-            .buffer_unordered(CHECK_CONCURRENCY)
-            .collect()
-            .await;
-        let mut txn = self.store.env().write_txn().map_err(store_error)?;
-        for (address, size) in read {
-            if let Some(size) = size {
-                self.sizes
-                    .put(&mut txn, &address, &size)
-                    .map_err(store_error)?;
-                sizes.insert(address, size);
-            }
-        }
-        txn.commit().map_err(store_error)?;
-        Ok(sizes)
-    }
-
     /// Fetch, with a `GetRequest` to the nodes holding it, the full listing
-    /// behind each digest entry of `work` not kept yet, and keep the first
-    /// that the node's entry describes. Addresses at least a quorum of whose
-    /// nearest nodes hold an entry go first. Each node is sent at most its
-    /// allowance in pages a cycle ([`Feeds::page_allowance`]), and a node
-    /// that failed to hand over the listing behind its entry isn't asked for
-    /// it again for [`RETRY_INTERVAL`], unless its entry changes. What
-    /// hasn't come by `deadline` is
-    /// left for later: its copies can't be had this time.
+    /// behind each digest entry of the addresses of `source` not kept yet,
+    /// and keep the first that the node's entry describes. The addresses
+    /// are read a batch at a time, and their fetches started as they are,
+    /// [`POLL_CONCURRENCY`] at once: those of addresses at least a quorum of
+    /// whose nearest nodes hold an entry first, then the others. Each node
+    /// is sent at most its allowance in pages a cycle
+    /// ([`Feeds::page_allowance`]), and a node that failed to hand over the
+    /// listing behind its entry isn't asked for it again for
+    /// [`RETRY_INTERVAL`], unless its entry changes. What hasn't come by
+    /// `deadline` is left for later: its copies can't be had this time.
     ///
     /// # Errors
     ///
     /// If the store can't be read or written.
-    async fn fetch_listings(&mut self, work: &[Work], deadline: Instant) -> Result<()> {
-        // A failure stands while the node's entry does.
-        let feeds = &self.feeds;
-        let now = unix_now();
-        self.failed.retain(|(peer, (address, digest)), retry_at| {
-            now < *retry_at
-                && feeds
-                    .entry(peer, address)
-                    .is_some_and(|entry| entry.digest == *digest)
-        });
-        let wanted = {
-            let txn = self.store.env().read_txn().map_err(store_error)?;
-            fetches_wanted(work, &self.failed, |(address, digest)| {
-                self.listings
-                    .get(&txn, &listing_key(address, digest))
-                    .is_ok_and(|kept| kept.is_some())
-            })
-        };
-        if wanted.is_empty() {
-            return Ok(());
-        }
+    async fn fetch_for(&self, source: Source, deadline: Instant) -> Result<()> {
         let Some(requests) = self.requests.as_ref() else {
             return Ok(());
         };
+        let now = unix_now();
         let (client, feeds, budget) = (&self.client, &self.feeds, &self.fetch_budget);
         let take = move |peer: &PeerId| budget.take(peer, || feeds.page_allowance(peer));
         let ask = move |peer: PeerId, address: XorName| async move {
@@ -1159,27 +1416,69 @@ impl Producer {
                 .next()
                 .and_then(|(_, answer)| answer)
         };
-        let (fetched, failed) = fetch_wanted(wanted, take, deadline, ask).await;
-        let retry_at = now.saturating_add(RETRY_INTERVAL.as_secs());
-        self.failed
-            .extend(failed.into_iter().map(|failure| (failure, retry_at)));
-        if fetched.is_empty() {
-            return Ok(());
+        let error: std::cell::RefCell<Option<Error>> = std::cell::RefCell::new(None);
+        let mut sink = FetchSink::new(self, now);
+        for backed in [true, false] {
+            if Instant::now() >= deadline {
+                break;
+            }
+            let wanted = WantedIter::new(self, source, backed, now, &error);
+            fetch_wanted(wanted, take, deadline, ask, |key, listing, failed| {
+                sink.add(key, listing, failed);
+            })
+            .await;
+            sink.flush()?;
+            if let Some(e) = error.borrow_mut().take() {
+                return Err(e);
+            }
         }
-        let mut txn = self.store.env().write_txn().map_err(store_error)?;
-        for ((address, digest), listing) in fetched {
-            let listing = Listing {
-                first_seen: None,
-                ..listing
-            };
-            let bytes = rmp_serde::to_vec(&listing)
-                .map_err(|e| Error::Serialization(format!("a fetched listing: {e}")))?;
+        sink.flush()
+    }
+
+    /// The full listings to fetch for the next batch of `source` after
+    /// `after`, of addresses at least a quorum of whose nearest nodes hold an
+    /// entry if `backed`, else of the others: each digest an entry names
+    /// that isn't kept, with the nodes whose entries name it but those that
+    /// failed to hand it over less than [`RETRY_INTERVAL`] before `now`.
+    /// Also returns the batch's last address, and whether the batch was the
+    /// last.
+    ///
+    /// # Errors
+    ///
+    /// If the store can't be read.
+    fn wanted_after(
+        &self,
+        source: Source,
+        after: Option<&XorName>,
+        backed: bool,
+        now: u64,
+    ) -> Result<(Vec<Wanted>, Option<XorName>, bool)> {
+        let batch = self.next_batch(source, after)?;
+        let last = batch.last().map(|(address, _)| *address);
+        let done = batch.len() < DECIDE_BATCH;
+        let mut work: Vec<Work> = Vec::new();
+        for (address, _) in &batch {
+            let nearest = self.census.nearest(address, NEAREST_NODES);
+            let copies = self.feeds.copies(address, &nearest)?;
+            if (copies.len() >= QUORUM_THRESHOLD) == backed && !copies.is_empty() {
+                work.push((*address, Vec::new(), copies));
+            }
+        }
+        let txn = self.store.env().read_txn().map_err(store_error)?;
+        let failed = |peer: &PeerId, (address, digest): &ListingId| {
+            self.known
+                .get(&txn, &failed_key(address, peer, digest))
+                .ok()
+                .flatten()
+                .and_then(|bytes| <[u8; 8]>::try_from(bytes).ok())
+                .is_some_and(|retry_at| now < u64::from_be_bytes(retry_at))
+        };
+        let kept = |(address, digest): &ListingId| {
             self.listings
-                .put(&mut txn, &listing_key(&address, &digest), &bytes)
-                .map_err(store_error)?;
-        }
-        txn.commit().map_err(store_error)?;
-        Ok(())
+                .get(&txn, &listing_key(address, digest))
+                .is_ok_and(|kept| kept.is_some())
+        };
+        Ok((fetches_wanted(&work, failed, kept), last, done))
     }
 
     /// What deciding an address needs to know of the nodes, as an index
@@ -1219,45 +1518,46 @@ impl Producer {
     ///
     /// If the store can't be read.
     fn last_holders(&self, address: &XorName) -> Result<Vec<PeerId>> {
-        let txn = self.store.env().read_txn().map_err(store_error)?;
-        let kept: Vec<PeerId> = self
-            .holders
-            .get(&txn, address)
-            .map_err(store_error)?
-            .map(|bytes| {
-                let (ids, _) = bytes.as_chunks::<32>();
-                ids.iter().map(|id| PeerId::from_bytes(*id)).collect()
-            })
-            .unwrap_or_default();
+        let kept: Vec<PeerId> = {
+            let txn = self.store.env().read_txn().map_err(store_error)?;
+            self.holders
+                .get(&txn, address)
+                .map_err(store_error)?
+                .map(|bytes| {
+                    let (ids, _) = bytes.as_chunks::<32>();
+                    ids.iter().map(|id| PeerId::from_bytes(*id)).collect()
+                })
+                .unwrap_or_default()
+        };
         if kept.is_empty() {
-            return Ok(self.feeds.holders(address));
+            return self.feeds.holders(address);
         }
         Ok(kept)
     }
 
-    /// What `decided`, decided at `at`, changes in what is published, and
-    /// since when addresses are deferred or below full support; counted into
-    /// `tally`. A `partial` decision, of what pushes changed between cycles,
-    /// leaves deferrals of addresses it didn't decide as they were. Notes in
-    /// `decided` which addresses' decisions stand: listed, or rejected for
-    /// good.
+    /// What `decided`, a batch decided at `at`, changes in what is
+    /// published, and since when its addresses are deferred or below full
+    /// support; counted into `tally`. Notes in `decided` which addresses'
+    /// decisions stand: listed, or rejected for good. A listed file whose
+    /// data map is shrunk is published with the size kept for it
+    /// ([`SIZES_DB`]), or if none is, without, and its root map is to be
+    /// read ([`SIZE_WANTED_TAG`]).
     ///
     /// # Errors
     ///
     /// If the store can't be read or written.
     fn publication(
-        &self,
+        &mut self,
         decided: &mut Decided,
         at: u64,
-        partial: bool,
         tally: &mut Tally,
     ) -> Result<Publication> {
         let Decided {
+            addresses,
             index,
             unlisted,
             known,
             waiting,
-            sizes,
             ..
         } = decided;
         let listed: BTreeMap<XorName, &CheckedListing> = index
@@ -1265,45 +1565,47 @@ impl Producer {
             .iter()
             .map(|checked| (checked.listing.address, checked))
             .collect();
-        let publication = read_publication(
-            &self.publisher,
-            index,
-            &listed,
-            unlisted,
-            sizes,
-            at,
-            tally,
-        )?;
+        let publication = {
+            let txn = self.store.env().read_txn().map_err(store_error)?;
+            let sizes = |address: &XorName| self.sizes.get(&txn, address).ok().flatten();
+            read_publication(&self.publisher, index, &listed, unlisted, sizes, at, tally)?
+        };
         tally.deferred.extend(waiting.iter().copied());
-        self.update_since(index, &listed, &publication, at, partial, tally)?;
+        self.update_since(&listed, &publication, addresses, at, tally)?;
         for (address, known) in known.iter_mut() {
             if let Some(known) = known {
                 known.decided = listed.contains_key(address) || tally.for_good.contains(address);
             }
         }
+        tally.for_good.clear();
+        // Sizes to read, and those no longer wanted.
+        let wanted = std::mem::take(&mut tally.wanted_sizes);
+        let mut txn = self.store.env().write_txn().map_err(store_error)?;
+        for (address, map) in wanted {
+            let row = tagged(SIZE_WANTED_TAG, &address);
+            if self.known.get(&txn, &row).map_err(store_error)?.is_none() {
+                let mut value = 0u64.to_be_bytes().to_vec();
+                value.extend(
+                    rmp_serde::to_vec(&map)
+                        .map_err(|e| Error::Serialization(format!("a data map: {e}")))?,
+                );
+                self.known
+                    .put(&mut txn, &row, &value)
+                    .map_err(store_error)?;
+            }
+        }
+        for change in &publication.changes {
+            if let IndexChange::Remove { address, .. } = change {
+                self.known
+                    .delete(&mut txn, &tagged(SIZE_WANTED_TAG, address))
+                    .map_err(store_error)?;
+            }
+        }
+        txn.commit().map_err(store_error)?;
         Ok(publication)
     }
 
-    /// How many addresses' decisions stand once `decided` is kept: listed,
-    /// or rejected for good. What `status.json` gives as the cycle's
-    /// `decided`, as an index read counts what it decides.
-    fn standing(&self, decided: &Decided) -> u64 {
-        let before = self.known.values().filter(|known| known.decided).count();
-        // Each address decided is in `decided.known` once.
-        let (mut gained, mut lost) = (0usize, 0usize);
-        for (address, known) in &decided.known {
-            let was = self.known.get(address).is_some_and(|known| known.decided);
-            let is = known.is_some_and(|known| known.decided);
-            match (was, is) {
-                (false, true) => gained += 1,
-                (true, false) => lost += 1,
-                _ => {}
-            }
-        }
-        (before + gained).saturating_sub(lost) as u64
-    }
-
-    /// Keep what `decided` decided, once published: what is known of each
+    /// Keep what `decided` decided, once staged: what is known of each
     /// address, the nodes whose copies counted, and the full listings still
     /// held; and settle its addresses in the mirrors.
     ///
@@ -1311,6 +1613,7 @@ impl Producer {
     ///
     /// If the store can't be written.
     fn keep(&mut self, decided: Decided) -> Result<()> {
+        let now = unix_now();
         let mut txn = self.store.env().write_txn().map_err(store_error)?;
         for (address, holders) in &decided.holders {
             let bytes: Vec<u8> = holders
@@ -1325,44 +1628,98 @@ impl Producer {
             self.holders
                 .delete(&mut txn, address)
                 .map_err(store_error)?;
-            self.drop_backoff.remove(address);
+            self.known
+                .delete(&mut txn, &tagged(BACKOFF_TAG, address))
+                .map_err(store_error)?;
         }
         for address in &decided.settle {
-            // Only the listings behind entries some mirror still holds stay.
-            let held: HashSet<[u8; 32]> = self
-                .feeds
-                .holders(address)
-                .iter()
-                .filter_map(|peer| self.feeds.entry(peer, address))
-                .map(|entry| entry.digest)
-                .collect();
+            // Only the listings behind entries some mirror still holds stay,
+            // and only the failures of entries still held.
+            let mut held: HashSet<(PeerId, [u8; 32])> = HashSet::new();
+            for peer in self.feeds.holders(address)? {
+                if let Some(entry) = self.feeds.entry(&peer, address)? {
+                    held.insert((peer, entry.digest));
+                }
+            }
+            let digests: HashSet<[u8; 32]> = held.iter().map(|(_, digest)| *digest).collect();
             let mut stale: Vec<Vec<u8>> = Vec::new();
             for row in self
                 .listings
+                .remap_data_type::<DecodeIgnore>()
                 .prefix_iter(&txn, address)
                 .map_err(store_error)?
             {
-                let (key, _) = row.map_err(store_error)?;
+                let (key, ()) = row.map_err(store_error)?;
                 let digest: Option<[u8; 32]> = key.get(32..).and_then(|d| d.try_into().ok());
-                if digest.is_none_or(|digest| !held.contains(&digest)) {
+                if digest.is_none_or(|digest| !digests.contains(&digest)) {
                     stale.push(key.to_vec());
                 }
             }
             for key in stale {
                 self.listings.delete(&mut txn, &key).map_err(store_error)?;
             }
-        }
-        txn.commit().map_err(store_error)?;
-        for (address, known) in decided.known {
-            match known {
-                Some(known) => {
-                    self.known.insert(address, known);
-                }
-                None => {
-                    self.known.remove(&address);
+            let mut stale: Vec<Vec<u8>> = Vec::new();
+            for row in self
+                .known
+                .prefix_iter(&txn, &tagged(FAILED_TAG, address))
+                .map_err(store_error)?
+            {
+                let (key, value) = row.map_err(store_error)?;
+                let peer: Option<[u8; 32]> = key.get(33..65).and_then(|p| p.try_into().ok());
+                let digest: Option<[u8; 32]> = key.get(65..).and_then(|d| d.try_into().ok());
+                let retry_at = <[u8; 8]>::try_from(value).map_or(0, u64::from_be_bytes);
+                let still = match (peer, digest) {
+                    (Some(peer), Some(digest)) => {
+                        held.contains(&(PeerId::from_bytes(peer), digest))
+                    }
+                    _ => false,
+                };
+                if !still || retry_at <= now {
+                    stale.push(key.to_vec());
                 }
             }
+            for key in stale {
+                self.known.delete(&mut txn, &key).map_err(store_error)?;
+            }
         }
+        for (address, known) in &decided.known {
+            let row = tagged(KNOWN_TAG, address);
+            let was = self
+                .known
+                .get(&txn, &row)
+                .map_err(store_error)?
+                .and_then(Known::decode)
+                .is_some_and(|known| known.decided);
+            let is = known.is_some_and(|known| known.decided);
+            match known {
+                Some(known) => {
+                    self.known
+                        .put(&mut txn, &row, &known.encode())
+                        .map_err(store_error)?;
+                    if known.again {
+                        self.known
+                            .put(&mut txn, &tagged(AGAIN_TAG, address), &[])
+                            .map_err(store_error)?;
+                    } else {
+                        self.known
+                            .delete(&mut txn, &tagged(AGAIN_TAG, address))
+                            .map_err(store_error)?;
+                    }
+                }
+                None => {
+                    self.known.delete(&mut txn, &row).map_err(store_error)?;
+                    self.known
+                        .delete(&mut txn, &tagged(AGAIN_TAG, address))
+                        .map_err(store_error)?;
+                }
+            }
+            match (was, is) {
+                (false, true) => self.standing += 1,
+                (true, false) => self.standing = self.standing.saturating_sub(1),
+                _ => {}
+            }
+        }
+        txn.commit().map_err(store_error)?;
         self.feeds.settle(&decided.settle)
     }
 
@@ -1380,15 +1737,15 @@ impl Producer {
         first: (PeerId, ChangesResponse),
         deadline: Instant,
     ) -> Result<()> {
-        let mut applied = self.take_push(first);
+        let mut applied = self.take_push(first)?;
         wait_past(self.published_second).await;
         while let Some(push) = self.pushes.try_recv() {
-            applied |= self.take_push(push);
+            applied |= self.take_push(push)?;
         }
+        self.feeds.save()?;
         if !applied {
             return Ok(());
         }
-        self.feeds.save()?;
         let Some(status) = self.last_status.clone() else {
             return Ok(());
         };
@@ -1396,106 +1753,225 @@ impl Producer {
             return Ok(());
         }
         let at = unix_now();
-        let addresses = self.feeds.pending().clone();
-        let mut decided = Box::pin(self.decide(addresses, false, deadline, deadline)).await?;
+        let source = Source::Pending { again: false };
+        Box::pin(self.fetch_for(source, deadline)).await?;
         let mut tally = Tally::default();
-        let mut publication = self.publication(&mut decided, at, true, &mut tally)?;
-        if !publication.changes.is_empty()
-            || !publication.support.is_empty()
-            || !publication.rejected.is_empty()
-        {
-            publication.status = status;
-            self.publish_spaced(&publication).await?;
+        let (_, staged) = Box::pin(self.decide_all(source, at, None, false, &mut tally)).await?;
+        if staged {
+            self.write_spaced(at, &status).await?;
             self.published_between += 1;
             debug!(
                 "Published what pushes changed: {} put, {} removed",
                 tally.put, tally.removed
             );
         }
-        self.keep(decided)
+        Ok(())
     }
 
     /// Take one push: whether it was applied to its node's mirror.
-    fn take_push(&mut self, (source, push): (PeerId, ChangesResponse)) -> bool {
+    ///
+    /// # Errors
+    ///
+    /// If the store can't be written.
+    fn take_push(&mut self, (source, push): (PeerId, ChangesResponse)) -> Result<bool> {
         self.pushes_between += 1;
-        matches!(
-            self.feeds.push(&self.census, &source, &push),
+        Ok(matches!(
+            self.feeds.push(&self.census, &source, &push)?,
             Pushed::Applied(_)
-        )
+        ))
     }
 
-    /// Publish `publication`, once the clock is past the second in which the
-    /// latest publication ended: so each file written again is written in a
-    /// later second than before.
+    /// Start reading the root maps of up to [`SIZES_PER_CYCLE`] listed files
+    /// whose sizes aren't known yet, in a task of its own, until `until`;
+    /// unless such a task is still reading. A root map that couldn't be read
+    /// before is read again only [`RETRY_INTERVAL`] after.
+    ///
+    /// # Errors
+    ///
+    /// If the store can't be read.
+    fn start_sizes(&mut self, until: Instant) -> Result<()> {
+        if self.size_job.is_some() {
+            return Ok(());
+        }
+        let now = unix_now();
+        let mut due: Vec<(XorName, DataMap)> = Vec::new();
+        {
+            let txn = self.store.env().read_txn().map_err(store_error)?;
+            for row in self
+                .known
+                .prefix_iter(&txn, &[SIZE_WANTED_TAG])
+                .map_err(store_error)?
+            {
+                if due.len() == SIZES_PER_CYCLE {
+                    break;
+                }
+                let (key, value) = row.map_err(store_error)?;
+                let Some(address) = key.get(1..).and_then(|a| XorName::try_from(a).ok()) else {
+                    continue;
+                };
+                let Some((retry_at, map)) = value.split_first_chunk::<8>() else {
+                    continue;
+                };
+                if u64::from_be_bytes(*retry_at) > now {
+                    continue;
+                }
+                if let Ok(map) = rmp_serde::from_slice::<DataMap>(map) {
+                    due.push((address, map));
+                }
+            }
+        }
+        if due.is_empty() {
+            return Ok(());
+        }
+        let client = Arc::clone(&self.client);
+        let (sender, results) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            let client = &client;
+            let mut reads = stream::iter(due)
+                .map(|(address, map)| async move {
+                    match client.data_map_resolve_root(&map).await {
+                        Ok(root) => (address, root_size(&root)),
+                        Err(error) => {
+                            debug!(
+                                "Could not read the root map of {}: {error}",
+                                hex::encode(address)
+                            );
+                            (address, None)
+                        }
+                    }
+                })
+                .buffer_unordered(SIZES_PER_CYCLE);
+            let mut read = Vec::new();
+            while let Ok(Some(size)) = tokio::time::timeout_at(until, reads.next()).await {
+                read.push(size);
+            }
+            let _ = sender.send(read);
+        });
+        self.size_job = Some(SizeJob { results, task });
+        Ok(())
+    }
+
+    /// Take the sizes `read`: keep each one read, and fill it in to its
+    /// entry where that has none, as a put published with the latest
+    /// cycle's `status.json`; a root map that couldn't be read is read again
+    /// after [`RETRY_INTERVAL`].
     ///
     /// # Errors
     ///
     /// If the store or the published files can't be written.
-    async fn publish_spaced(&mut self, publication: &Publication) -> Result<()> {
+    async fn take_sizes(&mut self, read: Vec<(XorName, Option<u64>)>) -> Result<()> {
+        if read.is_empty() {
+            return Ok(());
+        }
+        let now = unix_now();
+        let retry_at = now.saturating_add(RETRY_INTERVAL.as_secs());
+        let mut sized: Vec<(XorName, u64)> = Vec::new();
+        let mut txn = self.store.env().write_txn().map_err(store_error)?;
+        for (address, size) in read {
+            let row = tagged(SIZE_WANTED_TAG, &address);
+            match size {
+                Some(size) => {
+                    self.sizes
+                        .put(&mut txn, &address, &size)
+                        .map_err(store_error)?;
+                    self.known.delete(&mut txn, &row).map_err(store_error)?;
+                    sized.push((address, size));
+                }
+                None => {
+                    let value = self
+                        .known
+                        .get(&txn, &row)
+                        .map_err(store_error)?
+                        .map(|value| {
+                            let mut value = value.to_vec();
+                            if value.len() >= 8 {
+                                value[..8].copy_from_slice(&retry_at.to_be_bytes());
+                            }
+                            value
+                        });
+                    if let Some(value) = value {
+                        self.known
+                            .put(&mut txn, &row, &value)
+                            .map_err(store_error)?;
+                    }
+                }
+            }
+        }
+        txn.commit().map_err(store_error)?;
+        let mut changes = Vec::new();
+        for (address, size) in sized {
+            let Some(mut entry) = self.publisher.entry(&address)? else {
+                continue;
+            };
+            if entry.entry.listing.size.is_none() && entry.data_map.is_some() {
+                entry.entry.listing.size = Some(size);
+                changes.push(IndexChange::Put(Box::new(entry)));
+            }
+        }
+        let Some(status) = self.last_status.clone() else {
+            return Ok(());
+        };
+        if changes.is_empty() {
+            return Ok(());
+        }
+        debug!("Filling in {} sizes read from root maps", changes.len());
+        self.publisher.stage(&Publication {
+            at: now,
+            changes,
+            ..Publication::default()
+        })?;
+        self.write_spaced(now, &status).await?;
+        self.published_between += 1;
+        Ok(())
+    }
+
+    /// Write what was staged, and `status`, once the clock is past the
+    /// second in which the latest publication ended: so each file written
+    /// again is written in a later second than before.
+    ///
+    /// # Errors
+    ///
+    /// If the store or the published files can't be written.
+    async fn write_spaced(&mut self, at: u64, status: &Status) -> Result<()> {
         wait_past(self.published_second).await;
-        let published = self.publisher.publish(publication);
+        let published = self.publisher.write_staged(at, status);
         self.published_second = unix_now();
         published.map(|_| ())
     }
 
-    /// Note since when each address has been deferred, and each listed one
-    /// below full support, and count them into `tally`. A `partial` index,
-    /// of what pushes changed between cycles, leaves the deferrals of
-    /// addresses it didn't decide as they were.
+    /// Note since when each address of `addresses`, a batch, has been
+    /// deferred, and each listed one below full support, and count them into
+    /// `tally`: an address of the batch not deferred loses its row.
+    ///
+    /// # Errors
+    ///
+    /// If the store can't be read or written.
     fn update_since(
         &self,
-        index: &ListingsIndex,
         listed: &BTreeMap<XorName, &CheckedListing>,
         publication: &Publication,
+        addresses: &[XorName],
         at: u64,
-        partial: bool,
         tally: &mut Tally,
     ) -> Result<()> {
+        let deferred: HashMap<XorName, &'static str> = tally.deferred.drain(..).collect();
         let mut txn = self.store.env().write_txn().map_err(store_error)?;
-        if !index.too_few_nodes && !partial {
-            let deferred: HashSet<XorName> =
-                tally.deferred.iter().map(|(address, _)| *address).collect();
-            let mut stale = Vec::new();
-            for row in self
-                .since
-                .prefix_iter(&txn, &[DEFERRED_TAG])
-                .map_err(store_error)?
-            {
-                let (key, _) = row.map_err(store_error)?;
-                let address: Option<XorName> = key.get(1..).and_then(|a| a.try_into().ok());
-                if address.is_none_or(|address| !deferred.contains(&address)) {
-                    stale.push(key.to_vec());
-                }
-            }
-            for key in stale {
-                self.since.delete(&mut txn, &key).map_err(store_error)?;
-            }
-        }
-        let mut groups: BTreeMap<&'static str, (u64, u64)> = BTreeMap::new();
-        for (address, reason) in &tally.deferred {
+        for address in addresses {
             let row = tagged(DEFERRED_TAG, address);
+            let Some(reason) = deferred.get(address) else {
+                self.since.delete(&mut txn, &row).map_err(store_error)?;
+                continue;
+            };
             let since = if let Some(since) = self.since.get(&txn, &row).map_err(store_error)? {
                 since
             } else {
                 self.since.put(&mut txn, &row, &at).map_err(store_error)?;
                 at
             };
-            let group = groups.entry(reason).or_insert((0, since));
+            let group = tally.groups.entry(reason).or_insert((0, since));
             group.0 += 1;
             group.1 = group.1.min(since);
         }
-        if index.too_few_nodes && index.deferred > 0 {
-            groups.insert("nodes_unanswered", (index.deferred as u64, at));
-        }
-        tally.deferred_groups = groups
-            .into_iter()
-            .map(|(reason, (addresses, oldest_since))| DeferredGroup {
-                reason: reason.to_string(),
-                addresses,
-                oldest_since,
-            })
-            .collect();
-
         for checked in listed.values() {
             let row = tagged(BELOW_FULL_TAG, &checked.listing.address);
             if checked.nodes < checked.nearest {
@@ -1513,25 +1989,17 @@ impl Producer {
                     .map_err(store_error)?;
             }
         }
-        let mut below = BelowFull::default();
-        for row in self
-            .since
-            .prefix_iter(&txn, &[BELOW_FULL_TAG])
-            .map_err(store_error)?
-        {
-            let (_, since) = row.map_err(store_error)?;
-            below.listings += 1;
-            below.oldest_since = Some(below.oldest_since.map_or(since, |old| old.min(since)));
-        }
-        tally.below_full = below;
-        txn.commit().map_err(store_error)?;
-        Ok(())
+        txn.commit().map_err(store_error)
     }
 
     /// `status.json` for the cycle that began at `at` (`clock`), which
     /// decided nothing if `too_few` of the census answered, after which
-    /// `decided` addresses' decisions stand. The publisher fills in the
-    /// feed's fields.
+    /// `decided` addresses' decisions stand, as `tally` counted it. The
+    /// publisher fills in the feed's fields.
+    ///
+    /// # Errors
+    ///
+    /// If the store can't be read.
     fn status(
         &mut self,
         at: u64,
@@ -1540,7 +2008,20 @@ impl Producer {
         too_few: bool,
         decided: u64,
         tally: &Tally,
-    ) -> Status {
+    ) -> Result<Status> {
+        let mut below = BelowFull::default();
+        {
+            let txn = self.store.env().read_txn().map_err(store_error)?;
+            for row in self
+                .since
+                .prefix_iter(&txn, &[BELOW_FULL_TAG])
+                .map_err(store_error)?
+            {
+                let (_, since) = row.map_err(store_error)?;
+                below.listings += 1;
+                below.oldest_since = Some(below.oldest_since.map_or(since, |old| old.min(since)));
+            }
+        }
         let after = Counters::now(&self.chain);
         let cycle = CycleStatus {
             started_at: at,
@@ -1556,17 +2037,25 @@ impl Producer {
         self.totals.bytes_in += cycle.bytes_in;
         self.totals.bytes_out += cycle.bytes_out;
         self.totals.rpc = self.chain.rpc_calls();
-        Status {
+        Ok(Status {
             cycle,
             census: self.census.status(at),
-            deferred: tally.deferred_groups.clone(),
-            below_full: tally.below_full.clone(),
+            deferred: tally
+                .groups
+                .iter()
+                .map(|(reason, (addresses, oldest_since))| DeferredGroup {
+                    reason: (*reason).to_string(),
+                    addresses: *addresses,
+                    oldest_since: *oldest_since,
+                })
+                .collect(),
+            below_full: below,
             drops: Drops {
                 removed: tally.removed,
                 carried: tally.carried,
             },
             ..self.base_status()
-        }
+        })
     }
 
     /// `status.json`'s fields that don't depend on a cycle.
@@ -1628,6 +2117,167 @@ impl Producer {
     #[must_use]
     pub fn publisher(&self) -> &Publisher {
         &self.publisher
+    }
+}
+
+/// What happened between cycles ([`Producer::run`]).
+enum Between {
+    /// A push came, or no sender is left.
+    Push(Option<(PeerId, ChangesResponse)>),
+    /// The sizes being read were read.
+    Sizes(Vec<(XorName, Option<u64>)>),
+}
+
+/// The sizes `job` read, once it has; never while there is no job.
+async fn sizes_read(job: &mut Option<SizeJob>) -> Vec<(XorName, Option<u64>)> {
+    match job {
+        Some(job) => (&mut job.results).await.unwrap_or_default(),
+        None => std::future::pending().await,
+    }
+}
+
+/// The full listings fetched, and the nodes that failed to hand theirs
+/// over, written to the store a chunk at a time.
+struct FetchSink<'a> {
+    producer: &'a Producer,
+    /// When the fetching began (Unix seconds).
+    now: u64,
+    fetched: Vec<(ListingId, Listing)>,
+    failed: Vec<(PeerId, ListingId)>,
+    error: Option<Error>,
+}
+
+impl<'a> FetchSink<'a> {
+    fn new(producer: &'a Producer, now: u64) -> Self {
+        Self {
+            producer,
+            now,
+            fetched: Vec::new(),
+            failed: Vec::new(),
+            error: None,
+        }
+    }
+
+    /// One listing fetched, or not, and the nodes that failed to hand it
+    /// over: written once a chunk has come.
+    fn add(&mut self, key: ListingId, listing: Option<Listing>, failed: Vec<PeerId>) {
+        if let Some(listing) = listing {
+            self.fetched.push((key, listing));
+        }
+        self.failed
+            .extend(failed.into_iter().map(|peer| (peer, key)));
+        if self.fetched.len() + self.failed.len() >= DECIDE_BATCH {
+            if let Err(e) = self.write() {
+                self.error.get_or_insert(e);
+            }
+        }
+    }
+
+    /// Write what has come, and say if any write failed.
+    fn flush(&mut self) -> Result<()> {
+        self.write()?;
+        match self.error.take() {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
+    }
+
+    fn write(&mut self) -> Result<()> {
+        if self.fetched.is_empty() && self.failed.is_empty() {
+            return Ok(());
+        }
+        let producer = self.producer;
+        let retry_at = self.now.saturating_add(RETRY_INTERVAL.as_secs());
+        let mut txn = producer.store.env().write_txn().map_err(store_error)?;
+        for ((address, digest), listing) in self.fetched.drain(..) {
+            let listing = Listing {
+                first_seen: None,
+                ..listing
+            };
+            let bytes = rmp_serde::to_vec(&listing)
+                .map_err(|e| Error::Serialization(format!("a fetched listing: {e}")))?;
+            producer
+                .listings
+                .put(&mut txn, &listing_key(&address, &digest), &bytes)
+                .map_err(store_error)?;
+        }
+        for (peer, (address, digest)) in self.failed.drain(..) {
+            producer
+                .known
+                .put(
+                    &mut txn,
+                    &failed_key(&address, &peer, &digest),
+                    &retry_at.to_be_bytes(),
+                )
+                .map_err(store_error)?;
+        }
+        txn.commit().map_err(store_error)
+    }
+}
+
+/// The full listings to fetch for the addresses of a source, a batch at a
+/// time ([`Producer::wanted_after`]), as an iterator: a store error ends it,
+/// kept in `error`.
+struct WantedIter<'a> {
+    producer: &'a Producer,
+    source: Source,
+    backed: bool,
+    now: u64,
+    after: Option<XorName>,
+    done: bool,
+    queue: VecDeque<Wanted>,
+    error: &'a std::cell::RefCell<Option<Error>>,
+}
+
+impl<'a> WantedIter<'a> {
+    fn new(
+        producer: &'a Producer,
+        source: Source,
+        backed: bool,
+        now: u64,
+        error: &'a std::cell::RefCell<Option<Error>>,
+    ) -> Self {
+        Self {
+            producer,
+            source,
+            backed,
+            now,
+            after: None,
+            done: false,
+            queue: VecDeque::new(),
+            error,
+        }
+    }
+}
+
+impl Iterator for WantedIter<'_> {
+    type Item = Wanted;
+
+    fn next(&mut self) -> Option<Wanted> {
+        loop {
+            if let Some(wanted) = self.queue.pop_front() {
+                return Some(wanted);
+            }
+            if self.done {
+                return None;
+            }
+            match self.producer.wanted_after(
+                self.source,
+                self.after.as_ref(),
+                self.backed,
+                self.now,
+            ) {
+                Ok((wanted, last, done)) => {
+                    self.queue.extend(wanted);
+                    self.after = last;
+                    self.done = done || last.is_none();
+                }
+                Err(e) => {
+                    *self.error.borrow_mut() = Some(e);
+                    self.done = true;
+                }
+            }
+        }
     }
 }
 
@@ -1693,20 +2343,20 @@ impl FetchBudget {
 
 /// The full listings to fetch for `work`: each digest an entry names that
 /// isn't `kept` yet, with the nodes holding an entry with it, but those that
-/// `failed` to hand it over. Those of addresses at least a quorum of whose
-/// nearest nodes hold an entry first, then the others, each in address
-/// order.
+/// `failed` to hand it over lately. Those of addresses at least a quorum of
+/// whose nearest nodes hold an entry first, then the others, each in
+/// address order.
 fn fetches_wanted(
     work: &[Work],
-    failed: &HashMap<(PeerId, ListingId), u64>,
+    failed: impl Fn(&PeerId, &ListingId) -> bool,
     kept: impl Fn(&ListingId) -> bool,
-) -> Vec<(ListingId, DigestCopies)> {
+) -> Vec<Wanted> {
     let mut wanted: BTreeMap<ListingId, (bool, DigestCopies)> = BTreeMap::new();
     for (address, _, copies) in work {
         let backed = copies.len() >= QUORUM_THRESHOLD;
         for (peer, entry) in copies {
             let key = (*address, entry.digest);
-            if failed.contains_key(&(*peer, key)) {
+            if failed(peer, &key) {
                 continue;
             }
             let slot = wanted.entry(key).or_insert((backed, Vec::new()));
@@ -1726,20 +2376,21 @@ fn fetches_wanted(
         .collect()
 }
 
-/// Fetch each of `wanted` ([`fetches_wanted`]) from its holders, one after
-/// another until one hands over a listing its entry describes, through
-/// `ask` (a `GetRequest` to a node for an address: `None` if it didn't
-/// answer, `Some(None)` if it holds none), [`POLL_CONCURRENCY`] at a time.
-/// A holder is asked only if `take` gives it a request from its allowance.
-/// What hasn't come by `deadline` is left. Returns the listings fetched, and
-/// each holder that was asked and failed to hand one over.
+/// Fetch each of `wanted` ([`fetches_wanted`]), taken as the fetches go,
+/// from its holders, one after another until one hands over a listing its
+/// entry describes, through `ask` (a `GetRequest` to a node for an address:
+/// `None` if it didn't answer, `Some(None)` if it holds none),
+/// [`POLL_CONCURRENCY`] at a time. A holder is asked only if `take` gives it
+/// a request from its allowance. What hasn't come by `deadline` is left.
+/// Each fetch, when it ends, goes to `done`: the listing, if one was handed
+/// over, and each holder that was asked and failed to hand one over.
 async fn fetch_wanted<A, Fut>(
-    wanted: Vec<(ListingId, DigestCopies)>,
+    wanted: impl Iterator<Item = Wanted>,
     take: impl Fn(&PeerId) -> bool + Copy,
     deadline: Instant,
     ask: A,
-) -> (Vec<(ListingId, Listing)>, Vec<(PeerId, ListingId)>)
-where
+    mut done: impl FnMut(ListingId, Option<Listing>, Vec<PeerId>),
+) where
     A: Fn(PeerId, XorName) -> Fut + Copy,
     Fut: std::future::Future<Output = Option<Option<Listing>>>,
 {
@@ -1760,16 +2411,9 @@ where
             (key, None, failed)
         })
         .buffer_unordered(POLL_CONCURRENCY);
-    let mut fetched = Vec::new();
-    let mut failed = Vec::new();
     loop {
         match tokio::time::timeout_at(deadline, fetches.next()).await {
-            Ok(Some((key, listing, peers))) => {
-                failed.extend(peers.into_iter().map(|peer| (peer, key)));
-                if let Some(listing) = listing {
-                    fetched.push((key, listing));
-                }
-            }
+            Ok(Some((key, listing, failed))) => done(key, listing, failed),
             Ok(None) => break,
             Err(_) => {
                 debug!("Fetching full listings reached its deadline");
@@ -1777,7 +2421,6 @@ where
             }
         }
     }
-    (fetched, failed)
 }
 
 /// A fetched listing's key in [`LISTINGS_DB`]: its address, then its
@@ -1787,6 +2430,58 @@ fn listing_key(address: &XorName, digest: &[u8; 32]) -> [u8; 64] {
     key[..32].copy_from_slice(address);
     key[32..].copy_from_slice(digest);
     key
+}
+
+/// A failed fetch's key in [`KNOWN_DB`] ([`FAILED_TAG`]): the address, the
+/// node and the digest of its entry.
+fn failed_key(address: &XorName, peer: &PeerId, digest: &[u8; 32]) -> [u8; 97] {
+    let mut key = [0u8; 97];
+    key[0] = FAILED_TAG;
+    key[1..33].copy_from_slice(address);
+    key[33..65].copy_from_slice(peer.as_bytes());
+    key[65..].copy_from_slice(digest);
+    key
+}
+
+/// Up to `limit` of the addresses of `db`'s rows tagged `tag` (the tag, then
+/// the address), after `after` (or from the first), in address order.
+///
+/// # Errors
+///
+/// If the store can't be read.
+fn tagged_after<DC>(
+    db: Database<Bytes, DC>,
+    txn: &RoTxn,
+    tag: u8,
+    after: Option<&XorName>,
+    limit: usize,
+) -> Result<Vec<XorName>> {
+    let from = match after {
+        Some(after) => tagged(tag, after),
+        None => vec![tag],
+    };
+    let end = [tag.saturating_add(1)];
+    let low = if after.is_some() {
+        Bound::Excluded(&from[..])
+    } else {
+        Bound::Included(&from[..])
+    };
+    let range = (low, Bound::Excluded(&end[..]));
+    let mut addresses = Vec::new();
+    for row in db
+        .remap_data_type::<DecodeIgnore>()
+        .range(txn, &range)
+        .map_err(store_error)?
+    {
+        if addresses.len() == limit {
+            break;
+        }
+        let (key, ()) = row.map_err(store_error)?;
+        if let Some(address) = key.get(1..).and_then(|rest| XorName::try_from(rest).ok()) {
+            addresses.push(address);
+        }
+    }
+    Ok(addresses)
 }
 
 /// A hash of an address's nearest nodes, in order: to tell whether they
@@ -1911,20 +2606,25 @@ impl Counters {
     }
 }
 
-/// What a cycle counted, for `status.json`.
+/// What a cycle counted, for `status.json`, its batches' counts added up.
 #[derive(Debug, Clone, Default)]
 struct Tally {
     put: u64,
     removed: u64,
     carried: u64,
+    /// The latest batch's listings and rejections for good.
     decided: u64,
     rejected_for_good: u64,
-    /// The addresses rejected for good.
+    /// The addresses of the latest batch rejected for good.
     for_good: HashSet<XorName>,
-    /// Each address deferred, with its reason's code.
+    /// Each address of the latest batch deferred, with its reason's code.
     deferred: Vec<(XorName, &'static str)>,
-    deferred_groups: Vec<DeferredGroup>,
-    below_full: BelowFull,
+    /// The addresses deferred, by reason: how many, and since when the
+    /// longest-waiting has waited.
+    groups: BTreeMap<&'static str, (u64, u64)>,
+    /// Each listed file of the latest batch whose data map is shrunk and
+    /// whose size isn't known yet, with its data map.
+    wanted_sizes: Vec<(XorName, DataMap)>,
 }
 
 /// Log what a cycle did.
@@ -1961,12 +2661,14 @@ fn log_cycle(report: &CycleReport) {
 /// What `index`, the read of the cycle that began at `at`, changes in what
 /// `publisher` has published. `listed` is what the read listed, by address;
 /// `unlisted`, each entry published before that the read didn't list, with
-/// why it is removed, or `None` to keep it; `sizes`, the size of each listed
-/// file whose data map is shrunk, where it is known. A listed entry is put
-/// where it changed, with its support where that changed; a removed one goes,
-/// with its support; a kept one is marked carried in its support. Unless the read
+/// why it is removed, or `None` to keep it; `sizes`, the size of a listed
+/// file whose data map is shrunk, where it is known: one whose size isn't is
+/// counted into `tally` as wanted. A listed entry is put where it changed,
+/// with its support where that changed; a removed one goes, with its
+/// support; a kept one is marked carried in its support. Unless the read
 /// found too few nodes, its rejections and deferrals go to `rejected.json`
-/// ([`rejected_changes`]). What it does is counted into `tally`.
+/// ([`rejected_changes`]), from the rows of the addresses the read is about.
+/// What it does is counted into `tally`.
 ///
 /// # Errors
 ///
@@ -1976,7 +2678,7 @@ fn read_publication(
     index: &ListingsIndex,
     listed: &BTreeMap<XorName, &CheckedListing>,
     unlisted: &[(ListingKey, Option<RemoveReason>)],
-    sizes: &HashMap<XorName, u64>,
+    sizes: impl Fn(&XorName) -> Option<u64>,
     at: u64,
     tally: &mut Tally,
 ) -> Result<Publication> {
@@ -1987,8 +2689,11 @@ fn read_publication(
     for checked in &index.listings {
         let address = checked.listing.address;
         let mut entry = Entry::new(&checked.listing, checked.level, at);
-        if shrunk_map(checked).is_some() {
-            entry.listing.size = sizes.get(&address).copied();
+        if let Some(map) = shrunk_map(checked) {
+            entry.listing.size = sizes(&address);
+            if entry.listing.size.is_none() {
+                tally.wanted_sizes.push((address, map.clone()));
+            }
         }
         let fresh = ShardEntry::new(entry, &checked.envelope);
         let unchanged = publisher
@@ -2029,14 +2734,17 @@ fn read_publication(
         }
     }
     if !index.too_few_nodes {
-        publication.rejected = rejected_changes(
-            publisher.rejected_entries()?,
-            index,
-            listed,
-            &carried,
-            at,
-            tally,
-        );
+        // The rows of the addresses this read is about: listed, kept,
+        // rejected, deferred or shown gone. Any other row stays as it is.
+        let mut about: BTreeSet<XorName> = listed.keys().copied().collect();
+        about.extend(unlisted.iter().map(|(key, _)| key.address));
+        about.extend(index.rejected.iter().map(|row| row.listing.address));
+        about.extend(index.decided_addresses());
+        let mut rows = Vec::new();
+        for address in &about {
+            rows.extend(publisher.rejected_entry(address)?);
+        }
+        publication.rejected = rejected_changes(rows, index, listed, &carried, at, tally);
     }
     tally.decided = listed.len() as u64 + tally.rejected_for_good;
     Ok(publication)
@@ -2338,8 +3046,8 @@ mod tests {
     use crate::data::client::listings::RejectedListing;
     use crate::data::client::listings_v1::SupportShard;
     use ant_listings::{
-        CheckLevel, Envelope, Flags, Listing, ListingPayment, Metadata, PaymentField, ShownFields,
-        SALTED_HASH_LEN,
+        AddressRange, CheckLevel, Envelope, Flags, Listing, ListingPayment, Metadata, PaymentField,
+        ShownFields, SALTED_HASH_LEN,
     };
 
     const ADDRESS: &str = "1111111111111111111111111111111111111111111111111111111111111111";
@@ -2678,7 +3386,7 @@ mod tests {
             index,
             &listed,
             &unlisted,
-            &HashMap::new(),
+            |_| None,
             at,
             &mut tally,
         )
@@ -2820,7 +3528,10 @@ mod tests {
         assert!(!rows[0].again);
         assert_eq!(rows[0].problem, PAID_BEFORE_VAULT);
         assert_eq!(rows[0].copies.len(), 2);
-        assert!(rows[0].copies.iter().all(|copy| copy.before_vault_deployment));
+        assert!(rows[0]
+            .copies
+            .iter()
+            .all(|copy| copy.before_vault_deployment));
 
         // One with a copy paid after the vault was deployed can still count
         // once 4 nodes serve it: it stays, carried. So does one rejected for
@@ -2961,7 +3672,7 @@ mod tests {
             &quiet,
             &BTreeMap::new(),
             &[],
-            &HashMap::new(),
+            |_| None,
             AT + 60,
             &mut tally,
         )
@@ -2982,7 +3693,7 @@ mod tests {
             &quiet,
             &BTreeMap::new(),
             &[(key, None)],
-            &HashMap::new(),
+            |_| None,
             AT + 60,
             &mut tally,
         )
@@ -3039,10 +3750,16 @@ mod tests {
         let (_dir, mut publisher) = publisher();
         let publish = |publisher: &mut Publisher, sizes: &HashMap<XorName, u64>, at| {
             let mut tally = Tally::default();
+            let size = |address: &XorName| sizes.get(address).copied();
             let publication =
-                read_publication(publisher, &index, &listed, &[], sizes, at, &mut tally).unwrap();
+                read_publication(publisher, &index, &listed, &[], size, at, &mut tally).unwrap();
             publisher.publish(&publication).unwrap();
-            tally.put
+            let wanted: Vec<XorName> = tally
+                .wanted_sizes
+                .iter()
+                .map(|(address, _)| *address)
+                .collect();
+            (tally.put, wanted)
         };
         let size = |publisher: &Publisher, address| {
             publisher
@@ -3054,18 +3771,19 @@ mod tests {
                 .size
         };
 
-        // Before its root map is read, it is listed without a size.
-        assert_eq!(publish(&mut publisher, &HashMap::new(), AT), 2);
+        // Before its root map is read, it is listed without a size, and its
+        // root map is to be read; the withheld one's never is.
+        assert_eq!(publish(&mut publisher, &HashMap::new(), AT), (2, vec![x]));
         assert_eq!(size(&publisher, x), None);
 
         // Once read, the entry changes to show it; the withheld one doesn't.
         let sizes = HashMap::from([(x, 92_000_000), (y, 5)]);
-        assert_eq!(publish(&mut publisher, &sizes, AT + 60), 1);
+        assert_eq!(publish(&mut publisher, &sizes, AT + 60), (1, Vec::new()));
         assert_eq!(size(&publisher, x), Some(92_000_000));
         assert_eq!(size(&publisher, y), None);
 
         // Decided again with the size kept, nothing changes.
-        assert_eq!(publish(&mut publisher, &sizes, AT + 120), 0);
+        assert_eq!(publish(&mut publisher, &sizes, AT + 120), (0, Vec::new()));
     }
 
     #[test]
@@ -3132,7 +3850,11 @@ mod tests {
         Duration,
     ) {
         let asked = std::sync::atomic::AtomicUsize::new(0);
-        let wanted = fetches_wanted(work, failed, |_| false);
+        let wanted = fetches_wanted(
+            work,
+            |peer, key| failed.contains_key(&(*peer, *key)),
+            |_| false,
+        );
         let started = Instant::now();
         let asked_ref = &asked;
         let take = |peer: &PeerId| budget.take(peer, || 8);
@@ -3148,10 +3870,22 @@ mod tests {
                 Some(Some(stored(address)))
             }
         };
-        let (fetched, failed) = fetch_wanted(wanted, take, deadline, ask).await;
+        let mut fetched = Vec::new();
+        let mut refused = Vec::new();
+        fetch_wanted(
+            wanted.into_iter(),
+            take,
+            deadline,
+            ask,
+            |key, listing, failed| {
+                fetched.extend(listing.map(|listing| (key, listing)));
+                refused.extend(failed.into_iter().map(|peer| (peer, key)));
+            },
+        )
+        .await;
         (
             fetched,
-            failed,
+            refused,
             asked.load(std::sync::atomic::Ordering::Relaxed),
             started.elapsed(),
         )
@@ -3179,7 +3913,7 @@ mod tests {
         copies.extend(others);
         work.push((x, Vec::new(), copies));
         // The address most nodes hold is fetched first.
-        let wanted = fetches_wanted(&work, &HashMap::new(), |_| false);
+        let wanted = fetches_wanted(&work, |_, _| false, |_| false);
         assert_eq!(wanted[0].0, (x, entry.digest));
 
         let mut failed: HashMap<(PeerId, ListingId), u64> = HashMap::new();
@@ -3244,5 +3978,351 @@ mod tests {
         let started = std::time::Instant::now();
         wait_past(second.saturating_sub(10)).await;
         assert!(started.elapsed() < Duration::from_millis(100));
+    }
+
+    /// A producer keeping its state in `dir`, whose client's node never
+    /// started and whose payment RPC is a closed port: anything it asked of
+    /// the network or the chain would fail. Its chain knows the block the
+    /// payment vault was deployed in ([`VAULT_BLOCK`]). Also returns the
+    /// node, to keep it alive.
+    async fn offline_producer(dir: &Path) -> (Producer, crate::data::Network) {
+        let closed = {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            listener.local_addr().unwrap().port()
+        };
+        let node = crate::data::Network::unstarted(&[], true, false)
+            .await
+            .unwrap();
+        let client = Client::from_node(Arc::clone(node.node()), Default::default())
+            .with_evm_network(crate::data::client::native_payment::test_plans::network(
+                closed,
+            ));
+        let mut producer = Producer::open(&dir.join("state"), &dir.join("v1"), client).unwrap();
+        producer.publisher.set_flush(false);
+        producer.chain = ListingChain::with_rpc(format!("http://127.0.0.1:{closed}"), [0x22; 20])
+            .unwrap()
+            .with_vault_deployment_block(VAULT_BLOCK)
+            .with_store(&producer.store)
+            .unwrap();
+        (producer, node)
+    }
+
+    /// `count` census nodes, spread over the address space.
+    fn census_nodes(producer: &mut Producer, count: u8) -> Vec<PeerId> {
+        let peers: Vec<PeerId> = (0..count)
+            .map(|n| PeerId::from_bytes([n.wrapping_mul(255 / count).wrapping_add(1); 32]))
+            .collect();
+        for peer in &peers {
+            producer.census.admit(*peer, Vec::new(), AT);
+        }
+        peers
+    }
+
+    /// Serve `listings` from `holders` of each one's nearest nodes, as their
+    /// mirrors show it, with the full listings fetched and kept.
+    fn serve(producer: &mut Producer, listings: &[Listing], holders: usize) {
+        let mut mirrors: BTreeMap<PeerId, Vec<DigestEntry>> = BTreeMap::new();
+        let mut txn = producer.store.env().write_txn().unwrap();
+        for listing in listings {
+            let entry = DigestEntry::new(listing);
+            for peer in producer
+                .census
+                .nearest(&listing.address, NEAREST_NODES)
+                .into_iter()
+                .take(holders)
+            {
+                mirrors.entry(peer).or_default().push(entry);
+            }
+            let kept = Listing {
+                first_seen: None,
+                ..listing.clone()
+            };
+            producer
+                .listings
+                .put(
+                    &mut txn,
+                    &listing_key(&listing.address, &entry.digest),
+                    &rmp_serde::to_vec(&kept).unwrap(),
+                )
+                .unwrap();
+        }
+        txn.commit().unwrap();
+        for peer in producer
+            .census
+            .nodes()
+            .map(|node| node.peer)
+            .collect::<Vec<_>>()
+        {
+            let mut entries = mirrors.remove(&peer).unwrap_or_default();
+            entries.sort_by_key(|entry| entry.address);
+            producer.feeds.seed(peer, AddressRange::ALL, &entries);
+        }
+    }
+
+    /// An address from `n`.
+    fn numbered(n: u32) -> XorName {
+        ant_protocol::compute_address(&n.to_be_bytes())
+    }
+
+    #[tokio::test]
+    async fn every_address_is_decided_a_batch_at_a_time() {
+        // More addresses than three batches, each served by 2 of its 7
+        // nearest nodes: too few to decide, so each is left for later, shown
+        // in rejected.json with its copies.
+        let dir = tempfile::tempdir().unwrap();
+        let (mut producer, _node) = offline_producer(dir.path()).await;
+        census_nodes(&mut producer, 8);
+        let count = 3 * DECIDE_BATCH as u32 + 10;
+        let listings: Vec<Listing> = (0..count)
+            .map(|n| showing_block(numbered(n), 81_950_000))
+            .collect();
+        serve(&mut producer, &listings, 2);
+
+        let mut tally = Tally::default();
+        let mut drops = DropCheck {
+            checked: false,
+            deadline: Instant::now() + CYCLE,
+        };
+        let (decided, staged) = producer
+            .decide_all(Source::All, AT, Some(&mut drops), false, &mut tally)
+            .await
+            .unwrap();
+        assert_eq!(decided, u64::from(count));
+        assert!(staged);
+        assert_eq!(
+            tally.groups.get("below_quorum"),
+            Some(&(u64::from(count), AT))
+        );
+        // Each batch let go of what it held: nothing is left in the tally
+        // but its counts.
+        assert!(tally.deferred.is_empty() && tally.for_good.is_empty());
+        producer.write_spaced(AT, &Status::default()).await.unwrap();
+        let rows = producer.publisher.rejected_entries().unwrap();
+        assert_eq!(rows.len(), count as usize);
+        assert!(rows.iter().all(|row| row.again && row.copies.len() == 2));
+        // Each is to be decided again next cycle, whatever changes.
+        let again = {
+            let txn = producer.store.env().read_txn().unwrap();
+            tagged_after(producer.known, &txn, AGAIN_TAG, None, usize::MAX).unwrap()
+        };
+        assert_eq!(again.len(), count as usize);
+        assert_eq!(producer.feeds.pending_count().unwrap(), 0);
+
+        // The next cycle decides them again, and finds nothing to change.
+        let mut tally = Tally::default();
+        let (decided, staged) = producer
+            .decide_all(
+                Source::Pending { again: true },
+                AT + 60,
+                None,
+                false,
+                &mut tally,
+            )
+            .await
+            .unwrap();
+        assert_eq!(decided, u64::from(count));
+        assert!(!staged);
+        // A restart forgets what this process knew of them, and decides
+        // every address again.
+        drop(producer);
+        let (producer, _node) = offline_producer(dir.path()).await;
+        let txn = producer.store.env().read_txn().unwrap();
+        assert!(producer.known.is_empty(&txn).unwrap());
+    }
+
+    #[tokio::test]
+    async fn the_addresses_of_every_source_are_read_once_in_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut producer, _node) = offline_producer(dir.path()).await;
+        census_nodes(&mut producer, 8);
+        // Held by a mirror, published, with a row in rejected.json, deferred,
+        // pending, and to decide again: some in more than one.
+        let held: Vec<XorName> = (0..300).map(numbered).collect();
+        let listings: Vec<Listing> = held
+            .iter()
+            .map(|address| showing_block(*address, 81_950_000))
+            .collect();
+        serve(&mut producer, &listings, 2);
+        let published: Vec<XorName> = (250..400).map(numbered).collect();
+        let mut index = ListingsIndex::default();
+        for address in &published {
+            index.listings.push(checked(*address));
+        }
+        let rejected: Vec<XorName> = (380..500).map(numbered).collect();
+        for address in &rejected {
+            defer(&mut index, *address, &[81_950_000]);
+        }
+        publish_read(&mut producer.publisher, &index, None, AT);
+        let deferred: Vec<XorName> = (490..520).map(numbered).collect();
+        let pending: Vec<XorName> = (510..530).map(numbered).collect();
+        let again: Vec<XorName> = (0..10).chain(525..540).map(numbered).collect();
+        {
+            let mut txn = producer.store.env().write_txn().unwrap();
+            for address in &deferred {
+                producer
+                    .since
+                    .put(&mut txn, &tagged(DEFERRED_TAG, address), &AT)
+                    .unwrap();
+            }
+            for address in &again {
+                producer
+                    .known
+                    .put(&mut txn, &tagged(AGAIN_TAG, address), &[])
+                    .unwrap();
+            }
+            txn.commit().unwrap();
+        }
+        producer.feeds.mark_pending(&pending).unwrap();
+
+        let read = |producer: &Producer, source: Source| {
+            let mut all: Vec<(XorName, bool)> = Vec::new();
+            let mut after: Option<XorName> = None;
+            loop {
+                let batch = producer.next_batch(source, after.as_ref()).unwrap();
+                assert!(batch.len() <= DECIDE_BATCH);
+                all.extend(batch.iter().copied());
+                match batch.last() {
+                    Some((last, _)) if batch.len() == DECIDE_BATCH => after = Some(*last),
+                    _ => return all,
+                }
+            }
+        };
+        let explained: BTreeSet<XorName> = pending.iter().chain(&again).copied().collect();
+        let mut every: BTreeSet<XorName> = explained.clone();
+        for addresses in [&held, &published, &rejected, &deferred] {
+            every.extend(addresses.iter().copied());
+        }
+        let all = read(&producer, Source::All);
+        assert_eq!(
+            all.iter().map(|(address, _)| *address).collect::<Vec<_>>(),
+            every.iter().copied().collect::<Vec<_>>()
+        );
+        for (address, why) in &all {
+            assert_eq!(*why, explained.contains(address));
+        }
+        let changed = read(&producer, Source::Pending { again: true });
+        assert_eq!(
+            changed
+                .iter()
+                .map(|(address, _)| *address)
+                .collect::<Vec<_>>(),
+            explained.iter().copied().collect::<Vec<_>>()
+        );
+        let pushed = read(&producer, Source::Pending { again: false });
+        let mut pending_sorted = pending.clone();
+        pending_sorted.sort_unstable();
+        assert_eq!(
+            pushed
+                .iter()
+                .map(|(address, _)| *address)
+                .collect::<Vec<_>>(),
+            pending_sorted
+        );
+    }
+
+    #[tokio::test]
+    async fn a_cycle_removes_a_listed_entry_whose_copies_were_all_paid_before_the_vault() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut producer, _node) = offline_producer(dir.path()).await;
+        census_nodes(&mut producer, 8);
+        let x = numbered(7);
+        let mut listed = ListingsIndex::default();
+        listed.listings.push(checked(x));
+        publish_read(&mut producer.publisher, &listed, None, AT);
+        // Two of its nearest nodes serve copies that show a block before the
+        // vault was deployed.
+        serve(&mut producer, &[showing_block(x, 80_204_042)], 2);
+
+        let mut tally = Tally::default();
+        producer
+            .decide_all(Source::All, AT + 60, None, false, &mut tally)
+            .await
+            .unwrap();
+        producer
+            .write_spaced(AT + 60, &Status::default())
+            .await
+            .unwrap();
+        assert_eq!((tally.removed, tally.carried), (1, 0));
+        assert!(producer.publisher.entry(&x).unwrap().is_none());
+        let rows = producer.publisher.rejected_entries().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!(!rows[0].again);
+        assert_eq!(rows[0].problem, PAID_BEFORE_VAULT);
+        // Its decision stands, as status.json counts it.
+        assert_eq!(producer.standing, 1);
+        assert!(tally.groups.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_size_read_is_filled_in_to_its_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut producer, _node) = offline_producer(dir.path()).await;
+        let x: XorName = [0x4e; 32];
+        let mut shrunk = checked(x);
+        shrunk.envelope = Envelope::readable(
+            &three_chunks(1_024, true),
+            Metadata::default(),
+            shrunk.listing.flags.shown,
+            true,
+        )
+        .unwrap();
+        shrunk.listing.flags = shrunk.envelope.flags();
+        let mut index = ListingsIndex::default();
+        index.listings.push(shrunk);
+        let listed: BTreeMap<XorName, &CheckedListing> = index
+            .listings
+            .iter()
+            .map(|checked| (checked.listing.address, checked))
+            .collect();
+        let mut tally = Tally::default();
+        let publication = read_publication(
+            &producer.publisher,
+            &index,
+            &listed,
+            &[],
+            |_| None,
+            AT,
+            &mut tally,
+        )
+        .unwrap();
+        producer.publisher.publish(&publication).unwrap();
+        assert_eq!(tally.wanted_sizes.len(), 1);
+        let published = producer.publisher.entry(&x).unwrap().unwrap();
+        assert_eq!(published.entry.listing.size, None);
+        let seq = producer.publisher.seq();
+
+        // Its root map couldn't be read: it is tried again only later.
+        {
+            let mut txn = producer.store.env().write_txn().unwrap();
+            let mut value = 0u64.to_be_bytes().to_vec();
+            value.extend(rmp_serde::to_vec(&three_chunks(1_024, true)).unwrap());
+            producer
+                .known
+                .put(&mut txn, &tagged(SIZE_WANTED_TAG, &x), &value)
+                .unwrap();
+            txn.commit().unwrap();
+        }
+        producer.last_status = Some(Status::default());
+        producer.take_sizes(vec![(x, None)]).await.unwrap();
+        producer.start_sizes(Instant::now() + CYCLE).unwrap();
+        assert!(producer.size_job.is_none(), "nothing is due yet");
+        assert_eq!(producer.publisher.seq(), seq);
+
+        // Read: the entry is put again with it, decided when it was.
+        producer
+            .take_sizes(vec![(x, Some(92_000_000))])
+            .await
+            .unwrap();
+        let filled = producer.publisher.entry(&x).unwrap().unwrap();
+        assert_eq!(filled.entry.listing.size, Some(92_000_000));
+        assert_eq!(filled.entry.decided_at, published.entry.decided_at);
+        assert_eq!(producer.publisher.seq(), seq + 1);
+        let txn = producer.store.env().read_txn().unwrap();
+        assert_eq!(producer.sizes.get(&txn, &x).unwrap(), Some(92_000_000));
+        assert!(producer
+            .known
+            .get(&txn, &tagged(SIZE_WANTED_TAG, &x))
+            .unwrap()
+            .is_none());
     }
 }
