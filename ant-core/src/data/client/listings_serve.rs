@@ -839,7 +839,9 @@ fn rejected_changes(
             tally.rejected_for_good += 1;
         }
         if carried.contains(&address) {
-            // Still listed, unconfirmed: any row it has is cleared below.
+            // Still listed, unconfirmed, and counted above as deferred or,
+            // every copy paid before the vault, rejected for good: either
+            // way it gets no row, and any it has is cleared below.
             continue;
         }
         let unchanged = existing.get(&entry.listing.address).is_some_and(|old| {
@@ -1451,6 +1453,35 @@ mod tests {
         assert_eq!(tally.deferred, [(x, "below_quorum")]);
         assert_eq!(carried(&publisher), Some(true));
         assert!(rows(&publisher).is_empty());
+    }
+
+    #[test]
+    fn a_carried_address_paid_before_the_vault_stays_listed_without_a_row() {
+        // A listed address that the next cycle can't decide: 2 of its 7
+        // nearest nodes serve it, and both copies were paid before the
+        // payment vault was deployed.
+        let x: XorName = [0x3d; 32];
+        let (_dir, mut publisher) = publisher();
+        let mut listing = ListingsIndex::default();
+        listing.listings.push(checked(x));
+        publish_read(&mut publisher, &listing, None, AT);
+        let mut deferring = ListingsIndex::default();
+        defer(&mut deferring, x, &[80_204_042, 80_204_042]);
+        let (publication, tally) = publish_read(&mut publisher, &deferring, None, AT + 60);
+        // It is rejected for good, so status.json leaves it out of its
+        // deferred groups and counts it as decided, and as carried.
+        assert!(tally.deferred.is_empty(), "deferred: {:?}", tally.deferred);
+        assert_eq!(tally.rejected_for_good, 1);
+        assert_eq!(tally.decided, 1);
+        assert_eq!(tally.carried, 1);
+        assert_eq!(tally.removed, 0);
+        // But its entry stays, marked carried, and rejected.json, which lists
+        // only what the producer doesn't list, has no row for it.
+        assert!(publication.rejected.is_empty());
+        assert!(publisher.rejected_entries().unwrap().is_empty());
+        assert!(publisher.entry(&x).unwrap().is_some());
+        let support = publisher.support(&x).unwrap().unwrap();
+        assert!(support.carried);
     }
 
     #[test]

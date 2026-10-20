@@ -398,7 +398,9 @@ dated in the future), and `other`; other reasons may be added. An address is
 not deferred when every copy its nearest nodes serve shows a payment from
 before the payment vault was deployed (`before_vault_deployment` in
 `rejected.json`): none of them can count, however many nodes come to serve
-them, so it is rejected for good (`again` false).
+them, so it is rejected for good, in `rejected.json` with `again` false,
+unless its entry is still listed, kept unconfirmed (`carried`): then it has
+no row there and stays listed, marked carried.
 
 ```json
 { "epoch": "8c1f0e2d3b4a5968", "seq": 12, "count": 2, "generated_at": 1791324061, "started_at": 1791320000,
@@ -419,8 +421,10 @@ them, so it is rejected for good (`again` false).
 
 `{"listings": [...]}`: the listings the producer didn't list, in key order,
 each address's latest rejection or deferral. An address the producer lists
-has no row, even while its entry is kept unconfirmed (`carried`) and
-`status.json` counts it as deferred. Each row has the entry's fields from
+has no row, even while its entry is kept unconfirmed (`carried`), whether
+the cycle left the address for later (`status.json` counts it as deferred)
+or rejected it for good, as when every copy was paid before the payment
+vault was deployed. Each row has the entry's fields from
 `address` to `time` (no `check`), then:
 
 | Field | Value |
