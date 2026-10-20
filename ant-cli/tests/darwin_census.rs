@@ -1167,6 +1167,13 @@ const DECODE_SITES: &[Site] = &[
     ),
     (
         "ant-core/src/data/client/listings_serve.rs",
+        "Producer::stored_listing",
+        "rmp_serde::from_slice",
+        1,
+        LOCAL_FILE,
+    ),
+    (
+        "ant-core/src/data/client/listings_serve.rs",
         "previous_entries",
         "serde_json::from_slice",
         1,
