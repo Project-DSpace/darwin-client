@@ -85,7 +85,8 @@ use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
 use super::listings::{
-    listings_traffic, unix_now, Carry, CheckedListing, ListingChain, ListingsIndex, WalkState,
+    listings_traffic, unix_now, Carry, CheckedListing, ListingChain, ListingsIndex, PendingCopy,
+    WalkState,
 };
 use super::listings_census::Census;
 use super::listings_publish::{IndexChange, Publication, Publisher, RejectedChange};
@@ -410,7 +411,13 @@ impl Producer {
             }
         }
         if !index.too_few_nodes {
-            publication.rejected = self.rejected_changes(&index, &listed, at, &mut tally)?;
+            publication.rejected = rejected_changes(
+                self.publisher.rejected_entries()?,
+                &index,
+                &listed,
+                at,
+                &mut tally,
+            );
         }
         tally.decided = listed.len() as u64 + tally.rejected_for_good;
         self.update_since(&index, &listed, &publication, at, &mut tally)?;
@@ -422,74 +429,6 @@ impl Producer {
             status: self.published_status(publication.status),
             put: tally.put,
         })
-    }
-
-    /// The changes to `rejected.json` this read makes. Each address it
-    /// rejected or deferred and didn't list gets its latest rejection or
-    /// deferral (the first in index order), left as it was where only the
-    /// time it was decided would change. A row is cleared once its address
-    /// is listed, decided without a rejection, or walked past by its whole
-    /// close group.
-    fn rejected_changes(
-        &self,
-        index: &ListingsIndex,
-        listed: &BTreeMap<XorName, &CheckedListing>,
-        at: u64,
-        tally: &mut Tally,
-    ) -> Result<Vec<RejectedChange>> {
-        let existing: HashMap<String, RejectedEntry> = self
-            .publisher
-            .rejected_entries()?
-            .into_iter()
-            .map(|entry| (entry.listing.address.clone(), entry))
-            .collect();
-        let mut changes = Vec::new();
-        let mut seen = HashSet::new();
-        for rejected in &index.rejected {
-            let address = rejected.listing.address;
-            if listed.contains_key(&address) || !seen.insert(address) {
-                continue;
-            }
-            let copies = index
-                .pending_copies
-                .get(&address)
-                .map_or(&[][..], Vec::as_slice);
-            let entry = RejectedEntry::new(rejected, copies, at);
-            if rejected.again {
-                let pending = index.pending_copies.contains_key(&address);
-                tally
-                    .deferred
-                    .push((address, deferral_reason(&rejected.problem, pending)));
-            } else {
-                tally.rejected_for_good += 1;
-            }
-            let unchanged = existing.get(&entry.listing.address).is_some_and(|old| {
-                RejectedEntry {
-                    decided_at: old.decided_at,
-                    ..entry.clone()
-                } == *old
-            });
-            if !unchanged {
-                changes.push(RejectedChange::Set(Box::new(entry)));
-            }
-        }
-        for old in existing.values() {
-            let Some(address) = old.listing.address() else {
-                continue;
-            };
-            if seen.contains(&address) {
-                continue;
-            }
-            let keep = !listed.contains_key(&address)
-                && old
-                    .listing
-                    .key()
-                    .is_some_and(|key| index.carry(&address, &key) == Carry::Keep);
-            if !keep {
-                changes.push(RejectedChange::Clear(address));
-            }
-        }
-        Ok(changes)
     }
 
     /// Note since when each address has been deferred, and each listed one
@@ -821,6 +760,95 @@ fn same_entry(old: &ShardEntry, fresh: &ShardEntry) -> bool {
         && old.data_map == fresh.data_map
 }
 
+/// Why an address is rejected for good when every copy its nearest nodes
+/// serve was paid before the payment vault was deployed
+/// ([`paid_before_vault`]).
+const PAID_BEFORE_VAULT: &str =
+    "every copy the nodes nearest its address serve shows it paid before the payment vault was \
+     deployed: not a payment to the vault";
+
+/// Whether `copies`, those the nearest nodes serve of an address too few of
+/// them serve to decide yet, all show a payment from before the payment vault
+/// was deployed ([`PendingCopy::before_vault_deployment`]). None of them can
+/// ever count, however many nodes come to serve them, so the address is
+/// rejected for good rather than left for a later cycle. An address with no
+/// copies, or with any copy not marked so, is not.
+fn paid_before_vault(copies: &[PendingCopy]) -> bool {
+    !copies.is_empty() && copies.iter().all(|copy| copy.before_vault_deployment)
+}
+
+/// The changes to `rejected.json`, whose rows are `existing`, that `index`, a
+/// read, makes. Each address it rejected or deferred and didn't list gets its
+/// latest rejection or deferral (the first in index order), left as it was
+/// where only the time it was decided would change. An address it deferred
+/// is rejected for good instead when every copy its nearest nodes serve was
+/// paid before the payment vault was deployed ([`paid_before_vault`]). A row
+/// is cleared once its address is listed, decided without a rejection, or
+/// walked past by its whole close group.
+fn rejected_changes(
+    existing: Vec<RejectedEntry>,
+    index: &ListingsIndex,
+    listed: &BTreeMap<XorName, &CheckedListing>,
+    at: u64,
+    tally: &mut Tally,
+) -> Vec<RejectedChange> {
+    let existing: HashMap<String, RejectedEntry> = existing
+        .into_iter()
+        .map(|entry| (entry.listing.address.clone(), entry))
+        .collect();
+    let mut changes = Vec::new();
+    let mut seen = HashSet::new();
+    for rejected in &index.rejected {
+        let address = rejected.listing.address;
+        if listed.contains_key(&address) || !seen.insert(address) {
+            continue;
+        }
+        let copies = index
+            .pending_copies
+            .get(&address)
+            .map_or(&[][..], Vec::as_slice);
+        let mut entry = RejectedEntry::new(rejected, copies, at);
+        if entry.again && paid_before_vault(copies) {
+            entry.again = false;
+            entry.problem = PAID_BEFORE_VAULT.to_owned();
+        }
+        if entry.again {
+            let pending = index.pending_copies.contains_key(&address);
+            tally
+                .deferred
+                .push((address, deferral_reason(&rejected.problem, pending)));
+        } else {
+            tally.rejected_for_good += 1;
+        }
+        let unchanged = existing.get(&entry.listing.address).is_some_and(|old| {
+            RejectedEntry {
+                decided_at: old.decided_at,
+                ..entry.clone()
+            } == *old
+        });
+        if !unchanged {
+            changes.push(RejectedChange::Set(Box::new(entry)));
+        }
+    }
+    for old in existing.values() {
+        let Some(address) = old.listing.address() else {
+            continue;
+        };
+        if seen.contains(&address) {
+            continue;
+        }
+        let keep = !listed.contains_key(&address)
+            && old
+                .listing
+                .key()
+                .is_some_and(|key| index.carry(&address, &key) == Carry::Keep);
+        if !keep {
+            changes.push(RejectedChange::Clear(address));
+        }
+    }
+    changes
+}
+
 /// A deferral's reason, as `status.json` gives it, from the problem the read
 /// gave: `pending` when fewer than a quorum of the nearest nodes serve it.
 fn deferral_reason(problem: &str, pending: bool) -> &'static str {
@@ -933,7 +961,10 @@ fn previous_entries(bytes: &[u8], at: u64) -> Result<Vec<(ShardEntry, Support)>>
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ant_listings::CheckLevel;
+    use crate::data::client::listings::RejectedListing;
+    use ant_listings::{
+        CheckLevel, Flags, Listing, ListingPayment, Metadata, PaymentField, ShownFields,
+    };
 
     const ADDRESS: &str = "1111111111111111111111111111111111111111111111111111111111111111";
 
@@ -1048,5 +1079,143 @@ mod tests {
             "nodes_unanswered"
         );
         assert_eq!(reason("something else; try again"), "other");
+    }
+
+    /// The block the payment vault was deployed in, on the bundled network.
+    const VAULT_BLOCK: u64 = 81_897_121;
+
+    /// When the cycle began.
+    const AT: u64 = 1_791_324_060;
+
+    /// A listing at `address` that shows only its block, `block`.
+    fn showing_block(address: XorName, block: u64) -> Listing {
+        Listing {
+            address,
+            flags: Flags {
+                shown: ShownFields::NONE.with(PaymentField::BlockNumber),
+                in_index: true,
+                withheld: true,
+            },
+            metadata: Metadata::default(),
+            size: None,
+            payment: ListingPayment {
+                block_number: Some(block),
+                ..ListingPayment::default()
+            },
+            first_seen: Some(1_791_324_000),
+        }
+    }
+
+    /// Leave `address` in `index` as a read does when fewer than 4 of its 7
+    /// nearest nodes serve it: one copy per node, each showing only its
+    /// block, `blocks`, and marked where that is before [`VAULT_BLOCK`].
+    fn defer(index: &mut ListingsIndex, address: XorName, blocks: &[u64]) {
+        index.deferred += 1;
+        index.rejected.push(RejectedListing {
+            listing: showing_block(address, blocks[0]),
+            problem: format!(
+                "served by {} of the 7 nodes nearest its address so far, needs 4; try again",
+                blocks.len()
+            ),
+            nodes: blocks.iter().filter(|&&block| block == blocks[0]).count(),
+            nearest: 7,
+            again: true,
+        });
+        let copies = blocks
+            .iter()
+            .zip(1u8..)
+            .map(|(&block, node)| PendingCopy {
+                node: PeerId::from_bytes([node; 32]),
+                block_number: Some(block),
+                block_timestamp: None,
+                first_seen: Some(1_791_324_000),
+                before_vault_deployment: block < VAULT_BLOCK,
+            })
+            .collect();
+        index.pending_copies.insert(address, copies);
+    }
+
+    /// The rows `changes` sets in `rejected.json`, failing on any it clears.
+    fn set_rows(changes: &[RejectedChange]) -> Vec<RejectedEntry> {
+        changes
+            .iter()
+            .map(|change| match change {
+                RejectedChange::Set(entry) => (**entry).clone(),
+                RejectedChange::Clear(address) => panic!("{} cleared", hex::encode(address)),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn an_address_every_copy_of_which_was_paid_before_the_vault_is_rejected_for_good() {
+        // As rejected.json shows two addresses: fewer than 4 of their 7
+        // nearest nodes serve them, and every copy those nodes serve was paid
+        // before the payment vault was deployed.
+        let (two, one) = ([0x3d; 32], [0x7e; 32]);
+        let mut index = ListingsIndex::default();
+        defer(&mut index, two, &[80_204_042, 80_204_042]);
+        defer(&mut index, one, &[80_204_042]);
+        let mut tally = Tally::default();
+        let changes = rejected_changes(Vec::new(), &index, &BTreeMap::new(), AT, &mut tally);
+        // Neither is left for a later cycle, so status.json's deferred
+        // groups, which the watchdog alerts on after a day, leave them out.
+        assert!(tally.deferred.is_empty(), "deferred: {:?}", tally.deferred);
+        assert_eq!(tally.rejected_for_good, 2);
+        // Both stay in rejected.json, rejected for good, with their copies.
+        let rows = set_rows(&changes);
+        assert_eq!(rows.len(), 2);
+        for (row, address, copies) in [(&rows[0], two, 2), (&rows[1], one, 1)] {
+            assert_eq!(row.listing.address, hex::encode(address));
+            assert!(!row.again);
+            assert_eq!(
+                row.problem,
+                "every copy the nodes nearest its address serve shows it paid before the \
+                 payment vault was deployed: not a payment to the vault"
+            );
+            assert_eq!((row.nodes, row.nearest), (copies, 7));
+            assert_eq!(row.copies.len(), copies);
+            assert!(row.copies.iter().all(|copy| copy.before_vault_deployment));
+            assert_eq!(row.decided_at, AT);
+        }
+        // The next cycle finds them the same: nothing to write.
+        let mut next = Tally::default();
+        let changes = rejected_changes(rows, &index, &BTreeMap::new(), AT + 60, &mut next);
+        assert!(changes.is_empty(), "{changes:?}");
+        assert!(next.deferred.is_empty());
+        assert_eq!(next.rejected_for_good, 2);
+    }
+
+    #[test]
+    fn an_address_with_any_copy_not_paid_before_the_vault_stays_deferred() {
+        // One copy was paid before the payment vault was deployed and one
+        // after it: the later one can still count once 4 nodes serve it.
+        let mixed = [0x3d; 32];
+        // And no copies at all to go by: the chain couldn't be read for it.
+        let unread = [0x7e; 32];
+        let mut index = ListingsIndex::default();
+        defer(&mut index, mixed, &[80_204_042, 81_950_000]);
+        index.rejected.push(RejectedListing {
+            listing: showing_block(unread, 81_950_000),
+            problem: "could not read the payment chain: refused; try again".into(),
+            nodes: 4,
+            nearest: 7,
+            again: true,
+        });
+        let mut tally = Tally::default();
+        let changes = rejected_changes(Vec::new(), &index, &BTreeMap::new(), AT, &mut tally);
+        assert_eq!(
+            tally.deferred,
+            [(mixed, "below_quorum"), (unread, "chain_unread")]
+        );
+        assert_eq!(tally.rejected_for_good, 0);
+        let rows = set_rows(&changes);
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().all(|row| row.again));
+        assert_eq!(
+            rows[0].problem,
+            "served by 2 of the 7 nodes nearest its address so far, needs 4; try again"
+        );
+        assert_eq!(rows[0].copies.len(), 2);
+        assert!(rows[1].copies.is_empty());
     }
 }

@@ -364,7 +364,11 @@ nearest the address serve it yet), `nodes_unanswered` (nodes nearest it have
 yet to answer for it), `envelope_unavailable` (no node serving it handed over
 its envelope), `chain_unread` (the payment chain couldn't be read for it),
 `not_on_chain_yet` (its payment isn't on the chain yet), `future_time` (it is
-dated in the future), and `other`; other reasons may be added.
+dated in the future), and `other`; other reasons may be added. An address is
+not deferred when every copy its nearest nodes serve shows a payment from
+before the payment vault was deployed (`before_vault_deployment` in
+`rejected.json`): none of them can count, however many nodes come to serve
+them, so it is rejected for good (`again` false).
 
 ```json
 { "epoch": "8c1f0e2d3b4a5968", "seq": 12, "count": 2, "generated_at": 1791324061, "started_at": 1791320000,
