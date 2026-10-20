@@ -12,15 +12,16 @@
 //!
 //! - each file only when its bytes change, whole (written beside it, flushed
 //!   to disk, then renamed over it), with `.gz` and `.zst` copies of the
-//!   same bytes;
-//! - the files a change touches first, then `pages.json`,
-//!   `feed/index.json`, and `head.json` last, so a file is written only
-//!   after every file it names is in place;
+//!   same bytes, which are checked again whenever the file is written with
+//!   the bytes it holds;
+//! - the files a change touches first (a content type's pages from its last
+//!   back), then `pages.json`, `feed/index.json`, and `head.json` last, so a
+//!   file is written only after every file it names is in place;
 //! - every prefix's shard files, empty or not;
 //! - support files at most every [`SUPPORT_INTERVAL`];
 //! - `status.json` every cycle, and `rejected.json` when it changes;
 //! - time pages that `pages.json` no longer lists are deleted
-//!   [`SUPERSEDED_KEPT`] later.
+//!   [`SUPERSEDED_KEPT`] after the `pages.json` written last listed them.
 //!
 //! There is no hide list: every listed entry is published.
 //!
@@ -42,7 +43,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fs::{self, OpenOptions};
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::ops::Bound;
 use std::path::{Path, PathBuf};
 
@@ -346,6 +347,7 @@ impl Publisher {
         let dbs = self.dbs;
         let mut txn = self.store.env().write_txn().map_err(store_error)?;
         let mut pending = dbs.pending(&txn)?;
+        dbs.carry_types(&txn, &mut pending)?;
         let mut applied = Applied {
             seq: self.seq,
             count: self.count,
@@ -360,7 +362,7 @@ impl Publisher {
         for change in &publication.rejected {
             dbs.set_rejected(&mut txn, change, &mut pending)?;
         }
-        dbs.repage(&mut txn, applied.moved, at, &mut pending)?;
+        dbs.repage(&mut txn, applied.moved, &mut pending)?;
         let generated_at = if applied.seq > self.seq {
             at
         } else {
@@ -477,8 +479,10 @@ impl Publisher {
     }
 
     /// Write the files `pending` names, in the order the module docs give,
-    /// and `status.json`; then clear what was written from the store.
-    fn write(&mut self, at: u64, status: &Status, pending: Pending) -> Result<Published> {
+    /// and `status.json`; then clear what was written from the store, and
+    /// note the time pages `pages.json` stopped listing as superseded at
+    /// `at`.
+    fn write(&mut self, at: u64, status: &Status, mut pending: Pending) -> Result<Published> {
         let dbs = self.dbs;
         self.files.written = 0;
         self.files.written_bytes = 0;
@@ -533,7 +537,10 @@ impl Publisher {
         }
         drop(txn);
         if !fixes.is_empty() {
-            dbs.fix_pages(self.store.env(), at, &fixes)?;
+            dbs.fix_pages(self.store.env(), &fixes)?;
+            pending
+                .superseded
+                .extend(fixes.iter().map(|fix| fix.old_path.clone()));
         }
         let mut status = status.clone();
         status.epoch.clone_from(&self.epoch);
@@ -545,7 +552,8 @@ impl Publisher {
         }
         self.files.put(STATUS_FILE, &json(&status)?)?;
         let txn = self.store.env().read_txn().map_err(store_error)?;
-        if pending.lists || !fixes.is_empty() {
+        let pages_written = pending.lists || !fixes.is_empty();
+        if pages_written {
             let bytes = dbs.pages_file(&txn, &self.epoch, self.seq, self.count)?;
             self.files.put(PAGES_FILE, &bytes)?;
         }
@@ -559,16 +567,30 @@ impl Publisher {
         let expired = dbs.expired_pages(&txn, at)?;
         drop(txn);
         for page in &expired {
-            if !page.listed {
+            if !page.keep {
                 self.files.remove(&page.path)?;
             }
         }
         let mut txn = self.store.env().write_txn().map_err(store_error)?;
+        // A page stays a day from when the `pages.json` written stopped
+        // listing it, however long after the change that was.
+        if pages_written {
+            for path in &pending.superseded {
+                dbs.pages
+                    .put(&mut txn, &superseded_row(at, path), &[])
+                    .map_err(store_error)?;
+            }
+        }
         let left = Pending {
             support: if support_written {
                 BTreeSet::new()
             } else {
                 pending.support
+            },
+            superseded: if pages_written {
+                BTreeSet::new()
+            } else {
+                pending.superseded
             },
             ..Pending::default()
         };
@@ -640,6 +662,10 @@ struct Pending {
     types: BTreeMap<String, TypeTodo>,
     /// Time pages, by first key as text.
     pages: BTreeSet<String>,
+    /// Time pages `pages.json` stops listing once it is next written: each
+    /// is noted as superseded when it is, to be deleted
+    /// [`SUPERSEDED_KEPT`] later.
+    superseded: BTreeSet<String>,
     /// `rejected.json`.
     rejected: bool,
     /// `pages.json`, `feed/index.json` and `head.json`.
@@ -654,6 +680,16 @@ struct TypeTodo {
     from: String,
     /// The most pages it may have on disk: those past its last are deleted.
     pages: u64,
+    /// The fewest pages it may have on disk: as many as its count gave when
+    /// its first change was recorded, or when a later publication found it
+    /// still to write, since that earlier write may have written some of
+    /// its pages before it stopped. While this or [`pages`](Self::pages)
+    /// differs from its number of pages now, the page that was last on disk
+    /// may link to the wrong next page, so its pages are written from there
+    /// on ([`Dbs::write_type_pages`]). 0 in a row an earlier version wrote:
+    /// all its pages are written.
+    #[serde(default)]
+    fewest: u64,
 }
 
 /// A content type and how many entries have it ([`TYPE_COUNT_TAG`]).
@@ -687,8 +723,9 @@ struct Expired {
     /// Its row in [`PAGES_DB`].
     row: Vec<u8>,
     path: String,
-    /// Whether `pages.json` lists it again, so it stays.
-    listed: bool,
+    /// Whether it stays: `pages.json` lists it again, or stopped listing it
+    /// again since, less than [`SUPERSEDED_KEPT`] ago.
+    keep: bool,
 }
 
 /// The publisher's databases.
@@ -744,12 +781,15 @@ impl Dbs {
         {
             let (key, value) = row.map_err(store_error)?;
             let count: TypeCount = parse(value)?;
+            // Every page is written, from the first: what is on disk is
+            // unknown.
             let todo = pending
                 .types
                 .entry(hex::encode(&key[1..]))
                 .or_insert_with(|| TypeTodo {
                     from: from.clone(),
                     pages: 0,
+                    fewest: 0,
                 });
             todo.from.clone_from(&from);
             todo.pages = todo.pages.max(type_pages(count.count));
@@ -915,10 +955,7 @@ impl Dbs {
     ) -> Result<()> {
         let id = *blake3::hash(content_type.as_bytes()).as_bytes();
         let count_row = tagged(TYPE_COUNT_TAG, &id);
-        let before = match self.order.get(txn, &count_row).map_err(store_error)? {
-            Some(value) => parse::<TypeCount>(value)?.count,
-            None => 0,
-        };
+        let before = self.type_count(txn, &id)?;
         let after = if add {
             before + 1
         } else {
@@ -942,18 +979,45 @@ impl Dbs {
             self.order.delete(txn, &member).map_err(store_error)?;
         }
         let key = hex::encode(key);
+        // On its first change, its pages on disk are those of `before`.
+        let pages = type_pages(before);
         let todo = pending
             .types
             .entry(hex::encode(id))
             .or_insert_with(|| TypeTodo {
                 from: key.clone(),
-                pages: 0,
+                pages,
+                fewest: pages,
             });
         if key < todo.from {
             todo.from = key;
         }
-        todo.pages = todo.pages.max(type_pages(before));
+        todo.pages = todo.pages.max(pages);
         pending.type_indexes.insert(shard_of(&id));
+        Ok(())
+    }
+
+    /// How many entries have the content type whose id is `id`.
+    fn type_count(&self, txn: &RoTxn, id: &[u8; 32]) -> Result<u64> {
+        match self
+            .order
+            .get(txn, &tagged(TYPE_COUNT_TAG, id))
+            .map_err(store_error)?
+        {
+            Some(value) => Ok(parse::<TypeCount>(value)?.count),
+            None => Ok(0),
+        }
+    }
+
+    /// Note, for each content type an earlier publication left to write,
+    /// that its pages on disk may now be as many as its count gives: that
+    /// publication's write may have written some of them before it stopped.
+    fn carry_types(&self, txn: &RoTxn, pending: &mut Pending) -> Result<()> {
+        for (id, todo) in &mut pending.types {
+            let pages = type_pages(self.type_count(txn, &hex32(id)?)?);
+            todo.fewest = todo.fewest.min(pages);
+            todo.pages = todo.pages.max(pages);
+        }
         Ok(())
     }
 
@@ -1017,13 +1081,7 @@ impl Dbs {
     /// same entries until the next one. Stretches that overlap, or meet at
     /// a key that moved, are joined, so each stretch found starts and ends
     /// at a page end that both the old pages and the new ones have.
-    fn repage(
-        &self,
-        txn: &mut RwTxn,
-        mut moved: Vec<Key>,
-        at: u64,
-        pending: &mut Pending,
-    ) -> Result<()> {
+    fn repage(&self, txn: &mut RwTxn, mut moved: Vec<Key>, pending: &mut Pending) -> Result<()> {
         moved.sort_unstable();
         moved.dedup();
         let mut stretches: Vec<(Option<Key>, Option<Key>)> = Vec::new();
@@ -1047,7 +1105,7 @@ impl Dbs {
             stretches.push((start, end));
         }
         for (after, through) in stretches {
-            self.repage_stretch(txn, after.as_ref(), through.as_ref(), at, pending)?;
+            self.repage_stretch(txn, after.as_ref(), through.as_ref(), pending)?;
         }
         Ok(())
     }
@@ -1089,7 +1147,6 @@ impl Dbs {
         txn: &mut RwTxn,
         after: Option<&Key>,
         through: Option<&Key>,
-        at: u64,
         pending: &mut Pending,
     ) -> Result<()> {
         let (start, end) = stretch_bounds(KEY_TAG, after, through);
@@ -1131,15 +1188,15 @@ impl Dbs {
         for (key, row) in &old {
             self.pages.delete(txn, key).map_err(store_error)?;
             if !new_paths.contains(row.path.as_str()) {
-                self.pages
-                    .put(txn, &superseded_row(at, &row.path), &[])
-                    .map_err(store_error)?;
+                pending.superseded.insert(row.path.clone());
             }
         }
         for (first, row) in &rows {
             self.pages
                 .put(txn, &tagged(PAGE_TAG, first), &json(row)?)
                 .map_err(store_error)?;
+            // Listed again before `pages.json` was written without it.
+            pending.superseded.remove(&row.path);
             if !old_paths.contains(row.path.as_str()) {
                 pending.pages.insert(hex::encode(first));
             }
@@ -1234,7 +1291,10 @@ impl Dbs {
     }
 
     /// Write the pages of the content type `id` from the one holding
-    /// `todo.from` on, and note those past its last to delete.
+    /// `todo.from` on, from the last back, and note those past its last to
+    /// delete. Where the type may have had another number of pages on disk,
+    /// they are written from the one before the last of the fewer, whose
+    /// link to the next page changes.
     fn write_type_pages(
         &self,
         txn: &RoTxn,
@@ -1265,8 +1325,8 @@ impl Dbs {
         }
         // Its keys from the last back: first those from `from` on, which
         // give the page `from` is in, then back to that page's start (or to
-        // the old last page's, whose link to the next changes when the
-        // number of pages does).
+        // that of a page that was last on disk, whose link to the next
+        // changes when the number of pages does).
         let per_page = TYPE_PAGE_LISTINGS as u64;
         let prefix = tagged(TYPE_TAG, &id_bytes);
         let mut rows = self
@@ -1285,8 +1345,12 @@ impl Dbs {
         }
         let position = count.saturating_sub(tail.len() as u64);
         let mut first_page = position / per_page;
-        if pages != todo.pages {
-            first_page = first_page.min(pages.min(todo.pages).saturating_sub(1));
+        // The pages before it hold the entries they held. Their links hold
+        // too, unless the type may have had another number of pages on disk:
+        // then the page that was last there, or is last now, links to the
+        // wrong next page, as may every page between them.
+        if todo.fewest != pages || todo.pages != pages {
+            first_page = first_page.min(pages.min(todo.fewest).saturating_sub(1));
         }
         let wanted = usize::try_from(count - first_page * per_page).unwrap_or(usize::MAX);
         if let Some(key) = before_from {
@@ -1302,7 +1366,12 @@ impl Dbs {
         }
         drop(rows);
         tail.reverse();
-        for (page, keys) in (first_page..).zip(tail.chunks(TYPE_PAGE_LISTINGS)) {
+        // From the last page back: each page is in place before the page
+        // that links to it as its next is written, so a reader of an older
+        // `index.json` never follows `next` to a page not written yet.
+        let chunks: Vec<&[Key]> = tail.chunks(TYPE_PAGE_LISTINGS).collect();
+        for (offset, keys) in chunks.into_iter().enumerate().rev() {
+            let page = first_page + offset as u64;
             let listings = keys
                 .iter()
                 .map(|key| self.listed(txn, &key_address(key)))
@@ -1370,22 +1439,18 @@ impl Dbs {
         files.put(&path, &bytes)
     }
 
-    /// Correct the rows of pages that didn't hold what their names said.
-    fn fix_pages(
-        &self,
-        env: &heed::Env<heed::WithoutTls>,
-        at: u64,
-        fixes: &[PageFix],
-    ) -> Result<()> {
+    /// Correct the rows of pages that didn't hold what their names said, and
+    /// note the names they had as superseded once `pages.json` is written.
+    fn fix_pages(&self, env: &heed::Env<heed::WithoutTls>, fixes: &[PageFix]) -> Result<()> {
         let mut txn = env.write_txn().map_err(store_error)?;
+        let mut pending = self.pending(&txn)?;
         for fix in fixes {
             self.pages
                 .put(&mut txn, &tagged(PAGE_TAG, &fix.first), &json(&fix.row)?)
                 .map_err(store_error)?;
-            self.pages
-                .put(&mut txn, &superseded_row(at, &fix.old_path), &[])
-                .map_err(store_error)?;
+            pending.superseded.insert(fix.old_path.clone());
         }
+        self.save_pending(&mut txn, &pending)?;
         txn.commit().map_err(store_error)
     }
 
@@ -1483,15 +1548,25 @@ impl Dbs {
         let mut expired = Vec::new();
         for row in self.pages.range(txn, &range).map_err(store_error)? {
             let (row, _) = row.map_err(store_error)?;
-            let path = String::from_utf8_lossy(row.get(9..).unwrap_or_default()).into_owned();
             expired.push(Expired {
                 row: row.to_vec(),
-                listed: false,
-                path,
+                keep: false,
+                path: superseded_path(row),
             });
         }
+        if expired.is_empty() {
+            return Ok(expired);
+        }
+        // A page `pages.json` listed again and then stopped listing again
+        // has a later row too: it stays a day from then.
+        let last = [SUPERSEDED_TAG + 1];
+        let rest = (Bound::Included(&end[..]), Bound::Excluded(&last[..]));
+        let mut later = HashSet::new();
+        for row in self.pages.range(txn, &rest).map_err(store_error)? {
+            later.insert(superseded_path(row.map_err(store_error)?.0));
+        }
         for page in &mut expired {
-            page.listed = self.lists_page(txn, &page.path)?;
+            page.keep = later.contains(&page.path) || self.lists_page(txn, &page.path)?;
         }
         Ok(expired)
     }
@@ -1608,32 +1683,36 @@ impl Files {
     }
 
     /// Write `bytes` as the file at `path` (from the directory), with its
-    /// `.gz` and `.zst` copies: each only if it differs or is missing.
+    /// `.gz` and `.zst` copies: each only if it differs or is missing. The
+    /// copies go first, so beside a file that already holds `bytes` they
+    /// are checked too: a write stopped after its copies were renamed in,
+    /// before its file was, leaves copies of other bytes there.
     fn put(&mut self, path: &str, bytes: &[u8]) -> Result<()> {
         let path = self.dir.join(path);
-        let gz = with_suffix(&path, ".gz");
-        let zst = with_suffix(&path, ".zst");
-        let old = match fs::read(&path) {
-            Ok(old) => Some(old),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => None,
-            Err(e) => return Err(io_error(&path, &e)),
-        };
+        let old = read_file(&path)?;
         let same = old.as_deref() == Some(bytes);
-        let gz_len = file_len(&gz)?;
-        let zst_len = file_len(&zst)?;
-        if same && gz_len.is_some() && zst_len.is_some() {
+        let mut copies = Vec::new();
+        for packing in [Packing::Gzip, Packing::Zstd] {
+            let copy = with_suffix(&path, packing.suffix());
+            if !same {
+                let old_len = file_len(&copy)?;
+                copies.push((copy, packing, old_len));
+                continue;
+            }
+            match read_file(&copy)? {
+                Some(held) if packing.holds(&held, bytes) => {}
+                held => copies.push((copy, packing, held.map(|held| held.len() as u64))),
+            }
+        }
+        if same && copies.is_empty() {
             return Ok(());
         }
         if let Some(dir) = path.parent() {
             self.ensure_dir(dir)?;
         }
-        if !same || gz_len.is_none() {
-            let packed = gzip(bytes).map_err(|e| io_error(&gz, &e))?;
-            self.replace(&gz, &packed, gz_len)?;
-        }
-        if !same || zst_len.is_none() {
-            let packed = zstd(bytes).map_err(|e| io_error(&zst, &e))?;
-            self.replace(&zst, &packed, zst_len)?;
+        for (copy, packing, old_len) in copies {
+            let packed = packing.pack(bytes).map_err(|e| io_error(&copy, &e))?;
+            self.replace(&copy, &packed, old_len)?;
         }
         if !same {
             self.replace(&path, bytes, old.map(|old| old.len() as u64))?;
@@ -1727,6 +1806,15 @@ fn measure(dir: &Path) -> Result<u64> {
     Ok(bytes)
 }
 
+/// The bytes of the file at `path`, if there is one.
+fn read_file(path: &Path) -> Result<Option<Vec<u8>>> {
+    match fs::read(path) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(io_error(path, &e)),
+    }
+}
+
 /// The length of the file at `path`, if there is one.
 fn file_len(path: &Path) -> Result<Option<u64>> {
     match fs::metadata(path) {
@@ -1757,6 +1845,44 @@ fn gzip(bytes: &[u8]) -> io::Result<Vec<u8>> {
 /// The `.zst` copy of a file's bytes: zstd at the library's default level.
 fn zstd(bytes: &[u8]) -> io::Result<Vec<u8>> {
     zstd::bulk::compress(bytes, zstd::DEFAULT_COMPRESSION_LEVEL)
+}
+
+/// A compressed copy beside each file.
+#[derive(Debug, Clone, Copy)]
+enum Packing {
+    Gzip,
+    Zstd,
+}
+
+impl Packing {
+    fn suffix(self) -> &'static str {
+        match self {
+            Self::Gzip => ".gz",
+            Self::Zstd => ".zst",
+        }
+    }
+
+    fn pack(self, bytes: &[u8]) -> io::Result<Vec<u8>> {
+        match self {
+            Self::Gzip => gzip(bytes),
+            Self::Zstd => zstd(bytes),
+        }
+    }
+
+    /// Whether `copy` is `bytes` compressed this way, and nothing else.
+    /// Unpacking it stops one byte past `bytes`: enough to tell.
+    fn holds(self, copy: &[u8], bytes: &[u8]) -> bool {
+        let limit = bytes.len() as u64 + 1;
+        let mut unpacked = Vec::with_capacity(bytes.len());
+        let read = match self {
+            Self::Gzip => flate2::read::MultiGzDecoder::new(copy)
+                .take(limit)
+                .read_to_end(&mut unpacked),
+            Self::Zstd => zstd::stream::read::Decoder::with_buffer(copy)
+                .and_then(|decoder| decoder.take(limit).read_to_end(&mut unpacked)),
+        };
+        read.is_ok() && unpacked == bytes
+    }
 }
 
 fn io_error(path: &Path, error: &io::Error) -> Error {
@@ -1862,6 +1988,11 @@ fn superseded_row(at: u64, path: &str) -> Vec<u8> {
         path.as_bytes(),
     ]
     .concat()
+}
+
+/// The path a [`superseded_row`] names.
+fn superseded_path(row: &[u8]) -> String {
+    String::from_utf8_lossy(row.get(9..).unwrap_or_default()).into_owned()
 }
 
 /// The rows, under `tag` (or none), of 32 bytes in `shard`: those whose
@@ -2888,14 +3019,72 @@ mod tests {
         assert_eq!(paged, model.keys.keys().copied().collect::<Vec<_>>());
     }
 
+    /// A verified entry at the address from `seed`, newer as `seed` grows,
+    /// of `content_type`.
+    fn typed(seed: u64, content_type: &str) -> ShardEntry {
+        let mut entry = lean(address(seed), 1_700_000_000 + seed);
+        entry.entry.listing.content_type = Some(content_type.into());
+        entry
+    }
+
+    /// `content_type` as its `by-type` index lists it.
+    fn type_summary(f: &Fixture, content_type: &str) -> Option<TypeSummary> {
+        let id = type_id(content_type);
+        f.file::<TypeIndex>(&type_index_path(&id[..3]))
+            .types
+            .into_iter()
+            .find(|summary| summary.content_type == content_type)
+    }
+
+    /// Read `content_type`'s entries both ways, as a reader does: oldest
+    /// first from its index's `first`, following `next`, and newest first
+    /// from `last`, following `prev`. Both must give every entry its index
+    /// counts, in key order; the pages' sizes, oldest first.
+    fn walk_type(f: &Fixture, content_type: &str) -> Vec<usize> {
+        let summary = type_summary(f, content_type).unwrap();
+        // Oldest first: from the first page, following `next`.
+        let mut oldest_first = Vec::new();
+        let mut sizes = Vec::new();
+        let mut at = Some(summary.first.clone());
+        while let Some(path) = at {
+            let page: TypePage = f.file(&path);
+            assert_eq!(page.page, sizes.len() as u64);
+            assert_eq!(path, type_page_path(content_type, page.page));
+            sizes.push(page.listings.len());
+            oldest_first.extend(page.listings.iter().map(|entry| entry.key().unwrap()));
+            at = page.next;
+        }
+        // Newest first: from the last, following `prev`, each page
+        // backwards.
+        let mut newest_first = Vec::new();
+        let mut at = Some(summary.last.clone());
+        while let Some(path) = at {
+            let page: TypePage = f.file(&path);
+            newest_first.extend(page.listings.iter().rev().map(|entry| entry.key().unwrap()));
+            at = page.prev;
+        }
+        assert_eq!(
+            oldest_first.len() as u64,
+            summary.count,
+            "oldest first, from `first` following `next`"
+        );
+        assert_eq!(
+            newest_first.len() as u64,
+            summary.count,
+            "newest first, from `last` following `prev`"
+        );
+        let mut sorted = oldest_first.clone();
+        sorted.sort();
+        assert_eq!(oldest_first, sorted);
+        newest_first.reverse();
+        assert_eq!(newest_first, oldest_first);
+        assert_eq!(sizes.len() as u64, summary.pages);
+        sizes
+    }
+
     #[test]
     fn content_type_pages_are_linked_both_ways() {
         let mut f = Fixture::new();
-        let typed = |seed: u64, content_type: &str| {
-            let mut entry = lean(address(seed), 1_700_000_000 + seed);
-            entry.entry.listing.content_type = Some(content_type.into());
-            entry
-        };
         let mut changes: Vec<IndexChange> =
             (0..600).map(|seed| put(typed(seed, "image/png"))).collect();
         changes.extend((600..603).map(|seed| put(typed(seed, "text/plain"))));
@@ -2903,46 +3092,8 @@ mod tests {
             changes,
             ..quiet(AT)
         });
-        let id = type_id("image/png");
-        let index_path = type_index_path(&id[..3]);
-        let summary = |f: &Fixture| {
-            f.file::<TypeIndex>(&index_path)
-                .types
-                .into_iter()
-                .find(|summary| summary.content_type == "image/png")
-        };
-        let walk = |f: &Fixture| {
-            let summary = summary(f).unwrap();
-            // Oldest first: from the first page, following `next`.
-            let mut oldest_first = Vec::new();
-            let mut sizes = Vec::new();
-            let mut at = Some(summary.first.clone());
-            while let Some(path) = at {
-                let page: TypePage = f.file(&path);
-                assert_eq!(page.page, sizes.len() as u64);
-                assert_eq!(path, type_page_path("image/png", page.page));
-                sizes.push(page.listings.len());
-                oldest_first.extend(page.listings.iter().map(|entry| entry.key().unwrap()));
-                at = page.next;
-            }
-            // Newest first: from the last, following `prev`, each page
-            // backwards.
-            let mut newest_first = Vec::new();
-            let mut at = Some(summary.last.clone());
-            while let Some(path) = at {
-                let page: TypePage = f.file(&path);
-                newest_first.extend(page.listings.iter().rev().map(|entry| entry.key().unwrap()));
-                at = page.prev;
-            }
-            let mut sorted = oldest_first.clone();
-            sorted.sort();
-            assert_eq!(oldest_first, sorted);
-            newest_first.reverse();
-            assert_eq!(newest_first, oldest_first);
-            assert_eq!(oldest_first.len() as u64, summary.count);
-            assert_eq!(sizes.len() as u64, summary.pages);
-            sizes
-        };
+        let summary = |f: &Fixture| type_summary(f, "image/png");
+        let walk = |f: &Fixture| walk_type(f, "image/png");
         assert_eq!(walk(&f), [256, 256, 88]);
         assert_eq!(summary(&f).unwrap().last, type_page_path("image/png", 2));
         // Fewer entries: the third page goes, and the second is the last.
@@ -2978,6 +3129,129 @@ mod tests {
             .iter()
             .all(|summary| summary.content_type != "text/plain"));
         assert!(!f.exists(&type_page_path("text/plain", 0)));
+    }
+
+    #[test]
+    fn a_content_type_read_oldest_first_reaches_entries_added_after_a_full_page() {
+        for full in [256u64, 512, 768] {
+            let mut f = Fixture::new();
+            f.publish(&Publication {
+                changes: (0..full)
+                    .map(|seed| put(typed(seed, "image/png")))
+                    .collect(),
+                ..quiet(AT)
+            });
+            let pages = usize::try_from(full / 256).unwrap();
+            assert_eq!(walk_type(&f, "image/png"), vec![256; pages]);
+            // Two entries newer than all of them, in one publication: the
+            // page that was last now links to a new one.
+            f.publish(&Publication {
+                changes: vec![
+                    put(typed(full, "image/png")),
+                    put(typed(full + 1, "image/png")),
+                ],
+                ..quiet(AT + 60)
+            });
+            let mut expected = vec![256; pages];
+            expected.push(2);
+            assert_eq!(walk_type(&f, "image/png"), expected, "{full} entries");
+        }
+    }
+
+    /// Stop the next publication's write after its content type pages:
+    /// `status.json`, written after them, can't be.
+    fn stop_after_type_pages(f: &Fixture) {
+        fs::remove_file(f.out().join(STATUS_FILE)).unwrap();
+        fs::create_dir(f.out().join(STATUS_FILE)).unwrap();
+    }
+
+    fn resume(f: &Fixture) {
+        fs::remove_dir(f.out().join(STATUS_FILE)).unwrap();
+    }
+
+    fn png(seeds: Range<u64>) -> Vec<IndexChange> {
+        seeds.map(|seed| put(typed(seed, "image/png"))).collect()
+    }
+
+    fn removed(seeds: Range<u64>) -> Vec<IndexChange> {
+        seeds.map(|seed| remove(address(seed))).collect()
+    }
+
+    #[test]
+    fn a_content_type_grown_by_a_stopped_write_then_shrunk_keeps_its_links() {
+        // Grown to two pages by a write that stopped, then back to one: the
+        // first page, written then with a link to the second, is written
+        // again without one.
+        let mut f = Fixture::new();
+        f.publish(&Publication {
+            changes: png(0..256),
+            ..quiet(AT)
+        });
+        stop_after_type_pages(&f);
+        let stopped = f.publisher.publish(&Publication {
+            changes: png(256..258),
+            ..quiet(AT + 60)
+        });
+        assert!(stopped.is_err());
+        assert_eq!(walk_type(&f, "image/png"), [256, 2]);
+        resume(&f);
+        f.publish(&Publication {
+            changes: removed(256..258),
+            ..quiet(AT + 120)
+        });
+        assert_eq!(walk_type(&f, "image/png"), [256]);
+        assert!(!f.exists(&type_page_path("image/png", 1)));
+    }
+
+    #[test]
+    fn a_content_type_shrunk_by_a_stopped_write_then_grown_keeps_its_links() {
+        // Shrunk to one page by a write that stopped, then grown back to
+        // two: the first page, written then with no link, links to the
+        // second again.
+        let mut f = Fixture::new();
+        f.publish(&Publication {
+            changes: png(0..258),
+            ..quiet(AT)
+        });
+        stop_after_type_pages(&f);
+        let stopped = f.publisher.publish(&Publication {
+            changes: removed(256..258),
+            ..quiet(AT + 60)
+        });
+        assert!(stopped.is_err());
+        assert_eq!(walk_type(&f, "image/png"), [256]);
+        resume(&f);
+        f.publish(&Publication {
+            changes: png(256..258),
+            ..quiet(AT + 120)
+        });
+        assert_eq!(walk_type(&f, "image/png"), [256, 2]);
+    }
+
+    #[test]
+    fn content_type_pages_are_written_from_the_last_back() {
+        let mut f = Fixture::new();
+        f.publish(&Publication {
+            changes: (0..256).map(|seed| put(typed(seed, "image/png"))).collect(),
+            ..quiet(AT)
+        });
+        // The first page can't be written: the new second page, which it
+        // will link to, is already in place.
+        let first = type_page_path("image/png", 0);
+        let second = type_page_path("image/png", 1);
+        fs::remove_file(f.out().join(&first)).unwrap();
+        fs::create_dir(f.out().join(&first)).unwrap();
+        let stopped = f.publisher.publish(&Publication {
+            changes: vec![put(typed(256, "image/png"))],
+            ..quiet(AT + 60)
+        });
+        assert!(stopped.is_err());
+        assert_eq!(f.file::<TypePage>(&second).listings.len(), 1);
+        // The index naming it isn't written until both are.
+        assert_eq!(type_summary(&f, "image/png").unwrap().pages, 1);
+        fs::remove_dir(f.out().join(&first)).unwrap();
+        f.publish(&quiet(AT + 120));
+        assert_eq!(walk_type(&f, "image/png"), [256, 1]);
     }
 
     #[test]
@@ -3220,6 +3494,94 @@ mod tests {
         f.publish(&quiet(again + day + 60));
         assert!(copies(&both).iter().all(|path| f.exists(path)));
         assert_eq!(f.publisher.files_bytes(), measure(&f.out()).unwrap());
+        // A page that leaves, comes back and leaves again stays a day from
+        // when it last left.
+        let first_left = again + day + 100;
+        let left_again = first_left + 20;
+        f.publish(&Publication {
+            changes: vec![remove([0xa0; 32])],
+            ..quiet(first_left)
+        });
+        f.publish(&Publication {
+            changes: vec![put(hiding())],
+            ..quiet(first_left + 10)
+        });
+        f.publish(&Publication {
+            changes: vec![remove([0xa0; 32])],
+            ..quiet(left_again)
+        });
+        f.publish(&quiet(first_left + day));
+        assert!(copies(&both).iter().all(|path| f.exists(path)));
+        f.publish(&quiet(left_again + day));
+        assert!(copies(&both).iter().all(|path| !f.exists(path)));
+        assert_eq!(f.publisher.files_bytes(), measure(&f.out()).unwrap());
+    }
+
+    #[test]
+    fn a_page_stays_a_day_from_when_the_pages_json_written_stops_listing_it() {
+        let mut f = Fixture::new();
+        f.publish(&first_publication());
+        let pages: Pages = f.file("pages.json");
+        let both = pages.pages[0].path.clone();
+        // The page that replaces it can't be written for three hours.
+        let only = format!(r#"{{"listings":[{SHOWN}]}}"#);
+        let only_page = page_path(&parse_key(&pages.pages[0].first).unwrap(), only.as_bytes());
+        fs::create_dir_all(f.out().join(&only_page)).unwrap();
+        let removed = AT + 100;
+        let failed = f.publisher.publish(&Publication {
+            changes: vec![remove([0xa0; 32])],
+            ..quiet(removed)
+        });
+        assert!(failed.is_err());
+        assert_eq!(f.file::<Pages>("pages.json").pages[0].path, both);
+        fs::remove_dir_all(f.out().join(&only_page)).unwrap();
+        let written = removed + 3 * 3_600;
+        f.publish(&quiet(written));
+        assert_eq!(f.file::<Pages>("pages.json").pages[0].path, only_page);
+        let day = SUPERSEDED_KEPT.as_secs();
+        f.publish(&quiet(removed + day));
+        assert!(f.exists(&both));
+        f.publish(&quiet(written + day));
+        assert!(!f.exists(&both));
+    }
+
+    #[test]
+    fn copies_left_by_a_write_stopped_part_way_are_written_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut files = Files::open(dir.path()).unwrap();
+        files.durable = false;
+        let a = br#"{"listings":["a"]}"#;
+        let b = br#"{"listings":["b"]}"#;
+        files.put("x.json", a).unwrap();
+        let path = dir.path().join("x.json");
+        let gz = with_suffix(&path, ".gz");
+        let zst = with_suffix(&path, ".zst");
+        let read = |path: &Path| fs::read(path).unwrap();
+        // Copies whose bytes it holds are left as they are.
+        let (gz_a, zst_a) = (read(&gz), read(&zst));
+        files.put("x.json", a).unwrap();
+        assert_eq!((read(&gz), read(&zst)), (gz_a.clone(), zst_a.clone()));
+        assert_eq!(files.written, 1);
+        // A write of other bytes stopped after its copies were renamed in,
+        // before the file was: putting the file's own bytes again writes
+        // its copies again.
+        fs::write(&gz, gzip(b).unwrap()).unwrap();
+        fs::write(&zst, zstd(b).unwrap()).unwrap();
+        files.put("x.json", a).unwrap();
+        assert_eq!((read(&gz), read(&zst)), (gz_a.clone(), zst_a.clone()));
+        assert_eq!(read(&path), a);
+        // So are copies holding more than the file's bytes, or unreadable
+        // ones.
+        fs::write(&gz, [gzip(a).unwrap(), gzip(b).unwrap()].concat()).unwrap();
+        fs::write(&zst, [zstd(a).unwrap(), b"junk".to_vec()].concat()).unwrap();
+        files.put("x.json", a).unwrap();
+        assert_eq!((read(&gz), read(&zst)), (gz_a.clone(), zst_a.clone()));
+        fs::write(&gz, b"not gzip").unwrap();
+        fs::write(&zst, &gz_a).unwrap();
+        files.put("x.json", a).unwrap();
+        assert_eq!((read(&gz), read(&zst)), (gz_a, zst_a));
+        // The file itself was written once.
+        assert_eq!(files.written, 1);
     }
 
     #[test]
