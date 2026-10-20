@@ -24,9 +24,16 @@ told apart by the commit `darwin --version` prints. Upstream's entries follow.
   earlier. The index as small static files, `listings/v1/`, is specified in `docs/listings-v1.md`,
   with its types in `ant_core::data::client::listings_v1`.
 - `darwin listings serve --state-dir DIR --out-dir DIR [--carry FILE]` keeps the index published
-  as the files of `listings/v1/`: each minute it reads the index as `darwin listings --state
-  --carry` does, keeps envelopes and final chain facts (paced and batched RPC calls), and writes
-  only the files whose bytes change. Reading nodes' change feeds is not in this version.
+  as the files of `listings/v1/`, deciding what `darwin listings --state --carry` decides, with
+  envelopes and final chain facts kept (paced and batched RPC calls), and writes only the files
+  whose bytes change. It keeps a census of the nodes, built from witnessed lookups, instead of
+  finding them anew each time; each minute it asks every node with a change feed (ds.15 or later)
+  what changed in its part of the address space, and reads the others with one `listings.v2`
+  request a minute and a full pass at most hourly. It decides again only the addresses whose
+  copies, nearest nodes or chain facts changed (and every address once a day), and publishes a
+  new listing a node pushes within seconds. An entry is dropped only when, in one cycle, all 7 of
+  its nearest nodes answered without a copy, a witnessed lookup confirms them, and each of them
+  and the nodes that last served it answers a request for the address with none.
 - Envelopes are darwin's default: `darwin file upload`, `darwin manifest create` and the
   library's file upload shortcuts store each upload in an envelope, with its payment record, a
   listing when listed, and a `.record`. The other ways of using the network remain, with no

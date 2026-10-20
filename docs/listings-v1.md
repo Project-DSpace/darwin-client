@@ -370,7 +370,7 @@ stopped, is stuck, or can't write its files.
 | `epoch`, `seq`, `count` | As in `head.json` |
 | `generated_at` | When this file was written |
 | `started_at` | When the producer started; `totals` count from then |
-| `cycle` | The latest cycle: `started_at`; `millis`, how long it took; `bytes_in` and `bytes_out`, the listings messages received from nodes and sent to them (see below); `rpc_calls` and `rpc_errors`, to the payment chain's RPC providers; `decided`, addresses decided; `too_few_answered`, true when the cycle decided and removed nothing because its read found too few nodes to trust (see below) |
+| `cycle` | The latest cycle: `started_at`; `millis`, how long it took; `bytes_in` and `bytes_out`, the listings messages received from nodes and sent to them (see below); `rpc_calls` and `rpc_errors`, to the payment chain's RPC providers; `decided`, addresses the cycle decided; `too_few_answered`, true when the cycle decided and removed nothing because too few of the nodes it knows answered (see below) |
 | `totals` | Since `started_at`: `cycles`, `bytes_in` and `bytes_out` (counted as the cycle's are), and `rpc`, for each provider its host name (`provider`), `calls` and `errors` |
 | `census` | The nodes the producer knows: `nodes`; `answering`, those that answered in the latest cycle; `leaves`, the parts the address space is split into; `versions`, how many nodes (`nodes`) give each `version` in their user agent (`null` when unknown); `silent`, each node that didn't answer (`node`, and `last_answered`, or `null` if never) |
 | `deferred` | Addresses left for a later cycle, grouped by `reason`, each group with `addresses`, how many, and `oldest_since`, since when the longest-waiting has waited. An entry kept unconfirmed (`carried`) whose address the cycle left for later counts too, though `rejected.json` doesn't list it |
@@ -383,11 +383,10 @@ receives from nodes and sends to them, each message's payload: not the DHT
 lookups that find the nodes, nor envelope fetches, nor the transport's own
 overhead.
 
-`too_few_answered`, in this version, is an index read's guard: the cycle's
-read found fewer than 7 nodes, or under three quarters of the most that any
-of the 10 reads before it found, however many of them answered, or none at
-all. A later version that keeps a census of the nodes sets it when fewer
-than 7 of the census answered the cycle, or under three quarters of it.
+`too_few_answered` is true when fewer than 7 of the census's nodes
+answered the cycle, or under three quarters of them. `census.answering`
+counts the nodes that answered the cycle's request, and `silent` lists the
+others.
 
 A deferral's `reason` is one of: `below_quorum` (fewer than 4 of the 7 nodes
 nearest the address serve it yet), `nodes_unanswered` (nodes nearest it have
@@ -502,16 +501,18 @@ Files are fetched one at a time, so a file can be newer than the
 
 ## How the producer keeps the files
 
-- Each minute (a cycle), it reads every node's index, decides the addresses
-  it finds, and writes the files those decisions change. An address is
-  decided only once at least 4 of its 7 nearest nodes serve a listing for
-  it. A later version asks nodes that keep a change feed only what changed,
-  decides again only the addresses whose copies, nearest nodes or chain
-  facts changed, and learns of a new listing as a node stores it, without
-  waiting for the next cycle; the files stay as this document gives them.
+- Each minute (a cycle), it asks every node it knows what changed in what
+  it serves, decides again the addresses whose copies, nearest nodes or
+  chain facts changed (and every address once a day), and writes the files
+  those decisions change. A node that stores a new listing pushes it, and
+  the producer publishes it within seconds, without waiting for the next
+  cycle. An address is decided only once at least 4 of its 7 nearest nodes
+  serve a listing for it.
 - It removes an entry only when, in one cycle, every node nearest its
-  address shows that it serves no listing there (`no_longer_served`), or
-  when deciding the address again rejects it (`rejected`). An entry it can't
+  address answers that it serves no listing there, and a witnessed lookup
+  of the address and a request for it to each of those nodes and to the
+  nodes that last served it confirm it (`no_longer_served`), or when
+  deciding the address again rejects it (`rejected`). An entry it can't
   confirm otherwise is kept, marked `carried` in its support file.
 - It writes a file only when its bytes change; the files a change touches
   first, then `pages.json`, `feed/index.json` and `head.json`. Time pages
