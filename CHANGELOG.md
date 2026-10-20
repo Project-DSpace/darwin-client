@@ -41,7 +41,8 @@ told apart by the commit `darwin --version` prints. Upstream's entries follow.
   from its root map once, at most 8 a cycle in a task of its own, and filled in to its entry as a
   put. What grows with the index (the mirrors, full listings, what is known of each address) is
   kept in the store, and addresses are decided 256 at a time, each batch recorded before the next
-  and the files written once, so the producer's memory doesn't grow with the index.
+  and the files written once, with `rejected.json` and `pages.json` written a row at a time, so
+  the producer's memory doesn't grow with the index.
 - Envelopes are darwin's default: `darwin file upload`, `darwin manifest create` and the
   library's file upload shortcuts store each upload in an envelope, with its payment record, a
   listing when listed, and a `.record`. The other ways of using the network remain, with no

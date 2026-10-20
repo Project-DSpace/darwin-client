@@ -23,6 +23,12 @@
 //!   ([`Publisher::publish_carry`]): its support files are written at once,
 //!   and the interval starts at the next support write, not at theirs;
 //! - `rejected.json` when it changes;
+//! - `rejected.json` and `pages.json`, which list every rejection and every
+//!   time page, a row at a time from the store as they are written, while
+//!   compared with the file there, and their compressed copies made a chunk
+//!   at a time: so writing them holds no more than a row, whatever they
+//!   list. The store keeps the rejections in key order for it
+//!   ([`SIDE_DB`]);
 //! - `status.json` every publication, last of all: after every other file,
 //!   and after the store has them as written, so a fresh `status.json`
 //!   means they are all in place. In a new output folder, `head.json` and
@@ -50,8 +56,8 @@
 //! moved), it writes every file again.
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
-use std::fs::{self, OpenOptions};
-use std::io::{self, Read, Write};
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::ops::Bound;
 use std::path::{Path, PathBuf};
 
@@ -146,6 +152,10 @@ const SUPERSEDED_TAG: u8 = b'x';
 const SUPPORT_TAG: u8 = b's';
 /// [`SIDE_DB`]: an address, to its latest rejection or deferral.
 const REJECTED_TAG: u8 = b'r';
+/// [`SIDE_DB`]: each [`REJECTED_TAG`] row in the order `rejected.json`
+/// lists it: 1 and its listing's key, or for a row whose listing gives no
+/// key, 0 and its address (no value). Kept with the rows.
+const REJECTED_ORDER_TAG: u8 = b'R';
 
 /// A file being written is first written under a name like this one, in the
 /// directory of the file it replaces, and then renamed over it.
@@ -287,6 +297,7 @@ impl Publisher {
                 (epoch, true)
             }
         };
+        dbs.order_rejected(&mut txn)?;
         let number = |key: &str| dbs.meta_numbers.get(&txn, key).map_err(store_error);
         let seq = number(SEQ)?.unwrap_or(0);
         let count = number(COUNT)?.unwrap_or(0);
@@ -685,8 +696,8 @@ impl Publisher {
             }
         }
         if pending.rejected {
-            let bytes = dbs.rejected(&txn)?;
-            self.files.put(REJECTED_FILE, &bytes)?;
+            self.files
+                .put_streamed(REJECTED_FILE, |out| dbs.write_rejected(&txn, out))?;
         }
         drop(txn);
         if !fixes.is_empty() {
@@ -698,8 +709,10 @@ impl Publisher {
         let txn = self.store.env().read_txn().map_err(store_error)?;
         let pages_written = pending.lists || !fixes.is_empty();
         if pages_written {
-            let bytes = dbs.pages_file(&txn, &self.epoch, self.seq, self.count)?;
-            self.files.put(PAGES_FILE, &bytes)?;
+            let (epoch, seq, count) = (self.epoch.clone(), self.seq, self.count);
+            self.files.put_streamed(PAGES_FILE, |out| {
+                dbs.write_pages_file(&txn, &epoch, seq, count, out)
+            })?;
         }
         if pending.lists {
             self.files
@@ -1216,17 +1229,29 @@ impl Dbs {
                 let address = address_of(&entry.listing.address)?;
                 let row = tagged(REJECTED_TAG, &address);
                 let bytes = json(entry)?;
-                if self.side.get(txn, &row).map_err(store_error)? != Some(&bytes[..]) {
+                let old = self.side.get(txn, &row).map_err(store_error)?;
+                if old != Some(&bytes[..]) {
+                    if let Some(old) = old {
+                        let old: RejectedEntry = parse(old)?;
+                        self.side
+                            .delete(txn, &order_row(&old, &address))
+                            .map_err(store_error)?;
+                    }
                     self.side.put(txn, &row, &bytes).map_err(store_error)?;
+                    self.side
+                        .put(txn, &order_row(entry, &address), &[])
+                        .map_err(store_error)?;
                     pending.rejected = true;
                 }
             }
             RejectedChange::Clear(address) => {
-                if self
-                    .side
-                    .delete(txn, &tagged(REJECTED_TAG, address))
-                    .map_err(store_error)?
-                {
+                let row = tagged(REJECTED_TAG, address);
+                if let Some(old) = self.side.get(txn, &row).map_err(store_error)? {
+                    let old: RejectedEntry = parse(old)?;
+                    self.side
+                        .delete(txn, &order_row(&old, address))
+                        .map_err(store_error)?;
+                    self.side.delete(txn, &row).map_err(store_error)?;
                     pending.rejected = true;
                 }
             }
@@ -1634,6 +1659,136 @@ impl Dbs {
         })
     }
 
+    /// Make the order rows of the rejections ([`REJECTED_ORDER_TAG`]) the
+    /// rows' own, as a store from before they were kept needs: once their
+    /// count is the rows' count, they are.
+    fn order_rejected(&self, txn: &mut RwTxn) -> Result<()> {
+        let count = |tag: u8, txn: &RoTxn| -> Result<usize> {
+            let mut count = 0;
+            for row in self
+                .side
+                .remap_data_type::<heed::types::DecodeIgnore>()
+                .prefix_iter(txn, &[tag])
+                .map_err(store_error)?
+            {
+                row.map_err(store_error)?;
+                count += 1;
+            }
+            Ok(count)
+        };
+        if count(REJECTED_TAG, txn)? == count(REJECTED_ORDER_TAG, txn)? {
+            return Ok(());
+        }
+        loop {
+            let keys: Vec<Vec<u8>> = self
+                .side
+                .remap_data_type::<heed::types::DecodeIgnore>()
+                .prefix_iter(txn, &[REJECTED_ORDER_TAG])
+                .map_err(store_error)?
+                .take(1_024)
+                .map(|row| row.map(|(key, ())| key.to_vec()))
+                .collect::<heed::Result<_>>()
+                .map_err(store_error)?;
+            if keys.is_empty() {
+                break;
+            }
+            for key in keys {
+                self.side.delete(txn, &key).map_err(store_error)?;
+            }
+        }
+        let mut order = Vec::new();
+        for row in self
+            .side
+            .prefix_iter(txn, &[REJECTED_TAG])
+            .map_err(store_error)?
+        {
+            let (key, value) = row.map_err(store_error)?;
+            let address: XorName = key[1..].try_into().map_err(|_| {
+                Error::Storage("listings store: a rejection row without its address".into())
+            })?;
+            let entry: RejectedEntry = parse(value)?;
+            order.push(order_row(&entry, &address));
+        }
+        for key in order {
+            self.side.put(txn, &key, &[]).map_err(store_error)?;
+        }
+        Ok(())
+    }
+
+    /// Write `rejected.json` to `out`, a row at a time in key order: the
+    /// bytes [`Self::rejected`] gives, without holding them.
+    fn write_rejected(&self, txn: &RoTxn, out: &mut dyn Write) -> Result<()> {
+        let (open, close) = list_ends(&Rejected {
+            listings: Vec::new(),
+        })?;
+        out.write_all(&open).map_err(stream_error)?;
+        let mut first = true;
+        for row in self
+            .side
+            .remap_data_type::<heed::types::DecodeIgnore>()
+            .prefix_iter(txn, &[REJECTED_ORDER_TAG])
+            .map_err(store_error)?
+        {
+            let (key, ()) = row.map_err(store_error)?;
+            let address = key.get(key.len().saturating_sub(32)..).unwrap_or_default();
+            let bytes = self
+                .side
+                .get(txn, &tagged(REJECTED_TAG, address))
+                .map_err(store_error)?
+                .ok_or_else(|| {
+                    Error::Storage("listings store: a rejection's place without its row".into())
+                })?;
+            let entry: RejectedEntry = parse(bytes)?;
+            if !first {
+                out.write_all(b",").map_err(stream_error)?;
+            }
+            first = false;
+            serde_json::to_writer(&mut *out, &entry).map_err(json_error)?;
+        }
+        out.write_all(&close).map_err(stream_error)
+    }
+
+    /// Write `pages.json` to `out`, a page at a time: the bytes
+    /// [`Self::pages_file`] gives, without holding them.
+    fn write_pages_file(
+        &self,
+        txn: &RoTxn,
+        epoch: &str,
+        seq: u64,
+        count: u64,
+        out: &mut dyn Write,
+    ) -> Result<()> {
+        let (open, close) = list_ends(&Pages {
+            epoch: epoch.to_string(),
+            seq,
+            count,
+            pages: Vec::new(),
+        })?;
+        out.write_all(&open).map_err(stream_error)?;
+        let mut first = true;
+        for row in self
+            .pages
+            .prefix_iter(txn, &[PAGE_TAG])
+            .map_err(store_error)?
+        {
+            let (key, value) = row.map_err(store_error)?;
+            let row: PageRow = parse(value)?;
+            let page = PageRef {
+                path: row.path,
+                first: hex::encode(&key[1..]),
+                last: row.last,
+                count: row.count,
+            };
+            if !first {
+                out.write_all(b",").map_err(stream_error)?;
+            }
+            first = false;
+            serde_json::to_writer(&mut *out, &page).map_err(json_error)?;
+        }
+        out.write_all(&close).map_err(stream_error)
+    }
+
+    #[cfg(test)]
     fn rejected(&self, txn: &RoTxn) -> Result<Vec<u8>> {
         let mut listings = self
             .side
@@ -1645,6 +1800,7 @@ impl Dbs {
         json(&Rejected { listings })
     }
 
+    #[cfg(test)]
     fn pages_file(&self, txn: &RoTxn, epoch: &str, seq: u64, count: u64) -> Result<Vec<u8>> {
         let pages = self
             .pages
@@ -1886,6 +2042,140 @@ impl Files {
         Ok(())
     }
 
+    /// Write the file at `path` (in the directory) with the bytes `fill`
+    /// writes, as [`Self::put`] writes bytes, without holding them: they are
+    /// written beside the file while compared with the file there, a chunk
+    /// at a time. If they differ, the compressed copies are made from them a
+    /// chunk at a time, and renamed into place, then the file. If they are
+    /// the same, the new bytes go, and a copy that doesn't hold them is made
+    /// again from the file.
+    fn put_streamed(
+        &mut self,
+        path: &str,
+        fill: impl FnOnce(&mut dyn Write) -> Result<()>,
+    ) -> Result<()> {
+        let path = self.dir.join(path);
+        let dir = path.parent().unwrap_or(&self.dir).to_path_buf();
+        self.ensure_dir(&dir)?;
+        let temp = self.temp_path(&dir);
+        let written = self.stream_beside(&path, &temp, fill);
+        let (len, same) = match written {
+            Ok(done) => done,
+            Err(e) => {
+                let _ = fs::remove_file(&temp);
+                return Err(e);
+            }
+        };
+        let source = if same {
+            let _ = fs::remove_file(&temp);
+            path.clone()
+        } else {
+            temp.clone()
+        };
+        for packing in [Packing::Gzip, Packing::Zstd] {
+            let copy = with_suffix(&path, packing.suffix());
+            if same && packing.holds_file(&copy, &path).unwrap_or(false) {
+                continue;
+            }
+            let old_len = file_len(&copy)?;
+            let packed = self.temp_path(&dir);
+            match packing.pack_file(&source, &packed, self.durable) {
+                Ok(packed_len) => {
+                    if let Err(e) = fs::rename(&packed, &copy) {
+                        let _ = fs::remove_file(&packed);
+                        if !same {
+                            let _ = fs::remove_file(&temp);
+                        }
+                        return Err(io_error(&copy, &e));
+                    }
+                    self.bytes = self
+                        .bytes
+                        .saturating_sub(old_len.unwrap_or(0))
+                        .saturating_add(packed_len);
+                }
+                Err(e) => {
+                    let _ = fs::remove_file(&packed);
+                    if !same {
+                        let _ = fs::remove_file(&temp);
+                    }
+                    return Err(io_error(&copy, &e));
+                }
+            }
+        }
+        if !same {
+            let old_len = file_len(&path)?;
+            if let Err(e) = fs::rename(&temp, &path) {
+                let _ = fs::remove_file(&temp);
+                return Err(io_error(&path, &e));
+            }
+            self.bytes = self
+                .bytes
+                .saturating_sub(old_len.unwrap_or(0))
+                .saturating_add(len);
+            self.written += 1;
+            self.written_bytes += len;
+        }
+        Ok(())
+    }
+
+    /// Write what `fill` writes to a new file at `temp`, flushed to disk if
+    /// durable, comparing it with the file at `path` as it goes. Returns its
+    /// length, and whether it is the same as that file.
+    fn stream_beside(
+        &self,
+        path: &Path,
+        temp: &Path,
+        fill: impl FnOnce(&mut dyn Write) -> Result<()>,
+    ) -> Result<(u64, bool)> {
+        let old = match File::open(path) {
+            Ok(file) => Some(BufReader::new(file)),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => None,
+            Err(e) => return Err(io_error(path, &e)),
+        };
+        let file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(temp)
+            .map_err(|e| io_error(temp, &e))?;
+        let mut writer = Compared {
+            out: BufWriter::new(file),
+            same: old.is_some(),
+            old,
+            len: 0,
+            chunk: Vec::new(),
+        };
+        fill(&mut writer)?;
+        let Compared {
+            out,
+            mut old,
+            mut same,
+            len,
+            ..
+        } = writer;
+        if let Some(old) = old.as_mut() {
+            // The old file is the same only if it ends here too.
+            let mut more = [0u8; 1];
+            same &= matches!(old.read(&mut more), Ok(0));
+        }
+        let file = out
+            .into_inner()
+            .map_err(|e| io_error(temp, &e.into_error()))?;
+        if self.durable && !same {
+            file.sync_data().map_err(|e| io_error(temp, &e))?;
+        }
+        Ok((len, same))
+    }
+
+    /// A new name for a file being written in `dir`.
+    fn temp_path(&mut self, dir: &Path) -> PathBuf {
+        self.temps += 1;
+        dir.join(format!(
+            "{TEMP_PREFIX}{}-{}{TEMP_SUFFIX}",
+            std::process::id(),
+            self.temps
+        ))
+    }
+
     /// Delete the file at `path` (from the directory) and its copies: the
     /// copies first, so a reader is never sent a copy without its file.
     fn remove(&mut self, path: &str) -> Result<()> {
@@ -2033,6 +2323,69 @@ impl Packing {
         }
     }
 
+    /// Whether the file at `copy` is the file at `path` compressed this way,
+    /// and nothing else, compared a chunk at a time: unpacking stops at the
+    /// first difference, or one byte past the file.
+    fn holds_file(self, copy: &Path, path: &Path) -> io::Result<bool> {
+        let packed = match File::open(copy) {
+            Ok(file) => BufReader::new(file),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(false),
+            Err(e) => return Err(e),
+        };
+        let mut unpacked: Box<dyn Read> = match self {
+            Self::Gzip => Box::new(flate2::read::MultiGzDecoder::new(packed)),
+            Self::Zstd => Box::new(zstd::stream::read::Decoder::with_buffer(packed)?),
+        };
+        let mut file = BufReader::new(File::open(path)?);
+        let (mut want, mut have) = (vec![0u8; 64 * 1024], vec![0u8; 64 * 1024]);
+        loop {
+            let read = file.read(&mut want)?;
+            if read == 0 {
+                // The copy must end here too.
+                let mut more = [0u8; 1];
+                return Ok(matches!(unpacked.read(&mut more), Ok(0)));
+            }
+            if unpacked.read_exact(&mut have[..read]).is_err() || have[..read] != want[..read] {
+                return Ok(false);
+            }
+        }
+    }
+
+    /// Compress the file at `from` this way into a new file at `to`, a chunk
+    /// at a time, flushed to disk if `durable`. Returns its length.
+    fn pack_file(self, from: &Path, to: &Path, durable: bool) -> io::Result<u64> {
+        let mut source = BufReader::new(File::open(from)?);
+        let file = OpenOptions::new().write(true).create_new(true).open(to)?;
+        let file = match self {
+            Self::Gzip => {
+                let mut encoder = flate2::write::GzEncoder::new(
+                    BufWriter::new(file),
+                    flate2::Compression::default(),
+                );
+                io::copy(&mut source, &mut encoder)?;
+                encoder
+                    .finish()?
+                    .into_inner()
+                    .map_err(io::IntoInnerError::into_error)?
+            }
+            Self::Zstd => {
+                let mut encoder = zstd::stream::write::Encoder::new(
+                    BufWriter::new(file),
+                    zstd::DEFAULT_COMPRESSION_LEVEL,
+                )?;
+                io::copy(&mut source, &mut encoder)?;
+                encoder
+                    .finish()?
+                    .into_inner()
+                    .map_err(io::IntoInnerError::into_error)?
+            }
+        };
+        if durable {
+            file.sync_data()?;
+        }
+        Ok(file.metadata()?.len())
+    }
+
     /// Whether `copy` is `bytes` compressed this way, and nothing else.
     /// Unpacking it stops one byte past `bytes`: enough to tell.
     fn holds(self, copy: &[u8], bytes: &[u8]) -> bool {
@@ -2055,6 +2408,70 @@ fn io_error(path: &Path, error: &io::Error) -> Error {
 
 fn json_error(error: serde_json::Error) -> Error {
     Error::Serialization(format!("listings files: {error}"))
+}
+
+fn stream_error(error: io::Error) -> Error {
+    Error::Storage(format!("listings files: {error}"))
+}
+
+/// The bytes of `value`, a file whose last field is a list, before and
+/// after the list's items: `value` given with the list empty.
+fn list_ends<T: Serialize>(value: &T) -> Result<(Vec<u8>, Vec<u8>)> {
+    let mut bytes = json(value)?;
+    if !bytes.ends_with(b"[]}") {
+        return Err(Error::Serialization(
+            "listings files: a list file's bytes don't end with its list".into(),
+        ));
+    }
+    let close = bytes.split_off(bytes.len() - 2);
+    Ok((bytes, close))
+}
+
+/// A rejection's order row ([`REJECTED_ORDER_TAG`]), for `entry` at
+/// `address`.
+fn order_row(entry: &RejectedEntry, address: &XorName) -> Vec<u8> {
+    let mut row = Vec::with_capacity(2 + LISTING_KEY_LEN);
+    row.push(REJECTED_ORDER_TAG);
+    match entry.listing.key() {
+        Some(key) => {
+            row.push(1);
+            row.extend_from_slice(&key.to_bytes());
+        }
+        None => {
+            row.push(0);
+            row.extend_from_slice(address);
+        }
+    }
+    row
+}
+
+/// A writer that writes to `out` and compares what it writes with `old`, a
+/// chunk at a time ([`Files::put_streamed`]).
+struct Compared {
+    out: BufWriter<File>,
+    old: Option<BufReader<File>>,
+    /// Whether everything written so far is what `old` holds there.
+    same: bool,
+    len: u64,
+    chunk: Vec<u8>,
+}
+
+impl Write for Compared {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.out.write_all(buf)?;
+        self.len += buf.len() as u64;
+        if self.same {
+            if let Some(old) = self.old.as_mut() {
+                self.chunk.resize(buf.len(), 0);
+                self.same = old.read_exact(&mut self.chunk).is_ok() && self.chunk == buf;
+            }
+        }
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.out.flush()
+    }
 }
 
 /// `value` as a file's bytes ([`file_bytes`]).
@@ -4132,5 +4549,202 @@ mod tests {
     #[ignore = "writes about 6 GB and takes minutes: run it on its own, in release"]
     fn size_and_time_at_a_million_listings() {
         size_and_time(1_000_000);
+    }
+
+    /// What `bytes` writes, a few bytes at a time, as a list file's rows
+    /// are written.
+    fn chunked(bytes: &[u8]) -> impl FnOnce(&mut dyn Write) -> Result<()> + '_ {
+        move |out: &mut dyn Write| {
+            for chunk in bytes.chunks(3) {
+                out.write_all(chunk).unwrap();
+            }
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_file_written_a_chunk_at_a_time_is_written_as_put_writes_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut files = Files::open(dir.path()).unwrap();
+        files.durable = false;
+        let a = br#"{"listings":["a","b"]}"#.to_vec();
+        let b = br#"{"listings":["a","c"]}"#.to_vec();
+        let path = dir.path().join("x.json");
+        let gz = with_suffix(&path, ".gz");
+        let zst = with_suffix(&path, ".zst");
+        let read = |path: &Path| fs::read(path).unwrap();
+        let unzstd = |bytes: Vec<u8>| zstd::decode_all(&bytes[..]).unwrap();
+        let modified = |path: &Path| fs::metadata(path).unwrap().modified().unwrap();
+        let held = |want: &[u8]| {
+            assert_eq!(read(&path), want);
+            assert_eq!(gunzip(&read(&gz)), want);
+            assert_eq!(unzstd(read(&zst)), want);
+        };
+
+        files.put_streamed("x.json", chunked(&a)).unwrap();
+        held(&a);
+        assert_eq!(files.written, 1);
+        // The same bytes again: nothing is written, not even the copies.
+        let times = (modified(&path), modified(&gz), modified(&zst));
+        files.put_streamed("x.json", chunked(&a)).unwrap();
+        assert_eq!((modified(&path), modified(&gz), modified(&zst)), times);
+        assert_eq!(files.written, 1);
+        // What they take is counted.
+        assert_eq!(files.bytes, measure(dir.path()).unwrap());
+        // A copy that doesn't hold them is made again from the file, which
+        // stays as it is: one of other bytes, one with more after them, and
+        // one that isn't a copy at all.
+        fs::write(&gz, gzip(&b).unwrap()).unwrap();
+        fs::write(&zst, b"not zstd").unwrap();
+        files.put_streamed("x.json", chunked(&a)).unwrap();
+        held(&a);
+        fs::write(&gz, [gzip(&a).unwrap(), gzip(&b).unwrap()].concat()).unwrap();
+        files.put_streamed("x.json", chunked(&a)).unwrap();
+        held(&a);
+        assert_eq!(files.written, 1);
+        // Other bytes, shorter or longer ones: the file and both copies.
+        files.put_streamed("x.json", chunked(&b)).unwrap();
+        held(&b);
+        files
+            .put_streamed("x.json", chunked(&b[..b.len() - 1]))
+            .unwrap();
+        held(&b[..b.len() - 1]);
+        files.put_streamed("x.json", chunked(&b)).unwrap();
+        held(&b);
+        assert_eq!(files.written, 4);
+        // Nothing is left beside them.
+        let names: Vec<String> = fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names.len(), 3, "{names:?}");
+        // A fill that fails leaves the file and its copies as they were.
+        let failing = |out: &mut dyn Write| {
+            out.write_all(b"{\"listings\":[").unwrap();
+            Err(Error::Storage("stopped".into()))
+        };
+        assert!(files.put_streamed("x.json", failing).is_err());
+        held(&b);
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 3);
+    }
+
+    /// A deferral at the address from `seed`, dated `time`.
+    fn deferral(seed: u64, time: u64) -> RejectedEntry {
+        let mut entry = deferred();
+        entry.listing.address = hex::encode(address(seed));
+        entry.listing.time = time;
+        entry.listing.first_seen = Some(time);
+        entry
+    }
+
+    /// Check that `rejected.json` and `pages.json` are the bytes their
+    /// whole builders give, and their copies hold them.
+    fn assert_lists_built_whole(f: &Fixture) {
+        let txn = f.store.env().read_txn().unwrap();
+        let dbs = f.publisher.dbs;
+        let rejected = dbs.rejected(&txn).unwrap();
+        assert_eq!(f.bytes(REJECTED_FILE), rejected);
+        assert_eq!(gunzip(&f.bytes("rejected.json.gz")), rejected);
+        let pages = dbs
+            .pages_file(
+                &txn,
+                f.publisher.epoch(),
+                f.publisher.seq(),
+                f.publisher.count(),
+            )
+            .unwrap();
+        assert_eq!(f.bytes(PAGES_FILE), pages);
+        assert_eq!(
+            zstd::decode_all(&f.bytes("pages.json.zst")[..]).unwrap(),
+            pages
+        );
+    }
+
+    #[test]
+    fn rejected_json_and_pages_json_are_written_row_by_row_as_built_whole() {
+        let mut f = Fixture::new();
+        f.publish(&first_publication());
+        assert_lists_built_whole(&f);
+        // Rows set, changed (and so moved in key order) and cleared, and
+        // entries put, over several publications, in an order unlike their
+        // keys.
+        for round in 0..4u64 {
+            let rejected = (0..300u64)
+                .map(|seed| {
+                    if (seed + round) % 5 == 0 {
+                        RejectedChange::Clear(address(seed))
+                    } else {
+                        let minutes = (seed * 7_919 + round * 13) % 1_000;
+                        RejectedChange::Set(Box::new(deferral(seed, 1_791_000_000 + minutes * 60)))
+                    }
+                })
+                .collect();
+            let changes = (0..500u64)
+                .map(|seed| {
+                    put(lean(
+                        address(10_000 + seed + round * 100),
+                        1_791_300_000 + seed,
+                    ))
+                })
+                .collect();
+            f.publish(&Publication {
+                at: AT + 60 * (round + 1),
+                changes,
+                rejected,
+                status: status(AT),
+                ..Publication::default()
+            });
+            assert_lists_built_whole(&f);
+        }
+        let rows: Rejected = f.file(REJECTED_FILE);
+        assert!(rows.listings.len() > 200, "{}", rows.listings.len());
+    }
+
+    #[test]
+    fn a_store_without_the_order_of_its_rejections_has_it_made_again() {
+        let mut f = Fixture::new();
+        let rejected = (0..50u64)
+            .map(|seed| RejectedChange::Set(Box::new(deferral(seed, 1_791_000_000 + seed * 60))))
+            .collect();
+        f.publish(&Publication {
+            at: AT,
+            rejected,
+            status: status(AT),
+            ..Publication::default()
+        });
+        let written = f.bytes(REJECTED_FILE);
+        // As a store from before the order was kept: no order rows.
+        {
+            let dbs = f.publisher.dbs;
+            let mut txn = f.store.env().write_txn().unwrap();
+            let keys: Vec<Vec<u8>> = dbs
+                .side
+                .prefix_iter(&txn, &[REJECTED_ORDER_TAG])
+                .unwrap()
+                .map(|row| row.unwrap().0.to_vec())
+                .collect();
+            assert_eq!(keys.len(), 50);
+            for key in keys {
+                dbs.side.delete(&mut txn, &key).unwrap();
+            }
+            txn.commit().unwrap();
+        }
+        f.reopen();
+        // The next write of rejected.json lists every row, in order.
+        f.publish(&Publication {
+            at: AT + 60,
+            rejected: vec![RejectedChange::Clear(address(7))],
+            status: status(AT + 60),
+            ..Publication::default()
+        });
+        assert_lists_built_whole(&f);
+        let before: Rejected = serde_json::from_slice(&written).unwrap();
+        let after: Rejected = f.file(REJECTED_FILE);
+        let expected: Vec<RejectedEntry> = before
+            .listings
+            .into_iter()
+            .filter(|row| row.listing.address != hex::encode(address(7)))
+            .collect();
+        assert_eq!(after.listings, expected);
     }
 }
