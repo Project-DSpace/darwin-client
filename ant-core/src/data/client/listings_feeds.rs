@@ -396,6 +396,8 @@ impl V2Read {
                 capped: false,
             });
             self.pass_began = Some(now);
+            // Reads between passes start again from the newest key after it.
+            self.cursor = None;
             ListingKey::MIN
         } else {
             self.cursor
@@ -525,14 +527,16 @@ struct NodeState {
     want_peers: bool,
     /// Whether its user agent shows the feed release.
     claims_feed: bool,
-    /// When it last refused a feed request, or didn't answer one before it
-    /// had ever answered one (Unix seconds).
+    /// When it last refused a feed request, or answered none when nothing
+    /// of its feed was known (Unix seconds).
     feed_refused_at: Option<u64>,
     /// Whether its copies counted in the last round.
     counted: bool,
     read: NodeRead,
     /// Whether it answered a request this round.
     answered: bool,
+    /// Whether it has answered a feed request since this process began.
+    feed_answered: bool,
     /// Addresses whose entries changed since the last save.
     dirty: BTreeSet<XorName>,
     /// Whether its record changed since the last save.
@@ -554,6 +558,7 @@ impl NodeState {
             counted: false,
             read: NodeRead::new(kind),
             answered: false,
+            feed_answered: false,
             dirty: BTreeSet::new(),
             meta_dirty: true,
         }
@@ -642,6 +647,7 @@ impl NodeState {
                     &answer,
                     Some(ListingsBody::Error { message }) if message == UNSUPPORTED
                 );
+                self.feed_answered |= self.answered;
                 let touched = match answer {
                     Some(body) if !refused => sync.answer(body),
                     _ => {
@@ -651,7 +657,10 @@ impl NodeState {
                 };
                 self.meta_dirty = true;
                 self.dirty.extend(touched.iter().copied());
-                let never_followed = sync.epoch() == 0 && !self.answered;
+                // A node never heard from through its feed, with nothing
+                // kept of it, may not keep one: older nodes drop a request
+                // they don't know.
+                let never_followed = !self.feed_answered && sync.epoch() == 0 && sync.is_empty();
                 let silent = sync.outcome() == Some(FeedOutcome::NoAnswer) && never_followed;
                 if refused || silent {
                     let mut touched = touched;
@@ -804,6 +813,7 @@ impl NodeRecord {
             feed_refused_at: self.feed_refused_at,
             counted: false,
             answered: false,
+            feed_answered: false,
             dirty: BTreeSet::new(),
             meta_dirty: false,
         })
@@ -2353,6 +2363,32 @@ mod tests {
         assert_eq!(feeds.pending().len(), 20);
         assert!(feeds.copies(&address(0), &[known]).is_empty());
         assert_eq!(feeds.holders(&address(0)), vec![known]);
+    }
+
+    #[tokio::test]
+    async fn a_node_part_read_through_its_feed_only_misses_when_silent() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        let mut feeds = Feeds::open(&store).unwrap();
+        let a = peer(1);
+        // More than it may be read for in a round: its first read of the
+        // range goes on into the next round.
+        let net = FakeNet::with(vec![(
+            a,
+            FakeNode::serving(Behaviour::Honest, entries(0, 3_000)),
+        )]);
+        let nodes = [feed_node(a)];
+        poll(&mut feeds, &net, &nodes, NOW).await;
+        assert!(!feeds.read(&a).unwrap().counts);
+        let held = feeds.nodes[&a].mirror.len();
+        assert!(held > 0 && held <= WALK_FREE_LISTINGS, "{held}");
+
+        net.node(&a, |node| node.behaviour = Behaviour::Silent);
+        poll(&mut feeds, &net, &nodes, NOW + 60).await;
+        let read = feeds.read(&a).unwrap();
+        assert_eq!(read.kind, ReadKind::Feed);
+        assert!(!read.fell_back);
+        assert_eq!(read.outcome, Some(FeedOutcome::NoAnswer));
     }
 
     #[tokio::test]

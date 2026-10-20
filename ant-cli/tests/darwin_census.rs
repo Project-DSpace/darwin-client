@@ -1145,6 +1145,13 @@ const DECODE_SITES: &[Site] = &[
         NOT_A_MAP,
     ),
     (
+        "ant-core/src/data/client/listings_feeds.rs",
+        "Feeds::open",
+        "serde_json::from_slice",
+        1,
+        LOCAL_FILE,
+    ),
+    (
         "ant-core/src/data/client/listings_publish.rs",
         "Files::holds",
         "serde_json::from_slice",
