@@ -92,6 +92,16 @@ epoch (a producer that starts without its state begins one) writes its
 segments under the same names, so segments are served to be revalidated, not
 cached.
 
+A web page on another origin reads the files only where the server allows
+its origin (`Access-Control-Allow-Origin`). It can revalidate by hand,
+keeping a file's `ETag` and sending it back as `If-None-Match`, only where
+the server also exposes `ETag` to it (`Access-Control-Expose-Headers`) and
+allows `If-None-Match` in its CORS preflights
+(`Access-Control-Allow-Headers`). Otherwise it should let the browser
+revalidate, as `fetch(url, { cache: "no-cache" })` does: the browser sends
+its own conditional request and, on a `304`, hands the page the copy it
+holds.
+
 ## The entry
 
 Every file but the support files and `rejected.json` lists entries. An entry
@@ -463,8 +473,9 @@ find the type, and page from `first` or `last` as above.
    `seq`: that is the index after record `seq`. A page that is missing means
    `pages.json` has moved on: read it again.
 2. Revalidate `head.json` as often as you like (a reader polling every 10
-   seconds costs a `304` while nothing changes). When its `epoch` differs
-   from yours, start again at step 1.
+   seconds costs a `304` while nothing changes; a web page on another origin
+   revalidates as **Caching** says). When its `epoch` differs from yours,
+   start again at step 1.
 3. When its `seq` is past yours, fetch the segments holding the records after
    yours, each with revalidation, and apply those records in order. A
    segment that is missing, or of another epoch, means starting again at
