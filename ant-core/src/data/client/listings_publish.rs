@@ -25,7 +25,9 @@
 //! - `rejected.json` when it changes;
 //! - `status.json` every publication, last of all: after every other file,
 //!   and after the store has them as written, so a fresh `status.json`
-//!   means they are all in place;
+//!   means they are all in place. In a new output folder, `head.json` and
+//!   the other files can therefore be there a moment before the first
+//!   `status.json` is;
 //! - time pages that `pages.json` no longer lists are deleted
 //!   [`SUPERSEDED_KEPT`] after the `pages.json` written last listed them.
 //!
