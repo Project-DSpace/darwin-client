@@ -19,7 +19,7 @@ All paths are relative to the directory the files are published in, such as
 |---|---|---|
 | `head.json` | Where the index stands, its newest 50 entries, and links to the rest | When the index changes |
 | `by-address/<prefix>.json` (4,096 files) | Every entry whose address starts with `<prefix>`, with its data map | When one of its entries changes |
-| `by-address/<prefix>.support.json` (4,096 files) | How many of each of those addresses' nearest nodes serve it | When that changes, at most every 10 minutes |
+| `by-address/<prefix>.support.json` (4,096 files) | How many of each of those addresses' nearest nodes serve it | When that changes, at most every 10 minutes (see below) |
 | `by-name/<prefix>.json` (4,096 files) | The entries of each exact name whose hash starts with `<prefix>`, newest first | When one of its entries changes |
 | `by-type/<prefix>/index.json` (4,096 files) | Each exact content type whose hash starts with `<prefix>`, with its first and last page | When one of its types changes |
 | `by-type/<prefix>/<type id>-<n>.json` | Page `n` of one content type's entries, in key order, linked to the pages before and after | When its entries change |
@@ -222,8 +222,10 @@ lag the shard by that much: an address in the shard and not yet in its
 support file has support not yet published, and an address in the support
 file and not in the shard is no longer listed. An epoch's first publication
 that takes entries from an earlier index (see `carried`) doesn't start the
-10 minutes: the first cycle to decide those entries publishes their support
-at once.
+10 minutes, so the support write after it isn't held back: the first cycle
+that changes any support, as deciding any of those entries does, publishes
+it at once, and support that changes later waits for the 10 minutes that
+write starts.
 
 | Field | Value |
 |---|---|
@@ -396,7 +398,9 @@ dated in the future), and `other`; other reasons may be added. An address is
 not deferred when every copy its nearest nodes serve shows a payment from
 before the payment vault was deployed (`before_vault_deployment` in
 `rejected.json`): none of them can count, however many nodes come to serve
-them, so it is rejected for good (`again` false).
+them, so it is rejected for good, in `rejected.json` with `again` false,
+unless its entry is still listed, kept unconfirmed (`carried`): then it has
+no row there and stays listed, marked carried.
 
 ```json
 { "epoch": "8c1f0e2d3b4a5968", "seq": 12, "count": 2, "generated_at": 1791324061, "started_at": 1791320000,
@@ -417,8 +421,10 @@ them, so it is rejected for good (`again` false).
 
 `{"listings": [...]}`: the listings the producer didn't list, in key order,
 each address's latest rejection or deferral. An address the producer lists
-has no row, even while its entry is kept unconfirmed (`carried`) and
-`status.json` counts it as deferred. Each row has the entry's fields from
+has no row, even while its entry is kept unconfirmed (`carried`), whether
+the cycle left the address for later (`status.json` counts it as deferred)
+or rejected it for good, as when every copy was paid before the payment
+vault was deployed. Each row has the entry's fields from
 `address` to `time` (no `check`), then:
 
 | Field | Value |

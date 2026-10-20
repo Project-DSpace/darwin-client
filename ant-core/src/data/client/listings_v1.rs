@@ -61,10 +61,12 @@ pub const MAX_PAGE_LISTINGS: usize = 4_000;
 /// How many records a feed segment holds once closed.
 pub const FEED_SEGMENT_RECORDS: u64 = 1_000;
 
-/// Support files are written at most this often. An epoch's first
-/// publication, when it takes entries from an earlier index (marked
-/// [`carried`](Support::carried)), doesn't start it: the first cycle to
-/// decide those entries publishes their support at once.
+/// Support files are written at most this often, with one exception: an
+/// epoch's first publication, when it takes entries from an earlier index
+/// (marked [`carried`](Support::carried)), doesn't start the interval, so
+/// the support write after it isn't held back. The first cycle that changes
+/// any support, as deciding any of those entries does, publishes it at once;
+/// support that changes later waits for the interval that write starts.
 pub const SUPPORT_INTERVAL: Duration = Duration::from_secs(10 * 60);
 
 /// How long a time page that `pages.json` no longer lists is kept, for
@@ -249,7 +251,8 @@ impl ShardEntry {
 }
 
 /// How many of the nodes nearest a listed address serve its listing, as the
-/// producer last measured it. Written at most every [`SUPPORT_INTERVAL`].
+/// producer last measured it. Written when that changes, at most every
+/// [`SUPPORT_INTERVAL`], with the exception it gives.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Support {
     /// The file's address, as 64 lowercase hex digits.
