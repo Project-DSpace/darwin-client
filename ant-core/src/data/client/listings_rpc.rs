@@ -11,7 +11,7 @@
 //!   which keeps readers off the RPC the nodes check uploads' payments
 //!   through. A provider that refuses a kind of call outright (HTTP 403, as
 //!   PublicNode refuses ranged `eth_getLogs`) is asked last for that kind
-//!   from then on.
+//!   for the next [`BUSY_MAX`], then in its place again.
 //! - **Batches.** Calls known together go to a provider in one request, a
 //!   JSON-RPC batch of up to [`RPC_BATCH`], and every call carries an id of
 //!   its own, unique for the reader's life.
@@ -21,8 +21,10 @@
 //! - **Backoff.** A provider over its limit (JSON-RPC error [`BUSY_CODE`],
 //!   HTTP 429 or 5xx) or not answering is held off: for [`BUSY_FIRST`], and
 //!   twice as long each time in a row, up to [`BUSY_MAX`]; an answer ends it.
-//!   Calls go to the next provider meanwhile, and wait for one held off only
-//!   when every other has failed them.
+//!   Calls go to the next provider meanwhile, the rest of a set sent in
+//!   batches too, and wait for one held off only when every other has failed
+//!   them. [`BUSY_CODE`] in answer to a log query fails that query alone:
+//!   ordofi gives it to a query over a wider span than it serves.
 //! - **Redaction.** An error names a provider by its host alone, never its
 //!   URL, which can carry a key.
 //! - **Chain.** Where the chain is known (a list of RPCs given in place of
@@ -197,8 +199,9 @@ impl Hold {
 struct ProviderState {
     bucket: Bucket,
     hold: Hold,
-    /// Whether it refused a call of each kind outright ([`Kind::slot`]).
-    refuses: [bool; 2],
+    /// Until when it is asked last for each kind of call ([`Kind::slot`]),
+    /// having refused one outright.
+    refuses: [Option<Instant>; 2],
     chain: OnChain,
 }
 
@@ -281,7 +284,7 @@ impl Rpc {
                 state: Mutex::new(ProviderState {
                     bucket: Bucket::full(now),
                     hold: Hold::default(),
-                    refuses: [false; 2],
+                    refuses: [None; 2],
                     chain: OnChain::Unchecked,
                 }),
             })
@@ -310,17 +313,28 @@ impl Rpc {
     }
 
     /// The order calls of `kind` ask the providers in, as indexes: its own,
-    /// with those that refused such a call moved last.
+    /// with those that refused such a call in the last [`BUSY_MAX`] moved
+    /// last.
     pub(crate) fn order(&self, kind: Kind) -> Vec<usize> {
+        self.order_at(kind, Instant::now())
+    }
+
+    /// [`order`](Self::order) at `now`.
+    fn order_at(&self, kind: Kind, now: Instant) -> Vec<usize> {
         let base = match kind {
             Kind::Chain => &self.chain_order,
             Kind::Logs => &self.logs_order,
         };
-        let (refused, first): (Vec<usize>, Vec<usize>) = base
-            .iter()
-            .copied()
-            .partition(|index| self.providers[*index].state().refuses[kind.slot()]);
+        let (refused, first): (Vec<usize>, Vec<usize>) = base.iter().copied().partition(|index| {
+            self.providers[*index].state().refuses[kind.slot()].is_some_and(|until| until > now)
+        });
         first.into_iter().chain(refused).collect()
+    }
+
+    /// Provider `index` refused a call of `kind` outright at `now`: ask it
+    /// last for such calls for the next [`BUSY_MAX`].
+    fn refused(&self, index: usize, kind: Kind, now: Instant) {
+        self.providers[index].state().refuses[kind.slot()] = Some(now + BUSY_MAX);
     }
 
     /// The host of provider `index`.
@@ -452,19 +466,22 @@ impl Rpc {
         calls: &[Call],
     ) -> Vec<std::result::Result<Value, String>> {
         if self.is_held(index) {
-            let host = self.host(index);
             return calls
                 .iter()
-                .map(|call| {
-                    Err(format!(
-                        "payment chain {} via {host}: held off while busy",
-                        call.method
-                    ))
-                })
+                .map(|call| Err(self.held_off(index, call)))
                 .collect();
         }
         let asked: Vec<&Call> = calls.iter().collect();
         self.send(index, kind, &asked).await
+    }
+
+    /// The error of `call` not sent to provider `index`, which is held off.
+    fn held_off(&self, index: usize, call: &Call) -> String {
+        format!(
+            "payment chain {} via {}: held off while busy",
+            call.method,
+            self.host(index)
+        )
     }
 
     /// The next provider to ask calls of `kind` that none of `tried` has
@@ -500,7 +517,9 @@ impl Rpc {
     }
 
     /// `calls` sent to provider `index`, in batches of up to [`RPC_BATCH`],
-    /// once it has said it is on the chain where that is checked.
+    /// once it has said it is on the chain where that is checked. Once a
+    /// batch's answer holds the provider off, the calls not yet sent fail
+    /// there as held off, unsent, so they go to the next provider.
     async fn send(
         &self,
         index: usize,
@@ -516,8 +535,13 @@ impl Rpc {
         }
         let mut results = Vec::with_capacity(calls.len());
         for chunk in calls.chunks(RPC_BATCH) {
+            if !results.is_empty() && self.is_held(index) {
+                break;
+            }
             results.extend(self.request(index, kind, chunk).await);
         }
+        let unsent = &calls[results.len()..];
+        results.extend(unsent.iter().map(|call| Err(self.held_off(index, call))));
         results
     }
 
@@ -558,7 +582,7 @@ impl Rpc {
     /// One request to provider `index`, carrying `calls` (at most
     /// [`RPC_BATCH`]), once its pace allows: each call's answer or error.
     /// Holds the provider off if it was busy, ends a hold if it answered,
-    /// and marks it as refusing `kind` if it refused.
+    /// and asks it last for `kind` for a while if it refused.
     async fn request(
         &self,
         index: usize,
@@ -591,9 +615,9 @@ impl Rpc {
         provider
             .calls
             .fetch_add(calls.len() as u64, Ordering::Relaxed);
-        let outcome = match self.post(&provider.url, &body).await {
-            Ok(answer) => answers_by_id(&answer, &ids),
-            Err(failure) => ids.iter().map(|_| Err(failure.clone())).collect(),
+        let (outcome, over_rpc) = match self.post(&provider.url, &body).await {
+            Ok(answer) => (answers_by_id(&answer, &ids), true),
+            Err(failure) => (ids.iter().map(|_| Err(failure.clone())).collect(), false),
         };
         let (mut busy, mut refused, mut answered) = (false, false, false);
         let results = calls
@@ -605,6 +629,17 @@ impl Rpc {
                     Ok(value)
                 }
                 Err(failure) => {
+                    // ordofi answers a log query over a wider span than it
+                    // serves with BUSY_CODE too: the query fails there, and
+                    // goes on to the next provider, but holds nothing off.
+                    let failure = match failure {
+                        Failure::Busy(message)
+                            if over_rpc && Kind::of(call.method) == Kind::Logs =>
+                        {
+                            Failure::Failed(message)
+                        }
+                        failure => failure,
+                    };
                     busy |= matches!(failure, Failure::Busy(_));
                     refused |= matches!(failure, Failure::Refused(_));
                     provider.errors.fetch_add(1, Ordering::Relaxed);
@@ -627,8 +662,9 @@ impl Rpc {
         } else if answered {
             state.hold.clear();
         }
+        drop(state);
         if refused {
-            state.refuses[kind.slot()] = true;
+            self.refused(index, kind, Instant::now());
         }
         results
     }
@@ -718,6 +754,9 @@ fn rpc_result(item: &Value) -> std::result::Result<Value, Failure> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
+    use super::super::listings::test_chain::{serve, MockChain};
     use super::*;
 
     #[test]
@@ -819,5 +858,93 @@ mod tests {
         let rpc = Rpc::new(urls(), Some(vec![1, 0]), None).unwrap();
         assert_eq!(rpc.order(Kind::Chain), vec![0, 1]);
         assert_eq!(rpc.order(Kind::Logs), vec![1, 0]);
+    }
+
+    #[test]
+    fn a_provider_refusing_a_kind_of_call_is_asked_last_for_it_for_a_while() {
+        let urls = ["http://a.test", "http://b.test", "http://c.test"]
+            .map(String::from)
+            .to_vec();
+        let rpc = Rpc::new(urls, Some(vec![1, 0, 2]), None).unwrap();
+        let now = Instant::now();
+        rpc.refused(1, Kind::Logs, now);
+        assert_eq!(rpc.order_at(Kind::Logs, now), vec![0, 2, 1]);
+        // Other calls still ask it in its place.
+        assert_eq!(rpc.order_at(Kind::Chain, now), vec![0, 1, 2]);
+        let later = now + BUSY_MAX;
+        assert_eq!(
+            rpc.order_at(Kind::Logs, later - Duration::from_millis(1)),
+            vec![0, 2, 1]
+        );
+        // Then in its place again, until it refuses again.
+        assert_eq!(rpc.order_at(Kind::Logs, later), vec![1, 0, 2]);
+    }
+
+    /// Two mock chains served locally, and paced-off providers for them in
+    /// that order.
+    async fn two_mocks() -> (Arc<Mutex<MockChain>>, Arc<Mutex<MockChain>>, Rpc) {
+        let first = Arc::new(Mutex::new(MockChain::with_blocks(10, 1_700_000_000)));
+        let second = Arc::new(Mutex::new(MockChain::with_blocks(10, 1_700_000_000)));
+        let urls = vec![
+            serve(Arc::clone(&first)).await,
+            serve(Arc::clone(&second)).await,
+        ];
+        let mut rpc = Rpc::new(urls, None, None).unwrap();
+        rpc.unpaced();
+        (first, second, rpc)
+    }
+
+    fn receipt_call(n: u64) -> Call {
+        Call::new("eth_getTransactionReceipt", json!([format!("0x{n:064x}")]))
+    }
+
+    #[tokio::test]
+    async fn a_busy_answer_to_a_log_query_holds_nothing_off() {
+        let (first, _, rpc) = two_mocks().await;
+        first.lock().unwrap().failing = vec![("eth_getLogs", BUSY_CODE)];
+        let filter = json!({ "fromBlock": "0x0", "toBlock": "0x9" });
+        let logs = rpc.call("eth_getLogs", json!([filter])).await.unwrap();
+        // The query went on to the next provider...
+        assert_eq!(logs.provider, 1);
+        // ...and the first still answers everything else first.
+        assert!(!rpc.is_held(0));
+        let receipt = rpc.batch(&[receipt_call(1)]).await.pop().unwrap().unwrap();
+        assert_eq!(receipt.provider, 0);
+        // The same answer to any other call holds it off.
+        first.lock().unwrap().failing = vec![("eth_getTransactionReceipt", BUSY_CODE)];
+        let receipt = rpc.batch(&[receipt_call(2)]).await.pop().unwrap().unwrap();
+        assert_eq!(receipt.provider, 1);
+        assert!(rpc.is_held(0));
+    }
+
+    #[tokio::test]
+    async fn calls_left_after_a_busy_batch_go_to_the_next_provider() {
+        let (first, second, rpc) = two_mocks().await;
+        first.lock().unwrap().failing = vec![("eth_getTransactionReceipt", BUSY_CODE)];
+        let calls: Vec<Call> = (0..250).map(receipt_call).collect();
+        let answers = rpc.batch(&calls).await;
+        assert!(answers
+            .iter()
+            .all(|answer| answer.as_ref().is_ok_and(|answer| answer.provider == 1)));
+        // One batch of 100 to the busy provider, none of the 150 after it.
+        {
+            let first = first.lock().unwrap();
+            assert_eq!(first.requests, 1);
+            assert_eq!(first.calls_to("eth_getTransactionReceipt"), 100);
+        }
+        assert_eq!(
+            second.lock().unwrap().calls_to("eth_getTransactionReceipt"),
+            250
+        );
+        // Sent to it alone, as facts are confirmed: those left are held off,
+        // unsent.
+        let (first, _, rpc) = two_mocks().await;
+        first.lock().unwrap().failing = vec![("eth_getTransactionReceipt", BUSY_CODE)];
+        let answers = rpc.batch_to(0, Kind::Chain, &calls).await;
+        assert_eq!(first.lock().unwrap().requests, 1);
+        assert!(answers.iter().all(Result::is_err));
+        assert!(answers[100..]
+            .iter()
+            .all(|answer| answer.as_ref().unwrap_err().contains("held off")));
     }
 }
