@@ -358,7 +358,7 @@ stopped, is stuck, or can't write its files.
 | `cycle` | The latest cycle: `started_at`; `millis`, how long it took; `bytes_in` and `bytes_out`, to and from nodes; `rpc_calls` and `rpc_errors`, to the payment chain's RPC providers; `decided`, addresses decided; `too_few_answered`, true when fewer than 7 nodes answered, or under three quarters of those known, so the cycle decided and removed nothing |
 | `totals` | Since `started_at`: `cycles`, `bytes_in`, `bytes_out`, and `rpc`, for each provider its host name (`provider`), `calls` and `errors` |
 | `census` | The nodes the producer knows: `nodes`; `answering`, those that answered in the latest cycle; `leaves`, the parts the address space is split into; `versions`, how many nodes (`nodes`) give each `version` in their user agent (`null` when unknown); `silent`, each node that didn't answer (`node`, and `last_answered`, or `null` if never) |
-| `deferred` | Addresses left for a later cycle, grouped by `reason`, each group with `addresses`, how many, and `oldest_since`, since when the longest-waiting has waited |
+| `deferred` | Addresses left for a later cycle, grouped by `reason`, each group with `addresses`, how many, and `oldest_since`, since when the longest-waiting has waited. An entry kept unconfirmed (`carried`) whose address the cycle left for later counts too, though `rejected.json` doesn't list it |
 | `below_full` | Entries fewer than all of their nearest nodes serve: `listings`, how many, and `oldest_since`, since when the longest-standing has been (`null` if none) |
 | `drops` | `removed`, entries the latest cycle removed; `carried`, entries kept unconfirmed (see the support files) |
 | `resources` | What the producer uses, each `null` where it can't tell: `rss_bytes` (memory), `store_bytes`, `files_bytes` (what it publishes) and `disk_free_bytes` |
@@ -392,7 +392,9 @@ them, so it is rejected for good (`again` false).
 ## rejected.json
 
 `{"listings": [...]}`: the listings the producer didn't list, in key order,
-each address's latest rejection or deferral. Each has the entry's fields from
+each address's latest rejection or deferral. An address the producer lists
+has no row, even while its entry is kept unconfirmed (`carried`) and
+`status.json` counts it as deferred. Each row has the entry's fields from
 `address` to `time` (no `check`), then:
 
 | Field | Value |

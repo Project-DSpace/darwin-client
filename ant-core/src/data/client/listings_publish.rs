@@ -630,7 +630,7 @@ impl Publisher {
     /// Whether to flush each file to disk before renaming it into place, as
     /// a publisher always does: tests, which write many files, may not.
     #[cfg(test)]
-    fn set_flush(&mut self, flush: bool) {
+    pub(crate) fn set_flush(&mut self, flush: bool) {
         self.files.durable = flush;
     }
 

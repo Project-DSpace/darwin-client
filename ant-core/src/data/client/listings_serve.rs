@@ -73,7 +73,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 use std::time::Duration;
 
-use ant_listings::NEAREST_NODES;
+use ant_listings::{ListingKey, NEAREST_NODES};
 use ant_protocol::transport::PeerId;
 use ant_protocol::XorName;
 use heed::byteorder::BigEndian;
@@ -331,22 +331,29 @@ impl Producer {
             }
         };
         let versions = self.versions(&index).await;
-        let published = self.publisher.keys()?;
         let listed: BTreeMap<XorName, &CheckedListing> = index
             .listings
             .iter()
             .map(|checked| (checked.listing.address, checked))
             .collect();
-        // Entries whose whole close group walked past them: each is removed
+        // Each published entry the read didn't list, with why it is removed,
+        // if it is. One whose whole close group walked past it is removed
         // only once its nearest nodes, asked now, serve none.
-        let mut gone = HashSet::new();
-        for key in &published {
-            if !listed.contains_key(&key.address)
-                && index.carry(&key.address, key) == Carry::NoLongerServed
-                && Box::pin(self.confirm_gone(&key.address, index.nodes_asked)).await
-            {
-                gone.insert(key.address);
+        let mut unlisted = Vec::new();
+        for key in self.publisher.keys()? {
+            if listed.contains_key(&key.address) {
+                continue;
             }
+            let removal = match index.carry(&key.address, &key) {
+                Carry::Decided => Some(RemoveReason::Rejected),
+                Carry::NoLongerServed => {
+                    Box::pin(self.confirm_gone(&key.address, index.nodes_asked))
+                        .await
+                        .then_some(RemoveReason::NoLongerServed)
+                }
+                Carry::Keep => None,
+            };
+            unlisted.push((key, removal));
         }
 
         // Nothing below awaits: a cancelled cycle has written nothing.
@@ -354,72 +361,8 @@ impl Producer {
             versions,
             ..Tally::default()
         };
-        let mut publication = Publication {
-            at,
-            ..Publication::default()
-        };
-        for checked in &index.listings {
-            let address = checked.listing.address;
-            let fresh = ShardEntry::new(
-                Entry::new(&checked.listing, checked.level, at),
-                &checked.envelope,
-            );
-            let unchanged = self
-                .publisher
-                .entry(&address)?
-                .is_some_and(|old| same_entry(&old, &fresh));
-            if !unchanged {
-                publication.changes.push(IndexChange::Put(Box::new(fresh)));
-                tally.put += 1;
-            }
-            let support = Support {
-                address: hex::encode(address),
-                nodes: checked.nodes,
-                nearest: checked.nearest,
-                quorum: checked.quorum,
-                carried: false,
-            };
-            if self.publisher.support(&address)?.as_ref() != Some(&support) {
-                publication.support.push(support);
-            }
-        }
-        for key in &published {
-            let address = key.address;
-            if listed.contains_key(&address) {
-                continue;
-            }
-            let reason = match index.carry(&address, key) {
-                Carry::Decided => Some(RemoveReason::Rejected),
-                Carry::NoLongerServed if gone.contains(&address) => {
-                    Some(RemoveReason::NoLongerServed)
-                }
-                Carry::NoLongerServed | Carry::Keep => None,
-            };
-            if let Some(reason) = reason {
-                publication
-                    .changes
-                    .push(IndexChange::Remove { address, reason });
-                tally.removed += 1;
-            } else {
-                tally.carried += 1;
-                if let Some(mut support) = self.publisher.support(&address)? {
-                    if !support.carried {
-                        support.carried = true;
-                        publication.support.push(support);
-                    }
-                }
-            }
-        }
-        if !index.too_few_nodes {
-            publication.rejected = rejected_changes(
-                self.publisher.rejected_entries()?,
-                &index,
-                &listed,
-                at,
-                &mut tally,
-            );
-        }
-        tally.decided = listed.len() as u64 + tally.rejected_for_good;
+        let mut publication =
+            read_publication(&self.publisher, &index, &listed, &unlisted, at, &mut tally)?;
         self.update_since(&index, &listed, &publication, at, &mut tally)?;
         publication.status = self.status(at, clock, before, Some(&index), tally.clone());
         self.publisher.publish(&publication)?;
@@ -753,6 +696,87 @@ fn log_cycle(report: &CycleReport) {
     );
 }
 
+/// What `index`, the read of the cycle that began at `at`, changes in what
+/// `publisher` has published. `listed` is what the read listed, by address;
+/// `unlisted`, each entry published before that the read didn't list, with
+/// why it is removed, or `None` to keep it. A listed entry is put where it
+/// changed, with its support where that changed; a removed one goes, with
+/// its support; a kept one is marked carried in its support. Unless the read
+/// found too few nodes, its rejections and deferrals go to `rejected.json`
+/// ([`rejected_changes`]). What it does is counted into `tally`.
+///
+/// # Errors
+///
+/// If the store can't be read.
+fn read_publication(
+    publisher: &Publisher,
+    index: &ListingsIndex,
+    listed: &BTreeMap<XorName, &CheckedListing>,
+    unlisted: &[(ListingKey, Option<RemoveReason>)],
+    at: u64,
+    tally: &mut Tally,
+) -> Result<Publication> {
+    let mut publication = Publication {
+        at,
+        ..Publication::default()
+    };
+    for checked in &index.listings {
+        let address = checked.listing.address;
+        let fresh = ShardEntry::new(
+            Entry::new(&checked.listing, checked.level, at),
+            &checked.envelope,
+        );
+        let unchanged = publisher
+            .entry(&address)?
+            .is_some_and(|old| same_entry(&old, &fresh));
+        if !unchanged {
+            publication.changes.push(IndexChange::Put(Box::new(fresh)));
+            tally.put += 1;
+        }
+        let support = Support {
+            address: hex::encode(address),
+            nodes: checked.nodes,
+            nearest: checked.nearest,
+            quorum: checked.quorum,
+            carried: false,
+        };
+        if publisher.support(&address)?.as_ref() != Some(&support) {
+            publication.support.push(support);
+        }
+    }
+    let mut carried = HashSet::new();
+    for (key, removal) in unlisted {
+        let address = key.address;
+        if let Some(reason) = *removal {
+            publication
+                .changes
+                .push(IndexChange::Remove { address, reason });
+            tally.removed += 1;
+        } else {
+            tally.carried += 1;
+            carried.insert(address);
+            if let Some(mut support) = publisher.support(&address)? {
+                if !support.carried {
+                    support.carried = true;
+                    publication.support.push(support);
+                }
+            }
+        }
+    }
+    if !index.too_few_nodes {
+        publication.rejected = rejected_changes(
+            publisher.rejected_entries()?,
+            index,
+            listed,
+            &carried,
+            at,
+            tally,
+        );
+    }
+    tally.decided = listed.len() as u64 + tally.rejected_for_good;
+    Ok(publication)
+}
+
 /// Whether `fresh` is `old` decided again: the same apart from when.
 fn same_entry(old: &ShardEntry, fresh: &ShardEntry) -> bool {
     old.entry.listing == fresh.entry.listing
@@ -778,17 +802,24 @@ fn paid_before_vault(copies: &[PendingCopy]) -> bool {
 }
 
 /// The changes to `rejected.json`, whose rows are `existing`, that `index`, a
-/// read, makes. Each address it rejected or deferred and didn't list gets its
-/// latest rejection or deferral (the first in index order), left as it was
-/// where only the time it was decided would change. An address it deferred
-/// is rejected for good instead when every copy its nearest nodes serve was
-/// paid before the payment vault was deployed ([`paid_before_vault`]). A row
-/// is cleared once its address is listed, decided without a rejection, or
-/// walked past by its whole close group.
+/// read, makes. `rejected.json` lists only addresses the producer didn't
+/// list: an address the read listed (`listed`), or whose published entry is
+/// kept unconfirmed (`carried`), has no row there, and loses any it had.
+/// Each other address the read rejected or deferred gets its latest
+/// rejection or deferral (the first in index order), left as it was where
+/// only the time it was decided would change. An address it deferred is
+/// rejected for good instead when every copy its nearest nodes serve was
+/// paid before the payment vault was deployed ([`paid_before_vault`]).
+/// Every address the read rejected or deferred and didn't list, carried or
+/// not, is counted into `tally`, as deferred (for `status.json`'s deferred
+/// groups) or as rejected for good. A row is cleared once its address is
+/// listed or carried, decided without a rejection, or walked past by its
+/// whole close group.
 fn rejected_changes(
     existing: Vec<RejectedEntry>,
     index: &ListingsIndex,
     listed: &BTreeMap<XorName, &CheckedListing>,
+    carried: &HashSet<XorName>,
     at: u64,
     tally: &mut Tally,
 ) -> Vec<RejectedChange> {
@@ -820,6 +851,10 @@ fn rejected_changes(
         } else {
             tally.rejected_for_good += 1;
         }
+        if carried.contains(&address) {
+            // Still listed, unconfirmed: any row it has is cleared below.
+            continue;
+        }
         let unchanged = existing.get(&entry.listing.address).is_some_and(|old| {
             RejectedEntry {
                 decided_at: old.decided_at,
@@ -834,14 +869,17 @@ fn rejected_changes(
         let Some(address) = old.listing.address() else {
             continue;
         };
+        if listed.contains_key(&address) || carried.contains(&address) {
+            changes.push(RejectedChange::Clear(address));
+            continue;
+        }
         if seen.contains(&address) {
             continue;
         }
-        let keep = !listed.contains_key(&address)
-            && old
-                .listing
-                .key()
-                .is_some_and(|key| index.carry(&address, &key) == Carry::Keep);
+        let keep = old
+            .listing
+            .key()
+            .is_some_and(|key| index.carry(&address, &key) == Carry::Keep);
         if !keep {
             changes.push(RejectedChange::Clear(address));
         }
@@ -963,7 +1001,8 @@ mod tests {
     use super::*;
     use crate::data::client::listings::RejectedListing;
     use ant_listings::{
-        CheckLevel, Flags, Listing, ListingPayment, Metadata, PaymentField, ShownFields,
+        CheckLevel, Envelope, Flags, Listing, ListingPayment, Metadata, PaymentField, ShownFields,
+        SALTED_HASH_LEN,
     };
 
     const ADDRESS: &str = "1111111111111111111111111111111111111111111111111111111111111111";
@@ -1156,7 +1195,14 @@ mod tests {
         defer(&mut index, two, &[80_204_042, 80_204_042]);
         defer(&mut index, one, &[80_204_042]);
         let mut tally = Tally::default();
-        let changes = rejected_changes(Vec::new(), &index, &BTreeMap::new(), AT, &mut tally);
+        let changes = rejected_changes(
+            Vec::new(),
+            &index,
+            &BTreeMap::new(),
+            &HashSet::new(),
+            AT,
+            &mut tally,
+        );
         // Neither is left for a later cycle, so status.json's deferred
         // groups, which the watchdog alerts on after a day, leave them out.
         assert!(tally.deferred.is_empty(), "deferred: {:?}", tally.deferred);
@@ -1179,7 +1225,14 @@ mod tests {
         }
         // The next cycle finds them the same: nothing to write.
         let mut next = Tally::default();
-        let changes = rejected_changes(rows, &index, &BTreeMap::new(), AT + 60, &mut next);
+        let changes = rejected_changes(
+            rows,
+            &index,
+            &BTreeMap::new(),
+            &HashSet::new(),
+            AT + 60,
+            &mut next,
+        );
         assert!(changes.is_empty(), "{changes:?}");
         assert!(next.deferred.is_empty());
         assert_eq!(next.rejected_for_good, 2);
@@ -1202,7 +1255,14 @@ mod tests {
             again: true,
         });
         let mut tally = Tally::default();
-        let changes = rejected_changes(Vec::new(), &index, &BTreeMap::new(), AT, &mut tally);
+        let changes = rejected_changes(
+            Vec::new(),
+            &index,
+            &BTreeMap::new(),
+            &HashSet::new(),
+            AT,
+            &mut tally,
+        );
         assert_eq!(
             tally.deferred,
             [(mixed, "below_quorum"), (unread, "chain_unread")]
@@ -1217,5 +1277,160 @@ mod tests {
         );
         assert_eq!(rows[0].copies.len(), 2);
         assert!(rows[1].copies.is_empty());
+    }
+
+    /// A publisher of files in a temporary directory, as the producer's,
+    /// with its store.
+    fn publisher() -> (tempfile::TempDir, Publisher) {
+        let dir = tempfile::tempdir().unwrap();
+        let store =
+            ListingsStore::open_with_map_size(&dir.path().join("store"), 64 * 1024 * 1024).unwrap();
+        let mut publisher = Publisher::open(&dir.path().join("v1"), &store).unwrap();
+        publisher.set_flush(false);
+        (dir, publisher)
+    }
+
+    /// The listing at `address`, showing only its block, as a read lists it
+    /// when all 7 of its nearest nodes serve it.
+    fn checked(address: XorName) -> CheckedListing {
+        let shown = ShownFields::NONE.with(PaymentField::BlockNumber);
+        CheckedListing {
+            listing: showing_block(address, 81_950_000),
+            envelope: Envelope::withheld_hash(
+                [0x5a; SALTED_HASH_LEN],
+                Metadata::default(),
+                shown,
+                true,
+            )
+            .unwrap(),
+            level: CheckLevel::Reported,
+            nodes: 7,
+            nearest: 7,
+            quorum: true,
+        }
+    }
+
+    /// Publish what `index`, the read of the cycle that began at `at`,
+    /// changes in what `publisher` has published, as a cycle does: each
+    /// published entry the read didn't list is removed for `removal`, or
+    /// kept if that is `None`. Returns the publication and what the cycle
+    /// counted.
+    fn publish_read(
+        publisher: &mut Publisher,
+        index: &ListingsIndex,
+        removal: Option<RemoveReason>,
+        at: u64,
+    ) -> (Publication, Tally) {
+        let listed: BTreeMap<XorName, &CheckedListing> = index
+            .listings
+            .iter()
+            .map(|checked| (checked.listing.address, checked))
+            .collect();
+        let unlisted: Vec<(ListingKey, Option<RemoveReason>)> = publisher
+            .keys()
+            .unwrap()
+            .into_iter()
+            .filter(|key| !listed.contains_key(&key.address))
+            .map(|key| (key, removal))
+            .collect();
+        let mut tally = Tally::default();
+        let publication =
+            read_publication(publisher, index, &listed, &unlisted, at, &mut tally).unwrap();
+        publisher.publish(&publication).unwrap();
+        (publication, tally)
+    }
+
+    #[test]
+    fn rejected_json_lists_only_addresses_the_producer_does_not_list() {
+        // One address through its life: listed, carried, rejected for good
+        // and removed, then listed and carried again.
+        let x: XorName = [0x3d; 32];
+        let (_dir, mut publisher) = publisher();
+        let rows = |publisher: &Publisher| publisher.rejected_entries().unwrap();
+        let carried = |publisher: &Publisher| {
+            publisher
+                .support(&x)
+                .unwrap()
+                .map(|support| support.carried)
+        };
+        let listing = || {
+            let mut index = ListingsIndex::default();
+            index.listings.push(checked(x));
+            index
+        };
+        // 2 of its 7 nearest nodes serve it, both copies paid to the vault:
+        // too few to decide it, so it is left for a later cycle.
+        let deferring = || {
+            let mut index = ListingsIndex::default();
+            defer(&mut index, x, &[81_950_000, 81_950_000]);
+            index
+        };
+
+        // Listed.
+        let (_, tally) = publish_read(&mut publisher, &listing(), None, AT);
+        assert_eq!(tally.put, 1);
+        assert_eq!(carried(&publisher), Some(false));
+        assert!(rows(&publisher).is_empty());
+        // A row for it in rejected.json too, as an earlier version wrote
+        // when a cycle kept it carried.
+        let old = deferring();
+        let row = RejectedEntry::new(&old.rejected[0], &old.pending_copies[&x], AT + 30);
+        publisher
+            .publish(&Publication {
+                at: AT + 30,
+                rejected: vec![RejectedChange::Set(Box::new(row))],
+                ..Publication::default()
+            })
+            .unwrap();
+        assert_eq!(rows(&publisher).len(), 1);
+
+        // Carried: the cycle can't decide it, so its entry stays, marked
+        // carried. It has no row in rejected.json, and the earlier one goes,
+        // while status.json counts it as deferred and as carried.
+        let (publication, tally) = publish_read(&mut publisher, &deferring(), None, AT + 60);
+        assert_eq!(publication.rejected, [RejectedChange::Clear(x)]);
+        assert_eq!(tally.deferred, [(x, "below_quorum")]);
+        assert_eq!(tally.carried, 1);
+        assert!(publisher.entry(&x).unwrap().is_some());
+        assert_eq!(carried(&publisher), Some(true));
+        assert!(rows(&publisher).is_empty());
+        // The next cycle finds it the same: nothing to write.
+        let (publication, tally) = publish_read(&mut publisher, &deferring(), None, AT + 120);
+        assert!(publication.rejected.is_empty());
+        assert!(publication.support.is_empty());
+        assert_eq!(tally.deferred, [(x, "below_quorum")]);
+
+        // Rejected for good: deciding it again rejects it, so it is removed,
+        // and rejected.json says why.
+        let mut rejecting = ListingsIndex::default();
+        rejecting.rejected.push(RejectedListing {
+            listing: showing_block(x, 81_950_000),
+            problem: "its payment is for another address".into(),
+            nodes: 4,
+            nearest: 7,
+            again: false,
+        });
+        let removal = Some(RemoveReason::Rejected);
+        let (_, tally) = publish_read(&mut publisher, &rejecting, removal, AT + 180);
+        assert_eq!((tally.removed, tally.rejected_for_good), (1, 1));
+        assert!(tally.deferred.is_empty());
+        assert_eq!(publisher.entry(&x).unwrap(), None);
+        let rejected = rows(&publisher);
+        assert_eq!(rejected.len(), 1);
+        assert_eq!(rejected[0].listing.address, hex::encode(x));
+        assert!(!rejected[0].again);
+
+        // And back: listed again, its row goes.
+        let (publication, _) = publish_read(&mut publisher, &listing(), None, AT + 240);
+        assert_eq!(publication.rejected, [RejectedChange::Clear(x)]);
+        assert!(publisher.entry(&x).unwrap().is_some());
+        assert_eq!(carried(&publisher), Some(false));
+        assert!(rows(&publisher).is_empty());
+        // Carried again: no row, and counted as deferred.
+        let (publication, tally) = publish_read(&mut publisher, &deferring(), None, AT + 300);
+        assert!(publication.rejected.is_empty());
+        assert_eq!(tally.deferred, [(x, "below_quorum")]);
+        assert_eq!(carried(&publisher), Some(true));
+        assert!(rows(&publisher).is_empty());
     }
 }
