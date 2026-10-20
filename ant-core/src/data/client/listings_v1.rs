@@ -460,7 +460,8 @@ pub struct SegmentRef {
     /// The number of its first record.
     pub first: u64,
     /// The number of its last record. A segment of
-    /// [`FEED_SEGMENT_RECORDS`] records is closed: it never changes.
+    /// [`FEED_SEGMENT_RECORDS`] records is closed: it doesn't change within
+    /// its epoch (a new epoch writes its own segments under the same names).
     pub last: u64,
 }
 
