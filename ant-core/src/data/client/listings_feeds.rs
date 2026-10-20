@@ -5,12 +5,12 @@
 //!
 //! **Nodes with the change feed** (the feed release,
 //! [`FEED_RELEASE`](super::listings_census::FEED_RELEASE) on) are followed
-//! with [`MirrorSync`], `ant-listings`'s reader state machine
-//! ([`FeedSync`](ant_listings::FeedSync)) with the mirror's entries kept in
-//! the store instead of in memory. It checks every answer and push as that
-//! crate defines (sequence numbers, ranges, one record per address, counts
-//! and set hashes, peers against the view) and bounds what a node can make
-//! the reader take. Each node is asked about its own leaf only
+//! with `MirrorSync` (`listings_mirror`), `ant-listings`'s reader state
+//! machine ([`FeedSync`](ant_listings::FeedSync)) with the mirror's entries
+//! kept in the store instead of in memory. It checks every answer and push
+//! as that crate defines (sequence numbers, ranges, one record per address,
+//! counts and set hashes, peers against the view) and bounds what a node
+//! can make the reader take. Each node is asked about its own leaf only
 //! ([`FeedNode::range`]):
 //!
 //! - the first time, it is asked where its feed stands, and the range is read
@@ -46,7 +46,7 @@
 //! **What counts.** A node's copies count in a cycle ([`NodeRead::counts`])
 //! when it is in sync: it answered this round, and its mirror is at the head
 //! it reported with the count and set hash it reported
-//! ([`MirrorSync::in_sync`]). A node read with v2 requests counts when it
+//! (`MirrorSync::in_sync`). A node read with v2 requests counts when it
 //! answered this round's request with a page the checks take; its mirror then
 //! holds what its pages showed. Only entries in the node's own range are
 //! kept, and only listings that pass [`Listing::validate`]
@@ -1668,9 +1668,9 @@ impl Feeds {
     /// Take a push from `peer`'s watch, routed between polls: applied if
     /// `peer` is read through its feed and the push brings its mirror
     /// exactly to the push's head, within its allowance (see
-    /// [`MirrorSync::push`]). The addresses it changes become pending, in
-    /// the store at once. `peer` must be the node the push came from, as the
-    /// transport gives it.
+    /// [`FeedSync::push`](ant_listings::FeedSync::push)). The addresses it
+    /// changes become pending, in the store at once. `peer` must be the node
+    /// the push came from, as the transport gives it.
     ///
     /// # Errors
     ///

@@ -198,7 +198,7 @@ pub const DECIDE_BATCH: usize = MAX_LIST_LIMIT as usize;
 pub const RETRY_INTERVAL: Duration = Duration::from_secs(60 * 60);
 
 /// How many root maps of shrunk data maps are read a cycle, all at once: as
-/// many as addresses are decided at once ([`CHECK_CONCURRENCY`]).
+/// many as addresses are decided at once (8).
 pub const SIZES_PER_CYCLE: usize = CHECK_CONCURRENCY;
 
 /// The store's directory inside the state directory.
