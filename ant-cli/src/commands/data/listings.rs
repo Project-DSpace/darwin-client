@@ -56,8 +56,9 @@ pub enum ListingsCommand {
 #[derive(Args)]
 pub struct ServeArgs {
     /// Where the producer keeps its state, created if missing: where each
-    /// node's walk carries on, chain facts, envelopes and the published
-    /// index. One process uses it at a time.
+    /// node's walk carries on, chain facts, envelopes, the published index,
+    /// and since when each address has been deferred or listed below full
+    /// support. One process uses it at a time.
     #[arg(long, value_name = "DIR")]
     pub state_dir: PathBuf,
     /// The directory to publish the files of listings/v1/ in, created if
