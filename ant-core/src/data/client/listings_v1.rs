@@ -651,9 +651,12 @@ pub struct CycleStatus {
     pub started_at: u64,
     /// How long it took, in milliseconds.
     pub millis: u64,
-    /// Bytes received from nodes.
+    /// Bytes of the listings messages received from nodes, each message's
+    /// payload only: not the DHT lookups that find the nodes, nor envelope
+    /// fetches, nor the transport's own overhead.
     pub bytes_in: u64,
-    /// Bytes sent to nodes.
+    /// Bytes of the listings messages sent to nodes, counted as `bytes_in`
+    /// is.
     pub bytes_out: u64,
     /// Calls made to the payment chain's RPC providers.
     pub rpc_calls: u64,
@@ -661,8 +664,17 @@ pub struct CycleStatus {
     pub rpc_errors: u64,
     /// Addresses decided.
     pub decided: u64,
-    /// Whether too few nodes answered (fewer than 7, or under three
-    /// quarters of the census) for the cycle to decide or drop anything.
+    /// Whether the cycle decided and dropped nothing because its read found
+    /// too few nodes to trust. In this version that is an index read's
+    /// guard ([`ListingsIndex::too_few_nodes`]): the read found fewer than 7
+    /// nodes, or under three quarters of the most that any of the recent
+    /// reads found, however many of them answered, or none at all. A
+    /// version with the census counts the census's nodes that answered:
+    /// fewer than 7 of them, or under three quarters of the census
+    /// ([`Census::guard_ok`]).
+    ///
+    /// [`ListingsIndex::too_few_nodes`]: super::listings::ListingsIndex::too_few_nodes
+    /// [`Census::guard_ok`]: super::listings_census::Census::guard_ok
     pub too_few_answered: bool,
 }
 
@@ -671,9 +683,11 @@ pub struct CycleStatus {
 pub struct Totals {
     /// Cycles run.
     pub cycles: u64,
-    /// Bytes received from nodes.
+    /// Bytes of the listings messages received from nodes, as
+    /// [`CycleStatus::bytes_in`] counts them.
     pub bytes_in: u64,
-    /// Bytes sent to nodes.
+    /// Bytes of the listings messages sent to nodes, as
+    /// [`CycleStatus::bytes_out`] counts them.
     pub bytes_out: u64,
     /// Calls to each RPC provider, and how many failed.
     pub rpc: Vec<RpcCalls>,

@@ -358,13 +358,24 @@ stopped, is stuck, or can't write its files.
 | `epoch`, `seq`, `count` | As in `head.json` |
 | `generated_at` | When this file was written |
 | `started_at` | When the producer started; `totals` count from then |
-| `cycle` | The latest cycle: `started_at`; `millis`, how long it took; `bytes_in` and `bytes_out`, to and from nodes; `rpc_calls` and `rpc_errors`, to the payment chain's RPC providers; `decided`, addresses decided; `too_few_answered`, true when fewer than 7 nodes answered, or under three quarters of those known, so the cycle decided and removed nothing |
-| `totals` | Since `started_at`: `cycles`, `bytes_in`, `bytes_out`, and `rpc`, for each provider its host name (`provider`), `calls` and `errors` |
+| `cycle` | The latest cycle: `started_at`; `millis`, how long it took; `bytes_in` and `bytes_out`, the listings messages received from nodes and sent to them (see below); `rpc_calls` and `rpc_errors`, to the payment chain's RPC providers; `decided`, addresses decided; `too_few_answered`, true when the cycle decided and removed nothing because its read found too few nodes to trust (see below) |
+| `totals` | Since `started_at`: `cycles`, `bytes_in` and `bytes_out` (counted as the cycle's are), and `rpc`, for each provider its host name (`provider`), `calls` and `errors` |
 | `census` | The nodes the producer knows: `nodes`; `answering`, those that answered in the latest cycle; `leaves`, the parts the address space is split into; `versions`, how many nodes (`nodes`) give each `version` in their user agent (`null` when unknown); `silent`, each node that didn't answer (`node`, and `last_answered`, or `null` if never) |
 | `deferred` | Addresses left for a later cycle, grouped by `reason`, each group with `addresses`, how many, and `oldest_since`, since when the longest-waiting has waited. An entry kept unconfirmed (`carried`) whose address the cycle left for later counts too, though `rejected.json` doesn't list it |
 | `below_full` | Entries fewer than all of their nearest nodes serve: `listings`, how many, and `oldest_since`, since when the longest-standing has been (`null` if none) |
 | `drops` | `removed`, entries the latest cycle removed; `carried`, entries kept unconfirmed (see the support files) |
 | `resources` | What the producer uses, each `null` where it can't tell: `rss_bytes` (memory), `store_bytes`, `files_bytes` (what it publishes) and `disk_free_bytes` |
+
+`bytes_in` and `bytes_out` count only the listings messages the producer
+receives from nodes and sends to them, each message's payload: not the DHT
+lookups that find the nodes, nor envelope fetches, nor the transport's own
+overhead.
+
+`too_few_answered`, in this version, is an index read's guard: the cycle's
+read found fewer than 7 nodes, or under three quarters of the most that any
+of the 10 reads before it found, however many of them answered, or none at
+all. A later version that keeps a census of the nodes sets it when fewer
+than 7 of the census answered the cycle, or under three quarters of it.
 
 A deferral's `reason` is one of: `below_quorum` (fewer than 4 of the 7 nodes
 nearest the address serve it yet), `nodes_unanswered` (nodes nearest it have

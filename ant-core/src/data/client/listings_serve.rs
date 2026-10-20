@@ -61,7 +61,10 @@
 //! listings --state --carry` makes one ([`Client::index_listings_with`],
 //! reading every node with listings v2 requests), with the walks' state kept
 //! in the store between cycles, and with the reader's chain facts and
-//! envelopes kept ([`ListingChain::with_store`]). What the read lists is
+//! envelopes kept ([`ListingChain::with_store`]). Its guard is the read's:
+//! a read that finds fewer than 7 nodes, or under three quarters of the most
+//! a recent read found, however many of them answer, decides and drops
+//! nothing ([`ListingsIndex::too_few_nodes`]). What the read lists is
 //! published. An entry it didn't decide is kept, marked carried, as `--carry`
 //! keeps it ([`ListingsIndex::carry`]). One it decided and rejected is
 //! removed as `rejected`. One whose whole close group walked past it is
