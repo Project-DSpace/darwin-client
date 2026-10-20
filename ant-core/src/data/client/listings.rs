@@ -1641,6 +1641,14 @@ impl ListingsRequests {
             .lock()
             .ok()?
             .expect(*peer, request_id, &body, self.take_pushes);
+        // A request dropped before its answer, such as at a poll's deadline,
+        // stops waiting too: no route is left behind for an answer that may
+        // never come.
+        let _forget = Forget {
+            routes: &self.routes,
+            peer: *peer,
+            request_id,
+        };
         let request = ListingsMessage { request_id, body }.encode();
         let answer = match request {
             Ok(request) => {
@@ -1661,13 +1669,26 @@ impl ListingsRequests {
                 None
             }
         };
-        if let Ok(mut routes) = self.routes.lock() {
-            routes.forget(peer, request_id);
-        }
         if answer.is_none() {
             debug!("{peer} did not answer a listings request");
         }
         answer
+    }
+}
+
+/// Stops waiting for one request's answer when dropped, however the request
+/// ends ([`ListingsRequests::ask`]).
+struct Forget<'a> {
+    routes: &'a Mutex<Routes>,
+    peer: PeerId,
+    request_id: u64,
+}
+
+impl Drop for Forget<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut routes) = self.routes.lock() {
+            routes.forget(&self.peer, self.request_id);
+        }
     }
 }
 

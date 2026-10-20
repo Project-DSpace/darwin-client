@@ -25,6 +25,8 @@ pub mod listings_census;
 #[cfg(feature = "native")]
 pub(crate) mod listings_facts;
 #[cfg(feature = "native")]
+pub mod listings_feeds;
+#[cfg(feature = "native")]
 pub mod listings_publish;
 #[cfg(feature = "native")]
 pub(crate) mod listings_rpc;

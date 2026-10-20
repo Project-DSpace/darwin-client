@@ -351,8 +351,10 @@ impl Publisher {
     /// ([`Producer::carry_from`](super::listings_serve::Producer::carry_from)),
     /// as [`publish`](Self::publish) does, but for the support files: they
     /// are written at once, and don't start the [`SUPPORT_INTERVAL`]. So the
-    /// first cycle to decide those entries publishes their support at once
-    /// too, rather than an interval after the carry.
+    /// support write after them isn't held back: the first publication that
+    /// changes any support, as a cycle deciding any of those entries does,
+    /// writes it at once rather than an interval after the carry, and that
+    /// write starts the interval.
     ///
     /// # Errors
     ///
