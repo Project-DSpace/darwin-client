@@ -2326,26 +2326,30 @@ mod tests {
     }
 
     /// A deferred listing, as the format's example of `rejected.json` has
-    /// it.
+    /// it: 2 of the 7 nodes nearest its address serve the same listing,
+    /// which they first stored an hour apart.
     fn deferred() -> RejectedEntry {
         let mut listing = hiding().entry.listing;
         listing.address = "c0".repeat(32);
-        listing.block_number = Some(80_204_042);
+        listing.first_seen = Some(1_791_327_600);
+        listing.time = 1_791_327_600;
+        let copy = |node: &str, first_seen: u64| CopyFields {
+            node: node.repeat(32),
+            block_number: Some(81_950_000),
+            block_timestamp: None,
+            first_seen: Some(first_seen),
+            time: first_seen,
+            before_vault_deployment: false,
+        };
         RejectedEntry {
             listing,
-            problem: "2 of the 7 nodes nearest its address serve it, needs 4; try again".into(),
+            problem: "served by 2 of the 7 nodes nearest its address so far, needs 4; try again"
+                .into(),
             again: true,
             nodes: 2,
             nearest: 7,
-            decided_at: AT,
-            copies: vec![CopyFields {
-                node: "03".repeat(32),
-                block_number: Some(80_204_042),
-                block_timestamp: None,
-                first_seen: Some(1_791_324_000),
-                time: 1_791_324_000,
-                before_vault_deployment: true,
-            }],
+            decided_at: 1_791_327_660,
+            copies: vec![copy("03", 1_791_324_000), copy("05", 1_791_327_600)],
         }
     }
 
@@ -2615,14 +2619,15 @@ mod tests {
                 concat!(
                     r#"{{"listings":[{{"address":"{address}","name":null,"content_type":null,"size":null,"#,
                     r#""readable":false,"hidden":["tx-hash","timestamp","log-index","quote"],"#,
-                    r#""block_number":80204042,"first_seen":1791324000,"time":1791324000,"#,
-                    r#""problem":"2 of the 7 nodes nearest its address serve it, needs 4; try again","#,
-                    r#""again":true,"nodes":2,"nearest":7,"decided_at":{at},"copies":["#,
-                    r#"{{"node":"{node}","block_number":80204042,"first_seen":1791324000,"time":1791324000,"before_vault_deployment":true}}]}}]}}"#
+                    r#""block_number":81950000,"first_seen":1791327600,"time":1791327600,"#,
+                    r#""problem":"served by 2 of the 7 nodes nearest its address so far, needs 4; try again","#,
+                    r#""again":true,"nodes":2,"nearest":7,"decided_at":1791327660,"copies":["#,
+                    r#"{{"node":"{first}","block_number":81950000,"first_seen":1791324000,"time":1791324000}},"#,
+                    r#"{{"node":"{second}","block_number":81950000,"first_seen":1791327600,"time":1791327600}}]}}]}}"#
                 ),
                 address = "c0".repeat(32),
-                node = "03".repeat(32),
-                at = AT
+                first = "03".repeat(32),
+                second = "05".repeat(32)
             )
         );
         // Beside each file, the same bytes compressed.

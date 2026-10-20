@@ -1350,48 +1350,61 @@ mod tests {
 
     #[test]
     fn rejected_is_pinned() {
-        let listing = hiding();
+        // The format's example: 2 of the 7 nodes nearest the address serve
+        // the same listing, which they first stored an hour apart, so it is
+        // dated by the later hour.
+        let mut listing = hiding();
+        listing.address = [0xc0; 32];
+        listing.first_seen = Some(1_791_327_600);
         let rejected = RejectedListing {
-            listing: listing.clone(),
-            problem: "2 of the 7 nodes nearest its address serve it, needs 4; try again".into(),
+            listing,
+            problem: "served by 2 of the 7 nodes nearest its address so far, needs 4; try again"
+                .into(),
             nodes: 2,
             nearest: 7,
             again: true,
         };
-        let copies = [
-            PendingCopy {
-                node: PeerId::from_bytes([3; 32]),
-                block_number: Some(80_204_042),
-                block_timestamp: None,
-                first_seen: Some(1_791_324_000),
-                before_vault_deployment: true,
-            },
-            PendingCopy {
-                node: PeerId::from_bytes([5; 32]),
-                block_number: Some(81_950_000),
-                block_timestamp: None,
-                first_seen: Some(1_791_327_600),
-                before_vault_deployment: false,
-            },
-        ];
-        let file = Rejected {
-            listings: vec![RejectedEntry::new(&rejected, &copies, 1_791_324_060)],
+        let copy = |node: u8, first_seen: u64| PendingCopy {
+            node: PeerId::from_bytes([node; 32]),
+            block_number: Some(81_950_000),
+            block_timestamp: None,
+            first_seen: Some(first_seen),
+            before_vault_deployment: false,
         };
-        let fields = HIDING_ENTRY
-            .strip_suffix(r#","check":"reported","decided_at":1791324060}"#)
-            .unwrap();
+        let copies = [copy(3, 1_791_324_000), copy(5, 1_791_327_600)];
+        let file = Rejected {
+            listings: vec![RejectedEntry::new(&rejected, &copies, 1_791_327_660)],
+        };
         pinned(
             &file,
             &format!(
                 concat!(
-                    r#"{{"listings":[{},"problem":"2 of the 7 nodes nearest its address serve it, needs 4; try again","#,
-                    r#""again":true,"nodes":2,"nearest":7,"decided_at":1791324060,"copies":["#,
-                    r#"{{"node":"{}","block_number":80204042,"first_seen":1791324000,"time":1791324000,"before_vault_deployment":true}},"#,
+                    r#"{{"listings":[{{"address":"{}","name":null,"content_type":null,"size":null,"#,
+                    r#""readable":false,"hidden":["tx-hash","timestamp","log-index","quote"],"#,
+                    r#""block_number":81950000,"first_seen":1791327600,"time":1791327600,"#,
+                    r#""problem":"served by 2 of the 7 nodes nearest its address so far, needs 4; try again","#,
+                    r#""again":true,"nodes":2,"nearest":7,"decided_at":1791327660,"copies":["#,
+                    r#"{{"node":"{}","block_number":81950000,"first_seen":1791324000,"time":1791324000}},"#,
                     r#"{{"node":"{}","block_number":81950000,"first_seen":1791327600,"time":1791327600}}]}}]}}"#
                 ),
-                fields,
+                "c0".repeat(32),
                 "03".repeat(32),
                 "05".repeat(32)
+            ),
+        );
+        // A copy paid before the payment vault was deployed says so; the
+        // others leave the field out.
+        let early = PendingCopy {
+            block_number: Some(80_204_042),
+            first_seen: Some(1_791_320_400),
+            before_vault_deployment: true,
+            ..copy(3, 0)
+        };
+        pinned(
+            &CopyFields::from(&early),
+            &format!(
+                r#"{{"node":"{}","block_number":80204042,"first_seen":1791320400,"time":1791320400,"before_vault_deployment":true}}"#,
+                "03".repeat(32)
             ),
         );
     }

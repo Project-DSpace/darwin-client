@@ -436,11 +436,19 @@ give it before any check. That is the latest of the earliest 4 of their dates
 where at least 4 of them serve it, otherwise their median (of two dates, the
 later).
 
+A private file's listing that 2 of the 7 nodes nearest its address serve,
+left for a later cycle: both copies show the same payment, and the nodes
+first stored it an hour apart, so it is dated by the later hour.
+
 ```json
-{ "listings": [{ "address": "a0a0…", "…": "…", "time": 1791324000,
-  "problem": "2 of the 7 nodes nearest its address serve it, needs 4; try again",
-  "again": true, "nodes": 2, "nearest": 7, "decided_at": 1791324060,
-  "copies": [{ "node": "0303…", "block_number": 80204042, "first_seen": 1791324000, "time": 1791324000, "before_vault_deployment": true },
+{ "listings": [{
+  "address": "c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0",
+  "name": null, "content_type": null, "size": null, "readable": false,
+  "hidden": ["tx-hash", "timestamp", "log-index", "quote"],
+  "block_number": 81950000, "first_seen": 1791327600, "time": 1791327600,
+  "problem": "served by 2 of the 7 nodes nearest its address so far, needs 4; try again",
+  "again": true, "nodes": 2, "nearest": 7, "decided_at": 1791327660,
+  "copies": [{ "node": "0303…", "block_number": 81950000, "first_seen": 1791324000, "time": 1791324000 },
              { "node": "0505…", "block_number": 81950000, "first_seen": 1791327600, "time": 1791327600 }] }] }
 ```
 
