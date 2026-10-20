@@ -35,7 +35,13 @@ told apart by the commit `darwin --version` prints. Upstream's entries follow.
   fetched once, within each node's allowance, and kept, and a node that doesn't hand one over
   can't keep an address from being decided. An entry is dropped only when, in one cycle, all 7 of
   its nearest nodes answered without a copy, a witnessed lookup confirms them, and each of them
-  and the nodes that last served it answers a request for the address with none.
+  and the nodes that last served it answers a request for the address with none. An entry every
+  copy of which shows a payment from before the payment vault was deployed is removed
+  (`rejected`), not kept as carried. The size of a readable file whose data map is shrunk is read
+  from its root map once, at most 8 a cycle in a task of its own, and filled in to its entry as a
+  put. What grows with the index (the mirrors, full listings, what is known of each address) is
+  kept in the store, and addresses are decided 256 at a time, each batch recorded before the next
+  and the files written once, so the producer's memory doesn't grow with the index.
 - Envelopes are darwin's default: `darwin file upload`, `darwin manifest create` and the
   library's file upload shortcuts store each upload in an envelope, with its payment record, a
   listing when listed, and a `.record`. The other ways of using the network remain, with no

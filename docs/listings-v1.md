@@ -114,7 +114,7 @@ its uploader chose to hide, and those fields are absent from its entry.
 | `address` | The file's address: its envelope's, 64 hex digits |
 | `name` | The name the uploader declared, or `null`. Treat it as untrusted text, not a path |
 | `content_type` | The content type the uploader declared, or `null` |
-| `size` | The file's size in bytes, as its data map gives it. The data map of a file over about 12.5 MB is shrunk into a child map, which gives no size: the producer reads its root map once to find it, and until then it is `null`. `null` when the data map is withheld |
+| `size` | The file's size in bytes, as its data map gives it. The data map of a file over about 12.5 MB is shrunk into a child map, which gives no size: the producer reads its root map once to find it, and until then it is `null`, so a size can be filled in later for an entry already published, which the feed records as an ordinary put. `null` when the data map is withheld |
 | `readable` | Whether anyone with the address can read the file: the envelope holds its data map rather than withholding it |
 | `hidden` | The payment fields the uploader hid, of `tx-hash`, `block`, `timestamp`, `log-index` and `quote`, in that order |
 | `tx_hash` | The payment's transaction hash. Absent when hidden |
@@ -513,6 +513,9 @@ Files are fetched one at a time, so a file can be newer than the
   nodes that last served it confirm it (`no_longer_served`), or when
   deciding the address again rejects it (`rejected`). An entry it can't
   confirm otherwise is kept, marked `carried` in its support file.
+- An entry whose file's data map is shrunk is published without a `size`
+  until the producer has read the file's root map, and is then put again
+  with it, in a later cycle or between cycles.
 - It writes a file only when its bytes change; the files a change touches
   first, then `pages.json`, `feed/index.json` and `head.json`. Time pages
   that `pages.json` no longer lists are deleted a day later.
