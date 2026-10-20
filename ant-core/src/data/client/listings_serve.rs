@@ -439,6 +439,13 @@ impl Producer {
         let Some(requests) = self.requests.as_ref() else {
             return Err(Error::Network("listings requests are not routed".into()));
         };
+        // A node no lookup has connected to since this process started is
+        // dialed at the addresses the census keeps for it.
+        requests.set_addresses(
+            self.census
+                .nodes()
+                .map(|node| (node.peer, node.addresses.clone())),
+        );
         let poll = Box::pin(self.feeds.poll(
             requests,
             &self.census,

@@ -1619,6 +1619,9 @@ pub(crate) struct ListingsRequests {
     /// Whether pushes have somewhere to go.
     take_pushes: bool,
     router: tokio::task::JoinHandle<()>,
+    /// Where nodes can be reached, to dial one this process isn't connected
+    /// to ([`Self::set_addresses`]).
+    addresses: Mutex<HashMap<PeerId, Vec<MultiAddr>>>,
 }
 
 impl ListingsRequests {
@@ -1678,6 +1681,21 @@ impl ListingsRequests {
             routes,
             take_pushes,
             router,
+            addresses: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Reach each node at the addresses `addresses` gives for it, such as a
+    /// census's, when this process isn't connected to it: without them, a
+    /// request to a node no lookup has connected to fails. Replaces those
+    /// given before.
+    pub(crate) fn set_addresses(
+        &self,
+        addresses: impl IntoIterator<Item = (PeerId, Vec<MultiAddr>)>,
+    ) {
+        let addresses: HashMap<PeerId, Vec<MultiAddr>> = addresses.into_iter().collect();
+        if let Ok(mut known) = self.addresses.lock() {
+            *known = addresses;
         }
     }
 
@@ -1700,10 +1718,20 @@ impl ListingsRequests {
             request_id,
         };
         let request = ListingsMessage { request_id, body }.encode();
+        let addresses = self
+            .addresses
+            .lock()
+            .ok()
+            .and_then(|known| known.get(peer).cloned())
+            .unwrap_or_default();
         let answer = match request {
             Ok(request) => {
                 LISTINGS_BYTES_SENT.fetch_add(request.len() as u64, Ordering::Relaxed);
-                match self.node.send_message(peer, TOPIC, request, &[]).await {
+                match self
+                    .node
+                    .send_message(peer, TOPIC, request, &addresses)
+                    .await
+                {
                     Ok(()) => tokio::time::timeout(REQUEST_TIMEOUT, receiver)
                         .await
                         .ok()
