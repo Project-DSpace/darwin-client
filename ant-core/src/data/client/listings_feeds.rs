@@ -1146,6 +1146,9 @@ struct NodeState {
     feed_refused_at: Option<u64>,
     /// Whether its copies counted in the last round.
     counted: bool,
+    /// Whether a push since its last round showed its mirror to lag it: its
+    /// copies don't count until it is read again ([`Feeds::behind`]).
+    behind: bool,
     read: NodeRead,
     /// Whether it answered a request this round.
     answered: bool,
@@ -1164,6 +1167,7 @@ impl NodeState {
             claims_feed: kind == ReadKind::Feed,
             feed_refused_at: None,
             counted: false,
+            behind: false,
             read: NodeRead::new(kind),
             answered: false,
             feed_answered: false,
@@ -1213,6 +1217,7 @@ impl NodeState {
 
     fn begin_round(&mut self, backed: usize) {
         self.answered = false;
+        self.behind = false;
         self.read = NodeRead::new(self.mirror.kind());
         match &mut self.mirror {
             Mirror::Feed(sync) => {
@@ -1451,6 +1456,7 @@ impl NodeRecord {
             claims_feed: self.kind == ReadKind::Feed,
             feed_refused_at: self.feed_refused_at,
             counted: false,
+            behind: false,
             answered: false,
             feed_answered: false,
             written: Some(self.clone()),
@@ -1697,6 +1703,14 @@ impl Feeds {
         };
         let mut entries = StoreEntries::begin(store, *dbs, *peer, census, backing)?;
         let pushed = sync.push(push, &mut entries);
+        if pushed == Pushed::Behind {
+            // Its mirror is known not to be at the head it reported: its
+            // copies don't count until it is read again, as for a node out
+            // of sync.
+            node.behind = true;
+            node.read.counts = false;
+            node.read.complete = false;
+        }
         let (txn, done) = entries.finish()?;
         commit_node(txn, done, *dbs, peer, node)?;
         self.apply_backing();
@@ -1816,10 +1830,27 @@ impl Feeds {
         txn.commit().map_err(store_error)
     }
 
-    /// How `peer`'s latest round went, if it is followed.
+    /// How `peer`'s latest round went, if it is followed. A push since that
+    /// showed its mirror to lag it ([`Self::behind`]) leaves its copies not
+    /// counting, and its mirror not complete.
     #[must_use]
     pub fn read(&self, peer: &PeerId) -> Option<&NodeRead> {
         self.nodes.get(peer).map(|node| &node.read)
+    }
+
+    /// Whether a push from `peer` since its latest round came behind its
+    /// mirror: the node is ahead of what the mirror holds, so its copies
+    /// don't count until the next round reads it again. What its copies
+    /// would decide waits for that round.
+    #[must_use]
+    pub fn behind(&self, peer: &PeerId) -> bool {
+        self.nodes.get(peer).is_some_and(|node| node.behind)
+    }
+
+    /// Whether any node is [`Self::behind`].
+    #[must_use]
+    pub fn any_behind(&self) -> bool {
+        self.nodes.values().any(|node| node.behind)
     }
 
     /// The entry `peer`'s mirror holds for `address`, counting or not.
@@ -2231,6 +2262,17 @@ impl Feeds {
         self.nodes.insert(peer, node);
     }
 
+    /// Take `peer` as if a push from it had come behind its mirror
+    /// ([`Self::behind`]): for tests of what is decided between cycles.
+    #[cfg(test)]
+    pub(crate) fn mark_behind(&mut self, peer: &PeerId) {
+        if let Some(node) = self.nodes.get_mut(peer) {
+            node.behind = true;
+            node.read.counts = false;
+            node.read.complete = false;
+        }
+    }
+
     /// The addresses pending, all of them: for tests.
     #[cfg(test)]
     fn pending_set(&self) -> BTreeSet<XorName> {
@@ -2455,7 +2497,7 @@ fn decode_entry(address: XorName, bytes: &[u8]) -> Option<DigestEntry> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use ant_listings::{
         nearest_by_distance, view_hash, ChangesRequest, FeedChange, Flags, Listing, ListingPayment,
@@ -2537,7 +2579,7 @@ mod tests {
     }
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    enum Behaviour {
+    pub(crate) enum Behaviour {
         Honest,
         /// Answers nothing.
         Silent,
@@ -2554,8 +2596,8 @@ mod tests {
     }
 
     /// A node, as a change feed and a listings v2 index.
-    struct FakeNode {
-        behaviour: Behaviour,
+    pub(crate) struct FakeNode {
+        pub(crate) behaviour: Behaviour,
         epoch: u64,
         head: u64,
         rows: BTreeMap<u64, FeedChange>,
@@ -2569,7 +2611,7 @@ mod tests {
     }
 
     impl FakeNode {
-        fn new(behaviour: Behaviour) -> Self {
+        pub(crate) fn new(behaviour: Behaviour) -> Self {
             Self {
                 behaviour,
                 epoch: 7,
@@ -2585,7 +2627,7 @@ mod tests {
             }
         }
 
-        fn serving(behaviour: Behaviour, served: Vec<DigestEntry>) -> Self {
+        pub(crate) fn serving(behaviour: Behaviour, served: Vec<DigestEntry>) -> Self {
             let mut node = Self::new(behaviour);
             for entry in served {
                 node.put(entry);
@@ -2601,11 +2643,11 @@ mod tests {
             node
         }
 
-        fn put(&mut self, entry: DigestEntry) {
+        pub(crate) fn put(&mut self, entry: DigestEntry) {
             self.record(entry.address, Some(entry));
         }
 
-        fn remove(&mut self, address: &XorName) {
+        pub(crate) fn remove(&mut self, address: &XorName) {
             self.record(*address, None);
         }
 
@@ -2643,7 +2685,7 @@ mod tests {
         }
 
         /// Number what it serves afresh under `epoch`, as after a wipe.
-        fn renumber(&mut self, epoch: u64) {
+        pub(crate) fn renumber(&mut self, epoch: u64) {
             self.epoch = epoch;
             self.head = 0;
             self.rows.clear();
@@ -2793,20 +2835,20 @@ mod tests {
 
     /// Fake nodes, and every request sent to them.
     #[derive(Default)]
-    struct FakeNet {
+    pub(crate) struct FakeNet {
         nodes: Mutex<HashMap<PeerId, FakeNode>>,
         asked: Mutex<Vec<(PeerId, ListingsBody)>>,
     }
 
     impl FakeNet {
-        fn with(nodes: Vec<(PeerId, FakeNode)>) -> Self {
+        pub(crate) fn with(nodes: Vec<(PeerId, FakeNode)>) -> Self {
             Self {
                 nodes: Mutex::new(nodes.into_iter().collect()),
                 asked: Mutex::default(),
             }
         }
 
-        fn node<T>(&self, peer: &PeerId, f: impl FnOnce(&mut FakeNode) -> T) -> T {
+        pub(crate) fn node<T>(&self, peer: &PeerId, f: impl FnOnce(&mut FakeNode) -> T) -> T {
             f(self.nodes.lock().unwrap().get_mut(peer).unwrap())
         }
 
@@ -3048,6 +3090,12 @@ mod tests {
         let pushes = net.node(&a, |node| std::mem::take(&mut node.pushes));
         assert_eq!(feeds.push(&ids, &a, &pushes[1]).unwrap(), Pushed::Behind);
         assert!(feeds.entry(&a, &address(502)).unwrap().is_none());
+        // The node is ahead of its mirror: its copies don't count, and its
+        // mirror isn't complete, until it is read again.
+        assert!(feeds.behind(&a));
+        let read = feeds.read(&a).unwrap();
+        assert!(!read.counts && !read.complete);
+        assert!(feeds.copies(&address(3), &[a]).unwrap().is_empty());
         // One from another epoch, or with peers, is left alone.
         let mut other_epoch = pushes[0].clone();
         other_epoch.epoch = 99;
@@ -3060,6 +3108,13 @@ mod tests {
         poll(&mut feeds, &net, &nodes, NOW + 60).await;
         assert!(net.mirrored(&feeds, &a));
         assert!(feeds.read(&a).unwrap().counts);
+        assert!(!feeds.behind(&a));
+        // Its copies counted at both polls: only what changed is pending,
+        // not every address it holds.
+        assert_eq!(
+            feeds.pending_set(),
+            BTreeSet::from([address(500), address(501), address(502)])
+        );
     }
 
     #[tokio::test]

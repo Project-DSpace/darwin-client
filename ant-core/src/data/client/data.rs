@@ -567,6 +567,16 @@ impl Client {
             .expect("a completed pass delivers its one chunk"))
     }
 
+    /// The record of the chunk at `address`, as fetched, unchecked: for a
+    /// reader that checks and decrypts it itself (the listings producer).
+    ///
+    /// # Errors
+    /// Returns the fetch error, or [`Error::NotFound`] if no node has it.
+    #[cfg(feature = "native")]
+    pub(crate) async fn data_record(&self, address: [u8; 32]) -> Result<Bytes> {
+        self.fetch_data_record(address).await
+    }
+
     async fn fetch_data_record(&self, address: [u8; 32]) -> Result<Bytes> {
         self.chunk_get_observed(&address)
             .await?

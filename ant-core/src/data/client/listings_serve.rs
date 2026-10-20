@@ -37,13 +37,16 @@
 //!    release from its latest pass, while it keeps answering. A mirror holds
 //!    digest entries: the full listing behind each is fetched once with a
 //!    `GetRequest`, checked against its entry
-//!    ([`ant_listings::DigestEntry::describes`]) and kept in the store.
-//!    Fetching is bounded: it takes at most [`CYCLE`], however long the
-//!    poll took, addresses most of whose nearest nodes hold an entry first,
-//!    each node asked at most its allowance in pages a cycle
-//!    ([`Feeds::page_allowance`]), and a node that failed to hand over the
-//!    listing behind its entry isn't asked for it again until its entry
-//!    changes, or [`RETRY_INTERVAL`] has passed.
+//!    ([`ant_listings::DigestEntry::describes`]) and kept in the store, in
+//!    the bytes a `GetResponse` carries it in; one of more than
+//!    [`MAX_LISTING_BYTES`] is out of spec, and never kept. Fetching is
+//!    bounded: it takes at most [`CYCLE`], however long the poll took; every
+//!    listing a quorum of an address's nearest nodes name is fetched before
+//!    any that fewer name; a node is sent one request at a time, at most its
+//!    allowance in pages a cycle ([`Feeds::page_allowance`]), and nothing
+//!    more that cycle once it leaves one unanswered; and a node that failed
+//!    to hand over the listing behind its entry isn't asked for it again
+//!    until its entry changes, or [`RETRY_INTERVAL`] has passed.
 //! 5. **Work per address**, as an index read decides it, a batch of
 //!    [`DECIDE_BATCH`] addresses at a time: an address fewer than 4 of its
 //!    nearest nodes serve is left for later, shown with its copies; any
@@ -60,11 +63,15 @@
 //!    changed: its copies or their `first_seen` in a mirror, a node's
 //!    copies starting or ceasing to count, or its 7 nearest nodes. It is
 //!    also decided again every cycle while its last result was "try again"
-//!    for any of its listings, left it for later or kept it unconfirmed,
-//!    while a copy of it couldn't be had, or while a chain fact it was
-//!    decided on isn't final ([`ListingChain::settled`]). Every
-//!    [`REDECIDE_INTERVAL`], and at each start, every address is decided
-//!    again, and a change no input explains is logged as an alert.
+//!    for any of its listings, a time in the future, left it for later or
+//!    kept it unconfirmed, rests on nodes that serve none of its listings
+//!    having been heard (no listing of it has a quorum), or while a chain
+//!    fact it was decided on isn't final ([`ListingChain::settled`]). Every
+//!    address is decided again at each start and every
+//!    [`REDECIDE_INTERVAL`], by a sweep: a batch at a time in address order,
+//!    after what changed, for what is left of each cycle's time (at least a
+//!    batch), over as many cycles as it takes. A change no input explains is
+//!    logged as an alert (but in the sweep after a start).
 //! 7. **Drops.** A published address is removed as `no_longer_served` only
 //!    when, within one cycle, all 7 of its nearest nodes answered and none
 //!    serves a copy at any key, and then [`Census::confirm_drop`] confirms
@@ -73,13 +80,14 @@
 //!    `GetRequest` to each of them, begun at or after the address's key
 //!    time plus `FIRST_SEEN_ROUNDING` and `CLOCK_MARGIN`, returns none, as
 //!    does one to each node that served it when it was last decided, unless
-//!    that node has left the census. Otherwise it stays, marked carried. A
-//!    drop the evidence refused isn't checked again for
-//!    [`RETRY_INTERVAL`] unless its nearest nodes, its copies or its
-//!    last holders change, and drops are checked within the cycle's time,
-//!    at least one a cycle. One decided and rejected is removed as
-//!    `rejected`, as is one every copy of which shows a payment from before
-//!    the payment vault was deployed.
+//!    that node has left the census. Otherwise it stays, marked carried.
+//!    Before that time no check is made. A drop the evidence refused isn't
+//!    checked again for [`RETRY_INTERVAL`] unless its nearest nodes, its
+//!    copies or its last holders change, and drops are checked for a
+//!    [`CYCLE`] from when deciding starts, at least one a cycle. An entry
+//!    decided and rejected is removed as `rejected`, as is one that itself
+//!    shows a payment from before the payment vault was deployed: every copy
+//!    of it shows that payment, so it can never count.
 //! 8. **Publishing.** Each batch's decisions are staged in the publisher's
 //!    store as they are made ([`Publisher::stage`]), and once every batch
 //!    is decided, the files they changed are written, then `status.json`
@@ -87,26 +95,31 @@
 //!
 //! **Sizes.** The listing of a file whose data map is shrunk into a child
 //! map gives no size. The producer reads such a file's root map once, as a
-//! download does, and keeps the size it gives for good: an entry is
-//! published with its size once known, and until then without, and an
-//! entry published without it has it filled in once it is read (a put).
-//! The reading never holds up a cycle or a push: after each cycle, once
-//! what the last task read is taken, a task of its own reads at most
-//! [`SIZES_PER_CYCLE`] root maps, for at most a [`CYCLE`]; one that can't be
-//! read is tried again after [`RETRY_INTERVAL`].
+//! download does but within bounds (`read_root_size`), and keeps the size
+//! it gives for good: an entry is published with its size once known, and
+//! until then without, and an entry published without it has it filled in
+//! once it is read (a put). The reading never holds up a cycle or a push:
+//! after each cycle, once what the last task read is taken, a task of its
+//! own reads at most [`SIZES_PER_CYCLE`] root maps, for at most a
+//! [`CYCLE`]. Each read is marked before it begins, so a map that couldn't
+//! be read, or whose reading was cut short, even by a stop, is read again
+//! only after [`RETRY_INTERVAL`]; one that can never give a size isn't
+//! read again, and its entry keeps none.
 //!
 //! Between cycles, nodes push the new records of the leaves they are asked
 //! about: a push that brings a mirror to the node's new head is applied
 //! ([`Feeds::push`]), and the addresses it changes are decided and
 //! published at once, after the guard of the latest cycle, with that
-//! cycle's `status.json`. A node can have only so many pushes waiting
-//! ([`PUSHES_WAITING_PER_NODE`](super::listings::PUSHES_WAITING_PER_NODE)).
-//! Pushes that come during a cycle's poll are decided with the cycle, so
-//! while a node is slow to answer the poll, they wait for it. Every
-//! publication begins in a later second than the one before it ended in,
-//! so a file written twice is never written twice in the same second: a
-//! server that tags files by their time to the second and their size then
-//! tags every version differently.
+//! cycle's `status.json`; one near a node whose push came behind its mirror
+//! waits for the next cycle ([`Feeds::behind`]). A node can have only so
+//! many pushes waiting (`PUSHES_WAITING_PER_NODE`, in `listings`). Pushes
+//! that come during a cycle's poll are decided with the cycle, so while a
+//! node is slow to answer the poll, they wait for it, and while a sweep
+//! takes the rest of each cycle's time, they wait for the next cycle. Every
+//! publication begins in a later second than the one before it ended in, so
+//! a file written twice is never written twice in the same second: a server
+//! that tags files by their time to the second and their size then tags
+//! every version differently (unless the clock is set back).
 //!
 //! **Memory.** What grows with the index is in the store, not in memory:
 //! the mirrors ([`Feeds`]), the full listings fetched, what is known of
@@ -118,11 +131,11 @@
 //! the next batch's are made; fetching takes the addresses a batch at a
 //! time too. So the producer holds a batch's work at a time, whatever the
 //! index holds. What is known of each address is this process's own: it is
-//! cleared at each start, which decides every address again in its first
-//! cycle, as an index read does every cycle, from the kept mirrors,
-//! listings, facts and envelopes, fetching nothing it fetched before. The
-//! nodes whose copies counted when an address was last decided are kept
-//! across starts, for drops.
+//! cleared at each start, and the sweep that starts with the first cycle
+//! decides every address again, as an index read does every cycle, from the
+//! kept mirrors, listings, facts and envelopes, fetching nothing it fetched
+//! before. The nodes whose copies counted when an address was last decided
+//! are kept across starts, for drops, and so are the sizes still to read.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::hash::{DefaultHasher, Hash, Hasher};
@@ -132,18 +145,20 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use ant_listings::{
-    AddressWalk, ChangesResponse, DigestEntry, Listing, ListingKey, Pushed, CLOCK_MARGIN,
-    FIRST_SEEN_ROUNDING, MAX_LIST_LIMIT, NEAREST_NODES, QUORUM_THRESHOLD,
+    AddressWalk, ChangesResponse, DigestEntry, Listing, ListingError, ListingKey, ListingsBody,
+    ListingsMessage, Pushed, CLOCK_MARGIN, FIRST_SEEN_ROUNDING, MAX_LIST_LIMIT, NEAREST_NODES,
+    QUORUM_THRESHOLD,
 };
 use ant_protocol::transport::PeerId;
-use ant_protocol::XorName;
+use ant_protocol::{XorName, MAX_WIRE_MESSAGE_SIZE};
 use futures::stream::{self, StreamExt};
 use heed::byteorder::BigEndian;
 use heed::types::{Bytes, DecodeIgnore, U64};
 use heed::{Database, RoTxn};
-use self_encryption::DataMap;
+use self_encryption::{DataMap, DataMapIndex, MAX_CHUNK_SIZE};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
+use tokio::sync::Semaphore;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
@@ -201,6 +216,28 @@ pub const RETRY_INTERVAL: Duration = Duration::from_secs(60 * 60);
 /// many as addresses are decided at once (8).
 pub const SIZES_PER_CYCLE: usize = CHECK_CONCURRENCY;
 
+/// The most bytes a full listing kept for a digest entry may take, as a
+/// `GetResponse` carries it: a page's share of a message, since a node
+/// answers with up to [`MAX_LIST_LIMIT`] listings in one message of at most
+/// [`MAX_WIRE_MESSAGE_SIZE`] bytes. The largest listing the format allows
+/// (every field shown, the longest name and content type, an ML-DSA quote)
+/// takes about half of it. A node that hands over a larger one counts as
+/// having failed to hand over the listing behind its entry, and nothing of
+/// it is kept.
+pub const MAX_LISTING_BYTES: usize = MAX_WIRE_MESSAGE_SIZE / MAX_LIST_LIMIT as usize;
+
+/// How many chunks a data map shrunk once holds: self-encryption shrinks a
+/// map of more than 3 chunks by encrypting it, as content, into 3 chunks, as
+/// long as it takes at most 3 times [`MAX_CHUNK_SIZE`].
+const SHRUNK_CHUNKS: usize = 3;
+
+/// The most bytes of root map read for a file's size: what a map shrunk
+/// once holds in its [`SHRUNK_CHUNKS`] chunks, the root map of a file of up
+/// to about 650 GB. A file whose data map is shrunk more than once, or
+/// whose map declares more, keeps no size: its root map isn't read. The
+/// root maps being read at once hold this much between them at most.
+const MAX_ROOT_MAP_BYTES: usize = SHRUNK_CHUNKS * MAX_CHUNK_SIZE;
+
 /// The store's directory inside the state directory.
 pub const STORE_DIR: &str = "listings.mdb";
 
@@ -215,7 +252,8 @@ const HOLDERS_DB: &str = "serve_holders";
 
 /// The full listings behind the mirrors' digest entries, as `GetRequest`s
 /// fetched them: the address and the digest, to the listing without
-/// `first_seen`, in MessagePack.
+/// `first_seen`, in the bytes a `GetResponse` carries it in
+/// ([`kept_bytes`]), at most [`MAX_LISTING_BYTES`].
 const LISTINGS_DB: &str = "serve_listings";
 
 /// The size of each listed file whose data map is shrunk, as its root map
@@ -223,9 +261,16 @@ const LISTINGS_DB: &str = "serve_listings";
 /// envelope's address fixes its data map.
 const SIZES_DB: &str = "serve_sizes";
 
+/// Each listed file whose data map is shrunk and whose size isn't known: the
+/// address, to when its root map may be read next (Unix seconds, 8 bytes
+/// big-endian: 0 at once, [`u64::MAX`] never) and the data map, in
+/// MessagePack. Kept across starts, so a read that a stop cut short isn't
+/// begun again at once.
+const SIZE_WANTED_DB: &str = "serve_size_wanted";
+
 /// What this process knows of the addresses it works on, by a tag and the
-/// address ([`KNOWN_TAG`], [`AGAIN_TAG`], [`BACKOFF_TAG`], [`FAILED_TAG`],
-/// [`SIZE_WANTED_TAG`]). Cleared at each start.
+/// address ([`KNOWN_TAG`], [`AGAIN_TAG`], [`BACKOFF_TAG`], [`FAILED_TAG`]).
+/// Cleared at each start.
 const KNOWN_DB: &str = "serve_known";
 
 /// [`SINCE_DB`]: an address deferred since then.
@@ -251,11 +296,6 @@ const BACKOFF_TAG: u8 = b'r';
 /// (Unix seconds). It isn't asked before then while its entry stays the
 /// same.
 const FAILED_TAG: u8 = b'f';
-
-/// [`KNOWN_DB`]: a listed address whose data map is shrunk and whose size
-/// isn't known yet, to when its root map may be read (Unix seconds, 0 at
-/// once) and the data map, in MessagePack.
-const SIZE_WANTED_TAG: u8 = b'w';
 
 /// How [`Client::decide_backed`] begins the problem of a listing it rejects
 /// without looking it up, because another one a quorum serves counts: its
@@ -296,6 +336,10 @@ type Work = (XorName, Vec<PeerId>, DigestCopies);
 /// A full listing to fetch, and the nodes whose entries name it.
 type Wanted = (ListingId, DigestCopies);
 
+/// Addresses to decide, each with whether a change of its inputs explains
+/// deciding it ([`Producer::next_batch`]).
+type Batch = Vec<(XorName, bool)>;
+
 /// What the producer keeps of an address between cycles ([`KNOWN_TAG`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Known {
@@ -306,22 +350,28 @@ struct Known {
     again: bool,
     /// Whether its decision stands: listed, or rejected for good.
     decided: bool,
+    /// The cycle of this process it was last decided in, or after
+    /// ([`Producer::cycles`]): a sweep passes over an address its cycle
+    /// already decided.
+    cycle: u32,
 }
 
 impl Known {
-    fn encode(self) -> [u8; 9] {
-        let mut bytes = [0u8; 9];
+    fn encode(self) -> [u8; 13] {
+        let mut bytes = [0u8; 13];
         bytes[..8].copy_from_slice(&self.nearest.to_be_bytes());
         bytes[8] = u8::from(self.again) | (u8::from(self.decided) << 1);
+        bytes[9..].copy_from_slice(&self.cycle.to_be_bytes());
         bytes
     }
 
     fn decode(bytes: &[u8]) -> Option<Self> {
-        let bytes: &[u8; 9] = bytes.try_into().ok()?;
+        let bytes: &[u8; 13] = bytes.try_into().ok()?;
         Some(Self {
             nearest: u64::from_be_bytes(bytes[..8].try_into().ok()?),
             again: bytes[8] & 1 != 0,
             decided: bytes[8] & 2 != 0,
+            cycle: u32::from_be_bytes(bytes[9..].try_into().ok()?),
         })
     }
 }
@@ -333,9 +383,28 @@ struct Seen {
     nearest: u64,
     /// The nodes whose copies counted.
     holders: Vec<PeerId>,
-    /// Whether a copy couldn't be had: the full listing behind a node's
-    /// entry wasn't fetched.
-    unheard: bool,
+}
+
+/// Every address decided again, a batch at a time in address order, over as
+/// many cycles as it takes: each cycle goes on from where the last stopped,
+/// for what is left of the cycle's time.
+#[derive(Debug, Clone, Copy)]
+struct Sweep {
+    /// The last address decided, if any yet.
+    after: Option<XorName>,
+    /// When it began (Unix seconds): once done, every address has been
+    /// decided again since then.
+    began: u64,
+    /// Whether a change no input explains is logged as an alert: not in the
+    /// first after a start, or after a cycle that decided nothing.
+    alert: bool,
+}
+
+impl Sweep {
+    /// Whether `address` is still to come in the sweep.
+    fn ahead(&self, address: &XorName) -> bool {
+        self.after.is_none_or(|after| *address > after)
+    }
 }
 
 /// A drop the evidence refused: checked again once its inputs change, or
@@ -411,13 +480,28 @@ struct Decided {
     /// each with its deferral's reason: shown in no row of `rejected.json`,
     /// as there is no listing to show, but counted as deferred.
     waiting: Vec<(XorName, &'static str)>,
+    /// Full listings kept that couldn't be read back: they go, to be fetched
+    /// again.
+    unreadable: Vec<ListingId>,
+}
+
+/// What reading a file's root map gave ([`read_root_size`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SizeRead {
+    /// The file's size.
+    Sized(u64),
+    /// The map can't give one, however often it is read: malformed, shrunk
+    /// more than once, or more than [`MAX_ROOT_MAP_BYTES`].
+    Never,
+    /// It couldn't be read this time: a chunk wasn't handed over.
+    Later,
 }
 
 /// The root maps being read, by a task of their own ([`SIZES_PER_CYCLE`]).
 struct SizeJob {
-    /// Each address read, with the size its root map gave, or `None` if it
-    /// couldn't be read. Those not read by the deadline aren't in it.
-    results: tokio::sync::oneshot::Receiver<Vec<(XorName, Option<u64>)>>,
+    /// Each address read, with what reading it gave. Those not read by the
+    /// deadline aren't in it.
+    results: tokio::sync::oneshot::Receiver<Vec<(XorName, SizeRead)>>,
     task: tokio::task::JoinHandle<()>,
 }
 
@@ -442,6 +526,8 @@ pub struct Producer {
     /// The size of each listed file whose data map is shrunk
     /// ([`SIZES_DB`]).
     sizes: Database<Bytes, U64<BigEndian>>,
+    /// The sizes still to read ([`SIZE_WANTED_DB`]).
+    size_wanted: Database<Bytes, Bytes>,
     /// What is known of each address ([`KNOWN_DB`]).
     known: Database<Bytes, Bytes>,
     /// Routes the answers to listings requests, and the nodes' pushes to
@@ -458,8 +544,13 @@ pub struct Producer {
     fetch_budget: FetchBudget,
     /// Nodes to ask for their nearest peers at the next poll.
     want_peers: BTreeSet<PeerId>,
-    /// When this process last decided every address (Unix seconds).
+    /// When this process last decided every address (Unix seconds): when
+    /// the latest sweep that went to the end began.
     decided_all_at: Option<u64>,
+    /// The sweep under way, deciding every address again, if any.
+    sweep: Option<Sweep>,
+    /// Cycles run by this process, wrapping: the latest's number.
+    cycles: u32,
     /// Whether the latest cycle's guard let it decide: pushes are decided
     /// between cycles only then.
     guard_ok: bool,
@@ -474,10 +565,16 @@ pub struct Producer {
     published_between: u64,
     /// The root maps being read, if any.
     size_job: Option<SizeJob>,
+    /// Room for the root maps being read at once: [`MAX_ROOT_MAP_BYTES`],
+    /// in permits of a KiB.
+    size_room: Arc<Semaphore>,
     /// When this process started, in Unix seconds.
     started_at: u64,
     /// Counts since then.
     totals: Totals,
+    /// The listings traffic counted into `totals` so far, received and
+    /// sent: traffic between cycles is added with the next cycle's.
+    traffic_counted: (u64, u64),
 }
 
 impl Producer {
@@ -501,14 +598,16 @@ impl Producer {
         let holders: Database<Bytes, Bytes> = store.database(HOLDERS_DB)?;
         let listings: Database<Bytes, Bytes> = store.database(LISTINGS_DB)?;
         let sizes: Database<Bytes, U64<BigEndian>> = store.database(SIZES_DB)?;
+        let size_wanted: Database<Bytes, Bytes> = store.database(SIZE_WANTED_DB)?;
         let known: Database<Bytes, Bytes> = store.database(KNOWN_DB)?;
         // What an earlier process knew of each address is its own: this
-        // one decides every address again in its first cycle.
+        // one decides every address again, starting in its first cycle.
         let mut txn = store.env().write_txn().map_err(store_error)?;
         known.clear(&mut txn).map_err(store_error)?;
         txn.commit().map_err(store_error)?;
         let (sink, pushes) = push_channel(PUSH_CAPACITY);
         let now = unix_now();
+        let traffic_counted = listings_traffic();
         Ok(Self {
             client: Arc::new(client),
             chain,
@@ -520,6 +619,7 @@ impl Producer {
             holders,
             listings,
             sizes,
+            size_wanted,
             known,
             requests: None,
             sink: Some(sink),
@@ -528,6 +628,8 @@ impl Producer {
             fetch_budget: FetchBudget::default(),
             want_peers: BTreeSet::new(),
             decided_all_at: None,
+            sweep: None,
+            cycles: 0,
             guard_ok: false,
             last_status: None,
             // An earlier process may have published in this second.
@@ -535,8 +637,10 @@ impl Producer {
             pushes_between: 0,
             published_between: 0,
             size_job: None,
+            size_room: Arc::new(Semaphore::new(MAX_ROOT_MAP_BYTES.div_ceil(1024))),
             started_at: now,
             totals: Totals::default(),
+            traffic_counted,
         })
     }
 
@@ -702,10 +806,12 @@ impl Producer {
     /// that fail are no error: the cycle decides less.
     pub async fn cycle(&mut self) -> Result<CycleReport> {
         let clock = std::time::Instant::now();
+        let began = Instant::now();
         let at = unix_now();
         let before = Counters::now(&self.chain);
         let pushes_between = std::mem::take(&mut self.pushes_between);
         let published_between = std::mem::take(&mut self.published_between);
+        self.cycles = self.cycles.wrapping_add(1);
         self.start_requests();
         // Each node's allowance of full-listing requests starts again.
         self.fetch_budget.clear();
@@ -757,41 +863,48 @@ impl Producer {
         let mut tally = Tally::default();
         let mut considered = 0;
         if guard_ok {
-            let full = self
+            // Every address is decided again from its kept inputs at each
+            // start, after a cycle that decided nothing, and once a day: by
+            // a sweep, over as many cycles as it takes.
+            let due = self
                 .decided_all_at
                 .is_none_or(|all| at.saturating_sub(all) >= REDECIDE_INTERVAL.as_secs());
-            // Deciding every address again after a start, nothing needs
-            // explaining.
-            let alert = full && self.decided_all_at.is_some();
-            if !change.is_empty() && (alert || !full) {
+            if self.sweep.is_none() && due {
+                self.sweep = Some(Sweep {
+                    after: None,
+                    began: at,
+                    // Deciding every address again after a start, nothing
+                    // needs explaining.
+                    alert: self.decided_all_at.is_some(),
+                });
+            }
+            if !change.is_empty() {
                 self.mark_moved()?;
             }
-            let source = if full {
-                Source::All
-            } else {
-                Source::Pending { again: true }
-            };
-            // However long the poll took, fetching gets as long as a poll
-            // may take; drops get the rest of the cycle's time, and at least
-            // one check.
+            // What changed first. However long the poll took, fetching gets
+            // as long as a poll may take, and drops as long again from when
+            // deciding starts, at least one check.
+            let source = Source::Pending { again: true };
             let fetch_deadline = Instant::now() + CYCLE;
             Box::pin(self.fetch_for(source, fetch_deadline)).await?;
             let mut drops = DropCheck {
                 checked: false,
-                deadline,
+                deadline: Instant::now() + CYCLE,
             };
             let (decided, _) =
-                Box::pin(self.decide_all(source, at, Some(&mut drops), alert, &mut tally)).await?;
+                Box::pin(self.decide_all(source, at, Some(&mut drops), false, &mut tally)).await?;
             considered = decided;
-            if full {
-                self.decided_all_at = Some(at);
-            }
+            // Then the sweep, for what is left of the cycle's time, at least
+            // a batch.
+            considered +=
+                Box::pin(self.sweep_on(at, began + CYCLE, &mut drops, &mut tally)).await?;
         } else {
             // As an index read that finds too few nodes: nothing is decided
-            // or dropped, and every entry is kept, carried, until a cycle
+            // or dropped, and every entry is kept, carried, until a sweep
             // decides every address again.
             self.carry_all(at, &mut tally)?;
             self.decided_all_at = None;
+            self.sweep = None;
         }
         // A cycle that decides nothing counts no decision, as an index read
         // that finds too few nodes counts none.
@@ -853,7 +966,8 @@ impl Producer {
 
     /// Make pending every address whose nearest nodes changed since it was
     /// last decided, as after the census changed: those a mirror holds and
-    /// those decided, a batch at a time.
+    /// those decided, a batch at a time. One this process hasn't decided yet
+    /// is left to the sweep under way where that is still to come to it.
     ///
     /// # Errors
     ///
@@ -873,10 +987,11 @@ impl Producer {
                     let mut moved = Vec::new();
                     for address in &batch {
                         let nearest = nearest_hash(&self.census.nearest(address, NEAREST_NODES));
-                        if self
-                            .known_of(&txn, address)?
-                            .is_none_or(|known| known.nearest != nearest)
-                        {
+                        let moved_on = match self.known_of(&txn, address)? {
+                            Some(known) => known.nearest != nearest,
+                            None => !self.sweep.is_some_and(|sweep| sweep.ahead(address)),
+                        };
+                        if moved_on {
                             moved.push(*address);
                         }
                     }
@@ -909,7 +1024,7 @@ impl Producer {
     /// # Errors
     ///
     /// If the store can't be read.
-    fn next_batch(&self, source: Source, after: Option<&XorName>) -> Result<Vec<(XorName, bool)>> {
+    fn next_batch(&self, source: Source, after: Option<&XorName>) -> Result<Batch> {
         let limit = DECIDE_BATCH;
         let pending = self.feeds.pending_after(after, limit)?;
         let again = match source {
@@ -935,14 +1050,47 @@ impl Producer {
             .collect())
     }
 
-    /// Decide every address of `source`, a batch at a time: each batch
-    /// decided ([`Self::decide`]), its publication staged at `at`
-    /// ([`Publisher::stage`]) and what it decided kept ([`Self::keep`])
-    /// before the next. With `drops`, published addresses no node serves
-    /// any more are checked for dropping, within its time. With `alert`, a
-    /// change no input explains is logged. What is published is counted into
-    /// `tally`. Returns how many addresses were decided, and whether any
-    /// batch staged a change.
+    /// The next batch of `source` after `after` ([`Self::next_batch`]), with
+    /// the address to go on from and whether it was the last. Between
+    /// cycles (`Source::Pending { again: false }`), an address one of whose
+    /// nearest nodes' mirrors a push showed to lag the node is left out,
+    /// pending, for the next cycle to decide once the node is read again
+    /// ([`Feeds::behind`]).
+    ///
+    /// # Errors
+    ///
+    /// If the store can't be read.
+    fn batch_of(
+        &self,
+        source: Source,
+        after: Option<&XorName>,
+    ) -> Result<(Batch, Option<XorName>, bool)> {
+        let batch = self.next_batch(source, after)?;
+        let last = batch.last().map(|(address, _)| *address);
+        let done = batch.len() < DECIDE_BATCH;
+        let batch = if source == (Source::Pending { again: false }) && self.feeds.any_behind() {
+            batch
+                .into_iter()
+                .filter(|(address, _)| {
+                    !self
+                        .census
+                        .nearest(address, NEAREST_NODES)
+                        .iter()
+                        .any(|peer| self.feeds.behind(peer))
+                })
+                .collect()
+        } else {
+            batch
+        };
+        Ok((batch, last, done))
+    }
+
+    /// Decide every address of `source`, a batch at a time
+    /// ([`Self::decide_batch`]). With `drops`, published addresses no node
+    /// serves any more are checked for dropping, within its time. With
+    /// `alert`, a change no input explains is logged. What is published is
+    /// counted into `tally`. Returns how many addresses were decided, and
+    /// whether any batch staged a change.
     ///
     /// # Errors
     ///
@@ -959,38 +1107,119 @@ impl Producer {
         let mut staged = false;
         let mut after: Option<XorName> = None;
         loop {
-            let batch = self.next_batch(source, after.as_ref())?;
-            let Some(&(last, _)) = batch.last() else {
-                break;
-            };
+            let (batch, last, done) = self.batch_of(source, after.as_ref())?;
             decided_count += batch.len() as u64;
-            let explained: BTreeSet<XorName> = batch
-                .iter()
-                .filter(|(_, explained)| *explained)
-                .map(|(address, _)| *address)
-                .collect();
-            let addresses: Vec<XorName> = batch.iter().map(|(address, _)| *address).collect();
-            let full = batch.len() == DECIDE_BATCH;
-            let mut decided = Box::pin(self.decide(addresses, drops.as_deref_mut())).await?;
-            let publication = self.publication(&mut decided, at, tally)?;
-            if alert {
-                alert_unexplained(&publication, &explained);
+            staged |=
+                Box::pin(self.decide_batch(batch, at, drops.as_deref_mut(), alert, tally)).await?;
+            match last {
+                Some(last) if !done => after = Some(last),
+                _ => break,
             }
-            if !publication.changes.is_empty()
-                || !publication.support.is_empty()
-                || !publication.rejected.is_empty()
-            {
-                self.publisher.stage(&publication)?;
-                staged = true;
-            }
-            drop(publication);
-            self.keep(decided)?;
-            if !full {
-                break;
-            }
-            after = Some(last);
         }
         Ok((decided_count, staged))
+    }
+
+    /// Decide `batch`, addresses each with whether a change of its inputs
+    /// explains deciding it ([`Self::next_batch`]): decided
+    /// ([`Self::decide`]), its publication staged at `at`
+    /// ([`Publisher::stage`]) and what it decided kept ([`Self::keep`]). See
+    /// [`Self::decide_all`] for `drops`, `alert` and `tally`. Returns
+    /// whether it staged a change.
+    ///
+    /// # Errors
+    ///
+    /// If the store can't be read or written.
+    async fn decide_batch(
+        &mut self,
+        batch: Batch,
+        at: u64,
+        drops: Option<&mut DropCheck>,
+        alert: bool,
+        tally: &mut Tally,
+    ) -> Result<bool> {
+        if batch.is_empty() {
+            return Ok(false);
+        }
+        let explained: BTreeSet<XorName> = batch
+            .iter()
+            .filter(|(_, explained)| *explained)
+            .map(|(address, _)| *address)
+            .collect();
+        let addresses: Vec<XorName> = batch.iter().map(|(address, _)| *address).collect();
+        let mut decided = Box::pin(self.decide(addresses, drops)).await?;
+        let publication = self.publication(&mut decided, at, tally)?;
+        if alert {
+            alert_unexplained(&publication, &explained);
+        }
+        let staged = !publication.changes.is_empty()
+            || !publication.support.is_empty()
+            || !publication.rejected.is_empty();
+        if staged {
+            self.publisher.stage(&publication)?;
+        }
+        drop(publication);
+        self.keep(decided)?;
+        Ok(staged)
+    }
+
+    /// Go on with the sweep under way, if any, until `until`, at least a
+    /// batch: each batch of every address ([`Source::All`]) from where it
+    /// stopped, its full listings fetched, then decided at `at` as
+    /// [`Self::decide_all`] decides one, but for the addresses this cycle
+    /// decided already. A sweep that reaches the last address is done:
+    /// every address has been decided again since it began. Returns how many
+    /// addresses it decided.
+    ///
+    /// # Errors
+    ///
+    /// If the store can't be read or written.
+    async fn sweep_on(
+        &mut self,
+        at: u64,
+        until: Instant,
+        drops: &mut DropCheck,
+        tally: &mut Tally,
+    ) -> Result<u64> {
+        let mut decided = 0;
+        let mut first = true;
+        while let Some(sweep) = self.sweep {
+            if !first && Instant::now() >= until {
+                break;
+            }
+            first = false;
+            let (batch, last, done) = self.batch_of(Source::All, sweep.after.as_ref())?;
+            let batch: Batch = {
+                let txn = self.store.env().read_txn().map_err(store_error)?;
+                let mut fresh = Vec::with_capacity(batch.len());
+                for (address, explained) in batch {
+                    let this_cycle = self
+                        .known_of(&txn, &address)?
+                        .is_some_and(|known| known.cycle == self.cycles);
+                    if !this_cycle {
+                        fresh.push((address, explained));
+                    }
+                }
+                fresh
+            };
+            if !batch.is_empty() {
+                let addresses: Vec<XorName> = batch.iter().map(|(address, _)| *address).collect();
+                Box::pin(self.fetch_addresses(&addresses, until)).await?;
+                decided += batch.len() as u64;
+                Box::pin(self.decide_batch(batch, at, Some(&mut *drops), sweep.alert, tally))
+                    .await?;
+            }
+            self.sweep = match last {
+                Some(last) if !done => Some(Sweep {
+                    after: Some(last),
+                    ..sweep
+                }),
+                _ => {
+                    self.decided_all_at = Some(sweep.began);
+                    None
+                }
+            };
+        }
+        Ok(decided)
     }
 
     /// As an index read that finds too few nodes: every published entry is
@@ -1064,6 +1293,7 @@ impl Producer {
         let mut empty: Vec<(XorName, Vec<PeerId>)> = Vec::new();
         let mut unheard_addresses = 0usize;
         let mut with_copies: Vec<XorName> = Vec::new();
+        let mut unreadable: Vec<ListingId> = Vec::new();
         for address in &addresses {
             let nearest = self.census.nearest(address, NEAREST_NODES);
             let copies = self.feeds.copies(address, &nearest)?;
@@ -1074,7 +1304,15 @@ impl Producer {
             with_copies.push(*address);
             let (taken, unheard) = {
                 let txn = self.store.env().read_txn().map_err(store_error)?;
-                copies_from(|digest| self.stored_listing(&txn, address, digest), &copies)
+                let fetched = |digest: &[u8; 32]| match self.kept_listing(&txn, address, digest) {
+                    Kept::Listing(listing) => Some(*listing),
+                    Kept::Unreadable => {
+                        unreadable.push((*address, *digest));
+                        None
+                    }
+                    Kept::None => None,
+                };
+                copies_from(fetched, &copies)
             };
             if !unheard.is_empty() {
                 unheard_addresses += 1;
@@ -1109,14 +1347,17 @@ impl Producer {
         if unheard_addresses > 0 {
             debug!("{unheard_addresses} addresses have copies whose full listings couldn't be had");
         }
+        if !unreadable.is_empty() {
+            warn!(
+                "{} full listings kept couldn't be read back: they are fetched again",
+                unreadable.len()
+            );
+        }
         // Some node serves a copy: no drop to back off from.
         self.forget_backoffs(with_copies.iter())?;
         index.defer(&pending, &self.chain);
-        let pending_seen: Vec<Seen> = pending.iter().map(|found| Seen::of(found, false)).collect();
-        let backed_seen: Vec<Seen> = backed
-            .iter()
-            .map(|(found, unheard)| Seen::of(found, !unheard.is_empty()))
-            .collect();
+        let pending_seen: Vec<Seen> = pending.iter().map(Seen::of).collect();
+        let backed_seen: Vec<Seen> = backed.iter().map(|(found, _)| Seen::of(found)).collect();
         drop(pending);
         let mut decisions: Vec<Decision> = Vec::new();
         if !backed.is_empty() {
@@ -1159,13 +1400,36 @@ impl Producer {
             .iter()
             .map(|checked| (checked.listing.address, checked))
             .collect();
-        // Addresses one of whose listings was left to try again, or was
-        // rejected on chain facts that aren't final yet.
+        // Addresses one of whose listings was left to try again, was
+        // rejected on chain facts that aren't final yet, or was refused for
+        // a time in the future, which a later cycle's clock may pass.
+        let in_future = ListingError::TimeInFuture.to_string();
         let rows_again: HashSet<XorName> = index
             .rejected
             .iter()
-            .filter(|row| row.again || unsettled(&self.chain, row))
+            .filter(|row| {
+                row.again || unsettled(&self.chain, row) || row.problem.contains(&in_future)
+            })
             .map(|row| row.listing.address)
+            .collect();
+        // Addresses a listing of which a quorum of their nearest nodes
+        // serves: what nodes that serve none of their listings say can't
+        // change their decision. One decided without, a verified listing
+        // without a quorum or listings too few serve rejected, rests on those
+        // nodes having been heard: it is decided again each cycle, as an
+        // index read decides it.
+        let quorum_held: HashSet<XorName> = index
+            .rejected
+            .iter()
+            .filter(|row| row.nodes >= QUORUM_THRESHOLD)
+            .map(|row| row.listing.address)
+            .chain(
+                index
+                    .listings
+                    .iter()
+                    .filter(|checked| checked.quorum)
+                    .map(|checked| checked.listing.address),
+            )
             .collect();
         let mut decided = Decided {
             addresses,
@@ -1176,6 +1440,7 @@ impl Producer {
             forget,
             settle: Vec::new(),
             waiting: Vec::new(),
+            unreadable,
         };
         let mut considered: Vec<(XorName, u64, bool)> = Vec::new();
         for seen in pending_seen {
@@ -1184,9 +1449,14 @@ impl Producer {
         }
         for seen in backed_seen {
             let address = seen.address;
-            let again = seen.unheard
-                || !index.was_decided(&address)
+            // A copy whose full listing couldn't be had doesn't make its
+            // address decided again: one that waits for it isn't decided,
+            // and one decided without it can't be decided otherwise with it,
+            // as no other listing can have a quorum. It is fetched again
+            // when its entry changes, or by the next sweep.
+            let again = !index.was_decided(&address)
                 || rows_again.contains(&address)
+                || !quorum_held.contains(&address)
                 || listed
                     .get(&address)
                     .is_some_and(|checked| !self.chain.settled(&checked.listing));
@@ -1227,19 +1497,24 @@ impl Producer {
                     again,
                     // Set once published ([`Self::publication`]).
                     decided: false,
+                    cycle: self.cycles,
                 }),
             ));
             if listed.contains_key(&address) {
                 continue;
             }
-            if let Some(key) = self
-                .publisher
-                .entry(&address)?
-                .and_then(|entry| entry.entry.key())
-            {
-                decided
-                    .unlisted
-                    .push((key, removal(&index, &address, &key)));
+            let Some(published) = self.publisher.entry(&address)? else {
+                continue;
+            };
+            if let Some(key) = published.entry.key() {
+                let reason = removal(
+                    &index,
+                    &address,
+                    &key,
+                    &published.entry.listing,
+                    &self.chain,
+                );
+                decided.unlisted.push((key, reason));
             }
         }
         drop(listed);
@@ -1277,7 +1552,12 @@ impl Producer {
                 .entry(address)?
                 .and_then(|entry| entry.entry.key());
             if let Some(key) = published {
-                if !read_whole {
+                // Before its time plus FIRST_SEEN_ROUNDING and CLOCK_MARGIN,
+                // a node that stored it may not show it yet, so no check can
+                // drop it ([`Census::confirm_drop`]): none is made, and none
+                // is backed off from.
+                let too_soon = now < key.time.saturating_add(FIRST_SEEN_ROUNDING + CLOCK_MARGIN);
+                if !read_whole || too_soon {
                     kept.insert(*address);
                     continue;
                 }
@@ -1390,63 +1670,44 @@ impl Producer {
     }
 
     /// The full listing behind the entry of `address` with `digest`, as
-    /// fetched and kept, without `first_seen`: `None` if it isn't kept, or
-    /// can't be read.
-    fn stored_listing(
-        &self,
-        txn: &RoTxn<'_>,
-        address: &XorName,
-        digest: &[u8; 32],
-    ) -> Option<Listing> {
-        let bytes = self
-            .listings
-            .get(txn, &listing_key(address, digest))
-            .ok()
-            .flatten()?;
-        rmp_serde::from_slice(bytes).ok()
+    /// fetched and kept, without `first_seen` ([`kept_listing`]).
+    fn kept_listing(&self, txn: &RoTxn<'_>, address: &XorName, digest: &[u8; 32]) -> Kept {
+        match self.listings.get(txn, &listing_key(address, digest)) {
+            Ok(Some(bytes)) => kept_listing(bytes)
+                .map_or(Kept::Unreadable, |listing| Kept::Listing(Box::new(listing))),
+            Ok(None) => Kept::None,
+            Err(_) => Kept::Unreadable,
+        }
     }
 
     /// Fetch, with a `GetRequest` to the nodes holding it, the full listing
     /// behind each digest entry of the addresses of `source` not kept yet,
-    /// and keep the first that the node's entry describes. The addresses
-    /// are read a batch at a time, and their fetches started as they are,
-    /// [`POLL_CONCURRENCY`] at once: those of addresses at least a quorum of
-    /// whose nearest nodes hold an entry first, then the others. Each node
-    /// is sent at most its allowance in pages a cycle
-    /// ([`Feeds::page_allowance`]), and a node that failed to hand over the
-    /// listing behind its entry isn't asked for it again for
-    /// [`RETRY_INTERVAL`], unless its entry changes. What hasn't come by
-    /// `deadline` is left for later: its copies can't be had this time.
+    /// and keep the first that the node's entry describes and that takes at
+    /// most [`MAX_LISTING_BYTES`]. The addresses are read a batch at a time,
+    /// twice: first for the digests a quorum of their nearest nodes name,
+    /// then for the others, so every listing a quorum serves is fetched
+    /// before any that fewer do. How the fetches go is [`fetch_wanted`]'s:
+    /// [`POLL_CONCURRENCY`] at once, one request at a time to a node, each
+    /// node sent at most its allowance in pages a cycle
+    /// ([`Feeds::page_allowance`]) and nothing more once it leaves one
+    /// unanswered. A node that failed to hand over the listing behind its
+    /// entry isn't asked for it again for [`RETRY_INTERVAL`], unless its
+    /// entry changes. What hasn't come by `deadline` is left for later: its
+    /// copies can't be had this time.
     ///
     /// # Errors
     ///
     /// If the store can't be read or written.
     async fn fetch_for(&self, source: Source, deadline: Instant) -> Result<()> {
-        let Some(requests) = self.requests.as_ref() else {
-            return Ok(());
-        };
         let now = unix_now();
-        let (client, feeds, budget) = (&self.client, &self.feeds, &self.fetch_budget);
-        let take = move |peer: &PeerId| budget.take(peer, || feeds.page_allowance(peer));
-        let ask = move |peer: PeerId, address: XorName| async move {
-            client
-                .ask_for_listing(requests, &address, &[peer])
-                .await
-                .into_iter()
-                .next()
-                .and_then(|(_, answer)| answer)
-        };
         let error: std::cell::RefCell<Option<Error>> = std::cell::RefCell::new(None);
         let mut sink = FetchSink::new(self, now);
-        for backed in [true, false] {
+        for quorum in [true, false] {
             if Instant::now() >= deadline {
                 break;
             }
-            let wanted = WantedIter::new(self, source, backed, now, &error);
-            fetch_wanted(wanted, take, deadline, ask, |key, listing, failed| {
-                sink.add(key, listing, failed);
-            })
-            .await;
+            let wanted = WantedIter::new(self, source, quorum, now, &error);
+            self.fetch_wanted_into(wanted, deadline, &mut sink).await;
             sink.flush()?;
             if let Some(e) = error.borrow_mut().take() {
                 return Err(e);
@@ -1455,13 +1716,65 @@ impl Producer {
         sink.flush()
     }
 
+    /// Fetch the full listings behind the digest entries of `addresses`, as
+    /// [`Self::fetch_for`] fetches those of a source: those a quorum of
+    /// their nearest nodes name first.
+    ///
+    /// # Errors
+    ///
+    /// If the store can't be read or written.
+    async fn fetch_addresses(&self, addresses: &[XorName], deadline: Instant) -> Result<()> {
+        let now = unix_now();
+        let work = self.work_of(addresses)?;
+        let mut wanted = self.wanted_of(&work, true, now)?;
+        wanted.extend(self.wanted_of(&work, false, now)?);
+        if wanted.is_empty() {
+            return Ok(());
+        }
+        let mut sink = FetchSink::new(self, now);
+        self.fetch_wanted_into(wanted.into_iter(), deadline, &mut sink)
+            .await;
+        sink.flush()
+    }
+
+    /// Fetch `wanted` ([`fetch_wanted`]) through this producer's requests,
+    /// within each node's allowance this cycle, into `sink`.
+    async fn fetch_wanted_into(
+        &self,
+        wanted: impl Iterator<Item = Wanted>,
+        deadline: Instant,
+        sink: &mut FetchSink<'_>,
+    ) {
+        let Some(requests) = self.requests.as_ref() else {
+            return;
+        };
+        let (client, feeds, budget) = (&self.client, &self.feeds, &self.fetch_budget);
+        let take = move |peer: &PeerId| budget.take(peer, || feeds.page_allowance(peer));
+        let unanswered = move |peer: &PeerId| budget.exhaust(peer);
+        let ask = move |peer: PeerId, address: XorName| async move {
+            client
+                .ask_for_listing(requests, &address, &[peer])
+                .await
+                .into_iter()
+                .next()
+                .and_then(|(_, answer)| answer)
+        };
+        fetch_wanted(
+            wanted,
+            take,
+            unanswered,
+            deadline,
+            ask,
+            |key, listing, failed| sink.add(key, listing, failed),
+        )
+        .await;
+    }
+
     /// The full listings to fetch for the next batch of `source` after
-    /// `after`, of addresses at least a quorum of whose nearest nodes hold an
-    /// entry if `backed`, else of the others: each digest an entry names
-    /// that isn't kept, with the nodes whose entries name it but those that
-    /// failed to hand it over less than [`RETRY_INTERVAL`] before `now`.
-    /// Also returns the batch's last address, and whether the batch was the
-    /// last.
+    /// `after` ([`Self::batch_of`]): of the digests a quorum of each
+    /// address's nearest nodes name if `quorum`, else of the others
+    /// ([`Self::wanted_of`]). Also returns the batch's last address, and
+    /// whether the batch was the last.
     ///
     /// # Errors
     ///
@@ -1470,20 +1783,42 @@ impl Producer {
         &self,
         source: Source,
         after: Option<&XorName>,
-        backed: bool,
+        quorum: bool,
         now: u64,
     ) -> Result<(Vec<Wanted>, Option<XorName>, bool)> {
-        let batch = self.next_batch(source, after)?;
-        let last = batch.last().map(|(address, _)| *address);
-        let done = batch.len() < DECIDE_BATCH;
+        let (batch, last, done) = self.batch_of(source, after)?;
+        let addresses: Vec<XorName> = batch.iter().map(|(address, _)| *address).collect();
+        let work = self.work_of(&addresses)?;
+        Ok((self.wanted_of(&work, quorum, now)?, last, done))
+    }
+
+    /// Each of `addresses` that has copies this cycle, with them.
+    ///
+    /// # Errors
+    ///
+    /// If the store can't be read.
+    fn work_of(&self, addresses: &[XorName]) -> Result<Vec<Work>> {
         let mut work: Vec<Work> = Vec::new();
-        for (address, _) in &batch {
+        for address in addresses {
             let nearest = self.census.nearest(address, NEAREST_NODES);
             let copies = self.feeds.copies(address, &nearest)?;
-            if (copies.len() >= QUORUM_THRESHOLD) == backed && !copies.is_empty() {
+            if !copies.is_empty() {
                 work.push((*address, Vec::new(), copies));
             }
         }
+        Ok(work)
+    }
+
+    /// The full listings to fetch for `work` ([`fetches_wanted`]): each
+    /// digest an entry names that isn't kept, of those a quorum of the
+    /// address's nearest nodes name if `quorum`, else of the others, with
+    /// the nodes whose entries name it but those that failed to hand it over
+    /// less than [`RETRY_INTERVAL`] before `now`.
+    ///
+    /// # Errors
+    ///
+    /// If the store can't be read.
+    fn wanted_of(&self, work: &[Work], quorum: bool, now: u64) -> Result<Vec<Wanted>> {
         let txn = self.store.env().read_txn().map_err(store_error)?;
         let failed = |peer: &PeerId, (address, digest): &ListingId| {
             self.known
@@ -1498,7 +1833,7 @@ impl Producer {
                 .get(&txn, &listing_key(address, digest))
                 .is_ok_and(|kept| kept.is_some())
         };
-        Ok((fetches_wanted(&work, failed, kept), last, done))
+        Ok(fetches_wanted(work, quorum, failed, kept))
     }
 
     /// What deciding an address needs to know of the nodes, as an index
@@ -1561,7 +1896,7 @@ impl Producer {
     /// decisions stand: listed, or rejected for good. A listed file whose
     /// data map is shrunk is published with the size kept for it
     /// ([`SIZES_DB`]), or if none is, without, and its root map is to be
-    /// read ([`SIZE_WANTED_TAG`]).
+    /// read ([`SIZE_WANTED_DB`]).
     ///
     /// # Errors
     ///
@@ -1602,22 +1937,28 @@ impl Producer {
         let wanted = std::mem::take(&mut tally.wanted_sizes);
         let mut txn = self.store.env().write_txn().map_err(store_error)?;
         for (address, map) in wanted {
-            let row = tagged(SIZE_WANTED_TAG, &address);
-            if self.known.get(&txn, &row).map_err(store_error)?.is_none() {
+            // One already wanted keeps when it may be read next: a read
+            // begun before a stop isn't begun again at once.
+            if self
+                .size_wanted
+                .get(&txn, &address)
+                .map_err(store_error)?
+                .is_none()
+            {
                 let mut value = 0u64.to_be_bytes().to_vec();
                 value.extend(
                     rmp_serde::to_vec(&map)
                         .map_err(|e| Error::Serialization(format!("a data map: {e}")))?,
                 );
-                self.known
-                    .put(&mut txn, &row, &value)
+                self.size_wanted
+                    .put(&mut txn, &address, &value)
                     .map_err(store_error)?;
             }
         }
         for change in &publication.changes {
             if let IndexChange::Remove { address, .. } = change {
-                self.known
-                    .delete(&mut txn, &tagged(SIZE_WANTED_TAG, address))
+                self.size_wanted
+                    .delete(&mut txn, address)
                     .map_err(store_error)?;
             }
         }
@@ -1650,6 +1991,12 @@ impl Producer {
                 .map_err(store_error)?;
             self.known
                 .delete(&mut txn, &tagged(BACKOFF_TAG, address))
+                .map_err(store_error)?;
+        }
+        // A kept listing that can't be read back goes, to be fetched again.
+        for (address, digest) in &decided.unreadable {
+            self.listings
+                .delete(&mut txn, &listing_key(address, digest))
                 .map_err(store_error)?;
         }
         for address in &decided.settle {
@@ -1802,34 +2149,33 @@ impl Producer {
     }
 
     /// Start reading the root maps of up to [`SIZES_PER_CYCLE`] listed files
-    /// whose sizes aren't known yet, in a task of its own, for at most a
-    /// [`CYCLE`]; unless such a task is still reading, or what it read is
-    /// still to be taken. A root map that couldn't be read before is read
-    /// again only [`RETRY_INTERVAL`] after; one not read by the end is read
-    /// again by a later task.
+    /// whose sizes aren't known yet ([`read_root_size`]), in a task of its
+    /// own, for at most a [`CYCLE`]; unless such a task is still reading, or
+    /// what it read is still to be taken. Each read is marked before it
+    /// begins, so the map isn't read again for [`RETRY_INTERVAL`] unless it
+    /// gives a size: one that couldn't be read, that the end cut short, or
+    /// that a stop of the process cut short waits as long.
     ///
     /// # Errors
     ///
-    /// If the store can't be read.
+    /// If the store can't be read or written.
     fn start_sizes(&mut self) -> Result<()> {
         if self.size_job.is_some() {
             return Ok(());
         }
         let until = Instant::now() + CYCLE;
         let now = unix_now();
+        let next = now.saturating_add(RETRY_INTERVAL.as_secs());
         let mut due: Vec<(XorName, DataMap)> = Vec::new();
         {
-            let txn = self.store.env().read_txn().map_err(store_error)?;
-            for row in self
-                .known
-                .prefix_iter(&txn, &[SIZE_WANTED_TAG])
-                .map_err(store_error)?
-            {
-                if due.len() == SIZES_PER_CYCLE {
+            let mut txn = self.store.env().write_txn().map_err(store_error)?;
+            let mut rows: Vec<(XorName, Vec<u8>)> = Vec::new();
+            for row in self.size_wanted.iter(&txn).map_err(store_error)? {
+                if rows.len() == SIZES_PER_CYCLE {
                     break;
                 }
                 let (key, value) = row.map_err(store_error)?;
-                let Some(address) = key.get(1..).and_then(|a| XorName::try_from(a).ok()) else {
+                let Ok(address) = XorName::try_from(key) else {
                     continue;
                 };
                 let Some((retry_at, map)) = value.split_first_chunk::<8>() else {
@@ -1838,39 +2184,43 @@ impl Producer {
                 if u64::from_be_bytes(*retry_at) > now {
                     continue;
                 }
-                if let Ok(map) = rmp_serde::from_slice::<DataMap>(map) {
-                    due.push((address, map));
-                }
+                rows.push((address, map.to_vec()));
             }
+            for (address, map) in rows {
+                // A map that can't be decoded never gives a size.
+                let decoded = rmp_serde::from_slice::<DataMap>(&map).ok();
+                let mut value = decoded
+                    .as_ref()
+                    .map_or(u64::MAX, |_| next)
+                    .to_be_bytes()
+                    .to_vec();
+                value.extend_from_slice(&map);
+                self.size_wanted
+                    .put(&mut txn, &address, &value)
+                    .map_err(store_error)?;
+                due.extend(decoded.map(|map| (address, map)));
+            }
+            txn.commit().map_err(store_error)?;
         }
         if due.is_empty() {
             return Ok(());
         }
         let client = Arc::clone(&self.client);
+        let room = Arc::clone(&self.size_room);
         let (sender, results) = tokio::sync::oneshot::channel();
         let task = tokio::spawn(async move {
-            let client = &client;
+            let (client, room) = (&client, &room);
             let mut reads = stream::iter(due)
                 .map(|(address, map)| async move {
                     let started = std::time::Instant::now();
-                    match client.data_map_resolve_root(&map).await {
-                        Ok(root) => {
-                            debug!(
-                                "Read the root map of {} in {} ms",
-                                hex::encode(address),
-                                started.elapsed().as_millis()
-                            );
-                            (address, root_size(&root))
-                        }
-                        Err(error) => {
-                            debug!(
-                                "Could not read the root map of {} in {} ms: {error}",
-                                hex::encode(address),
-                                started.elapsed().as_millis()
-                            );
-                            (address, None)
-                        }
-                    }
+                    let fetch = |chunk: [u8; 32]| client.data_record(chunk);
+                    let read = read_root_size(&map, fetch, room).await;
+                    debug!(
+                        "Reading the root map of {} gave {read:?} in {} ms",
+                        hex::encode(address),
+                        started.elapsed().as_millis()
+                    );
+                    (address, read)
                 })
                 .buffer_unordered(SIZES_PER_CYCLE);
             let mut read = Vec::new();
@@ -1883,50 +2233,57 @@ impl Producer {
         Ok(())
     }
 
-    /// Take the sizes `read`: keep each one read, and fill it in to its
-    /// entry where that has none, as a put published with the latest
-    /// cycle's `status.json`; a root map that couldn't be read is read again
-    /// after [`RETRY_INTERVAL`].
+    /// Take what the root maps `read` gave: keep each size read, and fill it
+    /// in to its entry where that has none, as a put published with the
+    /// latest cycle's `status.json`. A map that can never give a size isn't
+    /// read again: its entry keeps none. One that couldn't be read is read
+    /// again once [`RETRY_INTERVAL`] has passed since it began.
     ///
     /// # Errors
     ///
     /// If the store or the published files can't be written.
-    async fn take_sizes(&mut self, read: Vec<(XorName, Option<u64>)>) -> Result<()> {
+    async fn take_sizes(&mut self, read: Vec<(XorName, SizeRead)>) -> Result<()> {
         if read.is_empty() {
             return Ok(());
         }
         let now = unix_now();
-        let retry_at = now.saturating_add(RETRY_INTERVAL.as_secs());
         let mut sized: Vec<(XorName, u64)> = Vec::new();
         let mut txn = self.store.env().write_txn().map_err(store_error)?;
-        for (address, size) in read {
-            let row = tagged(SIZE_WANTED_TAG, &address);
-            match size {
-                Some(size) => {
+        for (address, read) in read {
+            match read {
+                SizeRead::Sized(size) => {
                     self.sizes
                         .put(&mut txn, &address, &size)
                         .map_err(store_error)?;
-                    self.known.delete(&mut txn, &row).map_err(store_error)?;
+                    self.size_wanted
+                        .delete(&mut txn, &address)
+                        .map_err(store_error)?;
                     sized.push((address, size));
                 }
-                None => {
+                SizeRead::Never => {
+                    info!(
+                        "The data map of {} gives no size that can be read: its entry keeps none",
+                        hex::encode(address)
+                    );
                     let value = self
-                        .known
-                        .get(&txn, &row)
+                        .size_wanted
+                        .get(&txn, &address)
                         .map_err(store_error)?
                         .map(|value| {
                             let mut value = value.to_vec();
                             if value.len() >= 8 {
-                                value[..8].copy_from_slice(&retry_at.to_be_bytes());
+                                value[..8].copy_from_slice(&u64::MAX.to_be_bytes());
                             }
                             value
                         });
                     if let Some(value) = value {
-                        self.known
-                            .put(&mut txn, &row, &value)
+                        self.size_wanted
+                            .put(&mut txn, &address, &value)
                             .map_err(store_error)?;
                     }
                 }
+                // When it may be read next was set as it began.
+                SizeRead::Later => {}
             }
         }
         txn.commit().map_err(store_error)?;
@@ -2065,9 +2422,13 @@ impl Producer {
             decided,
             too_few_answered: too_few,
         };
+        // Totals count every listings message, those between cycles (pushes,
+        // and what they led to fetch) with the next cycle's.
         self.totals.cycles += 1;
-        self.totals.bytes_in += cycle.bytes_in;
-        self.totals.bytes_out += cycle.bytes_out;
+        let (counted_in, counted_out) = self.traffic_counted;
+        self.totals.bytes_in += after.bytes_in.saturating_sub(counted_in);
+        self.totals.bytes_out += after.bytes_out.saturating_sub(counted_out);
+        self.traffic_counted = (after.bytes_in, after.bytes_out);
         self.totals.rpc = self.chain.rpc_calls();
         Ok(Status {
             cycle,
@@ -2157,11 +2518,11 @@ enum Between {
     /// A push came, or no sender is left.
     Push(Option<(PeerId, ChangesResponse)>),
     /// The sizes being read were read.
-    Sizes(Vec<(XorName, Option<u64>)>),
+    Sizes(Vec<(XorName, SizeRead)>),
 }
 
 /// The sizes `job` read, once it has; never while there is no job.
-async fn sizes_read(job: &mut Option<SizeJob>) -> Vec<(XorName, Option<u64>)> {
+async fn sizes_read(job: &mut Option<SizeJob>) -> Vec<(XorName, SizeRead)> {
     match job {
         Some(job) => (&mut job.results).await.unwrap_or_default(),
         None => std::future::pending().await,
@@ -2174,7 +2535,8 @@ struct FetchSink<'a> {
     producer: &'a Producer,
     /// When the fetching began (Unix seconds).
     now: u64,
-    fetched: Vec<(ListingId, Listing)>,
+    /// Each listing fetched, in the bytes it is kept in ([`kept_bytes`]).
+    fetched: Vec<(ListingId, Vec<u8>)>,
     failed: Vec<(PeerId, ListingId)>,
     error: Option<Error>,
 }
@@ -2192,7 +2554,7 @@ impl<'a> FetchSink<'a> {
 
     /// One listing fetched, or not, and the nodes that failed to hand it
     /// over: written once a chunk has come.
-    fn add(&mut self, key: ListingId, listing: Option<Listing>, failed: Vec<PeerId>) {
+    fn add(&mut self, key: ListingId, listing: Option<Vec<u8>>, failed: Vec<PeerId>) {
         if let Some(listing) = listing {
             self.fetched.push((key, listing));
         }
@@ -2221,13 +2583,7 @@ impl<'a> FetchSink<'a> {
         let producer = self.producer;
         let retry_at = self.now.saturating_add(RETRY_INTERVAL.as_secs());
         let mut txn = producer.store.env().write_txn().map_err(store_error)?;
-        for ((address, digest), listing) in self.fetched.drain(..) {
-            let listing = Listing {
-                first_seen: None,
-                ..listing
-            };
-            let bytes = rmp_serde::to_vec(&listing)
-                .map_err(|e| Error::Serialization(format!("a fetched listing: {e}")))?;
+        for ((address, digest), bytes) in self.fetched.drain(..) {
             producer
                 .listings
                 .put(&mut txn, &listing_key(&address, &digest), &bytes)
@@ -2253,7 +2609,8 @@ impl<'a> FetchSink<'a> {
 struct WantedIter<'a> {
     producer: &'a Producer,
     source: Source,
-    backed: bool,
+    /// Whether for the digests a quorum names ([`Producer::wanted_of`]).
+    quorum: bool,
     now: u64,
     after: Option<XorName>,
     done: bool,
@@ -2265,14 +2622,14 @@ impl<'a> WantedIter<'a> {
     fn new(
         producer: &'a Producer,
         source: Source,
-        backed: bool,
+        quorum: bool,
         now: u64,
         error: &'a std::cell::RefCell<Option<Error>>,
     ) -> Self {
         Self {
             producer,
             source,
-            backed,
+            quorum,
             now,
             after: None,
             done: false,
@@ -2296,7 +2653,7 @@ impl Iterator for WantedIter<'_> {
             match self.producer.wanted_after(
                 self.source,
                 self.after.as_ref(),
-                self.backed,
+                self.quorum,
                 self.now,
             ) {
                 Ok((wanted, last, done)) => {
@@ -2322,27 +2679,74 @@ impl Iterator for WantedIter<'_> {
 /// nodes whose listing isn't fetched: their copies can't be had this time,
 /// and they count as nodes not heard from ([`Client::decide_backed`]), so
 /// no one node can keep an address from being decided by failing to hand
-/// over its listing.
+/// over its listing. Each digest is read once, however many copies share
+/// it.
 fn copies_from(
-    fetched: impl Fn(&[u8; 32]) -> Option<Listing>,
+    mut fetched: impl FnMut(&[u8; 32]) -> Option<Listing>,
     copies: &[(PeerId, DigestEntry)],
 ) -> (Vec<(PeerId, Listing)>, Vec<PeerId>) {
+    let mut read: HashMap<[u8; 32], Option<Listing>> = HashMap::new();
     let mut listed = Vec::with_capacity(copies.len());
     let mut unheard = Vec::new();
     for (peer, entry) in copies {
-        let Some(listing) = fetched(&entry.digest) else {
+        let listing = read
+            .entry(entry.digest)
+            .or_insert_with(|| fetched(&entry.digest));
+        let Some(listing) = listing else {
             unheard.push(*peer);
             continue;
         };
         let copy = Listing {
             first_seen: entry.first_seen,
-            ..listing
+            ..listing.clone()
         };
         if entry.describes(&copy) && copy.validate().is_ok() {
             listed.push((*peer, copy));
         }
     }
     (listed, unheard)
+}
+
+/// A full listing as the store keeps it ([`Producer::kept_listing`]).
+enum Kept {
+    /// The listing, without `first_seen`.
+    Listing(Box<Listing>),
+    /// None is kept.
+    None,
+    /// One is kept that can't be read back: it is let go, to be fetched
+    /// again.
+    Unreadable,
+}
+
+/// The bytes `listing` is kept in, without `first_seen`: those a
+/// `GetResponse` carries it in, the crate's wire encoding. `None` if it
+/// takes more than [`MAX_LISTING_BYTES`], or can't be encoded: out of
+/// spec, not kept.
+fn kept_bytes(listing: &Listing) -> Option<Vec<u8>> {
+    let message = ListingsMessage {
+        request_id: 0,
+        body: ListingsBody::GetResponse {
+            listing: Some(Listing {
+                first_seen: None,
+                ..listing.clone()
+            }),
+        },
+    };
+    let bytes = message.encode().ok()?;
+    (bytes.len() <= MAX_LISTING_BYTES).then_some(bytes)
+}
+
+/// The listing `bytes` keep ([`kept_bytes`]), if they can be read back.
+fn kept_listing(bytes: &[u8]) -> Option<Listing> {
+    if bytes.len() > MAX_LISTING_BYTES {
+        return None;
+    }
+    match ListingsMessage::decode(bytes).ok()?.body {
+        ListingsBody::GetResponse {
+            listing: Some(listing),
+        } if listing.first_seen.is_none() => Some(listing),
+        _ => None,
+    }
 }
 
 /// How many more `GetRequest`s for full listings each node may be sent
@@ -2371,73 +2775,115 @@ impl FetchBudget {
         *left -= 1;
         true
     }
+
+    /// `peer` left a request unanswered: it is sent nothing more this cycle.
+    fn exhaust(&self, peer: &PeerId) {
+        if let Ok(mut left) = self.0.lock() {
+            left.insert(*peer, 0);
+        }
+    }
 }
 
 /// The full listings to fetch for `work`: each digest an entry names that
-/// isn't `kept` yet, with the nodes holding an entry with it, but those that
-/// `failed` to hand it over lately. Those of addresses at least a quorum of
-/// whose nearest nodes hold an entry first, then the others, each in
-/// address order.
+/// isn't `kept` yet, with the nodes holding an entry with it, nearest first,
+/// but those that `failed` to hand it over lately. With `quorum`, only the
+/// digests at least [`QUORUM_THRESHOLD`] of the address's nearest nodes
+/// name; without, only the others. In address order, and for an address,
+/// the digests most nodes name first. So a node that makes up entries,
+/// named by it alone, can't keep the listing a quorum serves from being
+/// fetched: [`Producer::fetch_for`] fetches every digest a quorum names
+/// before any other.
 fn fetches_wanted(
     work: &[Work],
+    quorum: bool,
     failed: impl Fn(&PeerId, &ListingId) -> bool,
     kept: impl Fn(&ListingId) -> bool,
 ) -> Vec<Wanted> {
-    let mut wanted: BTreeMap<ListingId, (bool, DigestCopies)> = BTreeMap::new();
+    let mut wanted = Vec::new();
     for (address, _, copies) in work {
-        let backed = copies.len() >= QUORUM_THRESHOLD;
+        // Each digest its entries name: how many name it, and whom to ask.
+        let mut digests: BTreeMap<[u8; 32], (usize, DigestCopies)> = BTreeMap::new();
         for (peer, entry) in copies {
-            let key = (*address, entry.digest);
-            if failed(peer, &key) {
-                continue;
+            let slot = digests.entry(entry.digest).or_default();
+            slot.0 += 1;
+            if !failed(peer, &(*address, entry.digest)) {
+                slot.1.push((*peer, *entry));
             }
-            let slot = wanted.entry(key).or_insert((backed, Vec::new()));
-            slot.0 |= backed;
-            slot.1.push((*peer, *entry));
         }
+        let mut named: Vec<(usize, ListingId, DigestCopies)> = digests
+            .into_iter()
+            .filter(|(digest, (count, holders))| {
+                (*count >= QUORUM_THRESHOLD) == quorum
+                    && !holders.is_empty()
+                    && !kept(&(*address, *digest))
+            })
+            .map(|(digest, (count, holders))| (count, (*address, digest), holders))
+            .collect();
+        named.sort_by_key(|(count, _, _)| std::cmp::Reverse(*count));
+        wanted.extend(named.into_iter().map(|(_, key, holders)| (key, holders)));
     }
-    let mut wanted: Vec<(bool, ListingId, DigestCopies)> = wanted
-        .into_iter()
-        .filter(|(key, _)| !kept(key))
-        .map(|(key, (backed, holders))| (backed, key, holders))
-        .collect();
-    wanted.sort_by_key(|(backed, _, _)| !*backed);
     wanted
-        .into_iter()
-        .map(|(_, key, holders)| (key, holders))
-        .collect()
 }
 
 /// Fetch each of `wanted` ([`fetches_wanted`]), taken as the fetches go,
-/// from its holders, one after another until one hands over a listing its
-/// entry describes, through `ask` (a `GetRequest` to a node for an address:
-/// `None` if it didn't answer, `Some(None)` if it holds none),
-/// [`POLL_CONCURRENCY`] at a time. A holder is asked only if `take` gives it
-/// a request from its allowance. What hasn't come by `deadline` is left.
-/// Each fetch, when it ends, goes to `done`: the listing, if one was handed
-/// over, and each holder that was asked and failed to hand one over.
+/// from its holders, until one hands over a listing its entry describes,
+/// through `ask` (a `GetRequest` to a node for an address: `None` if it
+/// didn't answer, `Some(None)` if it holds none), [`POLL_CONCURRENCY`] at a
+/// time. A node is sent one request at a time: a fetch whose next holder is
+/// busy asks the first of its holders that isn't, or waits for whichever is
+/// free first. A holder is asked only if `take` gives it a request from its
+/// allowance; one that leaves a request unanswered goes to `unanswered`,
+/// which takes the rest of its allowance, so a node that never answers
+/// costs at most one request's wait a cycle. A listing that takes more than
+/// [`MAX_LISTING_BYTES`] isn't taken: its node failed to hand it over. What
+/// hasn't come by `deadline` is left. Each fetch, when it ends, goes to
+/// `done`: the listing, in the bytes it is kept in ([`kept_bytes`]), if one
+/// was handed over, and each holder that was asked and failed to hand one
+/// over.
 async fn fetch_wanted<A, Fut>(
     wanted: impl Iterator<Item = Wanted>,
     take: impl Fn(&PeerId) -> bool + Copy,
+    unanswered: impl Fn(&PeerId) + Copy,
     deadline: Instant,
     ask: A,
-    mut done: impl FnMut(ListingId, Option<Listing>, Vec<PeerId>),
+    mut done: impl FnMut(ListingId, Option<Vec<u8>>, Vec<PeerId>),
 ) where
     A: Fn(PeerId, XorName) -> Fut + Copy,
     Fut: std::future::Future<Output = Option<Option<Listing>>>,
 {
+    let slots = NodeSlots::default();
+    let slots = &slots;
     let mut fetches = stream::iter(wanted)
         .map(|(key, holders)| async move {
+            let mut left = holders;
             let mut failed = Vec::new();
-            for (peer, entry) in holders {
+            while !left.is_empty() {
+                let Some((index, _slot)) = slots.first_free(&left).await else {
+                    break;
+                };
+                let (peer, entry) = left.remove(index);
                 if !take(&peer) {
                     continue;
                 }
                 match ask(peer, key.0).await {
-                    Some(Some(listing)) if entry.describes(&listing) => {
-                        return (key, Some(listing), failed);
+                    None => {
+                        unanswered(&peer);
+                        failed.push(peer);
                     }
-                    _ => failed.push(peer),
+                    Some(Some(listing)) if entry.describes(&listing) => {
+                        match kept_bytes(&listing) {
+                            Some(bytes) => return (key, Some(bytes), failed),
+                            None => {
+                                debug!(
+                                    "{peer} handed over a listing for {} larger than \
+                                     {MAX_LISTING_BYTES} bytes",
+                                    hex::encode(key.0)
+                                );
+                                failed.push(peer);
+                            }
+                        }
+                    }
+                    Some(_) => failed.push(peer),
                 }
             }
             (key, None, failed)
@@ -2452,6 +2898,47 @@ async fn fetch_wanted<A, Fut>(
                 break;
             }
         }
+    }
+}
+
+/// One request in flight to each node at a time ([`fetch_wanted`]).
+#[derive(Debug, Default)]
+struct NodeSlots(Mutex<HashMap<PeerId, Arc<Semaphore>>>);
+
+impl NodeSlots {
+    /// `peer`'s slot.
+    fn slot(&self, peer: &PeerId) -> Arc<Semaphore> {
+        let mut slots = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        Arc::clone(
+            slots
+                .entry(*peer)
+                .or_insert_with(|| Arc::new(Semaphore::new(1))),
+        )
+    }
+
+    /// The place among `holders` of the first with no request in flight, with
+    /// its slot held; if all have one, of the first to be free. `None` if
+    /// none is left.
+    async fn first_free(
+        &self,
+        holders: &[(PeerId, DigestEntry)],
+    ) -> Option<(usize, tokio::sync::OwnedSemaphorePermit)> {
+        for (index, (peer, _)) in holders.iter().enumerate() {
+            if let Ok(permit) = self.slot(peer).try_acquire_owned() {
+                return Some((index, permit));
+            }
+        }
+        if holders.is_empty() {
+            return None;
+        }
+        let waits = holders
+            .iter()
+            .map(|(peer, _)| Box::pin(self.slot(peer).acquire_owned()));
+        let (permit, index, _) = futures::future::select_all(waits).await;
+        permit.ok().map(|permit| (index, permit))
     }
 }
 
@@ -2557,31 +3044,41 @@ fn unsettled(chain: &ListingChain, row: &RejectedListing) -> bool {
 }
 
 impl Seen {
-    /// What deciding keeps of `found`, whose copies were taken, and of which
-    /// some couldn't be had if `unheard`.
-    fn of(found: &AddressWalk<PeerId>, unheard: bool) -> Self {
+    /// What deciding keeps of `found`, whose copies were taken.
+    fn of(found: &AddressWalk<PeerId>) -> Self {
         Self {
             address: found.address,
             nearest: nearest_hash(&found.nearest),
             holders: found.copies.iter().map(|(peer, _)| *peer).collect(),
-            unheard,
         }
     }
 }
 
-/// Wait until the clock is past second `second` (Unix seconds).
+/// Wait until the clock is past second `second` (Unix seconds), the second
+/// the latest publication ended in: until the next second, at most. A
+/// clock that is behind `second` was set back since: waiting for it to
+/// catch up would hold every publication up for as long, so none is waited
+/// for, and the second may repeat.
 async fn wait_past(second: u64) {
     loop {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default();
-        if now.as_secs() > second {
-            return;
+        match now.as_secs().cmp(&second) {
+            std::cmp::Ordering::Greater => return,
+            std::cmp::Ordering::Less => {
+                warn!(
+                    "The clock is {} s behind the latest publication: it was set back",
+                    second - now.as_secs()
+                );
+                return;
+            }
+            std::cmp::Ordering::Equal => {
+                let rest = Duration::from_secs(1)
+                    .saturating_sub(Duration::from_nanos(u64::from(now.subsec_nanos())));
+                tokio::time::sleep(rest).await;
+            }
         }
-        let rest = Duration::from_secs(1)
-            .saturating_sub(Duration::from_nanos(u64::from(now.subsec_nanos())));
-        let ahead = Duration::from_secs(second.saturating_sub(now.as_secs()));
-        tokio::time::sleep(ahead + rest).await;
     }
 }
 
@@ -2809,20 +3306,90 @@ fn root_size(root: &DataMap) -> Option<u64> {
     })
 }
 
-/// Why the published entry at `address`, with key `key`, that `index`
-/// didn't list goes, if it does: `rejected` when `index` decided the address
-/// and rejected it, or left it for later with every copy its nearest nodes
-/// serve showing a payment from before the payment vault was deployed
-/// ([`paid_before_vault`]), which can never count however many nodes come to
-/// serve it, so such a listing never shows. Otherwise (left for later) it is
-/// kept, carried.
-fn removal(index: &ListingsIndex, address: &XorName, key: &ListingKey) -> Option<RemoveReason> {
-    let rejected = index.carry(address, key) == Carry::Decided
-        || index
-            .pending_copies
-            .get(address)
-            .is_some_and(|copies| paid_before_vault(copies));
+/// The size of the file whose data map is `map`, read from its root map
+/// ([`root_size`]) within bounds, fetching the chunks it needs through
+/// `fetch` (a chunk's record by its address). `map` must be shrunk once:
+/// at most [`SHRUNK_CHUNKS`] chunks, declaring at most
+/// [`MAX_ROOT_MAP_BYTES`] between them, that decrypt to a root map. Each
+/// chunk's record must have its address, and each decrypts to no more than
+/// the size `map` declares for it, with the hash it declares
+/// ([`DataMapIndex::decrypt_chunk`]), so no chunk can expand past what
+/// `map` declares. The bytes declared are held in `room` (a permit a KiB)
+/// while they are read, so the reads at once hold at most what `room`
+/// gives. A map that breaks any of this never gives a size
+/// ([`SizeRead::Never`]); one whose chunk wasn't handed over, or not as its
+/// address says, may later ([`SizeRead::Later`]).
+async fn read_root_size<F, Fut>(map: &DataMap, fetch: F, room: &Semaphore) -> SizeRead
+where
+    F: Fn([u8; 32]) -> Fut,
+    Fut: std::future::Future<Output = Result<bytes::Bytes>>,
+{
+    if !map.is_child() {
+        return root_size(map).map_or(SizeRead::Never, SizeRead::Sized);
+    }
+    let Ok(index) = DataMapIndex::new(map) else {
+        return SizeRead::Never;
+    };
+    let declared = usize::try_from(index.file_size()).unwrap_or(usize::MAX);
+    if index.infos().len() > SHRUNK_CHUNKS || declared > MAX_ROOT_MAP_BYTES {
+        return SizeRead::Never;
+    }
+    let permits = u32::try_from(declared.div_ceil(1024)).unwrap_or(u32::MAX);
+    let Ok(_room) = room.acquire_many(permits).await else {
+        return SizeRead::Later;
+    };
+    let mut content = Vec::with_capacity(declared);
+    for (chunk, info) in index.infos().iter().enumerate() {
+        let address = info.dst_hash.0;
+        let Ok(record) = fetch(address).await else {
+            return SizeRead::Later;
+        };
+        if crate::record::verify(&address, &record).is_err() {
+            return SizeRead::Later;
+        }
+        match index.decrypt_chunk(chunk, &record) {
+            Ok(plain) => content.extend_from_slice(&plain),
+            Err(_) => return SizeRead::Never,
+        }
+    }
+    match DataMap::from_bytes(&content) {
+        Ok(root) if !root.is_child() => root_size(&root).map_or(SizeRead::Never, SizeRead::Sized),
+        _ => SizeRead::Never,
+    }
+}
+
+/// Why the published entry at `address`, with key `key` and showing
+/// `shown`, that `index` didn't list goes, if it does: `rejected` when
+/// `index` decided the address and rejected it, or when the entry itself
+/// shows a payment from before the payment vault was deployed
+/// ([`shows_payment_before_vault`]). Every copy of such a listing shows that
+/// payment, so it can never count, however many nodes come to serve it, and
+/// it never shows. Otherwise (left for later) it is kept, carried: what
+/// copies of other listings for the address show, or which nodes answered
+/// this cycle, doesn't remove it.
+fn removal(
+    index: &ListingsIndex,
+    address: &XorName,
+    key: &ListingKey,
+    shown: &ListingFields,
+    chain: &ListingChain,
+) -> Option<RemoveReason> {
+    let rejected =
+        index.carry(address, key) == Carry::Decided || shows_payment_before_vault(shown, chain);
     rejected.then_some(RemoveReason::Rejected)
+}
+
+/// Whether `shown`, what a published entry shows, shows a payment from
+/// before `chain`'s payment vault was deployed: a block before the one it
+/// was deployed in, or a block timestamp before that block's, as a pending
+/// copy is marked ([`PendingCopy::before_vault_deployment`]).
+fn shows_payment_before_vault(shown: &ListingFields, chain: &ListingChain) -> bool {
+    shown
+        .block_number
+        .is_some_and(|block| chain.before_vault_deployment(block))
+        || shown
+            .block_timestamp
+            .is_some_and(|time| chain.timed_before_vault_deployment(time))
 }
 
 /// Why an address is rejected for good when every copy its nearest nodes
@@ -2895,9 +3462,9 @@ fn rejected_changes(
         }
         if carried.contains(&address) {
             // Still listed, unconfirmed, and counted above: it gets no row,
-            // and any it has is cleared below. (An address every copy of
-            // which was paid before the vault isn't kept carried: its entry
-            // goes, rejected ([`removal`]).)
+            // and any it has is cleared below. (An entry that itself shows a
+            // payment from before the vault isn't kept carried: it goes,
+            // rejected ([`removal`]).)
             continue;
         }
         let unchanged = existing.get(&entry.listing.address).is_some_and(|old| {
@@ -2967,10 +3534,12 @@ fn tagged(tag: u8, address: &XorName) -> Vec<u8> {
     row
 }
 
-/// This process's resident memory, in bytes, where the system says.
+/// This process's own resident memory, in bytes, where the system says:
+/// its anonymous pages (`RssAnon`), not the store's file pages mapped in,
+/// which the system can drop at any time and which grow with the store.
 fn rss_bytes() -> Option<u64> {
     let status = std::fs::read_to_string("/proc/self/status").ok()?;
-    let line = status.lines().find(|line| line.starts_with("VmRSS:"))?;
+    let line = status.lines().find(|line| line.starts_with("RssAnon:"))?;
     let kib: u64 = line.split_whitespace().nth(1)?.parse().ok()?;
     kib.checked_mul(1024)
 }
@@ -3372,9 +3941,14 @@ mod tests {
     /// The listing at `address`, showing only its block, as a read lists it
     /// when all 7 of its nearest nodes serve it.
     fn checked(address: XorName) -> CheckedListing {
+        checked_at(address, 81_950_000)
+    }
+
+    /// [`checked`], paid in `block`.
+    fn checked_at(address: XorName, block: u64) -> CheckedListing {
         let shown = ShownFields::NONE.with(PaymentField::BlockNumber);
         CheckedListing {
-            listing: showing_block(address, 81_950_000),
+            listing: showing_block(address, block),
             envelope: Envelope::withheld_hash(
                 [0x5a; SALTED_HASH_LEN],
                 Metadata::default(),
@@ -3522,21 +4096,24 @@ mod tests {
     }
 
     #[test]
-    fn a_listed_address_every_copy_of_which_was_paid_before_the_vault_is_removed() {
-        // A listed address that the next cycle can't decide: 2 of its 7
-        // nearest nodes serve it, and both copies were paid before the
-        // payment vault was deployed.
+    fn a_listed_entry_that_shows_a_payment_before_the_vault_is_removed() {
+        // An entry that itself shows a payment from before the payment vault
+        // was deployed, at an address the next cycle can't decide: 2 of its
+        // 7 nearest nodes serve it.
         let x: XorName = [0x3d; 32];
+        let chain = vault_chain();
         let (_dir, mut publisher) = publisher();
         let mut listing = ListingsIndex::default();
-        listing.listings.push(checked(x));
+        listing.listings.push(checked_at(x, 80_204_042));
         publish_read(&mut publisher, &listing, None, AT);
         let key = publisher.keys().unwrap()[0];
+        let shown = publisher.entry(&x).unwrap().unwrap().entry.listing;
         let mut deferring = ListingsIndex::default();
         defer(&mut deferring, x, &[80_204_042, 80_204_042]);
-        // None of its copies can ever count, however many nodes come to
-        // serve them: its entry goes, rejected, rather than staying carried.
-        let reason = removal(&deferring, &x, &key);
+        // Every copy of it shows that payment, so it can never count, however
+        // many nodes come to serve it: it goes, rejected, rather than staying
+        // carried.
+        let reason = removal(&deferring, &x, &key, &shown, &chain);
         assert_eq!(reason, Some(RemoveReason::Rejected));
         let (publication, tally) = publish_read(&mut publisher, &deferring, reason, AT + 60);
         assert_eq!(
@@ -3564,14 +4141,55 @@ mod tests {
             .copies
             .iter()
             .all(|copy| copy.before_vault_deployment));
-
-        // One with a copy paid after the vault was deployed can still count
-        // once 4 nodes serve it: it stays, carried. So does one rejected for
-        // a reason a later cycle may undo, and one too few copies show
-        // anything of.
+        // Whatever other listings for the address its nodes serve, and
+        // however its address is left for later.
         let mut mixed = ListingsIndex::default();
-        defer(&mut mixed, x, &[80_204_042, 81_950_000]);
-        assert_eq!(removal(&mixed, &x, &key), None);
+        defer(&mut mixed, x, &[81_950_000, 81_950_000]);
+        assert_eq!(
+            removal(&mixed, &x, &key, &shown, &chain),
+            Some(RemoveReason::Rejected)
+        );
+        assert_eq!(
+            removal(&ListingsIndex::default(), &x, &key, &shown, &chain),
+            Some(RemoveReason::Rejected)
+        );
+        // So does one that shows only a block timestamp from before then.
+        let timed = ListingFields {
+            block_number: None,
+            block_timestamp: Some(VAULT_TIME - 1),
+            ..shown.clone()
+        };
+        assert_eq!(
+            removal(&mixed, &x, &key, &timed, &chain),
+            Some(RemoveReason::Rejected)
+        );
+    }
+
+    #[test]
+    fn a_listed_entry_paid_to_the_vault_is_kept_whatever_other_copies_show() {
+        // An entry paid to the vault, at an address the cycle can't decide:
+        // the only copies that count this cycle show another listing, paid
+        // before the vault was deployed (its own nodes didn't count, say).
+        let x: XorName = [0x3d; 32];
+        let chain = vault_chain();
+        let (_dir, mut publisher) = publisher();
+        let mut listing = ListingsIndex::default();
+        listing.listings.push(checked(x));
+        publish_read(&mut publisher, &listing, None, AT);
+        let key = publisher.keys().unwrap()[0];
+        let shown = publisher.entry(&x).unwrap().unwrap().entry.listing;
+        let mut stale = ListingsIndex::default();
+        defer(&mut stale, x, &[80_204_042, 80_204_042]);
+        // It stays, carried, as an index read keeps it.
+        assert_eq!(removal(&stale, &x, &key, &shown, &chain), None);
+        let (publication, tally) = publish_read(&mut publisher, &stale, None, AT + 60);
+        assert!(publication.changes.is_empty());
+        assert_eq!((tally.removed, tally.carried), (0, 1));
+        assert!(publisher.entry(&x).unwrap().is_some());
+        // It gets no row while carried.
+        assert!(publisher.rejected_entries().unwrap().is_empty());
+        // Nor does one rejected for a reason a later cycle may undo, or one
+        // no copy of which shows anything.
         let mut unread = ListingsIndex::default();
         unread.rejected.push(RejectedListing {
             listing: showing_block(x, 81_950_000),
@@ -3580,8 +4198,11 @@ mod tests {
             nearest: 7,
             again: true,
         });
-        assert_eq!(removal(&unread, &x, &key), None);
-        assert_eq!(removal(&ListingsIndex::default(), &x, &key), None);
+        assert_eq!(removal(&unread, &x, &key, &shown, &chain), None);
+        assert_eq!(
+            removal(&ListingsIndex::default(), &x, &key, &shown, &chain),
+            None
+        );
     }
 
     #[test]
@@ -3630,6 +4251,16 @@ mod tests {
     /// A payment chain reader that is never asked anything.
     fn idle_chain() -> ListingChain {
         ListingChain::with_rpc("http://127.0.0.1:9".into(), [0x69; 20]).unwrap()
+    }
+
+    /// When the payment vault was deployed, as [`vault_chain`] knows it.
+    const VAULT_TIME: u64 = 1_791_316_916;
+
+    /// [`idle_chain`], knowing when the payment vault was deployed.
+    fn vault_chain() -> ListingChain {
+        idle_chain()
+            .with_vault_deployment_block(VAULT_BLOCK)
+            .with_vault_deployment_time(VAULT_TIME)
     }
 
     #[test]
@@ -3864,49 +4495,88 @@ mod tests {
         showing_block(address, 81_950_000)
     }
 
-    /// The fetches a faulty node `faulty` costs when it advertises `made_up` entries
-    /// no other node holds and never answers for them, beside an honest
-    /// node's entry for `x`: what is fetched and who failed, how many
-    /// requests the faulty node got, and how long it took.
+    /// How a node answers a `GetRequest` in [`fetch_round`].
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Answers {
+        /// With its listing, after 250 ms.
+        Honestly,
+        /// Never: the request times out after 10 s.
+        Never,
+        /// Never, and the request never ends.
+        Hangs,
+        /// With a listing its entry describes, but of `n` bytes of quote.
+        Oversized(usize),
+    }
+
+    /// What a round of fetching gave ([`fetch_round`]).
+    struct Round {
+        /// The listings fetched, as kept.
+        fetched: Vec<(ListingId, Vec<u8>)>,
+        /// The holders that failed to hand one over.
+        refused: Vec<(PeerId, ListingId)>,
+        /// The requests each node was sent.
+        asked: HashMap<PeerId, usize>,
+        /// The most requests in flight to one node at once.
+        most_in_flight: usize,
+        /// How long it took.
+        took: Duration,
+    }
+
+    /// One cycle's fetching of what `work` wants, but what `failed` refused
+    /// lately and what is `kept`, as [`Producer::fetch_for`] fetches: the
+    /// digests a quorum names first, each node within `allowance` requests,
+    /// answering as `answers` says (honestly if it says nothing).
     async fn fetch_round(
         work: &[Work],
         failed: &HashMap<(PeerId, ListingId), u64>,
-        faulty: PeerId,
+        kept: &HashSet<ListingId>,
+        answers: &HashMap<PeerId, Answers>,
+        allowance: impl Fn(&PeerId) -> usize + Copy,
         budget: &FetchBudget,
         deadline: Instant,
-        faulty_hangs: bool,
-    ) -> (
-        Vec<(ListingId, Listing)>,
-        Vec<(PeerId, ListingId)>,
-        usize,
-        Duration,
-    ) {
-        let asked = std::sync::atomic::AtomicUsize::new(0);
-        let wanted = fetches_wanted(
-            work,
-            |peer, key| failed.contains_key(&(*peer, *key)),
-            |_| false,
-        );
+    ) -> Round {
+        let failed = |peer: &PeerId, key: &ListingId| failed.contains_key(&(*peer, *key));
+        let kept = |key: &ListingId| kept.contains(key);
+        let mut wanted = fetches_wanted(work, true, failed, kept);
+        wanted.extend(fetches_wanted(work, false, failed, kept));
         let started = Instant::now();
-        let asked_ref = &asked;
-        let take = |peer: &PeerId| budget.take(peer, || 8);
+        let asked: Mutex<HashMap<PeerId, usize>> = Mutex::new(HashMap::new());
+        let in_flight: Mutex<(HashMap<PeerId, usize>, usize)> = Mutex::new((HashMap::new(), 0));
+        let (asked_ref, in_flight_ref) = (&asked, &in_flight);
+        let take = |peer: &PeerId| budget.take(peer, || allowance(peer));
+        let unanswered = |peer: &PeerId| budget.exhaust(peer);
         let ask = move |peer: PeerId, address: XorName| async move {
-            if peer == faulty {
-                asked_ref.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                if faulty_hangs {
-                    std::future::pending::<()>().await;
-                }
-                tokio::time::sleep(Duration::from_secs(10)).await;
-                None
-            } else {
-                Some(Some(stored(address)))
+            *asked_ref.lock().unwrap().entry(peer).or_default() += 1;
+            {
+                let mut flight = in_flight_ref.lock().unwrap();
+                let now = {
+                    let count = flight.0.entry(peer).or_default();
+                    *count += 1;
+                    *count
+                };
+                flight.1 = flight.1.max(now);
             }
+            let answer = match answers.get(&peer).copied().unwrap_or(Answers::Honestly) {
+                Answers::Honestly => {
+                    tokio::time::sleep(Duration::from_millis(250)).await;
+                    Some(Some(stored(address)))
+                }
+                Answers::Never => {
+                    tokio::time::sleep(Duration::from_secs(10)).await;
+                    None
+                }
+                Answers::Hangs => std::future::pending().await,
+                Answers::Oversized(bytes) => Some(Some(with_quote(address, bytes))),
+            };
+            *in_flight_ref.lock().unwrap().0.entry(peer).or_default() -= 1;
+            answer
         };
         let mut fetched = Vec::new();
         let mut refused = Vec::new();
         fetch_wanted(
             wanted.into_iter(),
             take,
+            unanswered,
             deadline,
             ask,
             |key, listing, failed| {
@@ -3915,61 +4585,182 @@ mod tests {
             },
         )
         .await;
-        (
+        let most_in_flight = in_flight.lock().unwrap().1;
+        Round {
             fetched,
             refused,
-            asked.load(std::sync::atomic::Ordering::Relaxed),
-            started.elapsed(),
-        )
+            asked: asked.into_inner().unwrap(),
+            most_in_flight,
+            took: started.elapsed(),
+        }
+    }
+
+    /// A listing at `address` whose entry describes it, as [`stored`], but
+    /// showing a quote of `bytes` bytes.
+    fn with_quote(address: XorName, bytes: usize) -> Listing {
+        let mut listing = stored(address);
+        listing.flags.shown = listing.flags.shown.with(PaymentField::Quote);
+        listing.payment.quote = Some(vec![7; bytes]);
+        listing
+    }
+
+    /// An address from `n`, spread over the address space.
+    fn spread(n: u32) -> XorName {
+        let mut address = [0x80; 32];
+        address[..4].copy_from_slice(&n.to_be_bytes());
+        address
     }
 
     #[tokio::test(start_paused = true)]
-    async fn a_node_that_never_hands_over_listings_costs_only_its_allowance() {
-        let (faulty, honest) = (PeerId::from_bytes([1; 32]), PeerId::from_bytes([2; 32]));
+    async fn a_node_that_never_answers_costs_one_request_a_cycle() {
+        let faulty = PeerId::from_bytes([1; 32]);
         let x: XorName = [0x3d; 32];
-        // The faulty node advertises 2,048 made-up addresses, each its own; an honest
-        // node and three others serve x.
+        // The faulty node advertises 2,048 made-up addresses, each its own;
+        // five honest nodes serve x.
         let mut work: Vec<Work> = (0..2_048u32)
             .map(|n| {
-                let mut address = [0x80; 32];
-                address[..4].copy_from_slice(&n.to_be_bytes());
-                let entry = DigestEntry::new(&stored(address));
-                (address, Vec::new(), vec![(faulty, entry)])
+                let address = spread(n);
+                (
+                    address,
+                    Vec::new(),
+                    vec![(faulty, DigestEntry::new(&stored(address)))],
+                )
             })
             .collect();
         let entry = DigestEntry::new(&stored(x));
-        let others: Vec<(PeerId, DigestEntry)> = (3..=6u8)
+        let copies: Vec<(PeerId, DigestEntry)> = (2..=6u8)
             .map(|n| (PeerId::from_bytes([n; 32]), entry))
             .collect();
-        let mut copies = vec![(honest, entry)];
-        copies.extend(others);
         work.push((x, Vec::new(), copies));
-        // The address most nodes hold is fetched first.
-        let wanted = fetches_wanted(&work, |_, _| false, |_| false);
+        // The listing a quorum names is fetched first.
+        let wanted = fetches_wanted(&work, true, |_, _| false, |_| false);
+        assert_eq!(wanted.len(), 1);
         assert_eq!(wanted[0].0, (x, entry.digest));
 
+        let answers = HashMap::from([(faulty, Answers::Never)]);
         let mut failed: HashMap<(PeerId, ListingId), u64> = HashMap::new();
         let mut budget = FetchBudget::default();
         let deadline = Instant::now() + CYCLE;
-        let (fetched, refused, asked, took) =
-            fetch_round(&work, &failed, faulty, &budget, deadline, false).await;
-        assert_eq!(fetched.len(), 1, "x is fetched");
-        assert_eq!(fetched[0].0, (x, entry.digest));
-        // Its allowance of 8 requests, all at once: one request's wait.
-        assert_eq!(asked, 8);
-        assert_eq!(refused.len(), 8);
-        assert!(took <= Duration::from_secs(11), "{took:?}");
-        failed.extend(refused.into_iter().map(|failure| (failure, u64::MAX)));
+        let round = fetch_round(
+            &work,
+            &failed,
+            &HashSet::new(),
+            &answers,
+            |_| 8,
+            &budget,
+            deadline,
+        )
+        .await;
+        assert_eq!(round.fetched.len(), 1, "x is fetched");
+        assert_eq!(round.fetched[0].0, (x, entry.digest));
+        // One request, unanswered: nothing more this cycle, whatever it
+        // advertises and whatever its allowance.
+        assert_eq!(round.asked.get(&faulty), Some(&1));
+        assert_eq!(round.refused.len(), 1);
+        assert!(round.took <= Duration::from_secs(11), "{:?}", round.took);
+        failed.extend(round.refused.into_iter().map(|failure| (failure, u64::MAX)));
 
-        // The next cycle: none of those 8 is asked again, and the faulty node gets
-        // its 8 requests, no more, whatever it advertises.
+        // The next cycle: the one it failed isn't asked again, and it gets
+        // one request more.
         budget.clear();
+        let kept = HashSet::from([(x, entry.digest)]);
         let deadline = Instant::now() + CYCLE;
-        let (_, refused, asked, took) =
-            fetch_round(&work, &failed, faulty, &budget, deadline, false).await;
-        assert_eq!(asked, 8);
-        assert!(refused.iter().all(|failure| !failed.contains_key(failure)));
-        assert!(took <= Duration::from_secs(11), "{took:?}");
+        let round = fetch_round(&work, &failed, &kept, &answers, |_| 8, &budget, deadline).await;
+        assert_eq!(round.asked.get(&faulty), Some(&1));
+        assert!(round
+            .refused
+            .iter()
+            .all(|failure| !failed.contains_key(failure)));
+        assert!(round.took <= Duration::from_secs(11), "{:?}", round.took);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn made_up_entries_never_hold_back_a_listing_a_quorum_serves() {
+        // At 30,000 addresses, six honest nodes serve the listing they hold
+        // (fetched before), and a faulty node, with an allowance of 438
+        // requests a cycle, advertises a made-up one it never hands over.
+        // After them all in address order, seven honest nodes serve a new
+        // listing.
+        let faulty = PeerId::from_bytes([1; 32]);
+        let honest: Vec<PeerId> = (2..=8u8).map(|n| PeerId::from_bytes([n; 32])).collect();
+        let mut kept: HashSet<ListingId> = HashSet::new();
+        let mut work: Vec<Work> = (0..30_000u32)
+            .map(|n| {
+                let address = spread(n);
+                let entry = DigestEntry::new(&stored(address));
+                kept.insert((address, entry.digest));
+                let mut copies: Vec<(PeerId, DigestEntry)> =
+                    honest[..6].iter().map(|peer| (*peer, entry)).collect();
+                let made_up = DigestEntry::new(&with_quote(address, 1));
+                copies.push((faulty, made_up));
+                (address, Vec::new(), copies)
+            })
+            .collect();
+        let new: XorName = [0xff; 32];
+        let entry = DigestEntry::new(&stored(new));
+        work.push((
+            new,
+            Vec::new(),
+            honest.iter().map(|peer| (*peer, entry)).collect(),
+        ));
+        let answers = HashMap::from([(faulty, Answers::Never)]);
+        let allowance = move |peer: &PeerId| if *peer == faulty { 438 } else { 8 };
+        let mut budget = FetchBudget::default();
+        let mut failed: HashMap<(PeerId, ListingId), u64> = HashMap::new();
+        for cycle in 0..5 {
+            budget.clear();
+            let deadline = Instant::now() + CYCLE;
+            let round = fetch_round(
+                &work, &failed, &kept, &answers, allowance, &budget, deadline,
+            )
+            .await;
+            assert!(
+                round
+                    .fetched
+                    .iter()
+                    .any(|(key, _)| *key == (new, entry.digest)),
+                "the new listing is fetched in cycle {cycle}"
+            );
+            assert_eq!(round.asked.get(&faulty), Some(&1), "cycle {cycle}");
+            assert!(round.took <= Duration::from_secs(11), "{:?}", round.took);
+            failed.extend(round.refused.into_iter().map(|failure| (failure, u64::MAX)));
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_node_has_one_request_in_flight_at_a_time() {
+        // 300 new listings at consecutive addresses, with the same nearest
+        // holder first, and six others each: as at a start without the
+        // listings kept.
+        let first = PeerId::from_bytes([1; 32]);
+        let others: Vec<PeerId> = (2..=7u8).map(|n| PeerId::from_bytes([n; 32])).collect();
+        let work: Vec<Work> = (0..300u32)
+            .map(|n| {
+                let address = spread(n);
+                let entry = DigestEntry::new(&stored(address));
+                let mut copies = vec![(first, entry)];
+                copies.extend(others.iter().map(|peer| (*peer, entry)));
+                (address, Vec::new(), copies)
+            })
+            .collect();
+        let budget = FetchBudget::default();
+        let deadline = Instant::now() + CYCLE;
+        let round = fetch_round(
+            &work,
+            &HashMap::new(),
+            &HashSet::new(),
+            &HashMap::new(),
+            |_| 438,
+            &budget,
+            deadline,
+        )
+        .await;
+        assert_eq!(round.fetched.len(), 300);
+        assert_eq!(round.most_in_flight, 1);
+        // A busy first holder doesn't hold the others up: all seven share
+        // the requests.
+        assert_eq!(round.asked.len(), 7);
+        assert!(round.took < CYCLE, "{:?}", round.took);
     }
 
     #[tokio::test(start_paused = true)]
@@ -3980,15 +4771,83 @@ mod tests {
             (x, Vec::new(), vec![(honest, DigestEntry::new(&stored(x)))]),
             (y, Vec::new(), vec![(faulty, DigestEntry::new(&stored(y)))]),
         ];
+        let answers = HashMap::from([(faulty, Answers::Hangs)]);
         let budget = FetchBudget::default();
         let deadline = Instant::now() + CYCLE;
-        let (fetched, refused, asked, took) =
-            fetch_round(&work, &HashMap::new(), faulty, &budget, deadline, true).await;
-        assert_eq!(fetched.len(), 1);
-        assert_eq!(asked, 1);
+        let round = fetch_round(
+            &work,
+            &HashMap::new(),
+            &HashSet::new(),
+            &answers,
+            |_| 8,
+            &budget,
+            deadline,
+        )
+        .await;
+        assert_eq!(round.fetched.len(), 1);
+        assert_eq!(round.asked.get(&faulty), Some(&1));
         // Cut short, not refused: it is asked again next time.
-        assert!(refused.is_empty());
-        assert_eq!(took, CYCLE);
+        assert!(round.refused.is_empty());
+        assert_eq!(round.took, CYCLE);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_oversized_listing_is_never_kept() {
+        // A node hands over a listing its entry describes and that passes
+        // every check a GetResponse gets, but with 4.5 MB of quote: under the
+        // wire limit, over a page's share of it.
+        let x: XorName = [0x3d; 32];
+        let big = with_quote(x, 4_500_000);
+        assert!(big.validate().is_ok());
+        assert_eq!(
+            ant_listings::check_get_response(&x, Some(big.clone())),
+            Ok(Some(big.clone()))
+        );
+        assert_eq!(kept_bytes(&big), None);
+        let (faulty, honest) = (PeerId::from_bytes([1; 32]), PeerId::from_bytes([2; 32]));
+        let entry = DigestEntry::new(&big);
+        let work: Vec<Work> = vec![(x, Vec::new(), vec![(faulty, entry), (honest, entry)])];
+        let answers = HashMap::from([
+            (faulty, Answers::Oversized(4_500_000)),
+            (honest, Answers::Oversized(4_500_000)),
+        ]);
+        let budget = FetchBudget::default();
+        let round = fetch_round(
+            &work,
+            &HashMap::new(),
+            &HashSet::new(),
+            &answers,
+            |_| 8,
+            &budget,
+            Instant::now() + CYCLE,
+        )
+        .await;
+        // Neither is kept: both failed to hand over the listing behind
+        // their entry, and their copies can't be had.
+        assert!(round.fetched.is_empty());
+        assert_eq!(round.refused.len(), 2);
+        // One kept by a version without the bound isn't read back.
+        let message = ListingsMessage {
+            request_id: 0,
+            body: ListingsBody::GetResponse {
+                listing: Some(Listing {
+                    first_seen: None,
+                    ..big
+                }),
+            },
+        };
+        assert_eq!(kept_listing(&message.encode().unwrap()), None);
+        // A listing of the largest size the format allows is kept.
+        let largest = with_quote(x, 9_000);
+        let bytes = kept_bytes(&largest).unwrap();
+        assert!(bytes.len() <= MAX_LISTING_BYTES);
+        assert_eq!(
+            kept_listing(&bytes),
+            Some(Listing {
+                first_seen: None,
+                ..largest
+            })
+        );
     }
 
     #[test]
@@ -4009,6 +4868,11 @@ mod tests {
         // A second already out isn't waited for.
         let started = std::time::Instant::now();
         wait_past(second.saturating_sub(10)).await;
+        assert!(started.elapsed() < Duration::from_millis(100));
+        // Nor is one the clock is behind, as after it was set back an hour:
+        // nothing waits for it to catch up.
+        let started = std::time::Instant::now();
+        wait_past(unix_now() + 3_600).await;
         assert!(started.elapsed() < Duration::from_millis(100));
     }
 
@@ -4074,7 +4938,7 @@ mod tests {
                 .put(
                     &mut txn,
                     &listing_key(&listing.address, &entry.digest),
-                    &rmp_serde::to_vec(&kept).unwrap(),
+                    &kept_bytes(&kept).unwrap(),
                 )
                 .unwrap();
         }
@@ -4253,16 +5117,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_cycle_removes_a_listed_entry_whose_copies_were_all_paid_before_the_vault() {
+    async fn a_cycle_removes_a_listed_entry_that_shows_a_payment_before_the_vault() {
         let dir = tempfile::tempdir().unwrap();
         let (mut producer, _node) = offline_producer(dir.path()).await;
         census_nodes(&mut producer, 8);
         let x = numbered(7);
+        // An entry showing a block before the vault was deployed, as an
+        // earlier index may have listed it; two of its nearest nodes serve
+        // it.
         let mut listed = ListingsIndex::default();
-        listed.listings.push(checked(x));
+        listed.listings.push(checked_at(x, 80_204_042));
         publish_read(&mut producer.publisher, &listed, None, AT);
-        // Two of its nearest nodes serve copies that show a block before the
-        // vault was deployed.
         serve(&mut producer, &[showing_block(x, 80_204_042)], 2);
 
         let mut tally = Tally::default();
@@ -4285,12 +5150,10 @@ mod tests {
         assert!(tally.groups.is_empty());
     }
 
-    #[tokio::test]
-    async fn a_size_read_is_filled_in_to_its_entry() {
-        let dir = tempfile::tempdir().unwrap();
-        let (mut producer, _node) = offline_producer(dir.path()).await;
-        let x: XorName = [0x4e; 32];
-        let mut shrunk = checked(x);
+    /// A listed file at `address` whose data map is shrunk, as a read lists
+    /// it.
+    fn shrunk_listing(address: XorName) -> CheckedListing {
+        let mut shrunk = checked(address);
         shrunk.envelope = Envelope::readable(
             &three_chunks(1_024, true),
             Metadata::default(),
@@ -4299,8 +5162,38 @@ mod tests {
         )
         .unwrap();
         shrunk.listing.flags = shrunk.envelope.flags();
+        shrunk
+    }
+
+    impl Decided {
+        /// What deciding a batch gives when it decides `index`, for tests of
+        /// publishing.
+        fn of(index: ListingsIndex) -> Self {
+            Self {
+                addresses: index
+                    .listings
+                    .iter()
+                    .map(|checked| checked.listing.address)
+                    .collect(),
+                index,
+                unlisted: Vec::new(),
+                known: Vec::new(),
+                holders: Vec::new(),
+                forget: Vec::new(),
+                settle: Vec::new(),
+                waiting: Vec::new(),
+                unreadable: Vec::new(),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_size_read_is_filled_in_to_its_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut producer, _node) = offline_producer(dir.path()).await;
+        let x: XorName = [0x4e; 32];
         let mut index = ListingsIndex::default();
-        index.listings.push(shrunk);
+        index.listings.push(shrunk_listing(x));
         let listed: BTreeMap<XorName, &CheckedListing> = index
             .listings
             .iter()
@@ -4323,38 +5216,941 @@ mod tests {
         assert_eq!(published.entry.listing.size, None);
         let seq = producer.publisher.seq();
 
-        // Its root map couldn't be read: it is tried again only later.
-        {
-            let mut txn = producer.store.env().write_txn().unwrap();
-            let mut value = 0u64.to_be_bytes().to_vec();
-            value.extend(rmp_serde::to_vec(&three_chunks(1_024, true)).unwrap());
+        // Its root map is to be read: a read is marked before it begins, so
+        // one that a stop cuts short isn't begun again at once.
+        let wanted = |producer: &Producer, address: &XorName| {
+            let txn = producer.store.env().read_txn().unwrap();
             producer
-                .known
-                .put(&mut txn, &tagged(SIZE_WANTED_TAG, &x), &value)
-                .unwrap();
-            txn.commit().unwrap();
+                .size_wanted
+                .get(&txn, address)
+                .unwrap()
+                .map(|value| u64::from_be_bytes(value[..8].try_into().unwrap()))
+        };
+        let mut index = ListingsIndex::default();
+        index.listings.push(shrunk_listing(x));
+        {
+            let mut decided = Decided::of(index);
+            let mut tally = Tally::default();
+            producer.publication(&mut decided, AT, &mut tally).unwrap();
         }
-        producer.last_status = Some(Status::default());
-        producer.take_sizes(vec![(x, None)]).await.unwrap();
+        assert_eq!(wanted(&producer, &x), Some(0));
+        let before = unix_now();
+        producer.start_sizes().unwrap();
+        assert!(producer.size_job.is_some());
+        // Stopped before it read anything.
+        producer.size_job = None;
+        let next = wanted(&producer, &x).unwrap();
+        assert!(next >= before + RETRY_INTERVAL.as_secs(), "{next}");
         producer.start_sizes().unwrap();
         assert!(producer.size_job.is_none(), "nothing is due yet");
+        // A read that couldn't be done leaves it so.
+        producer.last_status = Some(Status::default());
+        producer
+            .take_sizes(vec![(x, SizeRead::Later)])
+            .await
+            .unwrap();
+        assert_eq!(wanted(&producer, &x), Some(next));
         assert_eq!(producer.publisher.seq(), seq);
 
         // Read: the entry is put again with it, decided when it was.
         producer
-            .take_sizes(vec![(x, Some(92_000_000))])
+            .take_sizes(vec![(x, SizeRead::Sized(92_000_000))])
             .await
             .unwrap();
         let filled = producer.publisher.entry(&x).unwrap().unwrap();
         assert_eq!(filled.entry.listing.size, Some(92_000_000));
         assert_eq!(filled.entry.decided_at, published.entry.decided_at);
         assert_eq!(producer.publisher.seq(), seq + 1);
+        {
+            let txn = producer.store.env().read_txn().unwrap();
+            assert_eq!(producer.sizes.get(&txn, &x).unwrap(), Some(92_000_000));
+        }
+        assert_eq!(wanted(&producer, &x), None);
+
+        // A map that can never give a size is never read again, though its
+        // address is decided again, and its entry keeps none.
+        let y: XorName = [0x4f; 32];
+        let mut index = ListingsIndex::default();
+        index.listings.push(shrunk_listing(y));
+        let mut decided = Decided::of(index.clone());
+        producer
+            .publication(&mut decided, AT, &mut Tally::default())
+            .unwrap();
+        producer
+            .take_sizes(vec![(y, SizeRead::Never)])
+            .await
+            .unwrap();
+        assert_eq!(wanted(&producer, &y), Some(u64::MAX));
+        let mut decided = Decided::of(index);
+        producer
+            .publication(&mut decided, AT + 60, &mut Tally::default())
+            .unwrap();
+        assert_eq!(wanted(&producer, &y), Some(u64::MAX));
+        producer.start_sizes().unwrap();
+        assert!(producer.size_job.is_none());
+    }
+
+    // Producers over fake nodes: two side by side, one deciding what changed
+    // each cycle as `Producer::cycle` does after its first, one deciding
+    // every address each cycle, as an index read does, from the same inputs.
+    // What they publish differently is an address the first decided
+    // differently, or later.
+
+    use crate::data::client::listings_feeds::tests::{Behaviour, FakeNet, FakeNode};
+
+    /// An envelope withholding its data map and showing no payment field,
+    /// in the index: its listings are reported, with no chain call.
+    fn hidden_envelope(seed: u8) -> Envelope {
+        Envelope::withheld_hash(
+            [seed; SALTED_HASH_LEN],
+            Metadata::default(),
+            ShownFields::NONE,
+            true,
+        )
+        .unwrap()
+    }
+
+    /// The listing of `envelope` first stored in the hour of `first_seen`;
+    /// with `name`, one that doesn't match its envelope.
+    fn hidden_listing(envelope: &Envelope, first_seen: u64, name: Option<&str>) -> Listing {
+        Listing {
+            address: envelope.address(),
+            flags: envelope.flags(),
+            metadata: Metadata {
+                name: name.map(str::to_string),
+                ..envelope.metadata().clone()
+            },
+            size: None,
+            payment: ListingPayment::default(),
+            first_seen: Some(first_seen - first_seen % 3_600),
+        }
+    }
+
+    /// Keep `listing`'s full listing, as fetching it does.
+    fn keep_listing(producer: &Producer, listing: &Listing) {
+        let entry = DigestEntry::new(listing);
+        let mut txn = producer.store.env().write_txn().unwrap();
+        producer
+            .listings
+            .put(
+                &mut txn,
+                &listing_key(&listing.address, &entry.digest),
+                &kept_bytes(listing).unwrap(),
+            )
+            .unwrap();
+        txn.commit().unwrap();
+    }
+
+    /// One cycle, as `Producer::cycle` runs it but for the census's upkeep
+    /// and fetching (the full listings are kept already): poll the fake
+    /// nodes, note who answered, make pending the addresses whose nearest
+    /// nodes changed, then decide `source` with drops checked. Returns what
+    /// the cycle counted.
+    async fn fake_cycle(producer: &mut Producer, net: &FakeNet, now: u64, source: Source) -> Tally {
+        producer.cycles += 1;
+        let nodes: Vec<FeedNode> = producer
+            .census
+            .nodes()
+            .map(|node| FeedNode {
+                peer: node.peer,
+                range: producer.census.leaf_of(node.peer.as_bytes()),
+                feed: true,
+                want_peers: false,
+            })
+            .collect();
+        let deadline = Instant::now() + CYCLE;
+        producer
+            .feeds
+            .poll(net, &producer.census, &nodes, now, deadline, None)
+            .await
+            .unwrap();
+        let answered = producer.note_answers(now, &BTreeSet::new()).await;
+        assert!(producer.census.guard_ok(answered), "guard");
+        let change = producer.census.take_changes();
+        if !change.is_empty() && source != Source::All {
+            producer.mark_moved().unwrap();
+        }
+        let mut tally = Tally::default();
+        let mut drops = DropCheck {
+            checked: false,
+            deadline: Instant::now() + CYCLE,
+        };
+        producer
+            .decide_all(source, now, Some(&mut drops), false, &mut tally)
+            .await
+            .unwrap();
+        tally
+    }
+
+    /// What a producer published, `decided_at` aside, and what its latest
+    /// cycle counted for `status.json`.
+    #[derive(Debug, PartialEq)]
+    struct Shown {
+        entries: BTreeMap<String, (ListingFields, CheckLevel)>,
+        support: BTreeMap<String, Support>,
+        rejected: BTreeMap<String, RejectedEntry>,
+        standing: u64,
+        deferred: BTreeMap<&'static str, u64>,
+        below_full: u64,
+    }
+
+    fn shown(producer: &Producer, tally: &Tally) -> Shown {
+        let mut entries = BTreeMap::new();
+        let mut support = BTreeMap::new();
+        for key in producer.publisher.keys().unwrap() {
+            let entry = producer.publisher.entry(&key.address).unwrap().unwrap();
+            entries.insert(
+                hex::encode(key.address),
+                (entry.entry.listing.clone(), entry.entry.check),
+            );
+            if let Some(row) = producer.publisher.support(&key.address).unwrap() {
+                support.insert(hex::encode(key.address), row);
+            }
+        }
+        let rejected = producer
+            .publisher
+            .rejected_entries()
+            .unwrap()
+            .into_iter()
+            .map(|mut row| {
+                row.decided_at = 0;
+                (row.listing.address.clone(), row)
+            })
+            .collect();
+        let deferred = tally
+            .groups
+            .iter()
+            .map(|(reason, (count, _))| (*reason, *count))
+            .collect();
+        let below_full = {
+            let txn = producer.store.env().read_txn().unwrap();
+            producer
+                .since
+                .prefix_iter(&txn, &[BELOW_FULL_TAG])
+                .unwrap()
+                .count() as u64
+        };
+        Shown {
+            entries,
+            support,
+            rejected,
+            standing: producer.standing,
+            deferred,
+            below_full,
+        }
+    }
+
+    /// Two producers over the same census of `count` nodes, their requests
+    /// routed: one to decide what changed, one every address.
+    async fn producer_pair(
+        dirs: &(tempfile::TempDir, tempfile::TempDir),
+        count: u8,
+    ) -> (
+        (Producer, crate::data::Network),
+        (Producer, crate::data::Network),
+        Vec<PeerId>,
+    ) {
+        let (mut changed, node_changed) = offline_producer(dirs.0.path()).await;
+        let (mut every, node_every) = offline_producer(dirs.1.path()).await;
+        let peers = census_nodes(&mut changed, count);
+        census_nodes(&mut every, count);
+        changed.start_requests();
+        every.start_requests();
+        ((changed, node_changed), (every, node_every), peers)
+    }
+
+    #[tokio::test]
+    async fn a_nearest_node_serving_nothing_there_going_silent_is_decided_as_a_read_decides_it() {
+        // An address no listing of which has a quorum of its nearest nodes:
+        // 3 of them serve one listing, 1 another (not matching the
+        // envelope), and 3 serve nothing. Deciding it rests on those 3 having
+        // been heard: once one of them stops answering, a read leaves it to
+        // try again, and so must the producer that decides what changed.
+        let now = unix_now();
+        let old = now - 10 * 3_600;
+        let dirs = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let ((mut changed, _a), (mut every, _b), peers) = producer_pair(&dirs, 8).await;
+        let envelope = hidden_envelope(0x61);
+        let a = envelope.address();
+        let nearest = changed.census.nearest(&a, NEAREST_NODES);
+        let one = hidden_listing(&envelope, old, None);
+        let other = hidden_listing(&envelope, old, Some("other.txt"));
+        // A control: every one of its nearest nodes serves its listing.
+        let envelope_b = hidden_envelope(0x62);
+        let b = envelope_b.address();
+        let listing_b = hidden_listing(&envelope_b, old, None);
+        for producer in [&changed, &every] {
+            producer.chain.keep_envelope(&a, &envelope.to_bytes());
+            producer.chain.keep_envelope(&b, &envelope_b.to_bytes());
+            keep_listing(producer, &one);
+            keep_listing(producer, &other);
+            keep_listing(producer, &listing_b);
+        }
+        let mut served: BTreeMap<PeerId, Vec<DigestEntry>> = BTreeMap::new();
+        for peer in &nearest[..3] {
+            served
+                .entry(*peer)
+                .or_default()
+                .push(DigestEntry::new(&one));
+        }
+        served
+            .entry(nearest[3])
+            .or_default()
+            .push(DigestEntry::new(&other));
+        for peer in changed.census.nearest(&b, NEAREST_NODES) {
+            served
+                .entry(peer)
+                .or_default()
+                .push(DigestEntry::new(&listing_b));
+        }
+        let net = FakeNet::with(
+            peers
+                .iter()
+                .map(|peer| {
+                    let entries = served.remove(peer).unwrap_or_default();
+                    (*peer, FakeNode::serving(Behaviour::Honest, entries))
+                })
+                .collect(),
+        );
+        let tc = fake_cycle(&mut changed, &net, now, Source::All).await;
+        let te = fake_cycle(&mut every, &net, now, Source::All).await;
+        assert_eq!(shown(&changed, &tc), shown(&every, &te), "cycle 1");
+
+        // One of A's nearest nodes that serves nothing there stops answering.
+        let silent = nearest[4];
+        net.node(&silent, |node| node.behaviour = Behaviour::Silent);
+        let tc = fake_cycle(
+            &mut changed,
+            &net,
+            now + 60,
+            Source::Pending { again: true },
+        )
+        .await;
+        let te = fake_cycle(&mut every, &net, now + 60, Source::All).await;
+        let (sc, se) = (shown(&changed, &tc), shown(&every, &te));
+        assert!(
+            se.rejected[&hex::encode(a)].again,
+            "a read leaves it to try again"
+        );
+        assert_eq!(sc, se, "cycle 2");
+
+        // It answers again: both decide it again.
+        net.node(&silent, |node| node.behaviour = Behaviour::Honest);
+        let tc = fake_cycle(
+            &mut changed,
+            &net,
+            now + 120,
+            Source::Pending { again: true },
+        )
+        .await;
+        let te = fake_cycle(&mut every, &net, now + 120, Source::All).await;
+        assert_eq!(shown(&changed, &tc), shown(&every, &te), "cycle 3");
+    }
+
+    #[tokio::test]
+    async fn a_listing_dated_in_the_future_is_decided_again_each_cycle() {
+        // All 7 nearest nodes date a listing 3 h ahead of the producer's
+        // clock: it is refused for that, and decided again every cycle, as
+        // a read decides it, so it is listed once the time comes.
+        let now = unix_now();
+        let ahead = now + 3 * 3_600;
+        let dir = tempfile::tempdir().unwrap();
+        let (mut producer, _node) = offline_producer(dir.path()).await;
+        let peers = census_nodes(&mut producer, 8);
+        producer.start_requests();
+        let envelope = hidden_envelope(0x71);
+        let a = envelope.address();
+        let listing = hidden_listing(&envelope, ahead, None);
+        producer.chain.keep_envelope(&a, &envelope.to_bytes());
+        keep_listing(&producer, &listing);
+        let nearest = producer.census.nearest(&a, NEAREST_NODES);
+        let net = FakeNet::with(
+            peers
+                .iter()
+                .map(|peer| {
+                    let entries = if nearest.contains(peer) {
+                        vec![DigestEntry::new(&listing)]
+                    } else {
+                        Vec::new()
+                    };
+                    (*peer, FakeNode::serving(Behaviour::Honest, entries))
+                })
+                .collect(),
+        );
+        fake_cycle(&mut producer, &net, now, Source::All).await;
+        let rows = producer.publisher.rejected_entries().unwrap();
+        assert!(rows.iter().any(|row| row
+            .problem
+            .contains(&ListingError::TimeInFuture.to_string())));
         let txn = producer.store.env().read_txn().unwrap();
-        assert_eq!(producer.sizes.get(&txn, &x).unwrap(), Some(92_000_000));
+        assert!(
+            producer
+                .known
+                .get(&txn, &tagged(AGAIN_TAG, &a))
+                .unwrap()
+                .is_some(),
+            "decided again next cycle"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_drop_too_soon_after_its_time_is_neither_checked_nor_backed_off() {
+        // A published entry whose time is an hour ago, that none of its
+        // nearest nodes serves any more: until 2 h after its time, a node
+        // that stored it may not show it yet, so its drop can't be checked.
+        // Nothing is checked, and nothing backs it off: the first cycle after
+        // the 2 h checks it.
+        let now = unix_now();
+        let dir = tempfile::tempdir().unwrap();
+        let (mut producer, _node) = offline_producer(dir.path()).await;
+        let peers = census_nodes(&mut producer, 8);
+        producer.start_requests();
+        let x = numbered(42);
+        let mut index = ListingsIndex::default();
+        let mut entry = checked(x);
+        entry.listing.flags.shown = ShownFields::NONE
+            .with(PaymentField::BlockNumber)
+            .with(PaymentField::BlockTimestamp);
+        entry.listing.payment.block_timestamp = Some(now - 3_600);
+        entry.listing.first_seen = None;
+        index.listings.push(entry);
+        publish_read(&mut producer.publisher, &index, None, now - 60);
+        let net = FakeNet::with(
+            peers
+                .iter()
+                .map(|peer| (*peer, FakeNode::new(Behaviour::Honest)))
+                .collect(),
+        );
+        let tally = fake_cycle(&mut producer, &net, now, Source::All).await;
+        assert_eq!((tally.removed, tally.carried), (0, 1));
+        assert_eq!(producer.backoff_of(&x).unwrap(), None);
+        // Kept, carried, and looked at again next cycle.
+        let txn = producer.store.env().read_txn().unwrap();
         assert!(producer
             .known
-            .get(&txn, &tagged(SIZE_WANTED_TAG, &x))
+            .get(&txn, &tagged(AGAIN_TAG, &x))
             .unwrap()
-            .is_none());
+            .is_some());
+    }
+
+    #[tokio::test]
+    async fn an_entry_paid_to_the_vault_stays_while_its_holders_are_silent() {
+        // A listed entry paid after the vault was deployed, served by 5 of
+        // its 7 nearest nodes; 2 others serve an old listing for the same
+        // address, paid before. The 5 stop answering for a cycle (a
+        // restart), the census of 20 still passes the guard: the only copies
+        // that count show the old payment, but they are copies of another
+        // listing, so the entry stays, carried, as a read keeps it.
+        let now = unix_now();
+        let dir = tempfile::tempdir().unwrap();
+        let (mut producer, _node) = offline_producer(dir.path()).await;
+        let peers = census_nodes(&mut producer, 20);
+        producer.start_requests();
+        let x = numbered(7);
+        let mut listed = ListingsIndex::default();
+        listed.listings.push(checked(x));
+        publish_read(&mut producer.publisher, &listed, None, now - 60);
+        let valid = showing_block(x, 81_950_000);
+        let old = showing_block(x, 80_204_042);
+        keep_listing(&producer, &valid);
+        keep_listing(&producer, &old);
+        let nearest = producer.census.nearest(&x, NEAREST_NODES);
+        let net = FakeNet::with(
+            peers
+                .iter()
+                .map(|peer| {
+                    let rank = nearest.iter().position(|near| near == peer);
+                    let entries = match rank {
+                        Some(0..=4) => vec![DigestEntry::new(&valid)],
+                        Some(_) => vec![DigestEntry::new(&old)],
+                        None => Vec::new(),
+                    };
+                    (*peer, FakeNode::serving(Behaviour::Honest, entries))
+                })
+                .collect(),
+        );
+        fake_cycle(&mut producer, &net, now, Source::All).await;
+        for peer in &nearest[..5] {
+            net.node(peer, |node| node.behaviour = Behaviour::Silent);
+        }
+        let tally = fake_cycle(
+            &mut producer,
+            &net,
+            now + 60,
+            Source::Pending { again: true },
+        )
+        .await;
+        assert_eq!((tally.removed, tally.carried), (0, 1));
+        let kept = producer.publisher.entry(&x).unwrap().unwrap();
+        assert_eq!(kept.entry.listing.block_number, Some(81_950_000));
+        assert!(producer.publisher.support(&x).unwrap().unwrap().carried);
+        // While carried, it has no row.
+        assert!(producer.publisher.rejected_entries().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn deciding_what_changed_agrees_with_deciding_every_address() {
+        // Random uploads, repairs, other listings, competing listings,
+        // removals, nodes going silent and answering again, new feed epochs,
+        // and nodes joining and leaving the census: after each, the producer
+        // that decides what changed publishes what one deciding every
+        // address publishes.
+        use rand::{Rng, SeedableRng};
+        for seed in 0..4u64 {
+            let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
+            let start = unix_now();
+            let old = start - 10 * 3_600;
+            let dirs = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+            let (mut changed, node_changed) = offline_producer(dirs.0.path()).await;
+            let (mut every, node_every) = offline_producer(dirs.1.path()).await;
+            let _nodes = (node_changed, node_every);
+            // 12 nodes in all, 10 in the census at first.
+            let all: Vec<PeerId> = (0u8..12)
+                .map(|n| PeerId::from_bytes([n.wrapping_mul(21).wrapping_add(3); 32]))
+                .collect();
+            for peer in &all[..10] {
+                changed.census.admit(*peer, Vec::new(), AT);
+                every.census.admit(*peer, Vec::new(), AT);
+            }
+            let _ = changed.census.take_changes();
+            let _ = every.census.take_changes();
+            changed.start_requests();
+            every.start_requests();
+            let envelopes: Vec<Envelope> = (0u8..12).map(|n| hidden_envelope(0x10 + n)).collect();
+            let main: Vec<Listing> = envelopes
+                .iter()
+                .map(|envelope| hidden_listing(envelope, old, None))
+                .collect();
+            let alt: Vec<Listing> = envelopes
+                .iter()
+                .map(|envelope| hidden_listing(envelope, old, Some("alt.txt")))
+                .collect();
+            for producer in [&changed, &every] {
+                for (envelope, (one, other)) in envelopes.iter().zip(main.iter().zip(&alt)) {
+                    producer
+                        .chain
+                        .keep_envelope(&envelope.address(), &envelope.to_bytes());
+                    keep_listing(producer, one);
+                    keep_listing(producer, other);
+                }
+            }
+            let net = FakeNet::with(
+                all.iter()
+                    .map(|peer| (*peer, FakeNode::new(Behaviour::Honest)))
+                    .collect(),
+            );
+            let mut silent: Option<PeerId> = None;
+            let mut holds: BTreeSet<(PeerId, usize)> = BTreeSet::new();
+            let mut epoch = 100u64;
+            let mut now = start;
+            for step in 0..40 {
+                let census: Vec<PeerId> = changed.census.nodes().map(|node| node.peer).collect();
+                let event = match rng.gen_range(0..100) {
+                    0..=19 => {
+                        let i = rng.gen_range(0..main.len());
+                        let near = changed.census.nearest(&main[i].address, NEAREST_NODES);
+                        let k = rng.gen_range(4..=near.len());
+                        for n in &near[..k] {
+                            net.node(n, |node| node.put(DigestEntry::new(&main[i])));
+                            holds.insert((*n, i));
+                        }
+                        "upload"
+                    }
+                    20..=29 => {
+                        let i = rng.gen_range(0..main.len());
+                        let near = changed.census.nearest(&main[i].address, 9);
+                        let n = near[rng.gen_range(0..near.len())];
+                        net.node(&n, |node| node.put(DigestEntry::new(&main[i])));
+                        holds.insert((n, i));
+                        "repair"
+                    }
+                    30..=39 => {
+                        let i = rng.gen_range(0..main.len());
+                        let near = changed.census.nearest(&main[i].address, NEAREST_NODES);
+                        let n = near[rng.gen_range(0..near.len())];
+                        net.node(&n, |node| node.put(DigestEntry::new(&alt[i])));
+                        holds.insert((n, i));
+                        "another listing"
+                    }
+                    40..=44 => {
+                        // Two listings, neither with a quorum: 3 of its
+                        // nearest serve one, 1 another, 3 nothing.
+                        let i = rng.gen_range(0..main.len());
+                        let near = changed.census.nearest(&main[i].address, NEAREST_NODES);
+                        for (rank, n) in near.iter().enumerate() {
+                            match rank {
+                                0..=2 => {
+                                    net.node(n, |node| node.put(DigestEntry::new(&main[i])));
+                                    holds.insert((*n, i));
+                                }
+                                3 => {
+                                    net.node(n, |node| node.put(DigestEntry::new(&alt[i])));
+                                    holds.insert((*n, i));
+                                }
+                                _ => {
+                                    net.node(n, |node| node.remove(&main[i].address));
+                                    holds.remove(&(*n, i));
+                                }
+                            }
+                        }
+                        "competing listings"
+                    }
+                    45..=49 => {
+                        let i = rng.gen_range(0..main.len());
+                        let n = all[rng.gen_range(0..all.len())];
+                        net.node(&n, |node| node.remove(&main[i].address));
+                        holds.remove(&(n, i));
+                        "remove"
+                    }
+                    50..=64 => {
+                        if let Some(peer) = silent.take() {
+                            net.node(&peer, |node| node.behaviour = Behaviour::Honest);
+                            "answers again"
+                        } else {
+                            // Where there is one, a nearest node of some
+                            // address that serves nothing there.
+                            let i = rng.gen_range(0..main.len());
+                            let near = changed.census.nearest(&main[i].address, NEAREST_NODES);
+                            let free: Vec<PeerId> = near
+                                .iter()
+                                .filter(|peer| !holds.contains(&(**peer, i)))
+                                .copied()
+                                .collect();
+                            let peer = if free.is_empty() {
+                                census[rng.gen_range(0..census.len())]
+                            } else {
+                                free[rng.gen_range(0..free.len())]
+                            };
+                            net.node(&peer, |node| node.behaviour = Behaviour::Silent);
+                            silent = Some(peer);
+                            "silent"
+                        }
+                    }
+                    65..=72 => {
+                        let n = census[rng.gen_range(0..census.len())];
+                        epoch += 1;
+                        net.node(&n, |node| node.renumber(epoch));
+                        "new epoch"
+                    }
+                    73..=81 => {
+                        let outside: Vec<PeerId> = all
+                            .iter()
+                            .filter(|peer| changed.census.get(peer).is_none())
+                            .copied()
+                            .collect();
+                        if outside.is_empty() {
+                            "nothing"
+                        } else {
+                            let peer = outside[rng.gen_range(0..outside.len())];
+                            changed.census.admit(peer, Vec::new(), now);
+                            every.census.admit(peer, Vec::new(), now);
+                            "joins"
+                        }
+                    }
+                    82..=89 => {
+                        if census.len() <= 9 {
+                            "nothing"
+                        } else {
+                            let candidates: Vec<PeerId> = census
+                                .iter()
+                                .filter(|peer| Some(**peer) != silent)
+                                .copied()
+                                .collect();
+                            let peer = candidates[rng.gen_range(0..candidates.len())];
+                            changed.census.remove(&peer);
+                            every.census.remove(&peer);
+                            "leaves"
+                        }
+                    }
+                    _ => "nothing",
+                };
+                now += 60;
+                let source = if step == 0 {
+                    Source::All
+                } else {
+                    Source::Pending { again: true }
+                };
+                let tc = fake_cycle(&mut changed, &net, now, source).await;
+                let te = fake_cycle(&mut every, &net, now, Source::All).await;
+                assert_eq!(
+                    shown(&changed, &tc),
+                    shown(&every, &te),
+                    "seed {seed}, step {step}, after '{event}'"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_sweep_decides_every_address_over_as_many_cycles_as_it_takes() {
+        // More addresses than three batches, each served by 2 of its 7
+        // nearest nodes, and no time left in any cycle: each cycle's sweep
+        // decides one batch, and goes on from there the next.
+        let dir = tempfile::tempdir().unwrap();
+        let (mut producer, _node) = offline_producer(dir.path()).await;
+        census_nodes(&mut producer, 8);
+        let count = 3 * DECIDE_BATCH as u32 + 10;
+        let listings: Vec<Listing> = (0..count)
+            .map(|n| showing_block(numbered(n), 81_950_000))
+            .collect();
+        serve(&mut producer, &listings, 2);
+        producer.start_requests();
+        producer.sweep = Some(Sweep {
+            after: None,
+            began: AT,
+            alert: false,
+        });
+        let mut decided = Vec::new();
+        for cycle in 0..4 {
+            producer.cycles += 1;
+            let mut drops = DropCheck {
+                checked: false,
+                deadline: Instant::now(),
+            };
+            let mut tally = Tally::default();
+            let swept = producer
+                .sweep_on(AT + 60 * cycle, Instant::now(), &mut drops, &mut tally)
+                .await
+                .unwrap();
+            decided.push(swept);
+        }
+        let batch = DECIDE_BATCH as u64;
+        assert_eq!(decided, [batch, batch, batch, 10]);
+        assert!(producer.sweep.is_none());
+        assert_eq!(producer.decided_all_at, Some(AT));
+        // Each was decided, and is to be decided again each cycle.
+        let txn = producer.store.env().read_txn().unwrap();
+        let again = tagged_after(producer.known, &txn, AGAIN_TAG, None, usize::MAX).unwrap();
+        assert_eq!(again.len(), count as usize);
+    }
+
+    #[tokio::test]
+    async fn a_sweep_passes_over_what_its_cycle_decided_already() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut producer, _node) = offline_producer(dir.path()).await;
+        census_nodes(&mut producer, 8);
+        let addresses: Vec<XorName> = (0..40).map(numbered).collect();
+        let listings: Vec<Listing> = addresses
+            .iter()
+            .map(|address| showing_block(*address, 81_950_000))
+            .collect();
+        serve(&mut producer, &listings, 2);
+        producer.start_requests();
+        // A cycle decides what changed first, then sweeps: what it decided
+        // isn't decided twice, which would count it twice.
+        producer.cycles += 1;
+        producer.feeds.mark_pending(&addresses[..15]).unwrap();
+        let mut drops = DropCheck {
+            checked: false,
+            deadline: Instant::now() + CYCLE,
+        };
+        let mut tally = Tally::default();
+        let (first, _) = producer
+            .decide_all(
+                Source::Pending { again: false },
+                AT,
+                Some(&mut drops),
+                false,
+                &mut tally,
+            )
+            .await
+            .unwrap();
+        assert_eq!(first, 15);
+        producer.sweep = Some(Sweep {
+            after: None,
+            began: AT,
+            alert: false,
+        });
+        let swept = producer
+            .sweep_on(AT, Instant::now() + CYCLE, &mut drops, &mut tally)
+            .await
+            .unwrap();
+        assert_eq!(swept, 25);
+        assert_eq!(tally.groups.get("below_quorum"), Some(&(40, AT)));
+        // The next cycle's sweep decides them all.
+        producer.cycles += 1;
+        producer.sweep = Some(Sweep {
+            after: None,
+            began: AT + 60,
+            alert: true,
+        });
+        let swept = producer
+            .sweep_on(
+                AT + 60,
+                Instant::now() + CYCLE,
+                &mut drops,
+                &mut Tally::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(swept, 40);
+    }
+
+    #[tokio::test]
+    async fn the_census_changing_marks_only_what_the_sweep_has_passed() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut producer, _node) = offline_producer(dir.path()).await;
+        census_nodes(&mut producer, 8);
+        let mut addresses: Vec<XorName> = (0..20).map(numbered).collect();
+        addresses.sort_unstable();
+        let listings: Vec<Listing> = addresses
+            .iter()
+            .map(|address| showing_block(*address, 81_950_000))
+            .collect();
+        serve(&mut producer, &listings, 2);
+        // After a start, nothing is decided yet, and the sweep is still to
+        // come to every address: a census change marks nothing.
+        producer.sweep = Some(Sweep {
+            after: None,
+            began: AT,
+            alert: false,
+        });
+        producer.mark_moved().unwrap();
+        assert_eq!(producer.feeds.pending_count().unwrap(), 0);
+        // Once the sweep has passed the first half, those it passed are
+        // marked, where nothing is known of them.
+        producer.sweep = Some(Sweep {
+            after: Some(addresses[9]),
+            began: AT,
+            alert: false,
+        });
+        producer.mark_moved().unwrap();
+        assert_eq!(producer.feeds.pending_count().unwrap(), 10);
+        for address in &addresses[..10] {
+            assert!(producer.feeds.is_pending(address).unwrap());
+        }
+    }
+
+    #[tokio::test]
+    async fn between_cycles_an_address_near_a_node_behind_its_push_waits() {
+        // Between cycles, a push from a node came behind its mirror: the
+        // node holds what its mirror doesn't show. What it serves near the
+        // addresses pushes changed is waited for: they stay pending, to be
+        // decided with the next cycle, which reads the node again.
+        let dir = tempfile::tempdir().unwrap();
+        let (mut producer, _node) = offline_producer(dir.path()).await;
+        census_nodes(&mut producer, 20);
+        let addresses: Vec<XorName> = (0..40).map(numbered).collect();
+        let listings: Vec<Listing> = addresses
+            .iter()
+            .map(|address| showing_block(*address, 81_950_000))
+            .collect();
+        serve(&mut producer, &listings, 2);
+        producer.start_requests();
+        producer.feeds.mark_pending(&addresses).unwrap();
+        let behind = producer.census.nearest(&addresses[0], NEAREST_NODES)[0];
+        producer.feeds.mark_behind(&behind);
+        let near_behind: BTreeSet<XorName> = addresses
+            .iter()
+            .filter(|address| {
+                producer
+                    .census
+                    .nearest(address, NEAREST_NODES)
+                    .contains(&behind)
+            })
+            .copied()
+            .collect();
+        assert!(!near_behind.is_empty() && near_behind.len() < addresses.len());
+        let mut tally = Tally::default();
+        let (decided, _) = producer
+            .decide_all(
+                Source::Pending { again: false },
+                AT,
+                None,
+                false,
+                &mut tally,
+            )
+            .await
+            .unwrap();
+        assert_eq!(decided as usize, addresses.len() - near_behind.len());
+        for address in &addresses {
+            assert_eq!(
+                producer.feeds.is_pending(address).unwrap(),
+                near_behind.contains(address)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_root_map_is_read_within_its_bounds() {
+        use self_encryption::{bytes::Bytes as Content, test_helpers::random_bytes};
+        // A file of 8 chunks, its data map shrunk once into 3, as an upload
+        // shrinks a map of more than 3 chunks.
+        let content = random_bytes(8 * 1_024);
+        let (root, _) = self_encryption::encrypt(content).unwrap();
+        let mut root_infos = root.infos().to_vec();
+        // A root map of more than 3 chunks: 8 chunks of 1 KiB each claimed.
+        while root_infos.len() < 8 {
+            let mut info = root_infos[0].clone();
+            info.index = root_infos.len();
+            root_infos.push(info);
+        }
+        let root = DataMap::new(root_infos);
+        let mut records: HashMap<[u8; 32], Content> = HashMap::new();
+        let (shrunk, _) = self_encryption::shrink_data_map(root.clone(), |address, bytes| {
+            records.insert(address.0, bytes);
+            Ok(())
+        })
+        .unwrap();
+        assert!(shrunk.is_child());
+        assert_eq!(shrunk.infos().len(), SHRUNK_CHUNKS);
+        let records = &records;
+        let fetch = |address: [u8; 32]| async move {
+            records
+                .get(&address)
+                .cloned()
+                .ok_or_else(|| Error::NotFound("no such chunk".into()))
+        };
+        let room = Semaphore::new(MAX_ROOT_MAP_BYTES.div_ceil(1024));
+        assert_eq!(
+            read_root_size(&shrunk, fetch, &room).await,
+            SizeRead::Sized(root_size(&root).unwrap())
+        );
+        // A chunk no node hands over: later.
+        let missing = |_: [u8; 32]| async { Err(Error::NotFound("no such chunk".into())) };
+        assert_eq!(
+            read_root_size(&shrunk, missing, &room).await,
+            SizeRead::Later
+        );
+        // A record that isn't the chunk its address names: later, from
+        // another node.
+        let wrong = |_: [u8; 32]| async { Ok(Content::from_static(b"not the chunk")) };
+        assert_eq!(read_root_size(&shrunk, wrong, &room).await, SizeRead::Later);
+        // A map that declares each chunk smaller than it decrypts to: the
+        // decryption stops at what it declares, and the map never gives a
+        // size.
+        let mut small = shrunk.infos().to_vec();
+        for info in &mut small {
+            info.src_size = 10;
+        }
+        let small = DataMap::with_child(small, shrunk.child().unwrap());
+        assert_eq!(read_root_size(&small, fetch, &room).await, SizeRead::Never);
+        // One that declares more than a map shrunk once holds, or more
+        // chunks, is never fetched.
+        let fetched = std::sync::atomic::AtomicUsize::new(0);
+        let fetched = &fetched;
+        let never_fetched = |_: [u8; 32]| async move {
+            fetched.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Err::<Content, Error>(Error::NotFound("no such chunk".into()))
+        };
+        let mut large = shrunk.infos().to_vec();
+        large[0].src_size = MAX_ROOT_MAP_BYTES;
+        let large = DataMap::with_child(large, shrunk.child().unwrap());
+        assert_eq!(
+            read_root_size(&large, never_fetched, &room).await,
+            SizeRead::Never
+        );
+        let mut more = shrunk.infos().to_vec();
+        let mut extra = more[0].clone();
+        extra.index = more.len();
+        more.push(extra);
+        let more = DataMap::with_child(more, shrunk.child().unwrap());
+        assert_eq!(
+            read_root_size(&more, never_fetched, &room).await,
+            SizeRead::Never
+        );
+        assert_eq!(fetched.load(std::sync::atomic::Ordering::Relaxed), 0);
+        // The room held is given back.
+        assert_eq!(room.available_permits(), MAX_ROOT_MAP_BYTES.div_ceil(1024));
     }
 }
