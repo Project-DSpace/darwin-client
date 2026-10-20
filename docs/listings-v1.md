@@ -507,8 +507,8 @@ Files are fetched one at a time, so a file can be newer than the
   those decisions change. A node that stores a new listing pushes it, and
   the producer publishes it within seconds, without waiting for the next
   cycle; while a node is slow to answer a cycle's requests, a listing pushed
-  during the cycle is published with the cycle. An address is decided only once at least 4 of its 7 nearest nodes
-  serve a listing for it.
+  during the cycle is published with the cycle. An address is decided only
+  once at least 4 of its 7 nearest nodes serve a listing for it.
 - It removes an entry only when, in one cycle, every node nearest its
   address answers that it serves no listing there, and a witnessed lookup
   of the address and a request for it to each of those nodes and to the
