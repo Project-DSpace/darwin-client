@@ -1290,8 +1290,10 @@ impl NodeState {
         self.switch(ReadKind::V2, entries);
     }
 
-    /// End the round: how it went.
+    /// End the round: how it went. A push that came behind the mirror during
+    /// the round is behind it no more: the round read the node since.
     fn end_round(&mut self) {
+        self.behind = false;
         let fell_back = self.claims_feed && self.mirror.kind() == ReadKind::V2;
         let entries = usize::try_from(self.mirror.len()).unwrap_or(usize::MAX);
         self.read = match &mut self.mirror {
