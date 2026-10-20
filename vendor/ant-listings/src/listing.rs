@@ -460,8 +460,7 @@ pub fn median_first_seen(values: impl IntoIterator<Item = u64>) -> Option<u64> {
 
 /// One listing, merged from the copies of it that peers returned. Its own
 /// fields are those the copies agree on; take the listing itself, with its
-/// `first_seen`, from [`checked_listing_among`](Self::checked_listing_among)
-/// the nodes nearest its address.
+/// `first_seen`, from [`check_copies`] among the nodes nearest its address.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MergedListing<P> {
     /// The listing with `first_seen` left out (`None`): each peer's value is
@@ -593,7 +592,7 @@ impl<P: PartialEq> MergedListing<P> {
     /// The values are not checked, so one out of bounds moves the median
     /// and can fail the listing: use it to know what to fetch
     /// ([`payment_lookup`](crate::payment_lookup)), then check the listing
-    /// with [`checked_listing_among`](Self::checked_listing_among).
+    /// with [`check_copies`].
     ///
     /// For a repairing node, `nearest` is the close-group peers it asked; for
     /// an indexer, the nodes nearest the listing's address.
@@ -616,8 +615,11 @@ impl<P: PartialEq> MergedListing<P> {
     /// returned is checked on its own first, and the values that fail are
     /// dropped: one in the future, or one before the payment where the
     /// payment's block is known. So such a value neither fails the listing
-    /// nor moves its `first_seen`, which is the [`median_first_seen`] of the
-    /// values that pass, one per peer. A listing without `first_seen` is
+    /// nor becomes its `first_seen`, which is the [`median_first_seen`] of
+    /// the values that pass, one per peer. That takes no quorum: peers whose
+    /// values are most of those that pass set it, however few they are. To
+    /// date a listing that only a quorum of the nearest nodes can date
+    /// earlier, use [`check_copies`]. A listing without `first_seen` is
     /// checked as it is, whoever served it.
     ///
     /// `check` is called once for each different value, so it must give the
@@ -633,6 +635,11 @@ impl<P: PartialEq> MergedListing<P> {
     /// [`ListingError::MissingFirstSeen`] if none of `nearest` returned it,
     /// and if no value passes, the error `check` gave for the median of them
     /// all. For any other listing, the error `check` gave for it.
+    #[deprecated(
+        since = "0.3.1",
+        note = "dates a listing by the median of the values that pass, which fewer than a \
+                quorum of the nearest nodes can move earlier; use check_copies"
+    )]
     pub fn checked_listing_among(
         &self,
         nearest: &[P],
@@ -693,15 +700,15 @@ impl<P: PartialEq> MergedListing<P> {
 /// out in the order their first copy came in.
 ///
 /// - A copy that fails [`Listing::validate`] is left out, so it neither
-///   counts nor moves the median.
+///   counts nor dates the listing.
 /// - A peer counts at most once for an address: a second copy equal to its
 ///   first is ignored.
 /// - A peer that returned two different copies for an address, even ones
 ///   that differ only in `first_seen`, is left out for that address
 ///   altogether.
 ///
-/// Take each group's listing from [`MergedListing::checked_listing_among`]
-/// the nodes nearest its address, so that only they set its `first_seen`.
+/// Check each group, and take its listing, with [`check_copies`] among the
+/// nodes nearest its address, so that only they set its `first_seen`.
 #[must_use]
 pub fn merge_copies<P: Eq + Hash + Clone>(
     copies: impl IntoIterator<Item = (P, Listing)>,
@@ -818,17 +825,30 @@ pub fn listing_to_check<P: PartialEq>(
 /// Check `group`, the copies of one listing, against what was fetched for
 /// [`listing_to_check`]: as a node checks its close group's copies when it
 /// repairs a listing, and as an indexer checks the copies the nodes nearest
-/// an address serve. Only the dates of `nearest` count:
+/// an address serve. A listing without `first_seen` is checked as it is,
+/// whoever served it.
 ///
-/// - a group at least `needed` of them serve is dated as [`quorum_listing`]
-///   dates it, over the dates that pass their own check: a date in the
-///   future, or before the payment, is dropped first, so one node can't fail
-///   a listing a quorum serves by sending one. If fewer than `needed` dates
-///   pass, the group is checked as below. Where every date passes, this is
-///   [`quorum_listing`]'s date;
-/// - any other group is checked with
-///   [`MergedListing::checked_listing_among`]: each date on its own, those
-///   that fail dropped, and the median of the rest.
+/// A listing that needs `first_seen` is dated by the dates of `nearest`
+/// alone, one per node, each checked on its own first: a date in the
+/// future, or before the payment where the payment's block is known, fails
+/// and is dropped, so nodes sending such dates can't fail a listing while
+/// another node's date passes. Of the dates that pass:
+///
+/// - if at least `needed` pass, it is dated by the latest of the earliest
+///   `needed`, so that `needed` of them date it then or earlier. Where every
+///   date passes, this is [`quorum_listing`]'s date;
+/// - if fewer pass, or `needed` is 0, by the latest of them.
+///
+/// So a listing is never dated earlier than `needed` dates that pass put
+/// it, however many nodes serve it. Nodes fewer than `needed` can't date it
+/// earlier than every other date that passes, whatever they send: early
+/// dates, dates that fail, or nothing. `needed` agreeing dates still can.
+///
+/// Dating it later takes less. Where at most `needed` dates pass, or
+/// `needed` is 0, it is the latest of them, so any one node whose date
+/// passes can date it later, as late as `check` allows: with
+/// [`verify_listing_receipts`](crate::verify_listing_receipts), the checker's
+/// clock plus [`CLOCK_MARGIN`].
 ///
 /// `check` is typically [`verify_listing_receipts`](crate::verify_listing_receipts)
 /// over what was fetched. It is called once for each different date, so it
@@ -836,23 +856,27 @@ pub fn listing_to_check<P: PartialEq>(
 ///
 /// # Errors
 ///
-/// The error `check` gives for the listing, or
-/// [`ListingError::MissingFirstSeen`] if it needs a date that too few of
-/// `nearest` sent.
+/// For a listing that needs `first_seen`:
+/// [`ListingError::MissingFirstSeen`] if none of `nearest` sent one, and if
+/// no date passes, the error `check` gave for the median of them all. For
+/// any other listing, the error `check` gave for it.
 pub fn check_copies<P: PartialEq>(
     group: &MergedListing<P>,
     nearest: &[P],
     needed: usize,
     mut check: impl FnMut(&Listing) -> Result<ListingCheck, PaymentError>,
 ) -> Result<(Listing, ListingCheck), PaymentError> {
-    if group.count_among(nearest) < needed || !needs_first_seen(group.listing.flags) {
-        return group.checked_listing_among(nearest, check);
+    if !needs_first_seen(group.listing.flags) {
+        let listing = group.listing.clone();
+        let checked = check(&listing)?;
+        return Ok((listing, checked));
     }
     let mut dates: Vec<u64> = group.first_seen_among(nearest).collect();
     dates.sort_unstable();
+    // Each different date checked once, earliest first.
     let mut results: Vec<(u64, Result<ListingCheck, PaymentError>)> = Vec::new();
     for &date in &dates {
-        if !results.iter().any(|(checked, _)| *checked == date) {
+        if results.last().is_none_or(|(checked, _)| *checked != date) {
             results.push((date, check(&group.with_first_seen(date))));
         }
     }
@@ -860,24 +884,28 @@ pub fn check_copies<P: PartialEq>(
         results
             .iter()
             .find(|(checked, _)| *checked == date)
-            .map(|(_, result)| result.clone())
+            .map(|(_, result)| result)
     };
-    let passing: Vec<u64> = dates
+    // The dates that pass, one per node, earliest first.
+    let passing: Vec<(u64, ListingCheck)> = dates
         .iter()
-        .copied()
-        .filter(|&date| result_for(date).is_some_and(|result| result.is_ok()))
+        .filter_map(|&date| match result_for(date) {
+            Some(Ok(checked)) => Some((date, *checked)),
+            _ => None,
+        })
         .collect();
-    if let Some(&date) = needed.checked_sub(1).and_then(|index| passing.get(index)) {
-        if let Some(Ok(checked)) = result_for(date) {
-            return Ok((group.with_first_seen(date), checked));
-        }
+    let chosen = needed
+        .checked_sub(1)
+        .and_then(|index| passing.get(index))
+        .or_else(|| passing.last());
+    if let Some(&(date, checked)) = chosen {
+        return Ok((group.with_first_seen(date), checked));
     }
-    group.checked_listing_among(nearest, |listing| {
-        listing
-            .first_seen
-            .and_then(result_for)
-            .unwrap_or_else(|| check(listing))
-    })
+    let median = median_first_seen(dates.iter().copied()).ok_or(ListingError::MissingFirstSeen)?;
+    match result_for(median) {
+        Some(Err(error)) => Err(error.clone()),
+        _ => Err(ListingError::MissingFirstSeen.into()),
+    }
 }
 
 /// Where a listing sits in the index: by time, then block number, log index
@@ -1798,6 +1826,9 @@ mod tests {
         );
     }
 
+    // checked_listing_among is deprecated but still public, so what it does
+    // stays pinned.
+    #[allow(deprecated)]
     #[test]
     fn checked_listings_drop_values_that_fail_on_their_own() {
         use crate::payment::{CheckLevel, ListingCheck, PaymentError};
@@ -1979,11 +2010,17 @@ mod tests {
             Ok((dated(h + 3_600), ok))
         );
 
-        // Fewer than a quorum of dates pass: the median of those that do.
+        // Fewer than a quorum of dates pass: the latest of those that do.
         let merged = merged_with(&[h, h - 3_600, far, far]);
         assert_eq!(
             check_copies(&merged, &nearest, 4, check),
             Ok((dated(h), ok))
+        );
+        // Not their median, which here is h.
+        let merged = merged_with(&[h, h - 3_600, h + 3_600, far]);
+        assert_eq!(
+            check_copies(&merged, &nearest, 4, check),
+            Ok((dated(h + 3_600), ok))
         );
 
         // None passes: the error the median of them all gives.
@@ -1991,6 +2028,443 @@ mod tests {
             check_copies(&merged_with(&[far, far, far, far]), &nearest, 4, check),
             Err(PaymentError::Malformed(ListingError::TimeInFuture))
         );
+    }
+
+    /// What a check passes a listing that hides its quote with.
+    const REPORTED: ListingCheck = ListingCheck {
+        level: crate::payment::CheckLevel::Reported,
+        paid_at: None,
+    };
+
+    /// A listing in the index that hides all five payment fields: nothing
+    /// locates its payment, so nothing bounds its `first_seen` from below.
+    fn unlocated() -> Listing {
+        Listing::new(
+            &envelope(ShownFields::NONE, true, false),
+            &full_payment(),
+            NOW,
+        )
+    }
+
+    /// One group of copies of `listing`, from peers 1, 2 and so on, each
+    /// with its value of `values` as `first_seen`.
+    fn dated_copies(listing: &Listing, values: &[u64]) -> MergedListing<u8> {
+        let copies = (1..).zip(values).map(|(peer, &value)| {
+            (
+                peer,
+                Listing {
+                    first_seen: Some(value),
+                    ..listing.clone()
+                },
+            )
+        });
+        merge_copies(copies).remove(0)
+    }
+
+    /// How a check takes the `first_seen` of a listing first seen in hour
+    /// `h`, as [`verify_listing_receipts`](crate::verify_listing_receipts)
+    /// does: an hour after `h` at the latest, or it is in the future, and,
+    /// with `bounded`, as where the payment's block is known, two hours
+    /// before `h` at the earliest, or it is before the payment.
+    fn verdict(first_seen: u64, h: u64, bounded: bool) -> Result<ListingCheck, PaymentError> {
+        if first_seen > h + 3_600 {
+            Err(PaymentError::Malformed(ListingError::TimeInFuture))
+        } else if bounded && first_seen + 2 * 3_600 < h {
+            Err(PaymentError::FirstSeenTooEarly)
+        } else {
+            Ok(REPORTED)
+        }
+    }
+
+    // Compares check_copies with the deprecated checked_listing_among.
+    #[allow(deprecated)]
+    #[test]
+    fn fewer_than_a_quorum_cannot_backdate_with_dates_that_fail() {
+        let honest = unlocated();
+        let h = honest.first_seen.unwrap();
+        let far = h + 100 * 3_600;
+        let check = |listing: &Listing| verdict(listing.first_seen.unwrap(), h, false);
+        let nearest = [1, 2, 3, 4, 5, 6, 7];
+        let dated = |first_seen| Listing {
+            first_seen: Some(first_seen),
+            ..honest.clone()
+        };
+
+        // Three colluding nodes and an honest one serve it, four of the
+        // seven nearest: two of the three date it in 1970, and the third in
+        // the future, so that its date fails and only three pass. The median
+        // of those three is 1970, but it takes four dates that pass to date
+        // it earlier than the latest that does.
+        let merged = dated_copies(&honest, &[0, 0, far, h]);
+        assert_eq!(merged.count_among(&nearest), 4);
+        assert_eq!(
+            merged.checked_listing_among(&nearest, check),
+            Ok((dated(0), REPORTED))
+        );
+        assert_eq!(
+            check_copies(&merged, &nearest, 4, check),
+            Ok((dated(h), REPORTED))
+        );
+
+        for (values, expected) in [
+            // In any order.
+            (vec![far, h, 0, 0], h),
+            (vec![h, 0, far, 0], h),
+            // Two of the three failing.
+            (vec![0, far, far, h], h),
+            // More honest nodes, one of them dating it an hour later.
+            (vec![0, 0, far, h, h], h),
+            (vec![0, 0, far, h, h + 3_600], h + 3_600),
+            // All three dating it in 1970: four dates pass, and the honest
+            // one is the latest of them.
+            (vec![0, 0, 0, h], h),
+            // Fewer than four serve it.
+            (vec![0, 0, h], h),
+            (vec![0, far, h], h),
+        ] {
+            assert_eq!(
+                check_copies(&dated_copies(&honest, &values), &nearest, 4, check),
+                Ok((dated(expected), REPORTED)),
+                "{values:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_quorum_of_dates_that_pass_still_dates_it_earlier() {
+        let honest = unlocated();
+        let h = honest.first_seen.unwrap();
+        let far = h + 100 * 3_600;
+        let nearest = [1, 2, 3, 4, 5, 6, 7];
+        let dated = |first_seen| Listing {
+            first_seen: Some(first_seen),
+            ..honest.clone()
+        };
+        for bounded in [false, true] {
+            let check = |listing: &Listing| verdict(listing.first_seen.unwrap(), h, bounded);
+            // The earliest date that passes.
+            let early = if bounded { h - 2 * 3_600 } else { 0 };
+            for (values, expected) in [
+                // Four of the seven date it earlier: a quorum can.
+                (vec![early, early, early, early, h, h, h], early),
+                // Whatever the others send.
+                (vec![early, early, early, early, far, far, far], early),
+                (vec![far, early, h, early, early, 0, early], early),
+                (
+                    vec![h - 3_600, h - 3_600, h - 3_600, h - 3_600, h],
+                    h - 3_600,
+                ),
+                // Three are not a quorum.
+                (vec![h - 3_600, h - 3_600, h - 3_600, h, h, far], h),
+                (vec![early, early, early, far, h, h + 3_600], h),
+            ] {
+                assert_eq!(
+                    check_copies(&dated_copies(&honest, &values), &nearest, 4, check),
+                    Ok((dated(expected), REPORTED)),
+                    "bounded {bounded}, {values:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn dates_when_every_date_passes_or_none_does() {
+        let honest = unlocated();
+        let h = honest.first_seen.unwrap();
+        let far = h + 100 * 3_600;
+        let check = |listing: &Listing| verdict(listing.first_seen.unwrap(), h, true);
+        let nearest = [1, 2, 3, 4, 5, 6, 7];
+        let dated = |first_seen| Listing {
+            first_seen: Some(first_seen),
+            ..honest.clone()
+        };
+
+        // Every date passes, and four or more serve it: quorum_listing's
+        // date.
+        for values in [
+            vec![h; 4],
+            vec![h; 7],
+            vec![h - 3_600, h, h, h + 3_600, h + 3_600],
+            vec![h, h - 7_200, h + 3_600, h - 3_600, h - 7_200, h, h - 3_600],
+        ] {
+            let merged = dated_copies(&honest, &values);
+            let expected = quorum_listing(&merged, &nearest, 4).unwrap();
+            assert_eq!(
+                check_copies(&merged, &nearest, 4, check),
+                Ok((expected, REPORTED)),
+                "{values:?}"
+            );
+        }
+
+        // Every date passes, but fewer than four: the latest.
+        for (values, expected) in [
+            (vec![h], h),
+            (vec![h + 3_600, h - 3_600], h + 3_600),
+            (vec![h - 3_600, h + 3_600, h], h + 3_600),
+            (vec![h - 7_200, h - 3_600, h - 7_200], h - 3_600),
+        ] {
+            assert_eq!(
+                check_copies(&dated_copies(&honest, &values), &nearest, 4, check),
+                Ok((dated(expected), REPORTED)),
+                "{values:?}"
+            );
+        }
+
+        // No date passes: the error the median of them all gives.
+        let future = PaymentError::Malformed(ListingError::TimeInFuture);
+        for (values, error) in [
+            (vec![far; 4], future.clone()),
+            (vec![0, 0, far], PaymentError::FirstSeenTooEarly),
+            (vec![0, far, far], future.clone()),
+            // The later of the two middle ones.
+            (vec![0, 0, far, far], future.clone()),
+            (
+                vec![far, 0, 0, 0, far, 0, far],
+                PaymentError::FirstSeenTooEarly,
+            ),
+        ] {
+            assert_eq!(
+                check_copies(&dated_copies(&honest, &values), &nearest, 4, check),
+                Err(error),
+                "{values:?}"
+            );
+        }
+        // None of the nearest sent a date.
+        assert_eq!(
+            check_copies(&dated_copies(&honest, &[h; 4]), &[8, 9], 4, check),
+            Err(PaymentError::Malformed(ListingError::MissingFirstSeen))
+        );
+
+        // A listing without first_seen is checked once, as it is, whoever
+        // served it.
+        let timed = Listing::new(
+            &envelope(ShownFields::ALL, true, false),
+            &full_payment(),
+            NOW,
+        );
+        let merged = merge_copies([(9, timed.clone())]).remove(0);
+        let mut calls = 0;
+        let result = check_copies(&merged, &nearest, 4, |listing| {
+            calls += 1;
+            assert_eq!(listing, &timed);
+            Ok(REPORTED)
+        });
+        assert_eq!((result, calls), (Ok((timed, REPORTED)), 1));
+        assert_eq!(
+            check_copies(&merged, &nearest, 4, |_| Err(PaymentError::NotPaid)),
+            Err(PaymentError::NotPaid)
+        );
+    }
+
+    #[test]
+    fn needed_dates_that_pass_date_it_then_or_earlier() {
+        let honest = unlocated();
+        let h = honest.first_seen.unwrap();
+        let far = h + 100 * 3_600;
+        let check = |listing: &Listing| verdict(listing.first_seen.unwrap(), h, false);
+        let nearest = [1, 2, 3, 4, 5, 6, 7];
+        let dated = |first_seen| Listing {
+            first_seen: Some(first_seen),
+            ..honest.clone()
+        };
+        // The date for each `needed` from 0 to 5: the latest of the earliest
+        // `needed` dates that pass, or, with fewer passing, or none needed,
+        // the latest of them all.
+        for (values, by_needed) in [
+            // Passing: 0, 0 and h.
+            (vec![0, 0, far, h], [h, 0, 0, h, h, h]),
+            // Passing: 0, h - 1 hour, h and h + 1 hour.
+            (
+                vec![h + 3_600, far, h, 0, h - 3_600],
+                [h + 3_600, 0, h - 3_600, h, h + 3_600, h + 3_600],
+            ),
+            (vec![h], [h; 6]),
+            (vec![far, h, far], [h; 6]),
+        ] {
+            let merged = dated_copies(&honest, &values);
+            for (needed, expected) in by_needed.into_iter().enumerate() {
+                assert_eq!(
+                    check_copies(&merged, &nearest, needed, check),
+                    Ok((dated(expected), REPORTED)),
+                    "{values:?}, needed {needed}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn random_groups_are_never_dated_before_needed_dates_that_pass() {
+        use std::cell::RefCell;
+
+        let honest = unlocated();
+        let h = honest.first_seen.unwrap();
+        let hour = 3_600;
+        // From 1970 to far in the future: some pass, some don't.
+        let values = [
+            0,
+            h - 3 * hour,
+            h - 2 * hour,
+            h - hour,
+            h,
+            h + hour,
+            h + 2 * hour,
+            h + 100 * hour,
+        ];
+        let mut mix = Mix(7);
+        let mut fewer = 0;
+        for _ in 0..4_000 {
+            let bounded = mix.pick(&[false, true]);
+            let needed = mix.pick(&[0, 1, 2, 3, 4, 5]);
+            // Nodes 1 to 9 each serve a copy or not, and up to seven of them
+            // are the nearest: the others' dates must not count.
+            let mut copies = Vec::new();
+            let mut nearest = Vec::new();
+            for peer in 1..=9u8 {
+                if mix.pick(&[true, false]) {
+                    let first_seen = Some(mix.pick(&values));
+                    copies.push((
+                        peer,
+                        Listing {
+                            first_seen,
+                            ..honest.clone()
+                        },
+                    ));
+                }
+                if nearest.len() < 7 && mix.pick(&[true, true, false]) {
+                    nearest.push(peer);
+                }
+            }
+            let Some(group) = merge_copies(copies.clone()).pop() else {
+                continue;
+            };
+            let mut dates: Vec<u64> = copies
+                .iter()
+                .filter(|(peer, _)| nearest.contains(peer))
+                .filter_map(|(_, copy)| copy.first_seen)
+                .collect();
+            dates.sort_unstable();
+            let passing: Vec<u64> = dates
+                .iter()
+                .copied()
+                .filter(|&date| verdict(date, h, bounded).is_ok())
+                .collect();
+            let asked = RefCell::new(Vec::new());
+            let result = check_copies(&group, &nearest, needed, |listing| {
+                let first_seen = listing.first_seen.unwrap();
+                asked.borrow_mut().push(first_seen);
+                verdict(first_seen, h, bounded)
+            });
+            let context = format!("needed {needed}, bounded {bounded}, dates {dates:?}");
+
+            // Each different date of the nearest is checked once, and
+            // nothing else.
+            let mut distinct = dates.clone();
+            distinct.dedup();
+            let mut asked = asked.into_inner();
+            asked.sort_unstable();
+            assert_eq!(asked, distinct, "{context}");
+
+            let Some(&latest) = passing.last() else {
+                // None passes: the error the median of them all gives, or,
+                // with no date at all, that there is none.
+                let error = match median_first_seen(dates.iter().copied()) {
+                    Some(median) => verdict(median, h, bounded).unwrap_err(),
+                    None => ListingError::MissingFirstSeen.into(),
+                };
+                assert_eq!(result, Err(error), "{context}");
+                continue;
+            };
+            let (listing, checked) = result.unwrap_or_else(|e| panic!("{context}: {e}"));
+            let date = listing.first_seen.unwrap();
+            assert_eq!(
+                listing,
+                Listing {
+                    first_seen: Some(date),
+                    ..honest.clone()
+                },
+                "{context}"
+            );
+            assert_eq!(checked, REPORTED, "{context}");
+            // A date that passes.
+            assert!(passing.contains(&date), "{context}: {date}");
+            // Never earlier than `needed` dates that pass put it: at least
+            // that many of them, or all of them if fewer, are at or before
+            // it.
+            let at_or_before = passing.iter().filter(|&&passed| passed <= date).count();
+            assert!(
+                at_or_before >= needed.min(passing.len()),
+                "{context}: {date}"
+            );
+            if needed >= 1 && passing.len() >= needed {
+                // With that many, the `needed`-th earliest: they date it
+                // then or earlier.
+                assert_eq!(date, passing[needed - 1], "{context}");
+            } else {
+                // With fewer, the latest, so none of them is later.
+                assert_eq!(date, latest, "{context}");
+                fewer += 1;
+            }
+        }
+        // Enough rounds have fewer than `needed` dates passing.
+        assert!(fewer > 500, "{fewer}");
+    }
+
+    #[test]
+    fn no_minority_dates_a_group_before_every_other_date_that_passes() {
+        let honest = unlocated();
+        let h = honest.first_seen.unwrap();
+        let hour = 3_600;
+        let check = |listing: &Listing| verdict(listing.first_seen.unwrap(), h, false);
+        let nearest = [1, 2, 3, 4, 5, 6, 7];
+        // What each colluding node can send: nothing, a date that passes,
+        // from 1970 to an hour before the honest nodes', or a date in the
+        // future, which fails.
+        let sends = [
+            None,
+            Some(0),
+            Some(h - 2 * hour),
+            Some(h - hour),
+            Some(h + 100 * hour),
+        ];
+        let mut mix = Mix(8);
+        for _ in 0..300 {
+            let needed = mix.pick(&[1, 2, 3, 4]);
+            // One to four honest nodes, their dates up to an hour apart.
+            let mut honest_dates = Vec::new();
+            for _ in 0..mix.pick(&[1, 2, 3, 4]) {
+                honest_dates.push(mix.pick(&[h, h + hour]));
+            }
+            let earliest = *honest_dates.iter().min().unwrap();
+            // Fewer than `needed` collude, among the other nearest nodes,
+            // and try everything they can send.
+            let colluders = (needed - 1).min(nearest.len() - honest_dates.len());
+            let choices = sends.len().pow(u32::try_from(colluders).unwrap());
+            for choice in 0..choices {
+                let mut values: Vec<Option<u64>> = honest_dates.iter().copied().map(Some).collect();
+                let mut rest = choice;
+                for _ in 0..colluders {
+                    values.push(sends[rest % sends.len()]);
+                    rest /= sends.len();
+                }
+                let copies = nearest.iter().zip(&values).filter_map(|(&peer, &value)| {
+                    value.map(|first_seen| {
+                        (
+                            peer,
+                            Listing {
+                                first_seen: Some(first_seen),
+                                ..honest.clone()
+                            },
+                        )
+                    })
+                });
+                let group = merge_copies(copies).remove(0);
+                let (listing, _) = check_copies(&group, &nearest, needed, check).unwrap();
+                assert!(
+                    listing.first_seen.unwrap() >= earliest,
+                    "needed {needed}, {values:?}"
+                );
+            }
+        }
     }
 
     #[test]

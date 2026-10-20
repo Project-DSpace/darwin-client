@@ -115,13 +115,19 @@ when the node first stored it, in Unix seconds rounded down to the hour, or the
 hour of the payment's block if the node's clock is behind it. Each node records
 its own, so copies of a listing can differ there. Copies equal apart from
 `first_seen` are one listing, dated by the values the nodes nearest its
-address returned that pass the checks below on their own. Where at least
-`min(4, majority of the nodes asked)` of them serve it, its `first_seen` is the
-latest of the earliest that many, so that a quorum of them date it then or
-earlier: with all seven answering, their median. Otherwise it is the median of
-those values: the later of the two middle ones for an even count, so moving it
-earlier takes more than half of them. Other nodes can't move it, however many
-there are.
+address returned that pass the checks below on their own, one per node. Where
+at least `min(4, majority of the nodes asked)` of those values pass, its
+`first_seen` is the latest of the earliest that many, so that a quorum of them
+date it then or earlier: with all seven passing, their median. Where fewer
+pass, it is the latest of them. So a listing is never dated earlier than a
+quorum of passing values put it, however many nodes serve it: nodes fewer
+than a quorum can't date it earlier than every other passing value, whether
+they send early values, values that fail, or none. Dating it later takes
+less. Where no more than a quorum of values pass, the latest of them counts,
+since any earlier one would let fewer than a quorum date it earlier. So any
+one node whose value passes can date it later, up to the checker's clock
+plus an hour (see Checks). Nodes further from its address can't move it,
+however many there are.
 
 Listings in the index are sorted by key: time, block number, log index and
 address, where the time is the block timestamp if shown, otherwise
@@ -206,10 +212,12 @@ block has only the first bound.
 
 Each nearest node's `first_seen` is checked against these bounds on its own,
 and values outside them are dropped before the date is taken (`check_copies`,
-for node repair and indexers alike). So a few nodes sending a value out of
-bounds can neither fail a listing nor move its time, and within the bounds it
-takes a quorum to move it earlier. This holds for a verified listing too: its
-quote proves the payment, not `first_seen`.
+for node repair and indexers alike). So nodes sending values out of bounds
+can't fail a listing while another node's value passes, and leaving fewer
+values to date it can't move its time earlier: with fewer than a quorum
+passing, the latest of them counts. Within the bounds it takes a quorum to
+move it earlier. This holds for a verified listing too: its quote proves the
+payment, not `first_seen`.
 
 The uploader keeps a proof: the envelope's bytes, the tx hash and the paid
 quote, and for a withheld data map the data map and salt. Anyone can check it

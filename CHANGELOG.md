@@ -17,10 +17,12 @@ told apart by the commit `darwin --version` prints. Upstream's entries follow.
 - Listings v2: envelopes on every visibility, optional payment fields, upload records and proofs
   (`darwin file prove`, `darwin file verify`), and the listings index (`darwin listings`,
   `darwin listing`) read with quorum checks.
-- darwin-listings is vendored at 0.3.0, which adds nodes' change feeds (digest entries, set hashes,
-  address ranges, pushes to watchers and `FeedSync`); the client routes their answers and pushes by
-  request id. The index as small static files, `listings/v1/`, is specified in
-  `docs/listings-v1.md`, with its types in `ant_core::data::client::listings_v1`.
+- darwin-listings is vendored at v0.3.1. 0.3.0 added nodes' change feeds (digest entries, set
+  hashes, address ranges, pushes to watchers and `FeedSync`); the client routes their answers and
+  pushes by request id. 0.3.1 dates a listing whose nearest nodes give fewer than 4 dates that pass
+  their checks by the latest of those dates, not their median, so fewer than 4 nodes can't date it
+  earlier. The index as small static files, `listings/v1/`, is specified in `docs/listings-v1.md`,
+  with its types in `ant_core::data::client::listings_v1`.
 - `darwin listings serve --state-dir DIR --out-dir DIR [--carry FILE]` keeps the index published
   as the files of `listings/v1/`: each minute it reads the index as `darwin listings --state
   --carry` does, keeps envelopes and final chain facts (paced and batched RPC calls), and writes

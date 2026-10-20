@@ -40,7 +40,7 @@ jobs:
             exit 1
           fi
 
-      # The vendored ant-listings is darwin-listings 0.3.0 unchanged; the ids
+      # The vendored ant-listings is darwin-listings v0.3.1 unchanged; the ids
       # it was vendored at are in its VENDORED.md.
       - name: Vendored ant-listings is unchanged
         run: |
