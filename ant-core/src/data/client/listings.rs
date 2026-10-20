@@ -96,7 +96,7 @@ const PEER_CONCURRENCY: usize = 64;
 
 /// Addresses decided at once. Each fetches its envelope from the nodes that
 /// served it and reads the payment from the chain.
-const CHECK_CONCURRENCY: usize = 8;
+pub(crate) const CHECK_CONCURRENCY: usize = 8;
 
 /// The walk phase of a read lasts at most this, or [`WALK_PHASE_FACTOR`]
 /// times as long as half the walks took, whichever is longer: a node that
@@ -256,6 +256,9 @@ struct Coverage {
     served: HashSet<XorName>,
     /// Addresses this read decided.
     decided: HashSet<XorName>,
+    /// Addresses shown to be no longer served by other means than this
+    /// read's walks ([`ListingsIndex::decided`]).
+    gone: HashSet<XorName>,
 }
 
 /// A listing that passed its checks.
@@ -394,6 +397,9 @@ impl ListingsIndex {
         if coverage.decided.contains(address) {
             return Carry::Decided;
         }
+        if coverage.gone.contains(address) {
+            return Carry::NoLongerServed;
+        }
         // A read from a time walked no node's index before `walk_start` of
         // it, and a node keys a listing that hides its time by its own date:
         // up to three of the nearest can date it well before the one
@@ -427,6 +433,49 @@ impl ListingsIndex {
             Carry::NoLongerServed
         } else {
             Carry::Keep
+        }
+    }
+
+    /// The index of what was decided outside an index read, as the listings
+    /// producer decides it from its census and its mirrors of the nodes'
+    /// indexes: `pending`, addresses fewer than a quorum of their nearest
+    /// nodes serve, left for later as a read leaves them; `decisions`, what
+    /// [`Client::decide_backed`] decided for the others; and `gone`,
+    /// addresses shown to be no longer served ([`Self::carry`] says
+    /// [`Carry::NoLongerServed`] for them). Every other address is left as it
+    /// was ([`Carry::Keep`]).
+    pub(crate) fn decided(
+        pending: &[AddressWalk<PeerId>],
+        decisions: Vec<Decision>,
+        gone: HashSet<XorName>,
+        chain: &ListingChain,
+    ) -> Self {
+        let mut index = Self {
+            coverage: Coverage {
+                gone,
+                ..Coverage::default()
+            },
+            ..Self::default()
+        };
+        index.defer_pending(pending, chain);
+        index.settle(decisions);
+        index
+    }
+
+    /// Whether this index decided `address`: listed it, or rejected it for
+    /// good.
+    pub(crate) fn was_decided(&self, address: &XorName) -> bool {
+        self.coverage.decided.contains(address)
+    }
+
+    /// The index of a cycle in which too few nodes answered to decide
+    /// anything: `deferred` addresses left for later, every earlier entry
+    /// kept ([`Self::carry`]).
+    pub(crate) fn too_few(deferred: usize) -> Self {
+        Self {
+            deferred,
+            too_few_nodes: true,
+            ..Self::default()
         }
     }
 
@@ -852,6 +901,7 @@ impl Client {
                     .map(|address| address.address)
                     .collect(),
                 decided: HashSet::new(),
+                gone: HashSet::new(),
             },
             ..ListingsIndex::default()
         };
@@ -4671,6 +4721,7 @@ mod tests {
                     walks,
                     served: only(served),
                     decided: only(decided),
+                    gone: HashSet::new(),
                 },
                 ..ListingsIndex::default()
             }
@@ -4771,6 +4822,7 @@ mod tests {
                     walks,
                     served: HashSet::from([address]),
                     decided: HashSet::new(),
+                    gone: HashSet::new(),
                 },
                 ..ListingsIndex::default()
             }
@@ -4848,6 +4900,7 @@ mod tests {
                     walks,
                     served: HashSet::new(),
                     decided: HashSet::new(),
+                    gone: HashSet::new(),
                 },
                 ..ListingsIndex::default()
             }

@@ -343,6 +343,8 @@ struct V2Read {
     pass: Option<Pass>,
     /// When the latest pass began (Unix seconds).
     pass_began: Option<u64>,
+    /// When the latest finished pass began (Unix seconds).
+    finished_began: Option<u64>,
     /// Whether the latest finished pass reached the end of its index with
     /// room for every entry in its range, and every read since had room.
     complete: bool,
@@ -479,6 +481,7 @@ impl V2Read {
                             touched.push(address);
                         }
                         self.complete = !pass.capped;
+                        self.finished_began = self.pass_began;
                         self.cursor = None;
                     }
                     Some(_) if PAGE.saturating_mul(pass.pages + 1) > allowance => {
@@ -731,6 +734,7 @@ impl NodeState {
             Mirror::V2(read) => Some(V2Record {
                 newest: read.newest.map(|key| hex::encode(key.to_bytes())),
                 pass_began: read.pass_began,
+                finished_began: read.finished_began,
                 complete: read.complete,
                 cursor: read.cursor.map(|key| hex::encode(key.to_bytes())),
             }),
@@ -770,6 +774,8 @@ struct V2Record {
     /// Keys in hex ([`ListingKey::to_bytes`]).
     newest: Option<String>,
     pass_began: Option<u64>,
+    #[serde(default)]
+    finished_began: Option<u64>,
     complete: bool,
     cursor: Option<String>,
 }
@@ -798,7 +804,10 @@ impl NodeRecord {
                         .collect(),
                     newest: key(&record.newest)?,
                     pass_began: record.pass_began,
-                    complete: record.complete,
+                    finished_began: record.finished_began,
+                    // A record from before the start of the finished pass was
+                    // kept can't say since when the mirror is complete.
+                    complete: record.complete && record.finished_began.is_some(),
                     cursor: key(&record.cursor)?,
                     ..V2Read::default()
                 })
@@ -907,6 +916,9 @@ pub struct Feeds {
     backing: Backing,
     /// The nodes the backing was counted with, in id order.
     members: Option<Vec<PeerId>>,
+    /// When the latest round began (Unix seconds): the time a node read
+    /// through its feed was last read in full ([`Self::complete_since`]).
+    round_at: u64,
 }
 
 impl std::fmt::Debug for Feeds {
@@ -993,6 +1005,7 @@ impl Feeds {
             pending_new: BTreeSet::new(),
             backing: Backing::default(),
             members: None,
+            round_at: 0,
         })
     }
 
@@ -1022,6 +1035,7 @@ impl Feeds {
         I: FeedIo,
         C: NearestNodes + ?Sized,
     {
+        self.round_at = now;
         self.reconcile(census, nodes, now);
         let peers: Vec<PeerId> = self.nodes.keys().copied().collect();
         for peer in &peers {
@@ -1262,6 +1276,33 @@ impl Feeds {
             Mirror::Feed(sync) => sync.peers(),
             Mirror::V2(_) => None,
         }
+    }
+
+    /// Since when `peer`'s mirror has held everything it serves in its range,
+    /// if it does this cycle ([`NodeRead::complete`]): for a node read
+    /// through its feed, the start of the latest round, which found it in
+    /// sync; for one read with v2 requests, when its latest finished pass
+    /// began. Like the start of a walk of a node's whole index in an index
+    /// read: a listing the node stored before then is in its mirror.
+    #[must_use]
+    pub fn complete_since(&self, peer: &PeerId) -> Option<u64> {
+        let node = self.nodes.get(peer)?;
+        if !node.read.complete {
+            return None;
+        }
+        match &node.mirror {
+            Mirror::Feed(_) => Some(self.round_at),
+            Mirror::V2(read) => read.finished_began,
+        }
+    }
+
+    /// Every address some node's mirror holds, counting or not.
+    #[must_use]
+    pub fn addresses(&self) -> BTreeSet<XorName> {
+        self.nodes
+            .values()
+            .flat_map(|node| node.mirror.addresses())
+            .collect()
     }
 
     /// The nodes followed, in id order.
