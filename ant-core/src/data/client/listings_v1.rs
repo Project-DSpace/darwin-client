@@ -99,7 +99,9 @@ pub struct ListingFields {
     pub name: Option<String>,
     /// The content type the uploader declared, if any.
     pub content_type: Option<String>,
-    /// The file's size in bytes, when the data map gives it directly.
+    /// The file's size in bytes, as its data map gives it. A listing gives
+    /// none for a data map shrunk into a child map; the producer reads the
+    /// root map to find it. `None` when withheld, or not yet read.
     pub size: Option<u64>,
     /// Whether anyone with the address can read the file: the envelope
     /// holds its data map, rather than withholding it.

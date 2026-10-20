@@ -114,7 +114,7 @@ its uploader chose to hide, and those fields are absent from its entry.
 | `address` | The file's address: its envelope's, 64 hex digits |
 | `name` | The name the uploader declared, or `null`. Treat it as untrusted text, not a path |
 | `content_type` | The content type the uploader declared, or `null` |
-| `size` | The file's size in bytes, when the data map gives it directly; else `null` |
+| `size` | The file's size in bytes, as its data map gives it. The data map of a file over about 12.5 MB is shrunk into a child map, which gives no size: the producer reads its root map once to find it, and until then it is `null`. `null` when the data map is withheld |
 | `readable` | Whether anyone with the address can read the file: the envelope holds its data map rather than withholding it |
 | `hidden` | The payment fields the uploader hid, of `tx-hash`, `block`, `timestamp`, `log-index` and `quote`, in that order |
 | `tx_hash` | The payment's transaction hash. Absent when hidden |
