@@ -15,11 +15,14 @@
 //!   same bytes, which are checked again whenever the file is written with
 //!   the bytes it holds;
 //! - the files a change touches first (a content type's pages from its last
-//!   back), then `pages.json`, `feed/index.json`, and `head.json` last, so a
-//!   file is written only after every file it names is in place;
+//!   back), then `pages.json`, `feed/index.json`, and `head.json` after
+//!   them, so a file is written only after every file it names is in place;
 //! - every prefix's shard files, empty or not;
 //! - support files at most every [`SUPPORT_INTERVAL`];
-//! - `status.json` every cycle, and `rejected.json` when it changes;
+//! - `rejected.json` when it changes;
+//! - `status.json` every publication, last of all: after every other file,
+//!   and after the store has them as written, so a fresh `status.json`
+//!   means they are all in place;
 //! - time pages that `pages.json` no longer lists are deleted
 //!   [`SUPERSEDED_KEPT`] after the `pages.json` written last listed them.
 //!
@@ -170,10 +173,10 @@ pub struct Publication {
     /// deferral, or none once it is listed or no longer served.
     pub rejected: Vec<RejectedChange>,
     /// How the producer is doing, for `status.json`, which every
-    /// publication writes: a publication between cycles passes the latest
-    /// cycle's. The publisher fills in `epoch`, `seq`, `count` and
-    /// `generated_at`, and `resources.files_bytes` where it is `None`; the
-    /// rest is written as given.
+    /// publication writes, after its other files: a publication between
+    /// cycles passes the latest cycle's. The publisher fills in `epoch`,
+    /// `seq`, `count` and `generated_at`, and `resources.files_bytes` where
+    /// it is `None`; the rest is written as given.
     pub status: Status,
 }
 
@@ -478,10 +481,11 @@ impl Publisher {
         self.files.bytes
     }
 
-    /// Write the files `pending` names, in the order the module docs give,
-    /// and `status.json`; then clear what was written from the store, and
-    /// note the time pages `pages.json` stopped listing as superseded at
-    /// `at`.
+    /// Write the files `pending` names, in the order the module docs give;
+    /// clear what was written from the store, and note the time pages
+    /// `pages.json` stopped listing as superseded at `at`; then write
+    /// `status.json`, last, so that a fresh one means every other file is in
+    /// place and the store has it as written.
     fn write(&mut self, at: u64, status: &Status, mut pending: Pending) -> Result<Published> {
         let dbs = self.dbs;
         self.files.written = 0;
@@ -542,15 +546,6 @@ impl Publisher {
                 .superseded
                 .extend(fixes.iter().map(|fix| fix.old_path.clone()));
         }
-        let mut status = status.clone();
-        status.epoch.clone_from(&self.epoch);
-        status.seq = self.seq;
-        status.count = self.count;
-        status.generated_at = (self.clock)();
-        if status.resources.files_bytes.is_none() {
-            status.resources.files_bytes = Some(self.files.bytes);
-        }
-        self.files.put(STATUS_FILE, &json(&status)?)?;
         let txn = self.store.env().read_txn().map_err(store_error)?;
         let pages_written = pending.lists || !fixes.is_empty();
         if pages_written {
@@ -611,6 +606,18 @@ impl Publisher {
         if support_written {
             self.support_at = Some(at);
         }
+        // Last of all, once the files above are in place and the store has
+        // them as written: a `status.json` that is fresh says so, and one a
+        // failed write leaves stale says it isn't.
+        let mut status = status.clone();
+        status.epoch.clone_from(&self.epoch);
+        status.seq = self.seq;
+        status.count = self.count;
+        status.generated_at = (self.clock)();
+        if status.resources.files_bytes.is_none() {
+            status.resources.files_bytes = Some(self.files.bytes);
+        }
+        self.files.put(STATUS_FILE, &json(&status)?)?;
         Ok(Published {
             epoch: self.epoch.clone(),
             seq: self.seq,
@@ -3159,14 +3166,24 @@ mod tests {
     }
 
     /// Stop the next publication's write after its content type pages:
-    /// `status.json`, written after them, can't be.
+    /// `pages.json`, written after them, can't be.
     fn stop_after_type_pages(f: &Fixture) {
-        fs::remove_file(f.out().join(STATUS_FILE)).unwrap();
-        fs::create_dir(f.out().join(STATUS_FILE)).unwrap();
+        block(f, PAGES_FILE);
     }
 
     fn resume(f: &Fixture) {
-        fs::remove_dir(f.out().join(STATUS_FILE)).unwrap();
+        unblock(f, PAGES_FILE);
+    }
+
+    /// Put a directory where the file at `path` is, so it can't be written.
+    fn block(f: &Fixture, path: &str) {
+        fs::remove_file(f.out().join(path)).unwrap();
+        fs::create_dir(f.out().join(path)).unwrap();
+    }
+
+    /// Take away the directory [`block`] put at `path`.
+    fn unblock(f: &Fixture, path: &str) {
+        fs::remove_dir(f.out().join(path)).unwrap();
     }
 
     fn png(seeds: Range<u64>) -> Vec<IndexChange> {
@@ -3642,6 +3659,42 @@ mod tests {
         assert_eq!(f.publisher.files_bytes(), measure(&f.out()).unwrap());
         f.reopen();
         assert_eq!(f.publisher.files_bytes(), measure(&f.out()).unwrap());
+    }
+
+    #[test]
+    fn status_json_is_written_last() {
+        let mut f = Fixture::new();
+        f.publish(&first_publication());
+        let cycle = |f: &Fixture| f.file::<Status>(STATUS_FILE).cycle.started_at;
+        let pending = |f: &Fixture| {
+            let txn = f.store.env().read_txn().unwrap();
+            f.publisher.dbs.pending(&txn).unwrap()
+        };
+        assert_eq!(cycle(&f), AT);
+        // A write that stops at head.json, written after the other files of
+        // a change, leaves status.json as it was, stale, though the files
+        // before head.json moved on.
+        block(&f, HEAD_FILE);
+        let stopped = f.publisher.publish(&Publication {
+            changes: vec![remove([0xa0; 32])],
+            ..quiet(AT + 60)
+        });
+        assert!(stopped.is_err());
+        assert_eq!(f.file::<FeedIndex>(FEED_INDEX_FILE).seq, 3);
+        assert_eq!(cycle(&f), AT);
+        assert!(pending(&f).lists);
+        // When status.json itself can't be written, every other file is in
+        // place, and the store has them as written.
+        unblock(&f, HEAD_FILE);
+        block(&f, STATUS_FILE);
+        let stopped = f.publisher.publish(&quiet(AT + 120));
+        assert!(stopped.is_err());
+        assert_eq!(f.file::<Head>(HEAD_FILE).seq, 3);
+        assert!(!pending(&f).lists);
+        // So the next publication has only status.json to write.
+        unblock(&f, STATUS_FILE);
+        assert_eq!(f.publish(&quiet(AT + 180)).files_written, 1);
+        assert_eq!(cycle(&f), AT + 180);
     }
 
     #[test]

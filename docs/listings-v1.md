@@ -27,7 +27,7 @@ All paths are relative to the directory the files are published in, such as
 | `pages/<first key>-<hash>.json` | One time page | Never: a page whose entries change gets a new name |
 | `feed/index.json` | The feed's segments | When the feed grows |
 | `feed/<first seq>.json` | Up to 1,000 of the feed's records | Until it holds 1,000, then not within its epoch |
-| `status.json` | How the producer is doing | Every cycle (each minute) |
+| `status.json` | How the producer is doing | Every cycle (each minute), after the cycle's other files |
 | `rejected.json` | Listings the producer didn't list, with why | When one changes |
 
 ## Conventions
@@ -78,7 +78,10 @@ an empty shard.
 one. Beside each file are `<file>.gz` and `<file>.zst`, the same bytes
 compressed, which a server can send as they are to a reader that accepts
 gzip or zstd. A file is written only after every file it names is in place;
-`head.json` is written after the other files of a change.
+`head.json` is written after the other files of a change, and `status.json`
+last, after every other file of the cycle, so a fresh `status.json` means the
+cycle's files are all in place. (So in a new directory, the first `head.json`
+comes a moment before the `status.json` it links to.)
 
 **Caching.** Time pages are named by their content, so they never change:
 keep them (they are served to be cached for a day). Every other file can
@@ -342,9 +345,10 @@ lists the segments: `{"epoch", "seq", "segments": [{"path", "first", "last"}]}`.
 
 ## status.json
 
-How the producer is doing, written at the end of every cycle (each minute).
-A `generated_at` more than a few minutes old means the producer has stopped
-or is stuck.
+How the producer is doing, written at the end of every cycle (each minute),
+after every other file of the cycle: a fresh one means they are all in
+place. A `generated_at` more than a few minutes old means the producer has
+stopped, is stuck, or can't write its files.
 
 | Field | Value |
 |---|---|
@@ -469,7 +473,10 @@ Files are fetched one at a time, so a file can be newer than the
   when deciding the address again rejects it (`rejected`). An entry it can't
   confirm otherwise is kept, marked `carried` in its support file.
 - It writes a file only when its bytes change; the files a change touches
-  first, then `pages.json`, `feed/index.json`, and `head.json` last. Time
-  pages that `pages.json` no longer lists are deleted a day later.
-- `status.json` is written every cycle; `rejected.json` when a rejection or
-  deferral changes.
+  first, then `pages.json`, `feed/index.json` and `head.json`. Time pages
+  that `pages.json` no longer lists are deleted a day later.
+- `rejected.json` is written when a rejection or deferral changes, and
+  `status.json` every cycle, last: once every other file of the cycle is in
+  place and the producer has recorded it as written. A cycle that can't
+  write its files leaves `status.json` as it was, so its `generated_at` goes
+  stale.

@@ -50,7 +50,7 @@
 //!    have left the census. Otherwise it stays, marked carried while
 //!    unconfirmed.
 //! 7. **Publishing** what changed ([`Publisher::publish`]), and
-//!    `status.json`.
+//!    `status.json` after every other file.
 //!
 //! Between cycles, nodes push the new records of the leaves they are asked
 //! about: a push that brings a mirror to the node's new head is applied,
