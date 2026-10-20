@@ -147,7 +147,7 @@ const ENTRY_LEN: usize = 8 * 3 + 1 + 8 + 32;
 
 /// The receiving end of the pushes a producer's `ListingsRequests` routes,
 /// each with the node it came from.
-pub type PushReceiver = tokio::sync::mpsc::Receiver<(PeerId, ChangesResponse)>;
+pub use super::listings::PushReceiver;
 
 /// Sends listings requests to nodes: the producer's `ListingsRequests`, or a
 /// stand-in in tests.
@@ -231,9 +231,13 @@ pub enum ReadKind {
 pub struct NodeRead {
     /// How it was read.
     pub kind: ReadKind,
-    /// Whether it answered a request this round, whatever the checks made of
-    /// the answer.
+    /// Whether it answered this round with answers the checks took: of the
+    /// kind asked for, none refused. Only then does it count as answering,
+    /// for the census and the cycle's guard.
     pub answered: bool,
+    /// Whether it sent any answer this round, whatever the checks made of
+    /// it.
+    pub replied: bool,
     /// Whether its copies count this cycle: in sync with its feed, or for a
     /// node read with v2 requests, it answered this round's request with a
     /// page the checks take.
@@ -261,6 +265,7 @@ impl NodeRead {
         Self {
             kind,
             answered: false,
+            replied: false,
             counts: false,
             complete: false,
             outcome: None,
@@ -280,7 +285,8 @@ pub struct PollReport {
     pub feed: usize,
     /// Those read with listings v2 requests.
     pub v2: usize,
-    /// Those that answered a request.
+    /// Those that answered a request, whatever the checks made of the
+    /// answer.
     pub answered: usize,
     /// Those whose copies count this cycle.
     pub counting: usize,
@@ -700,7 +706,8 @@ impl NodeState {
                 let in_sync = sync.in_sync();
                 NodeRead {
                     kind: ReadKind::Feed,
-                    answered: self.answered,
+                    answered: self.answered && sync.problem().is_none(),
+                    replied: self.answered,
                     counts: in_sync,
                     complete: in_sync,
                     outcome: sync.outcome(),
@@ -713,7 +720,10 @@ impl NodeState {
                 read.asked = None;
                 NodeRead {
                     kind: ReadKind::V2,
-                    answered: self.answered,
+                    // A page the checks took: an answer of another kind, or
+                    // a page they refused, isn't one.
+                    answered: read.answered && read.problem.is_none(),
+                    replied: self.answered,
                     counts: read.answered,
                     complete: read.answered && read.complete,
                     outcome: None,
@@ -1296,6 +1306,13 @@ impl Feeds {
         }
     }
 
+    /// `peer`'s allowance in pages a round: what it may be asked for in one,
+    /// as [`MAX_LIST_LIMIT`]-entry pages of its allowance of entries.
+    #[must_use]
+    pub fn page_allowance(&self, peer: &PeerId) -> usize {
+        allowance(self.backing.count(peer)).div_ceil(PAGE)
+    }
+
     /// Every address some node's mirror holds, counting or not.
     #[must_use]
     pub fn addresses(&self) -> BTreeSet<XorName> {
@@ -1447,7 +1464,7 @@ impl Feeds {
                 ReadKind::Feed => report.feed += 1,
                 ReadKind::V2 => report.v2 += 1,
             }
-            report.answered += usize::from(read.answered);
+            report.answered += usize::from(read.replied);
             report.counting += usize::from(read.counts);
             report.refused += usize::from(read.problem.is_some());
             report.fell_back += usize::from(read.fell_back);
@@ -2140,8 +2157,8 @@ mod tests {
         poll(&mut feeds, &net, &nodes, NOW).await;
         net.node(&a, |node| node.put(entry(address(500), 1)));
         let push = net.node(&a, |node| node.pushes.pop().unwrap());
-        let (sender, mut receiver) = tokio::sync::mpsc::channel(8);
-        sender.send((a, push)).await.unwrap();
+        let (sender, mut receiver) = crate::data::client::listings::push_channel(8);
+        assert!(sender.offer(a, push));
         drop(sender);
         let ids = Ids(vec![a]);
         let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
@@ -2200,6 +2217,10 @@ mod tests {
         let read = feeds.read(&a).unwrap();
         assert_eq!(read.outcome, Some(FeedOutcome::BadPage));
         assert!(read.problem.is_some());
+        // It replied, but with nothing the checks took: it doesn't count as
+        // answering, for the census or the cycle's guard.
+        assert!(read.replied && !read.answered);
+        assert_eq!(report.answered, 1);
         assert_eq!(read.entries, 0);
         assert!(feeds.pending().is_empty());
     }

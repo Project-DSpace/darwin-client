@@ -60,6 +60,7 @@ use ant_listings::{
     ListingPayment, ListingsBody, ListingsMessage, Lookup, MergedListing, NodeReport, PaidAt,
     PaymentError, PaymentLog, PaymentReceipt, ProvenUpload, WalkOutcome, WalkResult, CLOCK_MARGIN,
     DATA_PAYMENT_MADE_TOPIC, FIRST_SEEN_ROUNDING, MAX_LIST_LIMIT, QUORUM_THRESHOLD, TOPIC,
+    WALK_FREE_LISTINGS, WATCH_LEASE,
 };
 use ant_protocol::evm::{Amount, Network as EvmNetwork, QuoteHash};
 use ant_protocol::transport::{MultiAddr, P2PEvent, P2PNode, PeerId};
@@ -444,22 +445,32 @@ impl ListingsIndex {
     /// addresses shown to be no longer served ([`Self::carry`] says
     /// [`Carry::NoLongerServed`] for them). Every other address is left as it
     /// was ([`Carry::Keep`]).
+    #[cfg(test)]
     pub(crate) fn decided(
         pending: &[AddressWalk<PeerId>],
         decisions: Vec<Decision>,
         gone: HashSet<XorName>,
         chain: &ListingChain,
     ) -> Self {
-        let mut index = Self {
-            coverage: Coverage {
-                gone,
-                ..Coverage::default()
-            },
-            ..Self::default()
-        };
-        index.defer_pending(pending, chain);
-        index.settle(decisions);
+        let mut index = Self::default();
+        index.defer(pending, chain);
+        index.finish_decided(decisions, gone);
         index
+    }
+
+    /// Leave `pending` for later in an index decided outside an index read,
+    /// as [`Self::decided`] does: one batch of addresses at a time, before
+    /// [`Self::finish_decided`].
+    pub(crate) fn defer(&mut self, pending: &[AddressWalk<PeerId>], chain: &ListingChain) {
+        self.defer_pending(pending, chain);
+    }
+
+    /// Take in `decisions` and `gone` into an index decided outside an index
+    /// read, as [`Self::decided`] does, once every batch is deferred
+    /// ([`Self::defer`]).
+    pub(crate) fn finish_decided(&mut self, decisions: Vec<Decision>, gone: HashSet<XorName>) {
+        self.coverage.gone = gone;
+        self.settle(decisions);
     }
 
     /// Whether this index decided `address`: listed it, or rejected it for
@@ -924,7 +935,7 @@ impl Client {
         let context = &context;
         let requests = &requests;
         let decisions: Vec<Decision> = stream::iter(backed)
-            .map(|found| self.decide_backed(found, context, requests, chain))
+            .map(|found| self.decide_backed(found, context, requests, chain, &[]))
             .buffer_unordered(CHECK_CONCURRENCY)
             .collect()
             .await;
@@ -980,166 +991,219 @@ impl Client {
     }
 
     /// Decide an address at least a quorum of its nearest nodes serve.
+    ///
+    /// `unheard` are nearest nodes that serve a copy this read couldn't
+    /// take (the listings producer couldn't fetch the full listing behind
+    /// the node's entry): they count as nodes not heard from, whose walk
+    /// doesn't answer for the address, and aren't asked again. A listing a
+    /// quorum of the other copies serve is decided without them, as no other
+    /// can reach a quorum; otherwise the address waits for them, as for any
+    /// node that hasn't answered. An index read passes none.
     pub(crate) async fn decide_backed(
         &self,
         found: AddressWalk<PeerId>,
         context: &ReadContext,
         requests: &ListingsRequests,
         chain: &ListingChain,
+        unheard: &[PeerId],
     ) -> Decision {
-        let AddressWalk {
-            address,
-            nearest,
-            mut copies,
-            ..
-        } = found;
-        let needed = QUORUM_THRESHOLD;
-        let senders: Vec<PeerId> = nearest
+        let senders: Vec<PeerId> = found
+            .nearest
             .iter()
             .copied()
-            .filter(|peer| copies.iter().any(|(sender, _)| sender == peer))
+            .filter(|peer| found.copies.iter().any(|(sender, _)| sender == peer))
             .collect();
         let envelope = match self
-            .fetch_envelope(&address, &senders, context, chain)
+            .fetch_envelope(&found.address, &senders, context, chain)
             .await
         {
             Ok(Some(envelope)) => envelope,
             Ok(None) => {
                 return Decision::again(
-                    address,
-                    &merge_copies(copies),
-                    &nearest,
+                    found.address,
+                    &merge_copies(found.copies),
+                    &found.nearest,
                     "none of the nodes serving it handed over its envelope; try again",
                     Vec::new(),
                 )
             }
             Err(problem) => {
-                return Decision::rejected(address, &merge_copies(copies), &nearest, &problem)
-            }
-        };
-        let now = unix_now();
-        let mut heard: HashSet<PeerId> = copies.iter().map(|(peer, _)| *peer).collect();
-        let mut failed: Vec<Listing> = Vec::new();
-        let mut rejected: Vec<RejectedListing> = Vec::new();
-        let mut asked = false;
-        let groups = loop {
-            let groups: Vec<MergedListing<PeerId>> = merge_copies(copies.clone())
-                .into_iter()
-                .filter(|group| !failed.iter().any(|listing| same_listing(group, listing)))
-                .collect();
-            // The listing a quorum serves is checked first, and only it: no
-            // other can have a quorum of the same nodes.
-            if let Some(group) = groups
-                .iter()
-                .find(|group| group.count_among(&nearest) >= needed)
-            {
-                match check_quorum_group(group, &envelope, &nearest, chain, now).await {
-                    Ok(checked) => {
-                        let (chosen, problems) = decide_address(
-                            std::slice::from_ref(group),
-                            vec![Ok(checked)],
-                            &nearest,
-                            NEAREST_NODES,
-                        );
-                        for other in groups.iter().filter(|other| !std::ptr::eq(*other, group)) {
-                            rejected.push(rejected_group(
-                                other,
-                                &nearest,
-                                needed,
-                                "not looked up: the listing a quorum of the nearest nodes serve                                  counts"
-                                    .into(),
-                                false,
-                            ));
-                        }
-                        return Decision::from_groups(
-                            address,
-                            std::slice::from_ref(group),
-                            &nearest,
-                            chosen,
-                            problems,
-                            envelope,
-                            rejected,
-                        );
-                    }
-                    Err(GroupProblem::Again(problem)) => {
-                        return Decision::again(address, &groups, &nearest, &problem, rejected);
-                    }
-                    Err(GroupProblem::Invalid(problem)) => {
-                        // No other listing for the address is left.
-                        if groups.len() == 1 {
-                            return Decision::refused(address, group, &nearest, problem, rejected);
-                        }
-                        rejected.push(rejected_group(group, &nearest, needed, problem, false));
-                        failed.push(group_listing(group, &nearest, needed));
-                        continue;
-                    }
-                }
-            }
-            if asked {
-                break groups;
-            }
-            asked = true;
-            let to_ask: Vec<PeerId> =
-                peers_to_ask(&groups, &nearest, needed, &heard, &context.full_walks)
-                    .into_iter()
-                    .filter(|peer| !context.silent.contains(peer) && !context.is_demoted(peer))
-                    .collect();
-            if to_ask.is_empty() {
-                break groups;
-            }
-            for (peer, answer) in self.ask_for_listing(requests, &address, &to_ask).await {
-                match answer {
-                    Some(listing) => {
-                        heard.insert(peer);
-                        copies.extend(listing.map(|listing| (peer, listing)));
-                    }
-                    None => context.demote(peer),
-                }
-            }
-        };
-        if groups.is_empty() {
-            return Decision {
-                address,
-                listing: None,
-                rejected,
-                decided: true,
-            };
-        }
-        // No listing has a quorum: one may still get one if the nodes not
-        // heard from serve it, so nothing is decided until they answer.
-        let unheard: HashSet<&PeerId> = groups
-            .iter()
-            .flat_map(|group| {
-                group.unheard_among(
-                    &nearest,
-                    |peer| heard.contains(peer),
-                    |peer| context.full_walks.get(peer).copied(),
+                return Decision::rejected(
+                    found.address,
+                    &merge_copies(found.copies),
+                    &found.nearest,
+                    &problem,
                 )
+            }
+        };
+        let ask = |address, peers: Vec<PeerId>| async move {
+            self.ask_for_listing(requests, &address, &peers).await
+        };
+        decide_found(found, envelope, context, chain, unheard, unix_now(), ask).await
+    }
+}
+
+/// What [`Client::decide_backed`] decides of `found` once it has its
+/// `envelope`, at `now` (Unix seconds), asking nearest nodes for their
+/// listing of the address with `ask` (as [`Client::ask_for_listing`] asks
+/// them). See [`Client::decide_backed`] for `unheard`.
+pub(crate) async fn decide_found<F, Fut>(
+    found: AddressWalk<PeerId>,
+    envelope: Envelope,
+    context: &ReadContext,
+    chain: &ListingChain,
+    unheard: &[PeerId],
+    now: u64,
+    ask: F,
+) -> Decision
+where
+    F: Fn(XorName, Vec<PeerId>) -> Fut,
+    Fut: std::future::Future<Output = Vec<(PeerId, Option<Option<Listing>>)>>,
+{
+    let AddressWalk {
+        address,
+        nearest,
+        mut copies,
+        ..
+    } = found;
+    let needed = QUORUM_THRESHOLD;
+    // A node whose copy wasn't taken hasn't been heard for this address,
+    // whatever its walk.
+    let walked: std::borrow::Cow<'_, HashMap<PeerId, u64>> = if unheard.is_empty() {
+        std::borrow::Cow::Borrowed(&context.full_walks)
+    } else {
+        let mut walked = context.full_walks.clone();
+        for peer in unheard {
+            walked.remove(peer);
+        }
+        std::borrow::Cow::Owned(walked)
+    };
+    let mut heard: HashSet<PeerId> = copies.iter().map(|(peer, _)| *peer).collect();
+    let mut failed: Vec<Listing> = Vec::new();
+    let mut rejected: Vec<RejectedListing> = Vec::new();
+    let mut asked = false;
+    let groups = loop {
+        let groups: Vec<MergedListing<PeerId>> = merge_copies(copies.clone())
+            .into_iter()
+            .filter(|group| !failed.iter().any(|listing| same_listing(group, listing)))
+            .collect();
+        // The listing a quorum serves is checked first, and only it: no
+        // other can have a quorum of the same nodes.
+        if let Some(group) = groups
+            .iter()
+            .find(|group| group.count_among(&nearest) >= needed)
+        {
+            match check_quorum_group(group, &envelope, &nearest, chain, now).await {
+                Ok(checked) => {
+                    let (chosen, problems) = decide_address(
+                        std::slice::from_ref(group),
+                        vec![Ok(checked)],
+                        &nearest,
+                        NEAREST_NODES,
+                    );
+                    for other in groups.iter().filter(|other| !std::ptr::eq(*other, group)) {
+                        rejected.push(rejected_group(
+                            other,
+                            &nearest,
+                            needed,
+                            "not looked up: the listing a quorum of the nearest nodes serve                                  counts"
+                                .into(),
+                            false,
+                        ));
+                    }
+                    return Decision::from_groups(
+                        address,
+                        std::slice::from_ref(group),
+                        &nearest,
+                        chosen,
+                        problems,
+                        envelope,
+                        rejected,
+                    );
+                }
+                Err(GroupProblem::Again(problem)) => {
+                    return Decision::again(address, &groups, &nearest, &problem, rejected);
+                }
+                Err(GroupProblem::Invalid(problem)) => {
+                    // No other listing for the address is left.
+                    if groups.len() == 1 {
+                        return Decision::refused(address, group, &nearest, problem, rejected);
+                    }
+                    rejected.push(rejected_group(group, &nearest, needed, problem, false));
+                    failed.push(group_listing(group, &nearest, needed));
+                    continue;
+                }
+            }
+        }
+        if asked {
+            break groups;
+        }
+        asked = true;
+        let to_ask: Vec<PeerId> = peers_to_ask(&groups, &nearest, needed, &heard, &walked)
+            .into_iter()
+            .filter(|peer| {
+                !context.silent.contains(peer)
+                    && !context.is_demoted(peer)
+                    && !unheard.contains(peer)
             })
             .collect();
-        let most = groups
-            .iter()
-            .map(|group| group.count_among(&nearest))
-            .max()
-            .unwrap_or(0);
-        if most + unheard.len() >= needed {
-            let problem = format!(
-                "no listing for it has a quorum of its nearest nodes yet: {most} serve the one \
-                 most serve, {} haven't answered; try again",
-                unheard.len()
-            );
-            return Decision::again(address, &groups, &nearest, &problem, rejected);
+        if to_ask.is_empty() {
+            break groups;
         }
-        let mut checked = Vec::with_capacity(groups.len());
-        for group in &groups {
-            checked.push(check_group(group, &envelope, &nearest, needed, chain, now).await);
+        for (peer, answer) in ask(address, to_ask).await {
+            match answer {
+                Some(listing) => {
+                    heard.insert(peer);
+                    copies.extend(listing.map(|listing| (peer, listing)));
+                }
+                None => context.demote(peer),
+            }
         }
-        let (chosen, problems) = decide_address(&groups, checked, &nearest, NEAREST_NODES);
-        Decision::from_groups(
-            address, &groups, &nearest, chosen, problems, envelope, rejected,
-        )
+    };
+    if groups.is_empty() {
+        return Decision {
+            address,
+            listing: None,
+            rejected,
+            decided: true,
+        };
     }
+    // No listing has a quorum: one may still get one if the nodes not
+    // heard from serve it, so nothing is decided until they answer.
+    let unheard: HashSet<&PeerId> = groups
+        .iter()
+        .flat_map(|group| {
+            group.unheard_among(
+                &nearest,
+                |peer| heard.contains(peer),
+                |peer| walked.get(peer).copied(),
+            )
+        })
+        .collect();
+    let most = groups
+        .iter()
+        .map(|group| group.count_among(&nearest))
+        .max()
+        .unwrap_or(0);
+    if most + unheard.len() >= needed {
+        let problem = format!(
+            "no listing for it has a quorum of its nearest nodes yet: {most} serve the one \
+             most serve, {} haven't answered; try again",
+            unheard.len()
+        );
+        return Decision::again(address, &groups, &nearest, &problem, rejected);
+    }
+    let mut checked = Vec::with_capacity(groups.len());
+    for group in &groups {
+        checked.push(check_group(group, &envelope, &nearest, needed, chain, now).await);
+    }
+    let (chosen, problems) = decide_address(&groups, checked, &nearest, NEAREST_NODES);
+    Decision::from_groups(
+        address, &groups, &nearest, chosen, problems, envelope, rejected,
+    )
+}
 
+impl Client {
     /// The envelope at `address`: the one `chain` keeps for it
     /// ([`ListingChain::kept_envelope`]), else from the nodes that served its
     /// listing (`senders`, nearest first), never through a DHT lookup, and
@@ -1518,10 +1582,97 @@ pub(crate) fn listings_traffic() -> (u64, u64) {
     )
 }
 
-/// Where pushes from nodes' watches go: each with the node it came from.
-/// The router never waits for room: a push that doesn't fit is dropped, as
-/// pushes may be, and the next `ChangesRequest` to the node catches up.
-pub(crate) type PushSink = tokio::sync::mpsc::Sender<(PeerId, ChangesResponse)>;
+/// How many pushes from one node can wait to be taken: a node's free
+/// allowance in pages, [`WALK_FREE_LISTINGS`] over [`MAX_LIST_LIMIT`]. A push
+/// taken counts as a page against the node's allowance, so a node can't have
+/// more taken in a round; one beyond this is dropped, and the node's next
+/// `ChangesRequest` catches up. So no node can fill the room the others'
+/// pushes wait in.
+pub(crate) const PUSHES_WAITING_PER_NODE: usize = WALK_FREE_LISTINGS / MAX_LIST_LIMIT as usize;
+
+/// How many pushes from each node wait to be taken.
+type PushesWaiting = Arc<Mutex<HashMap<PeerId, usize>>>;
+
+/// Where pushes from nodes' watches go, each with the node it came from: a
+/// channel of a fixed size, of which each node may fill at most
+/// [`PUSHES_WAITING_PER_NODE`]. The router never waits for room: a push that
+/// doesn't fit is dropped, as pushes may be, and the next `ChangesRequest` to
+/// the node catches up. Made with [`push_channel`].
+pub(crate) struct PushSink {
+    sender: tokio::sync::mpsc::Sender<(PeerId, ChangesResponse)>,
+    waiting: PushesWaiting,
+}
+
+impl PushSink {
+    /// Queue `push` from `source`, unless the channel is full or `source`
+    /// already has [`PUSHES_WAITING_PER_NODE`] pushes waiting. Returns
+    /// whether it was queued.
+    pub(crate) fn offer(&self, source: PeerId, push: ChangesResponse) -> bool {
+        let Ok(mut waiting) = self.waiting.lock() else {
+            return false;
+        };
+        let count = waiting.entry(source).or_default();
+        if *count >= PUSHES_WAITING_PER_NODE {
+            return false;
+        }
+        if self.sender.try_send((source, push)).is_err() {
+            if *count == 0 {
+                waiting.remove(&source);
+            }
+            return false;
+        }
+        *count += 1;
+        true
+    }
+}
+
+/// The receiving end of the pushes a [`PushSink`] queues, each with the node
+/// it came from.
+#[derive(Debug)]
+pub struct PushReceiver {
+    receiver: tokio::sync::mpsc::Receiver<(PeerId, ChangesResponse)>,
+    waiting: PushesWaiting,
+}
+
+impl PushReceiver {
+    /// The next push, waiting for one; `None` once no sink is left.
+    pub async fn recv(&mut self) -> Option<(PeerId, ChangesResponse)> {
+        let push = self.receiver.recv().await?;
+        self.taken(&push.0);
+        Some(push)
+    }
+
+    /// The next push if one is waiting.
+    pub fn try_recv(&mut self) -> Option<(PeerId, ChangesResponse)> {
+        let push = self.receiver.try_recv().ok()?;
+        self.taken(&push.0);
+        Some(push)
+    }
+
+    fn taken(&self, source: &PeerId) {
+        if let Ok(mut waiting) = self.waiting.lock() {
+            if let Some(count) = waiting.get_mut(source) {
+                *count = count.saturating_sub(1);
+                if *count == 0 {
+                    waiting.remove(source);
+                }
+            }
+        }
+    }
+}
+
+/// A channel for pushes from nodes' watches, with room for `capacity`.
+pub(crate) fn push_channel(capacity: usize) -> (PushSink, PushReceiver) {
+    let (sender, receiver) = tokio::sync::mpsc::channel(capacity);
+    let waiting = PushesWaiting::default();
+    (
+        PushSink {
+            sender,
+            waiting: Arc::clone(&waiting),
+        },
+        PushReceiver { receiver, waiting },
+    )
+}
 
 /// A request id for a listings request: random, with the top bit clear. The
 /// id a node's pushes come with ([`push_request_id`], the bitwise
@@ -1538,8 +1689,9 @@ struct Routes {
     waiting: HashMap<(PeerId, u64), oneshot::Sender<ListingsBody>>,
     /// Each node's watch: the request id its pushes come with,
     /// [`push_request_id`] of the id of the latest `ChangesRequest` sent to
-    /// it, when that one set a watch.
-    watches: HashMap<PeerId, u64>,
+    /// it, when that one set a watch; and when it was set. It lapses after
+    /// [`WATCH_LEASE`], as the node's does.
+    watches: HashMap<PeerId, (u64, Instant)>,
 }
 
 /// What a message received on the listings topic is for.
@@ -1574,7 +1726,8 @@ impl Routes {
         self.waiting.insert((peer, request_id), sender);
         if let ListingsBody::ChangesRequest(request) = body {
             if request.watch && take_pushes {
-                self.watches.insert(peer, push_request_id(request_id));
+                self.watches
+                    .insert(peer, (push_request_id(request_id), Instant::now()));
             } else {
                 self.watches.remove(&peer);
             }
@@ -1594,16 +1747,29 @@ impl Routes {
     /// the order they arrive in, since a push can overtake the answer.
     fn route(&mut self, source: PeerId, message: ListingsMessage) -> Route {
         let ListingsMessage { request_id, body } = message;
-        if self.watches.get(&source) == Some(&request_id) {
-            return match body {
-                ListingsBody::ChangesResponse(push) => Route::Push(push),
-                _ => Route::Drop,
-            };
+        if let Some((watch, set_at)) = self.watches.get(&source) {
+            if *watch == request_id {
+                if set_at.elapsed() >= Duration::from_secs(WATCH_LEASE) {
+                    // Lapsed on the node too: a node's pushes past it aren't
+                    // taken.
+                    self.watches.remove(&source);
+                    return Route::Drop;
+                }
+                return match body {
+                    ListingsBody::ChangesResponse(push) => Route::Push(push),
+                    _ => Route::Drop,
+                };
+            }
         }
         match self.waiting.remove(&(source, request_id)) {
             Some(sender) => Route::Answer(sender, body),
             None => Route::Drop,
         }
+    }
+
+    /// End the routing of the watches of nodes `keep` doesn't keep.
+    fn keep_watches(&mut self, keep: impl Fn(&PeerId) -> bool) {
+        self.watches.retain(|peer, _| keep(peer));
     }
 }
 
@@ -1660,7 +1826,7 @@ impl ListingsRequests {
                             Route::Push(push) => {
                                 let full = pushes
                                     .as_ref()
-                                    .is_some_and(|sink| sink.try_send((source, push)).is_err());
+                                    .is_some_and(|sink| !sink.offer(source, push));
                                 if full {
                                     debug!("Dropped a listings push from {source}");
                                 }
@@ -1696,6 +1862,15 @@ impl ListingsRequests {
         let addresses: HashMap<PeerId, Vec<MultiAddr>> = addresses.into_iter().collect();
         if let Ok(mut known) = self.addresses.lock() {
             *known = addresses;
+        }
+    }
+
+    /// End the routing of pushes from the watches of nodes `keep` doesn't
+    /// keep, such as nodes that left the census: their pushes are dropped,
+    /// and use no room among those waiting to be taken.
+    pub(crate) fn keep_watches(&self, keep: impl Fn(&PeerId) -> bool) {
+        if let Ok(mut routes) = self.routes.lock() {
+            routes.keep_watches(keep);
         }
     }
 
@@ -5228,6 +5403,102 @@ mod tests {
         ));
     }
 
+    /// The context of a read in which every one of `nearest` was read in
+    /// full late enough to answer for any listing.
+    fn read_in_full(nearest: &[PeerId]) -> ReadContext {
+        ReadContext {
+            full_walks: nearest.iter().map(|peer| (*peer, u64::MAX / 2)).collect(),
+            silent: HashSet::new(),
+            addresses: HashMap::new(),
+            demoted: Mutex::new(HashSet::new()),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_copy_that_cant_be_had_doesnt_keep_an_address_from_being_decided() {
+        // Six of the seven nearest serve the uploader's listing; the seventh
+        // advertises a copy whose full listing it never hands over.
+        let envelope = envelope_showing(ShownFields::NONE.with(PaymentField::TxHash), true);
+        let payment = upload_payment(&envelope);
+        let listing = Listing::new(&envelope, &payment, BLOCK_TIME);
+        let nearest: Vec<PeerId> = (1..=7).map(peer).collect();
+        let liar = nearest[6];
+        let mut chain = MockChain::with_blocks(200, 1_800_000_000);
+        let quote: ant_protocol::evm::PaymentQuote = rmp_serde::from_slice(&payment.quote).unwrap();
+        chain.add_receipt(PaymentReceipt {
+            tx_hash: payment.tx_hash,
+            success: true,
+            block_number: 150,
+            logs: vec![paying_log(&quote, 4)],
+        });
+        let chain = reader(serve(Arc::new(Mutex::new(chain))).await);
+        let now = BLOCK_TIME + 3_600;
+        let context = read_in_full(&nearest);
+        let never_asked = |_: XorName, peers: Vec<PeerId>| async move {
+            assert!(peers.is_empty(), "{} nodes asked", peers.len());
+            Vec::new()
+        };
+        let walk = |copies: Vec<(PeerId, Listing)>| AddressWalk {
+            address: listing.address,
+            nearest: nearest.clone(),
+            support: copies.len(),
+            copies,
+        };
+        let honest: Vec<(PeerId, Listing)> = nearest[..6]
+            .iter()
+            .map(|peer| (*peer, listing.clone()))
+            .collect();
+
+        // An index read, where the liar's copy is another listing: the one
+        // six serve is listed.
+        let mut made_up = listing.clone();
+        made_up.metadata.name = Some("made-up.txt".into());
+        let mut with_liar = honest.clone();
+        with_liar.push((liar, made_up));
+        let read = decide_found(
+            walk(with_liar),
+            envelope.clone(),
+            &context,
+            &chain,
+            &[],
+            now,
+            never_asked,
+        )
+        .await;
+        // The producer, which couldn't have the liar's copy: the same.
+        let produced = decide_found(
+            walk(honest.clone()),
+            envelope.clone(),
+            &context,
+            &chain,
+            &[liar],
+            now,
+            never_asked,
+        )
+        .await;
+        for decision in [&read, &produced] {
+            assert!(decision.decided);
+            let listed = decision.listing.as_ref().expect("listed");
+            assert_eq!(listed.listing, listing);
+            assert_eq!((listed.nodes, listed.nearest, listed.quorum), (6, 7, true));
+        }
+
+        // Three serve it and the liar's copy can't be had: no listing has a
+        // quorum, and it may if the liar serves the same, so it waits, as
+        // for a node that hasn't answered, without asking the liar again.
+        let three = walk(honest[..3].to_vec());
+        let waiting =
+            decide_found(three, envelope, &context, &chain, &[liar], now, never_asked).await;
+        assert!(!waiting.decided);
+        assert!(waiting.listing.is_none());
+        assert!(waiting.rejected.iter().all(|row| row.again));
+        assert!(
+            waiting.rejected[0].problem.contains("1 haven't answered"),
+            "{}",
+            waiting.rejected[0].problem
+        );
+    }
+
     #[test]
     fn a_chain_unread_for_the_copy_a_quorum_serves_decides_nothing() {
         // A quoting node paid first (block 101) and serves its own copy; four
@@ -6434,6 +6705,55 @@ mod tests {
             ),
         );
         assert!(matches!(push, Route::Drop), "{push:?}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_watch_lapses_with_its_lease_and_ends_when_its_node_leaves() {
+        let mut routes = Routes::default();
+        let _first = routes.expect(peer(1), 5, &changes_request(0, true), true);
+        let _second = routes.expect(peer(2), 6, &changes_request(0, true), true);
+        let push = |routes: &mut Routes, node: u8, id: u64| {
+            routes.route(
+                peer(node),
+                message(
+                    push_request_id(id),
+                    ListingsBody::ChangesResponse(changes_response(1)),
+                ),
+            )
+        };
+        assert!(matches!(push(&mut routes, 1, 5), Route::Push(_)));
+        assert!(matches!(push(&mut routes, 2, 6), Route::Push(_)));
+        // Node 2 left: its pushes are no longer taken.
+        routes.keep_watches(|node| *node != peer(2));
+        assert!(matches!(push(&mut routes, 2, 6), Route::Drop));
+        assert!(matches!(push(&mut routes, 1, 5), Route::Push(_)));
+        // Node 1's watch lapses on the node with its lease: so it does here.
+        tokio::time::advance(Duration::from_secs(WATCH_LEASE)).await;
+        assert!(matches!(push(&mut routes, 1, 5), Route::Drop));
+    }
+
+    #[test]
+    fn a_node_can_have_only_so_many_pushes_waiting() {
+        let (sink, mut receiver) = push_channel(64);
+        for _ in 0..PUSHES_WAITING_PER_NODE {
+            assert!(sink.offer(peer(1), changes_response(1)));
+        }
+        assert!(
+            !sink.offer(peer(1), changes_response(2)),
+            "its share is full"
+        );
+        assert!(
+            sink.offer(peer(2), changes_response(1)),
+            "another node's push still fits"
+        );
+        // Taking one makes room for one more.
+        let (source, _) = receiver.try_recv().unwrap();
+        assert_eq!(source, peer(1));
+        assert!(sink.offer(peer(1), changes_response(3)));
+        // A full channel takes nothing.
+        let (small, _small_receiver) = push_channel(1);
+        assert!(small.offer(peer(1), changes_response(1)));
+        assert!(!small.offer(peer(2), changes_response(1)));
     }
 
     #[test]

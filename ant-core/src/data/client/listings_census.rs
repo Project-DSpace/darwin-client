@@ -30,11 +30,19 @@
 //! - **When.** A leaf is closed again when a member misses
 //!   [`MISSES_BEFORE_CLOSE`] polls in a row ([`Census::record_miss`]), when a
 //!   node's view changes ([`Census::record_view`]) and its list of peers
-//!   names a node the census lacks ([`Census::note_peers`]), and before any
-//!   listing in it is dropped ([`Census::witness`]); and every leaf is closed
-//!   once every [`REFRESH_INTERVAL`] ([`Census::refresh`]). The first two
-//!   queue the leaf, kept in the store, and [`Census::maintain`], once a
-//!   cycle, closes what is queued, or every leaf when the refresh is due.
+//!   names a node the census lacks that could be among its nearest
+//!   ([`Census::note_peers`]), and before any listing in it is dropped
+//!   ([`Census::witness`]); and every leaf is closed once every
+//!   [`REFRESH_INTERVAL`] ([`Census::refresh`]). The first two queue the
+//!   leaf, kept in the store, and [`Census::maintain`], once a cycle, closes
+//!   what is queued, [`CLOSE_CONCURRENCY`] lookups at a time across every
+//!   range, or every leaf when the refresh is due. What a node names can
+//!   cost only so much: an id farther from it than the census's
+//!   [`VIEW_PEERS`] nodes nearest it can't be one of its nearest peers and is
+//!   ignored, an id that answered no lookup isn't looked for again until the
+//!   next refresh, and a leaf is closed for what nodes name at most once
+//!   every [`MISSES_BEFORE_CLOSE`] cycles. A leaf closed in a cycle is closed
+//!   only once in it: the drops in it share that closing.
 //! - **Drops.** A published listing is dropped only on evidence for its
 //!   address within one cycle ([`Census::confirm_drop`]): all
 //!   [`NEAREST_NODES`] of the census's nodes nearest it answered and serve no
@@ -407,6 +415,21 @@ pub struct Census {
     /// called.
     changes: CensusChange,
     index: OnceLock<Index>,
+    /// Ids named in nodes' views that answered no lookup since the last
+    /// refresh: not looked for again until the next.
+    unanswered: BTreeSet<PeerId>,
+    /// Ids nodes named in their lists of peers that the census lacks, until
+    /// their part of the address space is closed: then, if they still
+    /// aren't in it, they answered no lookup.
+    named_lacking: BTreeSet<PeerId>,
+    /// How many cycles have begun ([`Self::maintain`] calls).
+    cycles: u64,
+    /// For each leaf queued for what a node named, the cycle it was queued
+    /// in: queued so at most once every [`MISSES_BEFORE_CLOSE`] cycles.
+    view_closes: BTreeMap<AddressRange, u64>,
+    /// The ranges closed in full in the current cycle: a drop in one shares
+    /// that closing.
+    closed_this_cycle: Vec<AddressRange>,
 }
 
 impl std::fmt::Debug for Census {
@@ -459,6 +482,11 @@ impl Census {
             refreshed_dirty: false,
             changes: CensusChange::default(),
             index: OnceLock::new(),
+            unanswered: BTreeSet::new(),
+            named_lacking: BTreeSet::new(),
+            cycles: 0,
+            view_closes: BTreeMap::new(),
+            closed_this_cycle: Vec::new(),
         })
     }
 
@@ -466,8 +494,10 @@ impl Census {
     /// closed when the refresh is due ([`Self::refresh_due`], and so at the
     /// first start), and otherwise each range queued ([`Self::queued`]) is
     /// closed, as the leaves now split it: the leaf holding it, or itself
-    /// where it holds several. A range closed leaves the queue; one whose
-    /// lookups failed stays for the next cycle.
+    /// where it holds several, every range at once, [`CLOSE_CONCURRENCY`]
+    /// lookups at a time. A range closed leaves the queue; one whose lookups
+    /// failed stays for the next cycle. It begins a cycle: what was closed in
+    /// the last no longer counts as closed in this one.
     ///
     /// # Errors
     ///
@@ -487,13 +517,21 @@ impl Census {
         now: u64,
         rng: &mut StdRng,
     ) -> Result<CensusChange> {
+        self.begin_cycle();
         if self.refresh_due(now) {
             return self.refresh_with(lookups, now, rng).await;
         }
+        let ranges = self.ranges_to_close();
+        if ranges.is_empty() {
+            return Ok(CensusChange::default());
+        }
+        let targets: Vec<(AddressRange, Option<XorName>)> =
+            ranges.iter().map(|range| (*range, None)).collect();
+        let explored = explore_many(lookups, &targets, rng).await;
         let mut change = CensusChange::default();
         let mut failure = None;
-        for range in self.ranges_to_close() {
-            match self.close_with(lookups, range, now, rng).await {
+        for (range, found) in ranges.into_iter().zip(explored) {
+            match self.take_closed(lookups, range, &found, now).await {
                 Ok(closed) => change.absorb(closed),
                 Err(e) => failure = Some(e),
             }
@@ -502,6 +540,13 @@ impl Census {
             None => Ok(change),
             Some(e) => Err(e),
         }
+    }
+
+    /// Begin a cycle: what was closed in the last no longer counts as
+    /// closed in this one ([`Self::witness`]).
+    pub(crate) fn begin_cycle(&mut self) {
+        self.cycles += 1;
+        self.closed_this_cycle.clear();
     }
 
     /// What closing the queue closes: for each range queued, the leaf that
@@ -550,14 +595,27 @@ impl Census {
         }
     }
 
-    /// Note the list of nearest peers `peer` gave after its view changed
-    /// ([`Self::record_view`]): the leaves of the ids in it that the census
-    /// lacks ([`Self::lacking`]) are queued to be closed again. Returns how
-    /// many leaves that queued.
-    pub fn note_peers(&mut self, peers: &[[u8; 32]]) -> usize {
-        let lacking = self.lacking(peers);
+    /// Note the list of nearest peers `reporter` gave after its view
+    /// changed ([`Self::record_view`]): the leaves of the ids in it that the
+    /// census lacks and that could be among its nearest ([`Self::lacking`])
+    /// are queued to be closed again, each leaf at most once every
+    /// [`MISSES_BEFORE_CLOSE`] cycles for what nodes name. Returns how many
+    /// leaves that queued.
+    pub fn note_peers(&mut self, reporter: &PeerId, peers: &[[u8; 32]]) -> usize {
+        let ids = self.lacking_ids(reporter, peers);
+        let lacking: BTreeSet<AddressRange> = ids.iter().map(|id| self.leaf_of(id)).collect();
+        self.named_lacking
+            .extend(ids.iter().map(|id| PeerId::from_bytes(*id)));
         let mut queued = 0;
         for range in lacking {
+            let recent = self
+                .view_closes
+                .get(&range)
+                .is_some_and(|at| self.cycles < at.saturating_add(u64::from(MISSES_BEFORE_CLOSE)));
+            if recent {
+                continue;
+            }
+            self.view_closes.insert(range, self.cycles);
             if self.queue.insert(range) {
                 queued += 1;
             }
@@ -597,13 +655,45 @@ impl Census {
         rng: &mut StdRng,
     ) -> Result<Witness> {
         let leaf = self.leaf_of(address);
-        let found = explore(lookups, leaf, Some(*address), rng).await;
+        // A leaf closed in full this cycle isn't closed again: the lookup of
+        // the address itself is all this needs.
+        let shared = self
+            .closed_this_cycle
+            .iter()
+            .any(|range| range.covers(&leaf));
+        let found = if shared {
+            let sighting = lookup_to_close(lookups, address).await;
+            let mut found = Exploration {
+                lookups: 1,
+                ..Exploration::default()
+            };
+            if let Ok(sighting) = &sighting {
+                for (peer, addresses) in &sighting.answered {
+                    found.answered.insert(*peer, addresses.clone());
+                }
+                found.named = sighting
+                    .named
+                    .iter()
+                    .filter(|peer| !found.answered.contains_key(peer))
+                    .copied()
+                    .collect();
+            }
+            found.first = Some(sighting.map_err(|e| e.to_string()));
+            found
+        } else {
+            explore(lookups, leaf, Some(*address), rng).await
+        };
         let mut agents = BTreeMap::new();
         for peer in found.answered.keys() {
             agents.insert(*peer, lookups.user_agent(peer).await);
         }
         let change = self.take_in(&found, &agents, now);
-        self.requeue(&leaf, &found.failed);
+        if !shared {
+            self.requeue(&leaf, &found.failed);
+            if found.failed.is_empty() && found.first.as_ref().is_some_and(|first| first.is_ok()) {
+                self.closed_this_cycle.push(leaf);
+            }
+        }
         let sighting = match &found.first {
             Some(Ok(sighting)) => sighting,
             Some(Err(e)) => {
@@ -619,7 +709,7 @@ impl Census {
                 )))
             }
         };
-        let closed = found.failed.is_empty();
+        let closed = shared || found.failed.is_empty();
         let mut answered: Vec<PeerId> = sighting.answered.iter().map(|(peer, _)| *peer).collect();
         answered.sort_unstable_by_key(|peer| distance(peer.as_bytes(), address));
         answered.dedup();
@@ -692,14 +782,17 @@ impl Census {
     /// ([`DropCheck::verdict`]). Before the key time plus
     /// [`FIRST_SEEN_ROUNDING`] and [`CLOCK_MARGIN`] nothing is looked up and
     /// the listing stays. What closing the leaf changed in the census is
-    /// given by [`Self::take_changes`].
+    /// given by [`Self::take_changes`]. The `GetRequest`s go through
+    /// `requests`, the caller's, which reaches each census node at the
+    /// addresses the census keeps for it.
     ///
     /// # Errors
     ///
     /// When the listing stays: why, as text for the log.
-    pub async fn confirm_drop(
+    pub(crate) async fn confirm_drop(
         &mut self,
         client: &Client,
+        requests: &ListingsRequests,
         address: &XorName,
         key_time: u64,
         expected: &[PeerId],
@@ -708,7 +801,7 @@ impl Census {
         let mut rng = StdRng::from_entropy();
         self.confirm_drop_with(
             &NetworkLookups(client.network()),
-            &NetworkGets(client),
+            &NetworkGets(client, requests),
             address,
             key_time,
             expected,
@@ -799,6 +892,10 @@ impl Census {
         now: u64,
         rng: &mut StdRng,
     ) -> Result<CensusChange> {
+        // Ids that answered no lookup are looked for again.
+        self.unanswered.clear();
+        self.named_lacking.clear();
+        self.view_closes.clear();
         let closed = self.close_with(lookups, AddressRange::ALL, now, rng).await;
         self.set_refreshed_at(now);
         closed
@@ -813,11 +910,26 @@ impl Census {
         rng: &mut StdRng,
     ) -> Result<CensusChange> {
         let found = explore(lookups, range, None, rng).await;
+        self.take_closed(lookups, range, &found, now).await
+    }
+
+    /// Take in what closing `range` found (`found`), as
+    /// [`Self::close_with`] does.
+    async fn take_closed<L: Lookups>(
+        &mut self,
+        lookups: &L,
+        range: AddressRange,
+        found: &Exploration,
+        now: u64,
+    ) -> Result<CensusChange> {
         let mut agents = BTreeMap::new();
         for peer in found.answered.keys() {
             agents.insert(*peer, lookups.user_agent(peer).await);
         }
-        let change = self.take_in(&found, &agents, now);
+        let change = self.take_in(found, &agents, now);
+        if found.failed.is_empty() {
+            self.closed_this_cycle.push(range);
+        }
         debug!(
             "Census: closing {} took {} lookups: {} joined, {} left, {} named that didn't \
              answer, {} parts closed, {} not",
@@ -830,7 +942,7 @@ impl Census {
             found.failed.len()
         );
         self.requeue(&range, &found.failed);
-        match found.error {
+        match &found.error {
             None => Ok(change),
             Some(error) => Err(Error::Network(format!(
                 "the census couldn't close {} of the {} parts of {} it looked up: {error}",
@@ -888,6 +1000,24 @@ impl Census {
             .filter(|peer| !self.nodes.contains_key(peer) && closed.contains(peer.as_bytes()))
             .copied()
             .collect();
+        // Ids nodes named whose part is now closed, and that didn't join,
+        // answered no lookup either.
+        let named: Vec<PeerId> = self
+            .named_lacking
+            .iter()
+            .filter(|peer| closed.contains(peer.as_bytes()))
+            .copied()
+            .collect();
+        for peer in named {
+            self.named_lacking.remove(&peer);
+            if !self.nodes.contains_key(&peer) && !change.unanswered.contains(&peer) {
+                change.unanswered.push(peer);
+            }
+        }
+        self.unanswered.extend(change.unanswered.iter().copied());
+        for peer in found.answered.keys() {
+            self.unanswered.remove(peer);
+        }
         change
     }
 
@@ -1151,18 +1281,47 @@ impl Census {
         index.peers[index.span(range)].to_vec()
     }
 
-    /// The leaves to close again because `peers`, a node's nearest peers as
-    /// its latest view lists them, name nodes the census lacks: the leaf of
-    /// each such id, once each, in address order. Empty when the census
-    /// holds every one of them.
+    /// The leaves to close again because `peers`, `reporter`'s nearest
+    /// peers as its latest view lists them, name nodes the census lacks: the
+    /// leaf of each such id, once each, in address order. Only ids that
+    /// could be among the reporter's [`VIEW_PEERS`] nearest count: nearer it
+    /// than the census's [`VIEW_PEERS`]th node nearest it (other than
+    /// itself), while the census holds that many. A farther id can't be one
+    /// of its nearest peers, and neither can a made-up one far from it, so
+    /// what a node names can only have leaves near it closed. Ids that
+    /// answered no lookup since the last refresh are left out. Empty when
+    /// the census holds every one of them.
     #[must_use]
-    pub fn lacking(&self, peers: &[[u8; 32]]) -> Vec<AddressRange> {
-        peers
+    pub fn lacking(&self, reporter: &PeerId, peers: &[[u8; 32]]) -> Vec<AddressRange> {
+        self.lacking_ids(reporter, peers)
             .iter()
-            .filter(|id| !self.nodes.contains_key(&PeerId::from_bytes(**id)))
             .map(|id| self.leaf_of(id))
             .collect::<BTreeSet<_>>()
             .into_iter()
+            .collect()
+    }
+
+    /// The ids of `peers` whose leaves [`Self::lacking`] gives.
+    fn lacking_ids(&self, reporter: &PeerId, peers: &[[u8; 32]]) -> Vec<[u8; 32]> {
+        let own = reporter.as_bytes();
+        let others: Vec<PeerId> = self
+            .nearest(own, VIEW_PEERS + 1)
+            .into_iter()
+            .filter(|peer| peer != reporter)
+            .take(VIEW_PEERS)
+            .collect();
+        let farthest = (others.len() >= VIEW_PEERS)
+            .then(|| others.last().map(|peer| distance(own, peer.as_bytes())))
+            .flatten();
+        peers
+            .iter()
+            .filter(|id| {
+                let peer = PeerId::from_bytes(**id);
+                !self.nodes.contains_key(&peer)
+                    && !self.unanswered.contains(&peer)
+                    && farthest.is_none_or(|farthest| distance(own, id) < farthest)
+            })
+            .copied()
             .collect()
     }
 
@@ -1342,8 +1501,8 @@ pub(crate) trait Gets {
 }
 
 /// The network's `GetRequest`s, sent as an index read's lookup of one
-/// address sends them, with answers routed as it routes them.
-struct NetworkGets<'a>(&'a Client);
+/// address sends them, through the caller's requests.
+struct NetworkGets<'a>(&'a Client, &'a ListingsRequests);
 
 impl Gets for NetworkGets<'_> {
     fn now(&self) -> u64 {
@@ -1351,9 +1510,8 @@ impl Gets for NetworkGets<'_> {
     }
 
     async fn get(&self, address: &XorName, peers: &[PeerId]) -> Vec<(PeerId, Served)> {
-        let requests = ListingsRequests::start(self.0.network().node(), None);
         self.0
-            .ask_for_listing(&requests, address, peers)
+            .ask_for_listing(self.1, address, peers)
             .await
             .into_iter()
             .map(|(peer, answer)| {
@@ -1422,23 +1580,44 @@ async fn explore<L: Lookups>(
     first: Option<XorName>,
     rng: &mut StdRng,
 ) -> Exploration {
-    let mut found = Exploration::default();
-    let mut open = vec![(range, first.filter(|first| range.contains(first)))];
+    explore_many(lookups, &[(range, first)], rng)
+        .await
+        .pop()
+        .unwrap_or_default()
+}
+
+/// Close each of `ranges`, as [`explore`] closes one, all at once:
+/// [`CLOSE_CONCURRENCY`] lookups at a time across them. What each found, in
+/// the same order.
+async fn explore_many<L: Lookups>(
+    lookups: &L,
+    ranges: &[(AddressRange, Option<XorName>)],
+    rng: &mut StdRng,
+) -> Vec<Exploration> {
+    let mut explored: Vec<Exploration> = ranges.iter().map(|_| Exploration::default()).collect();
+    // Taken from the end: the first range's parts first.
+    let mut open: Vec<(usize, AddressRange, Option<XorName>)> = ranges
+        .iter()
+        .enumerate()
+        .rev()
+        .map(|(at, (range, first))| (at, *range, first.filter(|first| range.contains(first))))
+        .collect();
     let mut running = FuturesUnordered::new();
     loop {
         while running.len() < CLOSE_CONCURRENCY {
-            let Some((part, given)) = open.pop() else {
+            let Some((at, part, given)) = open.pop() else {
                 break;
             };
             let target = given.unwrap_or_else(|| address_in(&part, rng));
             running.push(async move {
                 let sighting = lookup_to_close(lookups, &target).await;
-                (part, target, given.is_some(), sighting)
+                (at, part, target, given.is_some(), sighting)
             });
         }
-        let Some((part, target, is_first, sighting)) = running.next().await else {
+        let Some((at, part, target, is_first, sighting)) = running.next().await else {
             break;
         };
+        let found = &mut explored[at];
         found.lookups += 1;
         if is_first {
             found.first = Some(match &sighting {
@@ -1457,7 +1636,7 @@ async fn explore<L: Lookups>(
         match closed_by(&part, &target, &sighting) {
             Some(Split { closed, rest }) => {
                 found.closed.push(closed);
-                open.extend(rest.into_iter().map(|rest| (rest, None)));
+                open.extend(rest.into_iter().map(|rest| (at, rest, None)));
             }
             None => {
                 found.failed.push(part);
@@ -1476,9 +1655,11 @@ async fn explore<L: Lookups>(
         }
         found.named.extend(sighting.named);
     }
-    let answered = &found.answered;
-    found.named.retain(|peer| !answered.contains_key(peer));
-    found
+    for found in &mut explored {
+        let answered = &found.answered;
+        found.named.retain(|peer| !answered.contains_key(peer));
+    }
+    explored
 }
 
 /// A witnessed lookup of `target` for closing: [`LOOKUP_NODES`] wide, or
@@ -2110,12 +2291,12 @@ mod tests {
                     node.alive && node.behaviour == Behaviour::Honest && *id != own
                 })
                 .map(|(id, _)| *id);
-            let peers = nearest_of(honest, own, K)
+            let (neighbour, peers) = nearest_of(honest, own, K)
                 .into_iter()
-                .map(|neighbour| sim.peers_of(&neighbour))
-                .find(|peers| peers.contains(own))
+                .map(|neighbour| (neighbour, sim.peers_of(&neighbour)))
+                .find(|(_, peers)| peers.contains(own))
                 .expect("a neighbour lists the new node");
-            let leaves = census.lacking(&peers);
+            let leaves = census.lacking(&PeerId::from_bytes(neighbour), &peers);
             assert!(
                 leaves.contains(&census.leaf_of(own)),
                 "a new node's leaf is closed"
@@ -2129,11 +2310,12 @@ mod tests {
             .unwrap()
             .0;
         let liar_peers = sim.peers_of(&liar);
+        let liar = PeerId::from_bytes(liar);
         assert!(
-            !census.lacking(&liar_peers).is_empty(),
-            "made-up ids are lacking"
+            !census.lacking(&liar, &liar_peers).is_empty(),
+            "made-up ids near it are lacking"
         );
-        to_close.extend(census.lacking(&liar_peers));
+        to_close.extend(census.lacking(&liar, &liar_peers));
 
         let mut left = BTreeSet::new();
         let mut joined = BTreeSet::new();
@@ -2489,6 +2671,22 @@ mod tests {
         assert_eq!(old.view, None);
     }
 
+    /// An id that differs from `own` only in its last 8 bytes, `n`: nearer
+    /// `own` than any node with a random id.
+    fn next_to(own: &[u8; 32], n: u64) -> [u8; 32] {
+        let mut near = *own;
+        near[24..].copy_from_slice(&n.to_be_bytes());
+        near
+    }
+
+    /// An id that differs from `own` in every bit of its first 24 bytes, and
+    /// ends in `n`: farther from `own` than any node with a random id.
+    fn far_from(own: &[u8; 32], n: u64) -> [u8; 32] {
+        let mut far = own.map(|byte| !byte);
+        far[24..].copy_from_slice(&n.to_be_bytes());
+        far
+    }
+
     #[test]
     fn ids_a_node_lists_that_the_census_lacks_name_their_leaves() {
         let dir = tempfile::tempdir().unwrap();
@@ -2496,16 +2694,101 @@ mod tests {
         for n in 0..40 {
             census.admit(PeerId::from_bytes(id(n)), Vec::new(), 0);
         }
+        let reporter = PeerId::from_bytes(id(0));
         let known: Vec<[u8; 32]> = (0..10).map(id).collect();
-        assert!(census.lacking(&known).is_empty());
-        assert!(census.lacking(&[]).is_empty());
-        let unknown = [id(1_000), id(1_001), id(1_000)];
+        assert!(census.lacking(&reporter, &known).is_empty());
+        assert!(census.lacking(&reporter, &[]).is_empty());
+        // Ids nearer the reporter than its 20th nearest node could be its
+        // peers; ids far from it couldn't, and are ignored.
+        let unknown = [next_to(&id(0), 1), next_to(&id(0), 2)];
+        let far = [far_from(&id(0), 1), far_from(&id(0), 2)];
         let mut expected: Vec<AddressRange> = unknown.iter().map(|id| census.leaf_of(id)).collect();
         expected.sort_unstable();
         expected.dedup();
         let mut listed = known.clone();
         listed.extend(unknown);
-        assert_eq!(census.lacking(&listed), expected);
+        listed.extend(far);
+        listed.push(unknown[0]);
+        assert_eq!(census.lacking(&reporter, &listed), expected);
+        assert!(census.lacking(&reporter, &far).is_empty());
+        // While the census holds fewer than 20 other nodes, any id could be.
+        let small_dir = tempfile::tempdir().unwrap();
+        let small_store = ListingsStore::open_with_map_size(small_dir.path(), TEST_MAP).unwrap();
+        let mut small = Census::open(&small_store).unwrap();
+        for n in 0..10 {
+            small.admit(PeerId::from_bytes(id(n)), Vec::new(), 0);
+        }
+        assert_eq!(small.lacking(&reporter, &far).len(), 1);
+    }
+
+    #[test]
+    fn what_a_node_names_closes_only_so_much() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ListingsStore::open_with_map_size(dir.path(), TEST_MAP).unwrap();
+        let mut census = Census::open(&store).unwrap();
+        let mut sim = Sim::new(200, 0, 52);
+        let mut rng = rng(53);
+        run(census.maintain_with(&sim, 100, &mut rng)).unwrap();
+        let reporter = *ids(&census).iter().next().unwrap();
+        let own = *reporter.as_bytes();
+        // A node names made-up ids far from it: nothing is queued.
+        let far: Vec<[u8; 32]> = (1..=20).map(|n| far_from(&own, n)).collect();
+        assert_eq!(census.note_peers(&reporter, &far), 0);
+        assert!(census.queued().is_empty());
+        // Made-up ids next to it: its leaf is queued once, and closed.
+        let near: Vec<[u8; 32]> = (1..=5).map(|n| next_to(&own, n)).collect();
+        assert_eq!(census.note_peers(&reporter, &near), 1);
+        let change = run(census.maintain_with(&sim, 200, &mut rng)).unwrap();
+        assert!(change.joined.is_empty());
+        let unanswered: BTreeSet<PeerId> = change.unanswered.iter().copied().collect();
+        assert!(near
+            .iter()
+            .all(|id| unanswered.contains(&PeerId::from_bytes(*id))));
+        // Named again, they answered no lookup: not looked for again.
+        assert_eq!(census.note_peers(&reporter, &near), 0);
+        // New made-up ids next to it within MISSES_BEFORE_CLOSE cycles of
+        // the last: its leaf isn't queued again until then.
+        let lookups = sim.lookups.load(Ordering::Relaxed);
+        let mut fresh = 100;
+        for cycle in 0..MISSES_BEFORE_CLOSE {
+            let named: Vec<[u8; 32]> = (fresh..fresh + 5).map(|n| next_to(&own, n)).collect();
+            fresh += 5;
+            let queued = census.note_peers(&reporter, &named);
+            assert_eq!(
+                queued,
+                usize::from(cycle + 1 == MISSES_BEFORE_CLOSE),
+                "cycle {cycle}"
+            );
+            run(census.maintain_with(&sim, 300 + u64::from(cycle), &mut rng)).unwrap();
+        }
+        assert!(sim.lookups.load(Ordering::Relaxed) > lookups);
+        // A node that joins next to it is still found, from the next cycle on.
+        let joining = next_to(&own, 9_999);
+        sim.join(joining, &mut rng);
+        run(census.maintain_with(&sim, 400, &mut rng)).unwrap();
+        run(census.maintain_with(&sim, 401, &mut rng)).unwrap();
+        run(census.maintain_with(&sim, 402, &mut rng)).unwrap();
+        assert_eq!(census.note_peers(&reporter, &[joining]), 1);
+        let change = run(census.maintain_with(&sim, 403, &mut rng)).unwrap();
+        assert_eq!(change.joined, vec![PeerId::from_bytes(joining)]);
+    }
+
+    #[test]
+    fn queued_ranges_are_closed_together() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ListingsStore::open_with_map_size(dir.path(), TEST_MAP).unwrap();
+        let mut census = Census::open(&store).unwrap();
+        let sim = Sim::new(300, 0, 54);
+        let mut rng = rng(55);
+        run(census.maintain_with(&sim, 100, &mut rng)).unwrap();
+        let leaves = census.leaves();
+        assert!(leaves.len() >= 4, "{} leaves", leaves.len());
+        for leaf in leaves.iter().take(4) {
+            census.queue_close(*leaf);
+        }
+        run(census.maintain_with(&sim, 200, &mut rng)).unwrap();
+        assert!(census.queued().is_empty());
+        assert_eq!(ids(&census), sim.live());
     }
 
     #[test]
@@ -2576,8 +2859,8 @@ mod tests {
         };
         let _ = |census: &mut Census, client: &Client| send(&census.maintain(client));
         let _ = |census: &mut Census, client: &Client| send(&census.witness(client, &[0; 32]));
-        let _ = |census: &mut Census, client: &Client| {
-            send(&census.confirm_drop(client, &[0; 32], 0, &[], &[]));
+        let _ = |census: &mut Census, client: &Client, requests: &ListingsRequests| {
+            send(&census.confirm_drop(client, requests, &[0; 32], 0, &[], &[]));
         };
     }
 
@@ -2755,7 +3038,65 @@ mod tests {
         run(census.refresh_with(&sim, 10, &mut rng(seed))).unwrap();
         assert_eq!(ids(&census), sim.live());
         assert_eq!(census.take_changes().joined.len(), live);
+        // A cycle after the one that closed every leaf.
+        census.begin_cycle();
         (census, sim)
+    }
+
+    /// A network whose nodes answer lookups with their 7 nearest only, so
+    /// closing a leaf takes several lookups.
+    struct Narrow<'a>(&'a Sim);
+
+    impl Lookups for Narrow<'_> {
+        async fn witnessed(
+            &self,
+            target: &XorName,
+            count: usize,
+            view_count: usize,
+        ) -> Result<Sighting> {
+            self.0
+                .witnessed(target, count.min(NEAREST_NODES), view_count)
+                .await
+        }
+
+        async fn user_agent(&self, peer: &PeerId) -> Option<String> {
+            self.0.user_agent(peer).await
+        }
+    }
+
+    #[test]
+    fn the_drops_in_a_leaf_share_its_closing_within_a_cycle() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut census, sim) = closed_census(dir.path(), 300, 41);
+        let narrow = Narrow(&sim);
+        let mut rng = rng(42);
+        let first = id(9_100);
+        let mut second = first;
+        second[31] ^= 1;
+        assert_eq!(census.leaf_of(&first), census.leaf_of(&second));
+        let lookups = || sim.lookups.load(Ordering::Relaxed);
+        let before = lookups();
+        let witness = run(census.witness_with(&narrow, &first, 20, &mut rng)).unwrap();
+        assert!(witness.closed);
+        let closing = lookups() - before;
+        // The second in the leaf looks up only itself.
+        let before = lookups();
+        let witness = run(census.witness_with(&narrow, &second, 20, &mut rng)).unwrap();
+        let own = lookups() - before;
+        assert!(
+            own < closing,
+            "{own} lookups, against {closing} to close the leaf"
+        );
+        assert!(witness.closed);
+        assert_eq!(
+            witness.check(&census.nearest(&second, NEAREST_NODES)),
+            Ok(())
+        );
+        // The next cycle closes it again.
+        census.begin_cycle();
+        let before = lookups();
+        run(census.witness_with(&narrow, &second, 20, &mut rng)).unwrap();
+        assert!(lookups() - before > own);
     }
 
     #[test]
@@ -3006,14 +3347,16 @@ mod tests {
         // its leaf; upkeep takes it in.
         let own = id(424_242);
         sim.join(own, &mut rng);
-        let peers = nearest_of(sim.live().iter().map(|peer| *peer.as_bytes()), &own, K)
-            .into_iter()
-            .filter(|neighbour| *neighbour != own)
-            .map(|neighbour| sim.peers_of(&neighbour))
-            .find(|peers| peers.contains(&own))
-            .unwrap();
-        assert_eq!(census.note_peers(&peers), 1);
-        assert_eq!(census.note_peers(&peers), 0, "queued once");
+        let (neighbour, peers) =
+            nearest_of(sim.live().iter().map(|peer| *peer.as_bytes()), &own, K)
+                .into_iter()
+                .filter(|neighbour| *neighbour != own)
+                .map(|neighbour| (neighbour, sim.peers_of(&neighbour)))
+                .find(|(_, peers)| peers.contains(&own))
+                .unwrap();
+        let neighbour = PeerId::from_bytes(neighbour);
+        assert_eq!(census.note_peers(&neighbour, &peers), 1);
+        assert_eq!(census.note_peers(&neighbour, &peers), 0, "queued once");
         let change = run(census.maintain_with(&sim, 400, &mut rng)).unwrap();
         assert_eq!(change.joined, vec![PeerId::from_bytes(own)]);
         assert!(census.queued().is_empty());
