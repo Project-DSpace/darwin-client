@@ -403,7 +403,8 @@ producer's checks took, and `silent` lists the others.
 good. The producer decides every address again after it starts, a batch at a
 time, over more than one cycle where the index is large: until it has, the
 first cycles' `decided` and `deferred` count only the addresses decided since
-the start.
+the start. Likewise, while more changed than a cycle's minute holds,
+`deferred` counts the addresses deferred among those the cycle decided.
 
 A deferral's `reason` is one of: `below_quorum` (fewer than 4 of the 7 nodes
 nearest the address serve it yet), `nodes_unanswered` (nodes nearest it have
@@ -519,10 +520,11 @@ Files are fetched one at a time, so a file can be newer than the
 
 - Each minute (a cycle), it asks every node it knows what changed in what
   it serves, decides again the addresses whose copies, nearest nodes or
-  chain facts changed, and writes the files those decisions change. It
-  decides every address again after it starts and once a day, a batch at a
-  time for what is left of each cycle's minute, over as many cycles as that
-  takes. A node that stores a new listing pushes it, and the producer
+  chain facts changed, and writes the files those decisions change, as
+  many as the cycle's minute holds (what doesn't fit, the next cycle
+  decides). It decides every address again after it starts and once a
+  day, a batch at a time for what is left of each cycle's minute, over as
+  many cycles as that takes. A node that stores a new listing pushes it, and the producer
   publishes it within seconds, without waiting for the next cycle; while a
   node is slow to answer a cycle's requests, a listing pushed meanwhile is
   published with the cycle, and while every address is being decided again,

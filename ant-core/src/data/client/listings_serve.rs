@@ -66,12 +66,14 @@
 //!    for any of its listings, a time in the future, left it for later or
 //!    kept it unconfirmed, rests on nodes that serve none of its listings
 //!    having been heard (no listing of it has a quorum), or while a chain
-//!    fact it was decided on isn't final ([`ListingChain::settled`]). Every
-//!    address is decided again at each start and every
-//!    [`REDECIDE_INTERVAL`], by a sweep: a batch at a time in address order,
-//!    after what changed, for what is left of each cycle's time (at least a
-//!    batch), over as many cycles as it takes. A change no input explains is
-//!    logged as an alert (but in the sweep after a start).
+//!    fact it was decided on isn't final ([`ListingChain::settled`]). What
+//!    changed is decided a batch at a time in address order, for what is
+//!    left of the cycle's time (at least a batch); a pass cut short goes on
+//!    from where it stopped in the next cycle. Every address is decided
+//!    again at each start and every [`REDECIDE_INTERVAL`], by a sweep: after
+//!    what changed, a batch at a time, for what is left of each cycle's time
+//!    (at least a batch), over as many cycles as it takes. A change no input
+//!    explains is logged as an alert (but in the sweep after a start).
 //! 7. **Drops.** A published address is removed as `no_longer_served` only
 //!    when, within one cycle, all 7 of its nearest nodes answered and none
 //!    serves a copy at any key, and then [`Census::confirm_drop`] confirms
@@ -549,6 +551,9 @@ pub struct Producer {
     decided_all_at: Option<u64>,
     /// The sweep under way, deciding every address again, if any.
     sweep: Option<Sweep>,
+    /// Where the latest cycle's pass over what changed stopped, for want of
+    /// time: the next goes on from there ([`Self::decide_changed`]).
+    changed_after: Option<XorName>,
     /// Cycles run by this process, wrapping: the latest's number.
     cycles: u32,
     /// Whether the latest cycle's guard let it decide: pushes are decided
@@ -629,6 +634,7 @@ impl Producer {
             want_peers: BTreeSet::new(),
             decided_all_at: None,
             sweep: None,
+            changed_after: None,
             cycles: 0,
             guard_ok: false,
             last_status: None,
@@ -881,9 +887,10 @@ impl Producer {
             if !change.is_empty() {
                 self.mark_moved()?;
             }
-            // What changed first. However long the poll took, fetching gets
-            // as long as a poll may take, and drops as long again from when
-            // deciding starts, at least one check.
+            // What changed first, then the sweep, each for what is left of
+            // the cycle's time and at least a batch. However long the poll
+            // took, fetching gets as long as a poll may take, and drops as
+            // long again from when deciding starts, at least one check.
             let source = Source::Pending { again: true };
             let fetch_deadline = Instant::now() + CYCLE;
             Box::pin(self.fetch_for(source, fetch_deadline)).await?;
@@ -891,13 +898,9 @@ impl Producer {
                 checked: false,
                 deadline: Instant::now() + CYCLE,
             };
-            let (decided, _) =
-                Box::pin(self.decide_all(source, at, Some(&mut drops), false, &mut tally)).await?;
-            considered = decided;
-            // Then the sweep, for what is left of the cycle's time, at least
-            // a batch.
-            considered +=
-                Box::pin(self.sweep_on(at, began + CYCLE, &mut drops, &mut tally)).await?;
+            let until = began + CYCLE;
+            considered = Box::pin(self.decide_changed(at, until, &mut drops, &mut tally)).await?;
+            considered += Box::pin(self.sweep_on(at, until, &mut drops, &mut tally)).await?;
         } else {
             // As an index read that finds too few nodes: nothing is decided
             // or dropped, and every entry is kept, carried, until a sweep
@@ -1160,6 +1163,59 @@ impl Producer {
         drop(publication);
         self.keep(decided)?;
         Ok(staged)
+    }
+
+    /// Decide what changed (`Source::Pending { again: true }`): a batch at a
+    /// time in address order, from where the latest cycle's pass stopped,
+    /// past the last address round to the first and on to there, until
+    /// `until`, at least a batch, as [`Self::decide_all`] decides one. A
+    /// pass cut short is gone on with by the next cycle, so every address
+    /// in it comes in turn, however much changed. Returns how many
+    /// addresses it decided.
+    ///
+    /// # Errors
+    ///
+    /// If the store can't be read or written.
+    async fn decide_changed(
+        &mut self,
+        at: u64,
+        until: Instant,
+        drops: &mut DropCheck,
+        tally: &mut Tally,
+    ) -> Result<u64> {
+        let source = Source::Pending { again: true };
+        let began = self.changed_after.take();
+        let mut after = began;
+        // Whether the pass went past the last address, round to the first.
+        let mut round = false;
+        let mut decided = 0;
+        let mut first = true;
+        loop {
+            if !first && Instant::now() >= until {
+                self.changed_after = after;
+                break;
+            }
+            first = false;
+            let (mut batch, last, done) = self.batch_of(source, after.as_ref())?;
+            if round {
+                // What comes after where the pass began was decided already.
+                if let Some(began) = began {
+                    batch.retain(|(address, _)| *address <= began);
+                }
+            }
+            decided += batch.len() as u64;
+            Box::pin(self.decide_batch(batch, at, Some(&mut *drops), false, tally)).await?;
+            let back = round && began.is_some_and(|began| last.is_none_or(|last| last >= began));
+            match last {
+                Some(last) if !done && !back => after = Some(last),
+                _ if round || began.is_none() => break,
+                _ => {
+                    round = true;
+                    after = None;
+                }
+            }
+        }
+        Ok(decided)
     }
 
     /// Go on with the sweep under way, if any, until `until`, at least a
@@ -5922,6 +5978,77 @@ mod tests {
         let txn = producer.store.env().read_txn().unwrap();
         let again = tagged_after(producer.known, &txn, AGAIN_TAG, None, usize::MAX).unwrap();
         assert_eq!(again.len(), count as usize);
+    }
+
+    #[tokio::test]
+    async fn what_changed_is_decided_round_from_where_the_last_cycle_stopped() {
+        // More changed addresses than three batches, and no time left in any
+        // cycle: each cycle decides a batch, going on from where the last
+        // stopped, and once past the last address, round from the first.
+        let dir = tempfile::tempdir().unwrap();
+        let (mut producer, _node) = offline_producer(dir.path()).await;
+        census_nodes(&mut producer, 8);
+        let count = 3 * DECIDE_BATCH as u32 + 10;
+        let mut addresses: Vec<XorName> = (0..count).map(numbered).collect();
+        addresses.sort_unstable();
+        let listings: Vec<Listing> = addresses
+            .iter()
+            .map(|address| showing_block(*address, 81_950_000))
+            .collect();
+        serve(&mut producer, &listings, 2);
+        producer.start_requests();
+        producer.feeds.mark_pending(&addresses).unwrap();
+        let mut decided = Vec::new();
+        let mut cursors = Vec::new();
+        for cycle in 0..5u64 {
+            producer.cycles += 1;
+            let mut drops = DropCheck {
+                checked: false,
+                deadline: Instant::now(),
+            };
+            let swept = producer
+                .decide_changed(
+                    AT + 60 * cycle,
+                    Instant::now(),
+                    &mut drops,
+                    &mut Tally::default(),
+                )
+                .await
+                .unwrap();
+            decided.push(swept);
+            cursors.push(producer.changed_after);
+        }
+        let batch = DECIDE_BATCH as u64;
+        assert_eq!(decided, [batch, batch, batch, 10, batch]);
+        assert_eq!(
+            cursors,
+            [
+                Some(addresses[DECIDE_BATCH - 1]),
+                Some(addresses[2 * DECIDE_BATCH - 1]),
+                Some(addresses[3 * DECIDE_BATCH - 1]),
+                None,
+                Some(addresses[DECIDE_BATCH - 1]),
+            ]
+        );
+        assert_eq!(producer.feeds.pending_count().unwrap(), 0);
+        // With time enough, a pass goes round once, from where it stopped
+        // to there: every address is decided once.
+        producer.cycles += 1;
+        let mut drops = DropCheck {
+            checked: false,
+            deadline: Instant::now() + CYCLE,
+        };
+        let swept = producer
+            .decide_changed(
+                AT + 600,
+                Instant::now() + CYCLE,
+                &mut drops,
+                &mut Tally::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(swept, u64::from(count));
+        assert_eq!(producer.changed_after, None);
     }
 
     #[tokio::test]
