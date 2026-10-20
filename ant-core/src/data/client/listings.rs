@@ -19,10 +19,12 @@
 //!
 //! Each node records its own `first_seen` for a listing in the index that
 //! hides its time, so copies are merged across nodes
-//! ([`ant_listings::merge_copies`]) and dated as the nodes date them: only
-//! the values of the nodes nearest the address count, and a listing a quorum
-//! of them serve is dated so that a quorum of them date it then or earlier
-//! ([`quorum_listing`]). So nodes fewer than a quorum can't move its date
+//! ([`ant_listings::merge_copies`]) and dated as the nodes date them
+//! ([`check_copies`]): only the values of the nodes nearest the address
+//! count, each checked on its own first. Where a quorum of them pass, the
+//! listing is dated so that a quorum of them date it then or earlier
+//! ([`quorum_listing`]'s date, where every value passes); where fewer pass,
+//! by the latest that does. So nodes fewer than a quorum can't move its date
 //! earlier, however few others answer.
 //!
 //! [`Client::index_listings`] reads the whole index; [`Client::listing`]

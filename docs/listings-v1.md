@@ -109,7 +109,7 @@ its uploader chose to hide, and those fields are absent from its entry.
 | `block_timestamp` | The payment's block timestamp. Absent when hidden |
 | `log_index` | The position in its block of the payment vault's `DataPaymentMade` event for the envelope. Absent when hidden |
 | `quote_hash` | The hash of the paid quote, which that event names. Absent when the quote is hidden, or doesn't decode as a quote |
-| `first_seen` | For a listing that hides its block timestamp: when the nodes nearest its address first stored it, rounded down to the hour, dated so that at least 4 of them date it then or earlier. Absent otherwise |
+| `first_seen` | For a listing that hides its block timestamp: when the nodes nearest its address first stored it, rounded down to the hour. Of their dates that pass the checks, the latest of the earliest 4, so that at least 4 of them date it then or earlier; where fewer than 4 pass, the latest of them. Absent otherwise |
 | `time` | The time the index sorts by: `block_timestamp`, else `first_seen`, else 0 |
 | `check` | `verified`: the quote is shown, and the payment is checked on the chain and tied to the address. `reported`: the quote is hidden; the shown fields are checked, and the listing counts because at least 4 of the 7 nodes nearest its address serve it |
 | `decided_at` | When the producer decided the entry as it stands: the start of that cycle. Deciding it again with the same result leaves it unchanged |
