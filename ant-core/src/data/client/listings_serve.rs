@@ -217,9 +217,10 @@ impl Producer {
     /// as carried: published as they were, marked carried in their support,
     /// until a cycle decides their addresses or shows them no longer served.
     /// So nothing published is lost before the first cycles confirm it.
-    /// Their support files are written at once, and don't start the support
-    /// files' interval, so the first cycle to decide them publishes their
-    /// support at once too ([`Publisher::publish_carry`]). Returns how many
+    /// Their support files are written at once and don't start the support
+    /// files' interval, so the support write after them isn't held back: the
+    /// first cycle that changes any support, as deciding any of them does,
+    /// publishes it at once ([`Publisher::publish_carry`]). Returns how many
     /// were taken: none, without reading `previous`, once the store holds an
     /// index, and none if `previous` doesn't exist. Entries marked as failing
     /// their checks (`"valid": false`) are not taken; every other one is, as

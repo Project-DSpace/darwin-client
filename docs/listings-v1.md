@@ -19,7 +19,7 @@ All paths are relative to the directory the files are published in, such as
 |---|---|---|
 | `head.json` | Where the index stands, its newest 50 entries, and links to the rest | When the index changes |
 | `by-address/<prefix>.json` (4,096 files) | Every entry whose address starts with `<prefix>`, with its data map | When one of its entries changes |
-| `by-address/<prefix>.support.json` (4,096 files) | How many of each of those addresses' nearest nodes serve it | When that changes, at most every 10 minutes |
+| `by-address/<prefix>.support.json` (4,096 files) | How many of each of those addresses' nearest nodes serve it | When that changes, at most every 10 minutes (see below) |
 | `by-name/<prefix>.json` (4,096 files) | The entries of each exact name whose hash starts with `<prefix>`, newest first | When one of its entries changes |
 | `by-type/<prefix>/index.json` (4,096 files) | Each exact content type whose hash starts with `<prefix>`, with its first and last page | When one of its types changes |
 | `by-type/<prefix>/<type id>-<n>.json` | Page `n` of one content type's entries, in key order, linked to the pages before and after | When its entries change |
@@ -222,8 +222,10 @@ lag the shard by that much: an address in the shard and not yet in its
 support file has support not yet published, and an address in the support
 file and not in the shard is no longer listed. An epoch's first publication
 that takes entries from an earlier index (see `carried`) doesn't start the
-10 minutes: the first cycle to decide those entries publishes their support
-at once.
+10 minutes, so the support write after it isn't held back: the first cycle
+that changes any support, as deciding any of those entries does, publishes
+it at once, and support that changes later waits for the 10 minutes that
+write starts.
 
 | Field | Value |
 |---|---|
