@@ -214,38 +214,21 @@ impl Producer {
     /// as carried: published as they were, marked carried in their support,
     /// until a cycle decides their addresses or shows them no longer served.
     /// So nothing published is lost before the first cycles confirm it.
-    /// Returns how many were taken: none, without reading `previous`, once
-    /// the store holds an index, and none if `previous` doesn't exist.
-    /// Entries marked as failing their checks (`"valid": false`) are not
-    /// taken; every other one is, as it was published.
+    /// Their support files are written at once, and don't start the support
+    /// files' interval, so the first cycle to decide them publishes their
+    /// support at once too ([`Publisher::publish_carry`]). Returns how many
+    /// were taken: none, without reading `previous`, once the store holds an
+    /// index, and none if `previous` doesn't exist. Entries marked as failing
+    /// their checks (`"valid": false`) are not taken; every other one is, as
+    /// it was published.
     ///
     /// # Errors
     ///
     /// If `previous` can't be read or isn't such an output, or the index
     /// can't be published.
     pub fn carry_from(&mut self, previous: &Path) -> Result<usize> {
-        if self.publisher.seq() > 0 || self.publisher.count() > 0 {
-            return Ok(0);
-        }
-        let bytes = match std::fs::read(previous) {
-            Ok(bytes) => bytes,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
-            Err(e) => return Err(Error::Io(e)),
-        };
-        let at = unix_now();
-        let carried = previous_entries(&bytes, at)?;
-        let taken = carried.len();
-        let mut publication = Publication {
-            at,
-            status: self.base_status(),
-            ..Publication::default()
-        };
-        for (entry, support) in carried {
-            publication.changes.push(IndexChange::Put(Box::new(entry)));
-            publication.support.push(support);
-        }
-        self.publisher.publish(&publication)?;
-        Ok(taken)
+        let status = self.base_status();
+        carry_into(&mut self.publisher, previous, status)
     }
 
     /// Run cycles until `cancel` fires: one every [`CYCLE`], the first at
@@ -930,6 +913,37 @@ fn rss_bytes() -> Option<u64> {
     kib.checked_mul(1024)
 }
 
+/// [`Producer::carry_from`] into `publisher`, with `status` for
+/// `status.json`.
+///
+/// # Errors
+///
+/// As [`Producer::carry_from`].
+fn carry_into(publisher: &mut Publisher, previous: &Path, status: Status) -> Result<usize> {
+    if publisher.seq() > 0 || publisher.count() > 0 {
+        return Ok(0);
+    }
+    let bytes = match std::fs::read(previous) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(e) => return Err(Error::Io(e)),
+    };
+    let at = unix_now();
+    let carried = previous_entries(&bytes, at)?;
+    let taken = carried.len();
+    let mut publication = Publication {
+        at,
+        status,
+        ..Publication::default()
+    };
+    for (entry, support) in carried {
+        publication.changes.push(IndexChange::Put(Box::new(entry)));
+        publication.support.push(support);
+    }
+    publisher.publish_carry(&publication)?;
+    Ok(taken)
+}
+
 /// The entries of `bytes`, an earlier `darwin listings --json` output, but
 /// those marked as failing their checks: each as published, decided at
 /// `at`, with its support marked carried. An entry without `valid`, as one
@@ -1000,6 +1014,7 @@ fn previous_entries(bytes: &[u8], at: u64) -> Result<Vec<(ShardEntry, Support)>>
 mod tests {
     use super::*;
     use crate::data::client::listings::RejectedListing;
+    use crate::data::client::listings_v1::SupportShard;
     use ant_listings::{
         CheckLevel, Envelope, Flags, Listing, ListingPayment, Metadata, PaymentField, ShownFields,
         SALTED_HASH_LEN,
@@ -1432,5 +1447,48 @@ mod tests {
         assert_eq!(tally.deferred, [(x, "below_quorum")]);
         assert_eq!(carried(&publisher), Some(true));
         assert!(rows(&publisher).is_empty());
+    }
+
+    #[test]
+    fn the_first_cycle_after_a_carry_publishes_its_support_at_once() {
+        let (dir, mut publisher) = publisher();
+        let previous = dir.path().join("listings.json");
+        std::fs::write(&previous, format!("[{}]", printed(""))).unwrap();
+        let taken = carry_into(&mut publisher, &previous, Status::default()).unwrap();
+        assert_eq!(taken, 1);
+        let published = |publisher: &Publisher| {
+            let path = publisher.out_dir().join("by-address/111.support.json");
+            let bytes = std::fs::read(path).unwrap();
+            serde_json::from_slice::<SupportShard>(&bytes)
+                .unwrap()
+                .support[0]
+                .clone()
+        };
+        let carried = Support {
+            address: ADDRESS.into(),
+            nodes: 6,
+            nearest: 7,
+            quorum: true,
+            carried: true,
+        };
+        assert_eq!(published(&publisher), carried);
+        // The first cycle decides it: all 7 of its nearest nodes serve it.
+        // Its support is published at once, not 10 minutes after the carry.
+        let confirmed = Support {
+            nodes: 7,
+            carried: false,
+            ..carried
+        };
+        publisher
+            .publish(&Publication {
+                at: unix_now() + 60,
+                support: vec![confirmed.clone()],
+                ..Publication::default()
+            })
+            .unwrap();
+        assert_eq!(published(&publisher), confirmed);
+        // Once the store holds an index, a carry takes nothing.
+        let taken = carry_into(&mut publisher, &previous, Status::default()).unwrap();
+        assert_eq!(taken, 0);
     }
 }

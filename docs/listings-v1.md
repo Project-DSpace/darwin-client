@@ -210,7 +210,10 @@ many of the nodes nearest it serve its listing, as the producer last measured
 it. It is written when that changes, and at most every 10 minutes, so it can
 lag the shard by that much: an address in the shard and not yet in its
 support file has support not yet published, and an address in the support
-file and not in the shard is no longer listed.
+file and not in the shard is no longer listed. An epoch's first publication
+that takes entries from an earlier index (see `carried`) doesn't start the
+10 minutes: the first cycle to decide those entries publishes their support
+at once.
 
 | Field | Value |
 |---|---|
@@ -218,7 +221,7 @@ file and not in the shard is no longer listed.
 | `nodes` | How many of the nodes nearest the address answered and serve its listing |
 | `nearest` | How many nearest nodes count: 7, unless the network has fewer |
 | `quorum` | Whether `nodes` reaches the quorum, 4 of 7. Always true for a `reported` listing. A `verified` one without it is the earliest of several payments for its address, none of which a quorum of those nodes serves: a node asked to quote for the upload could have paid first |
-| `carried` | Whether the entry is kept from an earlier decision that the latest cycle couldn't make again (too few of the nearest nodes answered, or serve it), while what it takes to remove it isn't shown either |
+| `carried` | Whether the entry is kept from an earlier decision that the latest cycle couldn't make again (too few of the nearest nodes answered, or serve it), while what it takes to remove it isn't shown either. An epoch's first publication may also take entries from an earlier index, marked carried until a cycle decides them |
 
 ```json
 { "prefix": "a0a", "support": [{ "address": "a0a0…", "nodes": 6, "nearest": 7, "quorum": true, "carried": false }] }

@@ -439,7 +439,7 @@ Runs until SIGINT or SIGTERM (the cycle in hand finishes writing first) and keep
 |------|-------------|
 | `--state-dir <DIR>` | Where the producer keeps its state, created if missing. One process uses it at a time. |
 | `--out-dir <DIR>` | Where it publishes the files of `listings/v1/`, created if missing. |
-| `--carry <FILE>` | On a first start, an earlier `--json` output of `darwin listings` (such as a `listings.json` the producer takes over from), whose entries are published as carried until cycles decide their addresses, so nothing in it is lost meanwhile. Ignored once the state holds an index. |
+| `--carry <FILE>` | On a first start, an earlier `--json` output of `darwin listings` (such as a `listings.json` the producer takes over from), whose entries are published as carried until cycles decide their addresses, so nothing in it is lost meanwhile; the first cycle to decide them publishes their support at once. Ignored once the state holds an index. |
 
 **Its state** is one store, `listings.mdb` in the state directory: where each node's walk carries on, chain facts, envelopes and the published index. Back it up like other server state. Without it the producer starts cold: it reads every listing again, and starts a new feed under a new `epoch`, which tells readers to read the index afresh.
 

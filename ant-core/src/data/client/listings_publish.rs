@@ -18,7 +18,10 @@
 //!   back), then `pages.json`, `feed/index.json`, and `head.json` after
 //!   them, so a file is written only after every file it names is in place;
 //! - every prefix's shard files, empty or not;
-//! - support files at most every [`SUPPORT_INTERVAL`];
+//! - support files at most every [`SUPPORT_INTERVAL`], but for a first
+//!   start's carry of entries from an earlier index
+//!   ([`Publisher::publish_carry`]): its support files are written at once,
+//!   and the interval starts at the next support write, not at theirs;
 //! - `rejected.json` when it changes;
 //! - `status.json` every publication, last of all: after every other file,
 //!   and after the store has them as written, so a fresh `status.json`
@@ -340,7 +343,23 @@ impl Publisher {
     /// nothing), or the store or a file can't be written.
     pub fn publish(&mut self, publication: &Publication) -> Result<Published> {
         let pending = self.record(publication)?;
-        self.write(publication.at, &publication.status, pending)
+        self.write(publication.at, &publication.status, pending, false)
+    }
+
+    /// Publish `publication`, a first start's carry of entries from an
+    /// earlier index, marked carried in their support
+    /// ([`Producer::carry_from`](super::listings_serve::Producer::carry_from)),
+    /// as [`publish`](Self::publish) does, but for the support files: they
+    /// are written at once, and don't start the [`SUPPORT_INTERVAL`]. So the
+    /// first cycle to decide those entries publishes their support at once
+    /// too, rather than an interval after the carry.
+    ///
+    /// # Errors
+    ///
+    /// As [`publish`](Self::publish).
+    pub fn publish_carry(&mut self, publication: &Publication) -> Result<Published> {
+        let pending = self.record(publication)?;
+        self.write(publication.at, &publication.status, pending, true)
     }
 
     /// Apply `publication` to the published index in one transaction, with
@@ -485,15 +504,25 @@ impl Publisher {
     /// clear what was written from the store, and note the time pages
     /// `pages.json` stopped listing as superseded at `at`; then write
     /// `status.json`, last, so that a fresh one means every other file is in
-    /// place and the store has it as written.
-    fn write(&mut self, at: u64, status: &Status, mut pending: Pending) -> Result<Published> {
+    /// place and the store has it as written. For a `carry`
+    /// ([`Self::publish_carry`]), the support files are written whenever
+    /// they changed, and their writing doesn't start the
+    /// [`SUPPORT_INTERVAL`].
+    fn write(
+        &mut self,
+        at: u64,
+        status: &Status,
+        mut pending: Pending,
+        carry: bool,
+    ) -> Result<Published> {
         let dbs = self.dbs;
         self.files.written = 0;
         self.files.written_bytes = 0;
         let support_written = !pending.support.is_empty()
-            && self
-                .support_at
-                .is_none_or(|last| at.saturating_sub(last) >= SUPPORT_INTERVAL.as_secs());
+            && (carry
+                || self
+                    .support_at
+                    .is_none_or(|last| at.saturating_sub(last) >= SUPPORT_INTERVAL.as_secs()));
         let txn = self.store.env().read_txn().map_err(store_error)?;
         for &shard in &pending.address {
             let bytes = dbs.address_shard(&txn, shard)?;
@@ -594,9 +623,17 @@ impl Publisher {
             .put(&mut txn, FEED_WRITTEN, &self.seq)
             .map_err(store_error)?;
         if support_written {
-            dbs.meta_numbers
-                .put(&mut txn, SUPPORT_AT, &at)
-                .map_err(store_error)?;
+            if carry {
+                // The interval is left unstarted, so the next support write
+                // isn't held back by this one.
+                dbs.meta_numbers
+                    .delete(&mut txn, SUPPORT_AT)
+                    .map_err(store_error)?;
+            } else {
+                dbs.meta_numbers
+                    .put(&mut txn, SUPPORT_AT, &at)
+                    .map_err(store_error)?;
+            }
         }
         for page in &expired {
             dbs.pages.delete(&mut txn, &page.row).map_err(store_error)?;
@@ -604,7 +641,7 @@ impl Publisher {
         txn.commit().map_err(store_error)?;
         self.feed_written = self.seq;
         if support_written {
-            self.support_at = Some(at);
+            self.support_at = (!carry).then_some(at);
         }
         // Last of all, once the files above are in place and the store has
         // them as written: a `status.json` that is fresh says so, and one a
@@ -3626,6 +3663,46 @@ mod tests {
             ..quiet(AT + 2 * interval)
         });
         assert_eq!(f.publisher.support(&[0xee; 32]).unwrap(), None);
+    }
+
+    #[test]
+    fn a_carry_does_not_start_the_support_interval() {
+        let mut f = Fixture::new();
+        // An earlier start published an empty index: the support files'
+        // interval runs from then.
+        f.publish(&quiet(AT - 60));
+        let address = "11".repeat(32);
+        let path = "by-address/111.support.json";
+        let published = |f: &Fixture| f.file::<SupportShard>(path).support.first().cloned();
+        // A first start's carry: its support files are written at once.
+        let carried = Support {
+            carried: true,
+            ..support(&address, 6)
+        };
+        f.publisher
+            .publish_carry(&Publication {
+                changes: vec![put(shown())],
+                support: vec![carried.clone()],
+                ..quiet(AT)
+            })
+            .unwrap();
+        assert_eq!(published(&f), Some(carried));
+        // Nor do they start the interval, across a restart too: the first
+        // cycle to decide the entry publishes its support at once.
+        f.reopen();
+        f.publish(&Publication {
+            support: vec![support(&address, 7)],
+            ..quiet(AT + 60)
+        });
+        assert_eq!(published(&f), Some(support(&address, 7)));
+        // That cycle's write starts it.
+        f.publish(&Publication {
+            support: vec![support(&address, 5)],
+            ..quiet(AT + 120)
+        });
+        assert_eq!(published(&f), Some(support(&address, 7)));
+        f.publish(&quiet(AT + 60 + SUPPORT_INTERVAL.as_secs()));
+        assert_eq!(published(&f), Some(support(&address, 5)));
     }
 
     #[test]

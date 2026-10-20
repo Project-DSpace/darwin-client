@@ -61,7 +61,10 @@ pub const MAX_PAGE_LISTINGS: usize = 4_000;
 /// How many records a feed segment holds once closed.
 pub const FEED_SEGMENT_RECORDS: u64 = 1_000;
 
-/// Support files are written at most this often.
+/// Support files are written at most this often. An epoch's first
+/// publication, when it takes entries from an earlier index (marked
+/// [`carried`](Support::carried)), doesn't start it: the first cycle to
+/// decide those entries publishes their support at once.
 pub const SUPPORT_INTERVAL: Duration = Duration::from_secs(10 * 60);
 
 /// How long a time page that `pages.json` no longer lists is kept, for
@@ -262,7 +265,9 @@ pub struct Support {
     pub quorum: bool,
     /// Whether the entry is kept from an earlier decision that the latest
     /// cycle couldn't make again (too few of the nearest nodes answered, or
-    /// serve it), while what it takes to remove it isn't shown either.
+    /// serve it), while what it takes to remove it isn't shown either. An
+    /// epoch's first publication may also take entries from an earlier
+    /// index, marked carried until a cycle decides them.
     pub carried: bool,
 }
 
