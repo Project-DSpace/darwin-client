@@ -442,12 +442,13 @@ Files are fetched one at a time, so a file can be newer than the
 
 ## How the producer keeps the files
 
-- Each minute (a cycle), it asks the nodes what changed, decides again only
-  the addresses whose copies, nearest nodes or chain facts changed, and
-  writes the files those decisions change. Nodes also send it the listings
-  they store as they store them, so it need not wait for the next cycle to
-  learn of one. An address is decided only once at least 4 of its 7 nearest
-  nodes serve a listing for it.
+- Each minute (a cycle), it reads every node's index, decides the addresses
+  it finds, and writes the files those decisions change. An address is
+  decided only once at least 4 of its 7 nearest nodes serve a listing for
+  it. A later version asks nodes that keep a change feed only what changed,
+  decides again only the addresses whose copies, nearest nodes or chain
+  facts changed, and learns of a new listing as a node stores it, without
+  waiting for the next cycle; the files stay as this document gives them.
 - It removes an entry only when, in one cycle, every node nearest its
   address shows that it serves no listing there (`no_longer_served`), or
   when deciding the address again rejects it (`rejected`). An entry it can't

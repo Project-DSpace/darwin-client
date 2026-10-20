@@ -215,7 +215,8 @@ impl Producer {
     /// So nothing published is lost before the first cycles confirm it.
     /// Returns how many were taken: none, without reading `previous`, once
     /// the store holds an index, and none if `previous` doesn't exist.
-    /// Entries that failed their checks (`"valid": false`) are not taken.
+    /// Entries marked as failing their checks (`"valid": false`) are not
+    /// taken; every other one is, as it was published.
     ///
     /// # Errors
     ///
@@ -249,13 +250,22 @@ impl Producer {
     /// Run cycles until `cancel` fires: one every [`CYCLE`], the first at
     /// once. A cycle that fails is logged and the next one runs on time. On
     /// `cancel`, a cycle still reading the network is abandoned before it
-    /// has written anything; one writing its changes finishes first.
+    /// has written anything; one writing its changes finishes first. After
+    /// each cycle, and once it stops, the client's peer cache and adaptive
+    /// snapshot are saved ([`Client::save_peer_cache`]), so a restart, even
+    /// after the process was killed, joins through the peers it knew.
     ///
     /// # Errors
     ///
     /// Only if the producer can't go on at all: when its store can't be
     /// read or written.
     pub async fn run(&mut self, cancel: CancellationToken) -> Result<()> {
+        let result = self.run_cycles(&cancel).await;
+        self.save_client_state().await;
+        result
+    }
+
+    async fn run_cycles(&mut self, cancel: &CancellationToken) -> Result<()> {
         loop {
             let next = tokio::time::Instant::now() + CYCLE;
             // On the heap: an index read's future is too large for a main
@@ -269,11 +279,19 @@ impl Producer {
                     Err(e) => warn!("A listings cycle failed: {e}"),
                 },
             }
+            self.save_client_state().await;
             tokio::select! {
                 () = cancel.cancelled() => return Ok(()),
                 () = tokio::time::sleep_until(next) => {}
             }
         }
+    }
+
+    /// Save what the client learned of the network, as the one-shot
+    /// commands do when they end: its peer cache and adaptive snapshot.
+    async fn save_client_state(&self) {
+        self.client.save_peer_cache().await;
+        self.client.save_adaptive_snapshot();
     }
 
     /// Run one cycle (see the module docs) and publish what it changed.
@@ -846,9 +864,11 @@ fn rss_bytes() -> Option<u64> {
     kib.checked_mul(1024)
 }
 
-/// The entries of `bytes`, an earlier `darwin listings --json` output, that
-/// passed their checks: each as published, decided at `at`, with its support
-/// marked carried.
+/// The entries of `bytes`, an earlier `darwin listings --json` output, but
+/// those marked as failing their checks: each as published, decided at
+/// `at`, with its support marked carried. An entry without `valid`, as one
+/// carried over from an older output may be, is taken: a `listings.json`
+/// written from such outputs publishes it.
 ///
 /// # Errors
 ///
@@ -859,7 +879,7 @@ fn previous_entries(bytes: &[u8], at: u64) -> Result<Vec<(ShardEntry, Support)>>
     let mut carried = Vec::new();
     for (n, mut entry) in entries.into_iter().enumerate() {
         let bad = |e: String| Error::InvalidData(format!("entry {}: {e}", n + 1));
-        if entry.get("valid").and_then(Value::as_bool) != Some(true) {
+        if entry.get("valid").and_then(Value::as_bool) == Some(false) {
             continue;
         }
         let number =
@@ -929,12 +949,25 @@ mod tests {
     #[test]
     fn earlier_output_is_taken_as_carried_entries() {
         let rejected = r#"{"address":"2222222222222222222222222222222222222222222222222222222222222222","time":5,"nodes":2,"nearest":7,"valid":false,"problem":"try again"}"#;
-        let bytes = format!("[{},{rejected}]", printed(r#","time":1791321603"#));
+        // An entry with no `valid`, as one carried over unchanged from an
+        // older output may be: published, so taken.
+        let unmarked = printed("")
+            .replace(ADDRESS, &"33".repeat(32))
+            .replace(r#","valid":true"#, "");
+        assert!(!unmarked.contains("valid"));
+        let bytes = format!(
+            "[{},{rejected},{unmarked}]",
+            printed(r#","time":1791321603"#)
+        );
         let taken = previous_entries(bytes.as_bytes(), 100).unwrap();
+        let addresses: Vec<&str> = taken
+            .iter()
+            .map(|(entry, _)| entry.entry.listing.address.as_str())
+            .collect();
         assert_eq!(
-            taken.len(),
-            1,
-            "an entry that failed its checks isn't taken"
+            addresses,
+            [ADDRESS, "33".repeat(32).as_str()],
+            "an entry that failed its checks isn't taken; one not marked is"
         );
         let (entry, support) = &taken[0];
         assert_eq!(entry.entry.listing.address, ADDRESS);
