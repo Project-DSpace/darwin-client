@@ -114,7 +114,7 @@ its uploader chose to hide, and those fields are absent from its entry.
 | `address` | The file's address: its envelope's, 64 hex digits |
 | `name` | The name the uploader declared, or `null`. Treat it as untrusted text, not a path |
 | `content_type` | The content type the uploader declared, or `null` |
-| `size` | The file's size in bytes, as its data map gives it. The data map of a file over about 12.5 MB is shrunk into a child map, which gives no size: the producer reads its root map once to find it, and until then it is `null`, so a size can be filled in later for an entry already published, which the feed records as an ordinary put. `null` when the data map is withheld |
+| `size` | The file's size in bytes, as its data map gives it. The data map of a file over about 12.5 MB is shrunk into a child map, which gives no size: the producer reads its root map once to find it, and until then it is `null`, so a size can be filled in later for an entry already published, which the feed records as an ordinary put. It stays `null` where the root map can't give one: a data map shrunk more than once (a file over about 650 GB) isn't read. `null` when the data map is withheld. The listings the nodes serve give no size for a shrunk data map, so a reader that compares entries with its own read of the nodes must not count a size an entry has and its read lacks as a difference |
 | `readable` | Whether anyone with the address can read the file: the envelope holds its data map rather than withholding it |
 | `hidden` | The payment fields the uploader hid, of `tx-hash`, `block`, `timestamp`, `log-index` and `quote`, in that order |
 | `tx_hash` | The payment's transaction hash. Absent when hidden |
@@ -125,7 +125,7 @@ its uploader chose to hide, and those fields are absent from its entry.
 | `first_seen` | For a listing that hides its block timestamp: when the nodes nearest its address first stored it, rounded down to the hour. Of their dates that pass the checks, the latest of the earliest 4, so that at least 4 of them date it then or earlier; where fewer than 4 pass, the latest of them. Absent otherwise |
 | `time` | The time the index sorts by: `block_timestamp`, else `first_seen`, else 0 |
 | `check` | `verified`: the quote is shown, and the payment is checked on the chain and tied to the address. `reported`: the quote is hidden; the shown fields are checked, and the listing counts because at least 4 of the 7 nodes nearest its address serve it |
-| `decided_at` | When the producer decided the entry as it stands: the start of that cycle. Deciding it again with the same result leaves it unchanged |
+| `decided_at` | When the producer decided the entry as it stands: when the publication that decided it began, a cycle's start, or for a listing pushed between cycles, when that publication began. Deciding it again with the same result leaves it unchanged, and so does filling in its `size` |
 
 A verified listing whose payment shows every field:
 
@@ -178,7 +178,7 @@ index does, and only then.
 | `epoch` | The feed's epoch: 16 hex digits, chosen at random when the producer starts a new feed. When it changes, everything a reader holds from earlier files is void: read the index afresh |
 | `seq` | The number of the feed's latest record, 0 if it has none |
 | `count` | How many entries the index holds |
-| `generated_at` | When the index last changed: the start of the cycle that wrote the feed's latest record, or, before any, the cycle that began the epoch |
+| `generated_at` | When the index last changed: when the publication that wrote the feed's latest record began (see the feed's `at`), or, before any, the cycle that began the epoch |
 | `listings` | The newest 50 entries (fewer if the index is smaller), newest first: the largest keys first. Without data maps |
 | `links` | Where the other files are, relative to this one: `status`, `rejected`, `pages` and `feed` name files; `by_address`, `support`, `by_name` and `by_type` are patterns in which `{prefix}` stands for a prefix |
 
@@ -238,6 +238,14 @@ write starts.
 ```json
 { "prefix": "a0a", "support": [{ "address": "a0a0…", "nodes": 6, "nearest": 7, "quorum": true, "carried": false }] }
 ```
+
+The nearest nodes are those of the producer's census: the nodes it found
+answering witnessed lookups. A node that misses 3 of its polls in a row
+leaves the census when its part of the address space is closed again, and
+the next nearest takes its place, so for a while after a node stops, these
+counts (and `rejected.json`'s, and `status.json`'s `below_full`) can differ
+from what a one-off read of the network gives while the network still lists
+the node. A reader comparing support with its own read should allow for it.
 
 ## by-name/
 
@@ -337,9 +345,12 @@ epoch, and kept for good. A record is either:
   `no_longer_served` (in one cycle, every node nearest the address showed
   that it serves no listing there: the network no longer stores the file,
   though its payment stays on the chain) or `rejected` (deciding it again
-  rejected it); other reasons may be added.
+  rejected it, or the entry shows a payment from before the payment vault
+  was deployed, which can never count); other reasons may be added.
 
-`at` is the start of the cycle that made the change; the records of one cycle
+`at` is when the publication that made the change began: a cycle's start,
+or for a change published between cycles (a listing a node pushed, a size
+filled in), when that publication began. The records of one publication
 share it. Applying records 1 to `n`, in order, to an empty index gives the
 index after record `n`. A removal of an address that has no entry changes
 nothing.
@@ -371,12 +382,12 @@ stopped, is stuck, or can't write its files.
 | `generated_at` | When this file was written |
 | `started_at` | When the producer started; `totals` count from then |
 | `cycle` | The latest cycle: `started_at`; `millis`, how long it took; `bytes_in` and `bytes_out`, the listings messages received from nodes and sent to them (see below); `rpc_calls` and `rpc_errors`, to the payment chain's RPC providers; `decided`, addresses decided; `too_few_answered`, true when the cycle decided and removed nothing because too few of the nodes it knows answered (see below) |
-| `totals` | Since `started_at`: `cycles`, `bytes_in` and `bytes_out` (counted as the cycle's are), and `rpc`, for each provider its host name (`provider`), `calls` and `errors` |
+| `totals` | Since `started_at`: `cycles`, `bytes_in` and `bytes_out` (counted as the cycle's are, those between cycles, such as pushes, with the next cycle's), and `rpc`, for each provider its host name (`provider`), `calls` and `errors` |
 | `census` | The nodes the producer knows: `nodes`; `answering`, those that answered in the latest cycle; `leaves`, the parts the address space is split into; `versions`, how many nodes (`nodes`) give each `version` in their user agent (`null` when unknown); `silent`, each node that didn't answer (`node`, and `last_answered`, or `null` if never) |
 | `deferred` | Addresses left for a later cycle, grouped by `reason`, each group with `addresses`, how many, and `oldest_since`, since when the longest-waiting has waited. An entry kept unconfirmed (`carried`) whose address the cycle left for later counts too, though `rejected.json` doesn't list it |
 | `below_full` | Entries fewer than all of their nearest nodes serve: `listings`, how many, and `oldest_since`, since when the longest-standing has been (`null` if none) |
 | `drops` | `removed`, entries the latest cycle removed; `carried`, entries kept unconfirmed (see the support files) |
-| `resources` | What the producer uses, each `null` where it can't tell: `rss_bytes` (memory), `store_bytes`, `files_bytes` (what it publishes) and `disk_free_bytes` |
+| `resources` | What the producer uses, each `null` where it can't tell: `rss_bytes` (its own memory resident, not counting the pages of its store's file the system maps in and can drop at any time), `store_bytes`, `files_bytes` (what it publishes) and `disk_free_bytes` |
 
 `bytes_in` and `bytes_out` count only the listings messages the producer
 receives from nodes and sends to them, each message's payload: not the DHT
@@ -388,6 +399,12 @@ answered the cycle, or under three quarters of them. `census.answering`
 counts the nodes that answered the cycle's request with an answer the
 producer's checks took, and `silent` lists the others.
 
+`decided` counts the addresses whose decision stands: listed, or rejected for
+good. The producer decides every address again after it starts, a batch at a
+time, over more than one cycle where the index is large: until it has, the
+first cycles' `decided` and `deferred` count only the addresses decided since
+the start.
+
 A deferral's `reason` is one of: `below_quorum` (fewer than 4 of the 7 nodes
 nearest the address serve it yet), `nodes_unanswered` (nodes nearest it have
 yet to answer for it), `envelope_unavailable` (no node serving it handed over
@@ -397,9 +414,10 @@ dated in the future), and `other`; other reasons may be added. An address is
 not deferred when every copy its nearest nodes serve shows a payment from
 before the payment vault was deployed (`before_vault_deployment` in
 `rejected.json`): none of them can count, however many nodes come to serve
-them, so it is rejected for good, in `rejected.json` with `again` false, and
-an entry still listed for it is removed (`rejected`) rather than kept
-unconfirmed.
+them, so it is rejected for good, in `rejected.json` with `again` false. An
+entry still listed that itself shows such a payment is removed (`rejected`)
+whenever its address is decided again, rather than kept unconfirmed: every
+copy of it shows that payment.
 
 ```json
 { "epoch": "8c1f0e2d3b4a5968", "seq": 12, "count": 2, "generated_at": 1791324061, "started_at": 1791320000,
@@ -430,7 +448,7 @@ row has the entry's fields from `address` to `time` (no `check`), then:
 | `again` | True when nothing final was decided, so it may be listed later (deferred); false when it is rejected for good |
 | `nodes` | How many of the nodes nearest its address serve it |
 | `nearest` | How many nearest nodes count |
-| `decided_at` | The start of the cycle that decided this |
+| `decided_at` | When the publication that decided this began, as for an entry |
 | `copies` | For a listing too few of its nearest nodes serve yet, each of their copies: `node`, the `block_number`, `block_timestamp` and `first_seen` it shows (each absent when it doesn't), its `time`, and `before_vault_deployment: true` where the block or block timestamp it shows is earlier than the payment vault's deployment, so it paid something else. Absent otherwise |
 
 A rejected or deferred listing's `first_seen`, and so its `time`, is not
@@ -501,21 +519,26 @@ Files are fetched one at a time, so a file can be newer than the
 
 - Each minute (a cycle), it asks every node it knows what changed in what
   it serves, decides again the addresses whose copies, nearest nodes or
-  chain facts changed (and every address once a day), and writes the files
-  those decisions change. A node that stores a new listing pushes it, and
-  the producer publishes it within seconds, without waiting for the next
-  cycle; while a node is slow to answer a cycle's requests, a listing pushed
-  during the cycle is published with the cycle. An address is decided only
-  once at least 4 of its 7 nearest nodes serve a listing for it.
+  chain facts changed, and writes the files those decisions change. It
+  decides every address again after it starts and once a day, a batch at a
+  time for what is left of each cycle's minute, over as many cycles as that
+  takes. A node that stores a new listing pushes it, and the producer
+  publishes it within seconds, without waiting for the next cycle; while a
+  node is slow to answer a cycle's requests, a listing pushed meanwhile is
+  published with the cycle, and while every address is being decided again,
+  with the next. An address is decided only once at least 4 of its 7
+  nearest nodes serve a listing for it.
 - It removes an entry only when, in one cycle, every node nearest its
   address answers that it serves no listing there, and a witnessed lookup
   of the address and a request for it to each of those nodes and to the
   nodes that last served it confirm it (`no_longer_served`), or when
-  deciding the address again rejects it (`rejected`). An entry it can't
+  deciding the address again rejects it, or the entry shows a payment from
+  before the payment vault was deployed (`rejected`). An entry it can't
   confirm otherwise is kept, marked `carried` in its support file.
 - An entry whose file's data map is shrunk is published without a `size`
   until the producer has read the file's root map, and is then put again
-  with it, in a later cycle or between cycles.
+  with it, in a later cycle or between cycles. A data map shrunk more than
+  once, or whose root map can't give a size, leaves it without.
 - It writes a file only when its bytes change; the files a change touches
   first, then `pages.json`, `feed/index.json` and `head.json`. Time pages
   that `pages.json` no longer lists are deleted a day later.
