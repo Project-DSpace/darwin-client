@@ -55,8 +55,8 @@ pub enum ListingsCommand {
 /// Arguments of `darwin listings serve`.
 #[derive(Args)]
 pub struct ServeArgs {
-    /// Where the producer keeps its state, created if missing: the census of
-    /// nodes, each node's mirror, chain facts, envelopes and the published
+    /// Where the producer keeps its state, created if missing: where each
+    /// node's walk carries on, chain facts, envelopes and the published
     /// index. One process uses it at a time.
     #[arg(long, value_name = "DIR")]
     pub state_dir: PathBuf,
