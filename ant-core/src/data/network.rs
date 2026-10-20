@@ -545,6 +545,13 @@ impl Network {
         self.node.transport().peer_user_agent(peer).await
     }
 
+    /// Whether this node has a connection to `peer` now, with identities
+    /// exchanged.
+    #[cfg(feature = "native")]
+    pub async fn is_peer_connected(&self, peer: &PeerId) -> bool {
+        self.node.transport().is_peer_connected(peer).await
+    }
+
     /// Compute the live network-participation snapshot.
     ///
     /// Both node reads are in-memory, so this is cheap enough to call per
