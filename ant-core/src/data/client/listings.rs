@@ -5223,6 +5223,19 @@ mod tests {
             listing_to_check(&groups[0], &NEAREST, 4).and_then(|listing| listing.first_seen),
             Some(hour)
         );
+        // That median, taken before any check, is what a listing that doesn't
+        // count is shown with: two of three nodes dating it in 1970 date it
+        // so. Checked, as a listing that counts is, it is dated by the latest
+        // date that passes.
+        let groups = merge_copies(dated_copies(&listing, &NEAREST, &[0, 0, hour]));
+        assert_eq!(
+            listing_to_check(&groups[0], &NEAREST, 4).and_then(|listing| listing.first_seen),
+            Some(0)
+        );
+        let (dated, _) = check_group(&groups[0], &envelope, &NEAREST, 4, &unreachable, hour)
+            .await
+            .expect("checks out");
+        assert_eq!(dated.first_seen, Some(hour));
     }
 
     #[tokio::test]
