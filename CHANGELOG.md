@@ -31,7 +31,9 @@ told apart by the commit `darwin --version` prints. Upstream's entries follow.
   what changed in its part of the address space, and reads the others with one `listings.v2`
   request a minute and a full pass at most hourly. It decides again only the addresses whose
   copies, nearest nodes or chain facts changed (and every address once a day), and publishes a
-  new listing a node pushes within seconds. An entry is dropped only when, in one cycle, all 7 of
+  new listing a node pushes within seconds. The full listings behind the nodes' entries are
+  fetched once, within each node's allowance, and kept, and a node that doesn't hand one over
+  can't keep an address from being decided. An entry is dropped only when, in one cycle, all 7 of
   its nearest nodes answered without a copy, a witnessed lookup confirms them, and each of them
   and the nodes that last served it answers a request for the address with none.
 - Envelopes are darwin's default: `darwin file upload`, `darwin manifest create` and the

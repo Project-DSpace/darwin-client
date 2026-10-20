@@ -370,7 +370,7 @@ stopped, is stuck, or can't write its files.
 | `epoch`, `seq`, `count` | As in `head.json` |
 | `generated_at` | When this file was written |
 | `started_at` | When the producer started; `totals` count from then |
-| `cycle` | The latest cycle: `started_at`; `millis`, how long it took; `bytes_in` and `bytes_out`, the listings messages received from nodes and sent to them (see below); `rpc_calls` and `rpc_errors`, to the payment chain's RPC providers; `decided`, addresses the cycle decided; `too_few_answered`, true when the cycle decided and removed nothing because too few of the nodes it knows answered (see below) |
+| `cycle` | The latest cycle: `started_at`; `millis`, how long it took; `bytes_in` and `bytes_out`, the listings messages received from nodes and sent to them (see below); `rpc_calls` and `rpc_errors`, to the payment chain's RPC providers; `decided`, addresses decided; `too_few_answered`, true when the cycle decided and removed nothing because too few of the nodes it knows answered (see below) |
 | `totals` | Since `started_at`: `cycles`, `bytes_in` and `bytes_out` (counted as the cycle's are), and `rpc`, for each provider its host name (`provider`), `calls` and `errors` |
 | `census` | The nodes the producer knows: `nodes`; `answering`, those that answered in the latest cycle; `leaves`, the parts the address space is split into; `versions`, how many nodes (`nodes`) give each `version` in their user agent (`null` when unknown); `silent`, each node that didn't answer (`node`, and `last_answered`, or `null` if never) |
 | `deferred` | Addresses left for a later cycle, grouped by `reason`, each group with `addresses`, how many, and `oldest_since`, since when the longest-waiting has waited. An entry kept unconfirmed (`carried`) whose address the cycle left for later counts too, though `rejected.json` doesn't list it |
@@ -385,8 +385,8 @@ overhead.
 
 `too_few_answered` is true when fewer than 7 of the census's nodes
 answered the cycle, or under three quarters of them. `census.answering`
-counts the nodes that answered the cycle's request, and `silent` lists the
-others.
+counts the nodes that answered the cycle's request with an answer the
+producer's checks took, and `silent` lists the others.
 
 A deferral's `reason` is one of: `below_quorum` (fewer than 4 of the 7 nodes
 nearest the address serve it yet), `nodes_unanswered` (nodes nearest it have
@@ -506,7 +506,8 @@ Files are fetched one at a time, so a file can be newer than the
   chain facts changed (and every address once a day), and writes the files
   those decisions change. A node that stores a new listing pushes it, and
   the producer publishes it within seconds, without waiting for the next
-  cycle. An address is decided only once at least 4 of its 7 nearest nodes
+  cycle; while a node is slow to answer a cycle's requests, a listing pushed
+  during the cycle is published with the cycle. An address is decided only once at least 4 of its 7 nearest nodes
   serve a listing for it.
 - It removes an entry only when, in one cycle, every node nearest its
   address answers that it serves no listing there, and a witnessed lookup
