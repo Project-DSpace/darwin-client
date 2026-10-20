@@ -101,6 +101,7 @@
 //! [`V2_PASS_INTERVAL`] has passed since it began.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
+use std::future::Future;
 
 use ant_listings::{
     check_list_page, AddressRange, ChangesResponse, DigestEntry, FeedOutcome, FeedSync, ListingKey,
@@ -150,17 +151,23 @@ pub type PushReceiver = tokio::sync::mpsc::Receiver<(PeerId, ChangesResponse)>;
 
 /// Sends listings requests to nodes: the producer's `ListingsRequests`, or a
 /// stand-in in tests.
-#[async_trait::async_trait]
 pub trait FeedIo: Sync {
     /// Send `body` to `peer` and wait for its answer, or `None` if none
     /// came in time. An [`Error`](ListingsBody::Error) is the answer it is.
-    async fn ask(&self, peer: &PeerId, body: ListingsBody) -> Option<ListingsBody>;
+    fn ask(
+        &self,
+        peer: &PeerId,
+        body: ListingsBody,
+    ) -> impl Future<Output = Option<ListingsBody>> + Send;
 }
 
-#[async_trait::async_trait]
 impl FeedIo for ListingsRequests {
-    async fn ask(&self, peer: &PeerId, body: ListingsBody) -> Option<ListingsBody> {
-        ListingsRequests::ask(self, peer, body).await
+    fn ask(
+        &self,
+        peer: &PeerId,
+        body: ListingsBody,
+    ) -> impl Future<Output = Option<ListingsBody>> + Send {
+        ListingsRequests::ask(self, peer, body)
     }
 }
 
@@ -190,6 +197,23 @@ pub struct FeedNode {
     /// Whether to ask it for its nearest peers this round, such as after
     /// its view hash changed ([`Feeds::view`]).
     pub want_peers: bool,
+}
+
+impl FeedNode {
+    /// Every node of `census`, in id order, as [`Feeds::poll`] takes them:
+    /// each asked about its own leaf, through its feed where its user agent
+    /// shows the release, and asked for its peers where `want_peers` says.
+    pub fn from_census(census: &Census, want_peers: impl Fn(&PeerId) -> bool) -> Vec<Self> {
+        census
+            .nodes()
+            .map(|node| Self {
+                peer: node.peer,
+                range: census.leaf_of(node.peer.as_bytes()),
+                feed: census.supports_feed(&node.peer),
+                want_peers: want_peers(&node.peer),
+            })
+            .collect()
+    }
 }
 
 /// How a node is read.
@@ -985,7 +1009,7 @@ impl Feeds {
         pushes: Option<&mut PushReceiver>,
     ) -> Result<PollReport>
     where
-        I: FeedIo + ?Sized,
+        I: FeedIo,
         C: NearestNodes + ?Sized,
     {
         self.reconcile(census, nodes, now);
@@ -1446,4 +1470,1012 @@ fn decode_entry(address: XorName, bytes: &[u8]) -> Option<DigestEntry> {
         first_seen,
         digest: bytes[33..].try_into().ok()?,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ant_listings::{
+        nearest_by_distance, view_hash, ChangesRequest, FeedChange, Flags, Listing, ListingPayment,
+        Metadata, PaymentField, RangeListRequest, RangeListResponse, SetHash, ShownFields,
+    };
+    use ant_protocol::compute_address;
+    use std::ops::Bound;
+    use std::sync::Mutex;
+    use std::time::Duration;
+
+    const TEST_MAP: usize = 16 * 1024 * 1024;
+
+    /// When the first round runs.
+    const NOW: u64 = 1_791_324_060;
+
+    /// The most feed records a fake node reads for one request, as
+    /// darwin-node reads for one.
+    const MAX_FEED_READ: usize = 4_096;
+
+    /// The most pages a node that earned nothing answers in a round: its
+    /// free allowance's worth.
+    const FREE_PAGES: usize = WALK_FREE_LISTINGS / PAGE;
+
+    fn peer(byte: u8) -> PeerId {
+        PeerId::from_bytes([byte; 32])
+    }
+
+    fn address(n: u32) -> XorName {
+        compute_address(&n.to_be_bytes())
+    }
+
+    /// An entry for `address`; `version` tells its listings apart.
+    fn entry(address: XorName, version: u8) -> DigestEntry {
+        DigestEntry {
+            address,
+            time: 1_791_324_000,
+            block_number: 81_950_000,
+            log_index: 0,
+            first_seen: Some(1_791_324_000),
+            digest: [version; 32],
+        }
+    }
+
+    fn entries(from: u32, count: u32) -> Vec<DigestEntry> {
+        (from..from + count).map(|n| entry(address(n), 1)).collect()
+    }
+
+    /// A listing in the index at `address`, showing only its block, stored in
+    /// the hour of `first_seen`.
+    fn listing(address: XorName, first_seen: u64) -> Listing {
+        Listing {
+            address,
+            flags: Flags {
+                shown: ShownFields::NONE.with(PaymentField::BlockNumber),
+                in_index: true,
+                withheld: true,
+            },
+            metadata: Metadata::default(),
+            size: None,
+            payment: ListingPayment {
+                block_number: Some(81_950_000),
+                ..ListingPayment::default()
+            },
+            first_seen: Some(first_seen),
+        }
+    }
+
+    /// The census, as a list of node ids.
+    struct Ids(Vec<PeerId>);
+
+    impl NearestNodes for Ids {
+        fn nearest(&self, address: &XorName, n: usize) -> Vec<PeerId> {
+            let ids: Vec<[u8; 32]> = self.0.iter().map(|peer| *peer.as_bytes()).collect();
+            nearest_by_distance(address, &ids, n)
+                .into_iter()
+                .map(|at| self.0[at])
+                .collect()
+        }
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Behaviour {
+        Honest,
+        /// Answers nothing.
+        Silent,
+        /// Never answers, and holds the request open.
+        Hang,
+        /// Refuses feed requests as a node without the feed does.
+        Unsupported,
+        /// Gives a set hash that never matches what it serves.
+        WrongHash,
+        /// Answers with addresses outside the range asked about.
+        OutOfRange,
+        /// Makes up new records before each answer, so it always has more.
+        Endless,
+    }
+
+    /// A node, as a change feed and a listings v2 index.
+    struct FakeNode {
+        behaviour: Behaviour,
+        epoch: u64,
+        head: u64,
+        rows: BTreeMap<u64, FeedChange>,
+        seq_of: HashMap<XorName, u64>,
+        served: BTreeMap<XorName, DigestEntry>,
+        listings: BTreeMap<ListingKey, Listing>,
+        peers: Vec<[u8; 32]>,
+        watch: Option<AddressRange>,
+        pushes: Vec<ChangesResponse>,
+        made_up: u32,
+    }
+
+    impl FakeNode {
+        fn new(behaviour: Behaviour) -> Self {
+            Self {
+                behaviour,
+                epoch: 7,
+                head: 0,
+                rows: BTreeMap::new(),
+                seq_of: HashMap::new(),
+                served: BTreeMap::new(),
+                listings: BTreeMap::new(),
+                peers: Vec::new(),
+                watch: None,
+                pushes: Vec::new(),
+                made_up: 0,
+            }
+        }
+
+        fn serving(behaviour: Behaviour, served: Vec<DigestEntry>) -> Self {
+            let mut node = Self::new(behaviour);
+            for entry in served {
+                node.put(entry);
+            }
+            node
+        }
+
+        fn listing(behaviour: Behaviour, listings: Vec<Listing>) -> Self {
+            let mut node = Self::new(behaviour);
+            for listing in listings {
+                node.listings.insert(listing.key(), listing);
+            }
+            node
+        }
+
+        fn put(&mut self, entry: DigestEntry) {
+            self.record(entry.address, Some(entry));
+        }
+
+        fn remove(&mut self, address: &XorName) {
+            self.record(*address, None);
+        }
+
+        fn record(&mut self, address: XorName, entry: Option<DigestEntry>) {
+            self.head += 1;
+            let seq = self.head;
+            if let Some(old) = self.seq_of.insert(address, seq) {
+                self.rows.remove(&old);
+            }
+            let change = match entry {
+                Some(entry) => {
+                    self.served.insert(address, entry);
+                    FeedChange::Entry { seq, entry }
+                }
+                None => {
+                    self.served.remove(&address);
+                    FeedChange::Removed { seq, address }
+                }
+            };
+            self.rows.insert(seq, change);
+            if let Some(range) = self.watch.filter(|range| range.contains(&address)) {
+                let (count, set_hash) = self.totals(range);
+                self.pushes.push(ChangesResponse {
+                    epoch: self.epoch,
+                    head: seq,
+                    next: seq,
+                    count,
+                    set_hash,
+                    changes: vec![change],
+                    more: false,
+                    view: view_hash(&self.peers),
+                    peers: Vec::new(),
+                });
+            }
+        }
+
+        /// Number what it serves afresh under `epoch`, as after a wipe.
+        fn renumber(&mut self, epoch: u64) {
+            self.epoch = epoch;
+            self.head = 0;
+            self.rows.clear();
+            self.seq_of.clear();
+            let served: Vec<DigestEntry> = self.served.values().copied().collect();
+            for entry in served {
+                self.head += 1;
+                let seq = self.head;
+                self.seq_of.insert(entry.address, seq);
+                self.rows.insert(seq, FeedChange::Entry { seq, entry });
+            }
+        }
+
+        fn totals(&self, range: AddressRange) -> (u64, SetHash) {
+            let held: Vec<&DigestEntry> = self
+                .served
+                .values()
+                .filter(|entry| range.contains(&entry.address))
+                .collect();
+            (held.len() as u64, SetHash::of(held))
+        }
+
+        fn answer(&mut self, body: ListingsBody) -> Option<ListingsBody> {
+            if matches!(self.behaviour, Behaviour::Silent | Behaviour::Hang) {
+                return None;
+            }
+            let unsupported = Some(ListingsBody::Error {
+                message: UNSUPPORTED.into(),
+            });
+            match body {
+                ListingsBody::ChangesRequest(request) => {
+                    if self.behaviour == Behaviour::Unsupported {
+                        return unsupported;
+                    }
+                    self.watch = request.watch.then(|| request.range());
+                    Some(ListingsBody::ChangesResponse(self.changes(&request)))
+                }
+                ListingsBody::RangeListRequest(request) => {
+                    if self.behaviour == Behaviour::Unsupported {
+                        return unsupported;
+                    }
+                    Some(ListingsBody::RangeListResponse(self.range_list(&request)))
+                }
+                ListingsBody::ListRequest { from, limit } => {
+                    let limit = limit.min(MAX_LIST_LIMIT) as usize;
+                    let mut listings: Vec<Listing> = self
+                        .listings
+                        .range(from..)
+                        .map(|(_, listing)| listing.clone())
+                        .take(limit + 1)
+                        .collect();
+                    let more = listings.len() > limit;
+                    listings.truncate(limit);
+                    Some(ListingsBody::ListResponse { listings, more })
+                }
+                _ => None,
+            }
+        }
+
+        fn changes(&mut self, request: &ChangesRequest) -> ChangesResponse {
+            let range = request.range();
+            if self.behaviour == Behaviour::Endless {
+                for _ in 0..300 {
+                    self.made_up += 1;
+                    self.put(entry(address(1_000_000 + self.made_up), 9));
+                }
+            }
+            let (count, mut set_hash) = self.totals(range);
+            if self.behaviour == Behaviour::WrongHash {
+                set_hash = SetHash::of_entry(&entry([0xee; 32], 1));
+            }
+            let view = view_hash(&self.peers);
+            let peers = if request.want_peers {
+                self.peers.clone()
+            } else {
+                Vec::new()
+            };
+            if request.epoch != self.epoch || request.after > self.head {
+                return ChangesResponse {
+                    epoch: self.epoch,
+                    head: self.head,
+                    next: self.head,
+                    count,
+                    set_hash,
+                    changes: Vec::new(),
+                    more: false,
+                    view,
+                    peers,
+                };
+            }
+            let limit = request.limit.min(MAX_LIST_LIMIT) as usize;
+            let mut changes = Vec::new();
+            let mut last = request.after;
+            for (read, (&seq, change)) in self.rows.range(request.after + 1..).enumerate() {
+                if range.contains(&change.address()) || self.behaviour == Behaviour::OutOfRange {
+                    if changes.len() == limit {
+                        break;
+                    }
+                    changes.push(*change);
+                }
+                last = seq;
+                if read + 1 == MAX_FEED_READ {
+                    break;
+                }
+            }
+            let next = if self.rows.range(last + 1..).next().is_none() {
+                self.head
+            } else {
+                last
+            };
+            ChangesResponse {
+                epoch: self.epoch,
+                head: self.head,
+                next,
+                count,
+                set_hash,
+                changes,
+                more: next < self.head,
+                view,
+                peers,
+            }
+        }
+
+        fn range_list(&self, request: &RangeListRequest) -> RangeListResponse {
+            let range = request.range();
+            let limit = request.limit.min(MAX_LIST_LIMIT) as usize;
+            let from = request
+                .after
+                .map_or(Bound::Included(range.first()), Bound::Excluded);
+            let mut entries: Vec<DigestEntry> = self
+                .served
+                .range((from, Bound::Included(range.last())))
+                .map(|(_, entry)| *entry)
+                .take(limit + 1)
+                .collect();
+            let more = entries.len() > limit;
+            entries.truncate(limit);
+            if self.behaviour == Behaviour::OutOfRange {
+                let mut outside = range.last();
+                outside[0] ^= 0x80;
+                entries.insert(0, entry(outside, 1));
+                entries.truncate(limit);
+            }
+            RangeListResponse { entries, more }
+        }
+    }
+
+    /// Fake nodes, and every request sent to them.
+    #[derive(Default)]
+    struct FakeNet {
+        nodes: Mutex<HashMap<PeerId, FakeNode>>,
+        asked: Mutex<Vec<(PeerId, ListingsBody)>>,
+    }
+
+    impl FakeNet {
+        fn with(nodes: Vec<(PeerId, FakeNode)>) -> Self {
+            Self {
+                nodes: Mutex::new(nodes.into_iter().collect()),
+                asked: Mutex::default(),
+            }
+        }
+
+        fn node<T>(&self, peer: &PeerId, f: impl FnOnce(&mut FakeNode) -> T) -> T {
+            f(self.nodes.lock().unwrap().get_mut(peer).unwrap())
+        }
+
+        /// The requests sent to `peer` so far, and forget them.
+        fn take_asked(&self, peer: &PeerId) -> Vec<ListingsBody> {
+            let mut asked = self.asked.lock().unwrap();
+            let (to_peer, rest): (Vec<_>, Vec<_>) = asked.drain(..).partition(|(to, _)| to == peer);
+            *asked = rest;
+            to_peer.into_iter().map(|(_, body)| body).collect()
+        }
+
+        /// Whether the node serves exactly what `feeds` mirrors of it.
+        fn mirrored(&self, feeds: &Feeds, peer: &PeerId) -> bool {
+            self.node(peer, |node| {
+                let mirrored: Vec<DigestEntry> = feeds.nodes[peer]
+                    .mirror
+                    .addresses()
+                    .iter()
+                    .filter_map(|address| feeds.entry(peer, address).copied())
+                    .collect();
+                mirrored == node.served.values().copied().collect::<Vec<_>>()
+            })
+        }
+    }
+
+    impl FeedIo for FakeNet {
+        async fn ask(&self, peer: &PeerId, body: ListingsBody) -> Option<ListingsBody> {
+            self.asked.lock().unwrap().push((*peer, body.clone()));
+            let (hang, answer) = {
+                let mut nodes = self.nodes.lock().unwrap();
+                let node = nodes.get_mut(peer)?;
+                (node.behaviour == Behaviour::Hang, node.answer(body))
+            };
+            if hang {
+                std::future::pending::<()>().await;
+            }
+            answer
+        }
+    }
+
+    fn store(dir: &std::path::Path) -> ListingsStore {
+        ListingsStore::open_with_map_size(dir, TEST_MAP).unwrap()
+    }
+
+    fn feed_node(peer: PeerId) -> FeedNode {
+        FeedNode {
+            peer,
+            range: AddressRange::ALL,
+            feed: true,
+            want_peers: false,
+        }
+    }
+
+    fn v2_node(peer: PeerId) -> FeedNode {
+        FeedNode {
+            feed: false,
+            ..feed_node(peer)
+        }
+    }
+
+    async fn poll(feeds: &mut Feeds, net: &FakeNet, nodes: &[FeedNode], now: u64) -> PollReport {
+        let ids = Ids(nodes.iter().map(|node| node.peer).collect());
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+        feeds
+            .poll(net, &ids, nodes, now, deadline, None)
+            .await
+            .unwrap()
+    }
+
+    fn settle_all(feeds: &mut Feeds) {
+        let settled: Vec<XorName> = feeds.pending().iter().copied().collect();
+        feeds.settle(&settled).unwrap();
+    }
+
+    fn kinds(asked: &[ListingsBody]) -> Vec<&'static str> {
+        asked
+            .iter()
+            .map(|body| match body {
+                ListingsBody::ChangesRequest(_) => "changes",
+                ListingsBody::RangeListRequest(_) => "range",
+                ListingsBody::ListRequest { .. } => "list",
+                _ => "other",
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_node_is_read_afresh_then_followed_by_its_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        let mut feeds = Feeds::open(&store).unwrap();
+        let a = peer(1);
+        let net = FakeNet::with(vec![(
+            a,
+            FakeNode::serving(Behaviour::Honest, entries(0, 300)),
+        )]);
+        let nodes = [feed_node(a)];
+
+        let report = poll(&mut feeds, &net, &nodes, NOW).await;
+        assert_eq!((report.answered, report.counting, report.feed), (1, 1, 1));
+        // Read to the end, the mirror matches what the node said it served
+        // when the read began: it is in sync at once.
+        assert_eq!(kinds(&net.take_asked(&a)), ["changes", "range", "range"]);
+        assert!(net.mirrored(&feeds, &a));
+        let read = feeds.read(&a).unwrap();
+        assert!(read.counts && read.complete && read.answered);
+        assert_eq!(read.entries, 300);
+        assert_eq!(feeds.pending().len(), 300);
+        let first = address(0);
+        assert_eq!(feeds.copies(&first, &[a]), vec![(a, entry(first, 1))]);
+        assert_eq!(feeds.holders(&first), vec![a]);
+
+        // Once settled, only what changes next is pending.
+        settle_all(&mut feeds);
+        assert!(feeds.pending().is_empty());
+        net.node(&a, |node| {
+            node.put(entry(address(1_000), 1));
+            node.put(entry(address(1), 2));
+            node.remove(&address(2));
+        });
+        poll(&mut feeds, &net, &nodes, NOW + 60).await;
+        let asked = net.take_asked(&a);
+        assert_eq!(kinds(&asked), ["changes"]);
+        // Every feed request watches.
+        assert!(asked
+            .iter()
+            .all(|body| matches!(body, ListingsBody::ChangesRequest(r) if r.watch)));
+        assert!(net.mirrored(&feeds, &a));
+        let expected = BTreeSet::from([address(1_000), address(1), address(2)]);
+        assert_eq!(feeds.pending(), &expected);
+        assert!(feeds.read(&a).unwrap().counts);
+    }
+
+    #[tokio::test]
+    async fn a_restart_follows_on_from_the_kept_mirror() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = peer(1);
+        let net = FakeNet::with(vec![(
+            a,
+            FakeNode::serving(Behaviour::Honest, entries(0, 300)),
+        )]);
+        let nodes = [feed_node(a)];
+        let head = {
+            let store = store(dir.path());
+            let mut feeds = Feeds::open(&store).unwrap();
+            poll(&mut feeds, &net, &nodes, NOW).await;
+            let settled: Vec<XorName> = feeds.pending().iter().take(100).copied().collect();
+            feeds.settle(&settled).unwrap();
+            net.node(&a, |node| node.head)
+        };
+        net.take_asked(&a);
+        net.node(&a, |node| node.put(entry(address(5_000), 1)));
+
+        let store = store(dir.path());
+        let mut feeds = Feeds::open(&store).unwrap();
+        // What wasn't settled is still pending.
+        assert_eq!(feeds.pending().len(), 200);
+        assert_eq!(feeds.nodes[&a].mirror.len(), 300);
+        poll(&mut feeds, &net, &nodes, NOW + 60).await;
+        let asked = net.take_asked(&a);
+        assert_eq!(kinds(&asked), ["changes"]);
+        let ListingsBody::ChangesRequest(request) = &asked[0] else {
+            unreachable!()
+        };
+        assert_eq!((request.epoch, request.after), (7, head));
+        assert!(net.mirrored(&feeds, &a));
+        assert!(feeds.read(&a).unwrap().counts);
+        // Its copies count again after the restart: every address it holds
+        // is pending, to be decided afresh.
+        assert_eq!(feeds.pending().len(), 301);
+    }
+
+    #[tokio::test]
+    async fn a_new_epoch_reads_the_range_afresh() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        let mut feeds = Feeds::open(&store).unwrap();
+        let a = peer(1);
+        let net = FakeNet::with(vec![(
+            a,
+            FakeNode::serving(Behaviour::Honest, entries(0, 50)),
+        )]);
+        let nodes = [feed_node(a)];
+        poll(&mut feeds, &net, &nodes, NOW).await;
+        net.take_asked(&a);
+
+        net.node(&a, |node| {
+            for n in 0..10 {
+                node.remove(&address(n));
+            }
+            node.put(entry(address(77_777), 1));
+            node.renumber(8);
+        });
+        poll(&mut feeds, &net, &nodes, NOW + 60).await;
+        assert_eq!(kinds(&net.take_asked(&a)), ["changes", "range"]);
+        assert!(net.mirrored(&feeds, &a));
+        assert!(feeds.read(&a).unwrap().counts);
+        assert_eq!(feeds.nodes[&a].mirror.len(), 41);
+    }
+
+    #[tokio::test]
+    async fn pushes_that_fit_are_taken_between_polls() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        let mut feeds = Feeds::open(&store).unwrap();
+        let (a, stranger) = (peer(1), peer(9));
+        let net = FakeNet::with(vec![(
+            a,
+            FakeNode::serving(Behaviour::Honest, entries(0, 20)),
+        )]);
+        let nodes = [feed_node(a)];
+        let ids = Ids(vec![a]);
+        poll(&mut feeds, &net, &nodes, NOW).await;
+        settle_all(&mut feeds);
+
+        // A new listing is pushed, and taken at once, from its node only.
+        net.node(&a, |node| node.put(entry(address(500), 1)));
+        let push = net.node(&a, |node| node.pushes.pop().unwrap());
+        assert_eq!(feeds.push(&ids, &stranger, &push), Pushed::Ignored);
+        assert_eq!(
+            feeds.push(&ids, &a, &push),
+            Pushed::Applied(vec![address(500)])
+        );
+        assert!(feeds.read(&a).unwrap().counts);
+        assert_eq!(feeds.pending(), &BTreeSet::from([address(500)]));
+        // The same push again changes nothing.
+        assert_eq!(feeds.push(&ids, &a, &push), Pushed::Ignored);
+
+        // A push that skips a record is left for the next poll.
+        net.node(&a, |node| {
+            node.put(entry(address(501), 1));
+            node.put(entry(address(502), 1));
+        });
+        let pushes = net.node(&a, |node| std::mem::take(&mut node.pushes));
+        assert_eq!(feeds.push(&ids, &a, &pushes[1]), Pushed::Behind);
+        assert!(feeds.entry(&a, &address(502)).is_none());
+        // One from another epoch, or with peers, is left alone.
+        let mut other_epoch = pushes[0].clone();
+        other_epoch.epoch = 99;
+        assert_eq!(feeds.push(&ids, &a, &other_epoch), Pushed::Ignored);
+        let mut with_peers = pushes[0].clone();
+        with_peers.peers = vec![[3; 32]];
+        assert_eq!(feeds.push(&ids, &a, &with_peers), Pushed::Ignored);
+        feeds.save().unwrap();
+
+        poll(&mut feeds, &net, &nodes, NOW + 60).await;
+        assert!(net.mirrored(&feeds, &a));
+        assert!(feeds.read(&a).unwrap().counts);
+    }
+
+    #[tokio::test]
+    async fn pushes_during_a_poll_are_taken() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        let mut feeds = Feeds::open(&store).unwrap();
+        let a = peer(1);
+        let net = FakeNet::with(vec![(
+            a,
+            FakeNode::serving(Behaviour::Honest, entries(0, 20)),
+        )]);
+        let nodes = [feed_node(a)];
+        poll(&mut feeds, &net, &nodes, NOW).await;
+        net.node(&a, |node| node.put(entry(address(500), 1)));
+        let push = net.node(&a, |node| node.pushes.pop().unwrap());
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(8);
+        sender.send((a, push)).await.unwrap();
+        drop(sender);
+        let ids = Ids(vec![a]);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+        let report = feeds
+            .poll(&net, &ids, &nodes, NOW + 60, deadline, Some(&mut receiver))
+            .await
+            .unwrap();
+        assert!(report.pushes <= 1);
+        assert!(feeds.entry(&a, &address(500)).is_some());
+        assert!(feeds.read(&a).unwrap().counts);
+    }
+
+    #[tokio::test]
+    async fn a_node_whose_totals_never_match_never_counts() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        let mut feeds = Feeds::open(&store).unwrap();
+        let (a, b) = (peer(1), peer(2));
+        let net = FakeNet::with(vec![
+            (a, FakeNode::serving(Behaviour::WrongHash, entries(0, 300))),
+            (b, FakeNode::serving(Behaviour::Honest, entries(0, 300))),
+        ]);
+        let nodes = [feed_node(a), feed_node(b)];
+        for round in 0..3 {
+            poll(&mut feeds, &net, &nodes, NOW + 60 * round).await;
+            let asked = net.take_asked(&a).len();
+            assert!(asked <= FREE_PAGES + 1, "{asked} requests in a round");
+            assert!(!feeds.read(&a).unwrap().counts);
+            assert!(feeds.read(&a).unwrap().answered);
+            assert!(feeds.read(&b).unwrap().counts);
+        }
+        assert_eq!(
+            feeds.copies(&address(0), &[a, b]),
+            vec![(b, entry(address(0), 1))]
+        );
+    }
+
+    #[tokio::test]
+    async fn answers_outside_the_range_are_refused_and_change_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        let mut feeds = Feeds::open(&store).unwrap();
+        let a = peer(1);
+        let half = AddressRange::new([0; 32], 1);
+        let served: Vec<DigestEntry> = entries(0, 100)
+            .into_iter()
+            .filter(|entry| half.contains(&entry.address))
+            .collect();
+        let net = FakeNet::with(vec![(a, FakeNode::serving(Behaviour::OutOfRange, served))]);
+        let nodes = [FeedNode {
+            range: half,
+            ..feed_node(a)
+        }];
+        let report = poll(&mut feeds, &net, &nodes, NOW).await;
+        assert_eq!((report.refused, report.counting), (1, 0));
+        let read = feeds.read(&a).unwrap();
+        assert_eq!(read.outcome, Some(FeedOutcome::BadPage));
+        assert!(read.problem.is_some());
+        assert_eq!(read.entries, 0);
+        assert!(feeds.pending().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_flooding_node_is_held_to_its_allowance() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        let mut feeds = Feeds::open(&store).unwrap();
+        let (flood, endless, v2_flood) = (peer(1), peer(2), peer(3));
+        let made_up: Vec<Listing> = (0..5_000)
+            .map(|n| listing(address(n), 1_791_324_000))
+            .collect();
+        let net = FakeNet::with(vec![
+            (
+                flood,
+                FakeNode::serving(Behaviour::Honest, entries(0, 5_000)),
+            ),
+            (endless, FakeNode::new(Behaviour::Endless)),
+            (v2_flood, FakeNode::listing(Behaviour::Honest, made_up)),
+        ]);
+        let nodes = [feed_node(flood), feed_node(endless), v2_node(v2_flood)];
+        for round in 0..30 {
+            poll(&mut feeds, &net, &nodes, NOW + 60 * round).await;
+            for peer in [flood, endless] {
+                let asked = net.take_asked(&peer).len();
+                assert!(asked <= FREE_PAGES + 1, "{asked} requests in a round");
+                assert!(feeds.nodes[&peer].mirror.len() <= WALK_FREE_LISTINGS);
+            }
+            assert_eq!(net.take_asked(&v2_flood).len(), 1);
+            assert!(feeds.nodes[&v2_flood].mirror.len() <= WALK_FREE_LISTINGS);
+        }
+        // The v2 node's passes stop at its allowance, so it never seems
+        // complete.
+        assert!(!feeds.read(&v2_flood).unwrap().complete);
+    }
+
+    #[tokio::test]
+    async fn backed_entries_raise_a_nodes_allowance() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        let mut feeds = Feeds::open(&store).unwrap();
+        let peers: Vec<PeerId> = (1..=7).map(peer).collect();
+        let net = FakeNet::with(
+            peers
+                .iter()
+                .map(|peer| {
+                    (
+                        *peer,
+                        FakeNode::serving(Behaviour::Honest, entries(0, 3_000)),
+                    )
+                })
+                .collect(),
+        );
+        let nodes: Vec<FeedNode> = peers.iter().copied().map(feed_node).collect();
+        for round in 0..3 {
+            poll(&mut feeds, &net, &nodes, NOW + 60 * round).await;
+        }
+        for peer in &peers {
+            assert!(feeds.read(peer).unwrap().counts, "{peer}");
+            assert!(net.mirrored(&feeds, peer));
+        }
+        assert_eq!(feeds.backing.count(&peers[0]), 3_000);
+    }
+
+    #[tokio::test]
+    async fn nodes_without_the_feed_are_read_in_passes() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        let mut feeds = Feeds::open(&store).unwrap();
+        let a = peer(1);
+        let mut listings: Vec<Listing> = (0..600)
+            .map(|n| listing(address(n), 1_791_324_000))
+            .collect();
+        // Last in key order, so the first page holds 256 valid listings.
+        let mut invalid = listing(address(600), 1_791_327_600);
+        invalid.payment.block_number = None;
+        listings.push(invalid);
+        let net = FakeNet::with(vec![(a, FakeNode::listing(Behaviour::Honest, listings))]);
+        let nodes = [v2_node(a)];
+
+        let from_of = |asked: Vec<ListingsBody>| -> Vec<ListingKey> {
+            asked
+                .into_iter()
+                .map(|body| match body {
+                    ListingsBody::ListRequest { from, .. } => from,
+                    other => panic!("{other:?}"),
+                })
+                .collect()
+        };
+        let mut now = NOW;
+        poll(&mut feeds, &net, &nodes, now).await;
+        assert_eq!(from_of(net.take_asked(&a)), [ListingKey::MIN]);
+        let read = feeds.read(&a).unwrap();
+        assert!(read.counts && !read.complete);
+        assert_eq!((read.kind, read.entries), (ReadKind::V2, 256));
+        for _ in 0..2 {
+            now += 60;
+            poll(&mut feeds, &net, &nodes, now).await;
+            assert_eq!(net.take_asked(&a).len(), 1);
+        }
+        let read = feeds.read(&a).unwrap();
+        assert!(read.counts && read.complete);
+        // The listing that fails its checks is left out.
+        assert_eq!(read.entries, 600);
+        assert_eq!(feeds.pending().len(), 600);
+
+        // Between passes, a read from after the newest key finds a new
+        // listing; one removed stays until the next pass.
+        let newer = listing(address(9_000), 1_791_327_600);
+        net.node(&a, |node| {
+            node.listings.insert(newer.key(), newer.clone());
+            let gone = node.listings.keys().next().copied().unwrap();
+            node.listings.remove(&gone);
+        });
+        now += 60;
+        poll(&mut feeds, &net, &nodes, now).await;
+        let asked = from_of(net.take_asked(&a));
+        assert!(asked[0] > ListingKey::MIN, "{asked:?}");
+        assert!(feeds.entry(&a, &address(9_000)).is_some());
+        assert_eq!(feeds.read(&a).unwrap().entries, 601);
+
+        // No new pass before the interval; one at it, which drops the
+        // listing no longer served.
+        now = NOW + V2_PASS_INTERVAL.as_secs() - 1;
+        poll(&mut feeds, &net, &nodes, now).await;
+        assert!(from_of(net.take_asked(&a))[0] > ListingKey::MIN);
+        now = NOW + V2_PASS_INTERVAL.as_secs();
+        poll(&mut feeds, &net, &nodes, now).await;
+        assert_eq!(from_of(net.take_asked(&a)), [ListingKey::MIN]);
+        for _ in 0..2 {
+            now += 60;
+            poll(&mut feeds, &net, &nodes, now).await;
+        }
+        let read = feeds.read(&a).unwrap();
+        assert!(read.complete);
+        assert_eq!(read.entries, 600);
+
+        // A request it doesn't answer counts it out.
+        net.node(&a, |node| node.behaviour = Behaviour::Silent);
+        poll(&mut feeds, &net, &nodes, now + 60).await;
+        let read = feeds.read(&a).unwrap();
+        assert!(!read.counts && !read.answered);
+        assert!(feeds.copies(&address(1), &[a]).is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_node_that_refuses_the_feed_is_read_the_old_way() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        let mut feeds = Feeds::open(&store).unwrap();
+        let a = peer(1);
+        let listings: Vec<Listing> = (0..10)
+            .map(|n| listing(address(n), 1_791_324_000))
+            .collect();
+        let net = FakeNet::with(vec![(
+            a,
+            FakeNode::listing(Behaviour::Unsupported, listings),
+        )]);
+        let nodes = [feed_node(a)];
+
+        let report = poll(&mut feeds, &net, &nodes, NOW).await;
+        assert_eq!((report.fell_back, report.counting, report.v2), (1, 1, 1));
+        assert_eq!(kinds(&net.take_asked(&a)), ["changes", "list"]);
+        let read = feeds.read(&a).unwrap();
+        assert!(read.fell_back && read.counts && read.complete);
+        assert_eq!(read.entries, 10);
+
+        poll(&mut feeds, &net, &nodes, NOW + 60).await;
+        assert_eq!(kinds(&net.take_asked(&a)), ["list"]);
+        assert!(feeds.read(&a).unwrap().fell_back);
+
+        // Its feed is tried again after the interval.
+        poll(&mut feeds, &net, &nodes, NOW + V2_PASS_INTERVAL.as_secs()).await;
+        assert_eq!(kinds(&net.take_asked(&a)), ["changes", "list"]);
+    }
+
+    #[tokio::test]
+    async fn a_silent_new_node_is_read_the_old_way_and_a_known_one_only_misses() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        let mut feeds = Feeds::open(&store).unwrap();
+        let (new, known) = (peer(1), peer(2));
+        let net = FakeNet::with(vec![
+            (new, FakeNode::new(Behaviour::Silent)),
+            (known, FakeNode::serving(Behaviour::Honest, entries(0, 20))),
+        ]);
+        let nodes = [feed_node(new), feed_node(known)];
+        poll(&mut feeds, &net, &nodes, NOW).await;
+        // Asked twice through its feed, then once the old way.
+        assert_eq!(kinds(&net.take_asked(&new)), ["changes", "changes", "list"]);
+        assert!(feeds.read(&new).unwrap().fell_back);
+        settle_all(&mut feeds);
+
+        net.node(&known, |node| node.behaviour = Behaviour::Silent);
+        poll(&mut feeds, &net, &nodes, NOW + 60).await;
+        let read = feeds.read(&known).unwrap();
+        assert_eq!(read.kind, ReadKind::Feed);
+        assert!(!read.counts && !read.fell_back);
+        assert_eq!(read.outcome, Some(FeedOutcome::NoAnswer));
+        // Its copies no longer count: every address it holds is pending.
+        assert_eq!(feeds.pending().len(), 20);
+        assert!(feeds.copies(&address(0), &[known]).is_empty());
+        assert_eq!(feeds.holders(&address(0)), vec![known]);
+    }
+
+    #[tokio::test]
+    async fn a_hanging_node_doesnt_hold_up_the_poll() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        let mut feeds = Feeds::open(&store).unwrap();
+        let (hang, honest) = (peer(1), peer(2));
+        let net = FakeNet::with(vec![
+            (hang, FakeNode::new(Behaviour::Hang)),
+            (honest, FakeNode::serving(Behaviour::Honest, entries(0, 20))),
+        ]);
+        let nodes = [feed_node(hang), feed_node(honest)];
+        let ids = Ids(vec![hang, honest]);
+        let started = tokio::time::Instant::now();
+        let deadline = started + Duration::from_millis(300);
+        feeds
+            .poll(&net, &ids, &nodes, NOW, deadline, None)
+            .await
+            .unwrap();
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert!(feeds.read(&honest).unwrap().counts);
+        let read = feeds.read(&hang).unwrap();
+        assert!(!read.counts && !read.answered);
+        assert_eq!(read.outcome, Some(FeedOutcome::Deadline));
+    }
+
+    #[tokio::test]
+    async fn nodes_leaving_or_changing_range_drop_their_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let (a, b) = (peer(1), peer(2));
+        let net = FakeNet::with(vec![
+            (a, FakeNode::serving(Behaviour::Honest, entries(0, 100))),
+            (b, FakeNode::serving(Behaviour::Honest, entries(0, 100))),
+        ]);
+        let half = AddressRange::new([0; 32], 1);
+        let inside = entries(0, 100)
+            .iter()
+            .filter(|entry| half.contains(&entry.address))
+            .count();
+        {
+            let store = store(dir.path());
+            let mut feeds = Feeds::open(&store).unwrap();
+            poll(&mut feeds, &net, &[feed_node(a), feed_node(b)], NOW).await;
+            settle_all(&mut feeds);
+
+            let nodes = [FeedNode {
+                range: half,
+                ..feed_node(a)
+            }];
+            poll(&mut feeds, &net, &nodes, NOW + 60).await;
+            assert!(feeds.read(&b).is_none());
+            assert_eq!(feeds.read(&a).unwrap().entries, inside);
+            assert!(feeds.read(&a).unwrap().counts);
+            // Every address either node held is pending: b's left with b,
+            // and a's outside its new range left its mirror.
+            assert_eq!(feeds.pending().len(), 100);
+        }
+        let store = store(dir.path());
+        let feeds = Feeds::open(&store).unwrap();
+        assert_eq!(feeds.len(), 1);
+        assert_eq!(feeds.nodes[&a].range, half);
+        assert_eq!(feeds.nodes[&a].mirror.len(), inside);
+        let txn = store.env().read_txn().unwrap();
+        assert_eq!(feeds.entries_db.len(&txn).unwrap(), inside as u64);
+    }
+
+    #[tokio::test]
+    async fn view_peers_are_hints_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        let mut feeds = Feeds::open(&store).unwrap();
+        let a = peer(1);
+        let mut node = FakeNode::serving(Behaviour::Honest, entries(0, 5));
+        node.peers = vec![[0x42; 32], [0x43; 32]];
+        let net = FakeNet::with(vec![(a, node)]);
+        let nodes = [FeedNode {
+            want_peers: true,
+            ..feed_node(a)
+        }];
+        poll(&mut feeds, &net, &nodes, NOW).await;
+        assert_eq!(feeds.view_peers(&a), Some(&[[0x42; 32], [0x43; 32]][..]));
+        assert_eq!(feeds.view(&a), Some(view_hash(&[[0x42; 32], [0x43; 32]])));
+        assert_eq!(feeds.len(), 1);
+        assert!(feeds.read(&a).unwrap().counts);
+    }
+
+    #[test]
+    fn census_nodes_are_asked_about_their_leaves() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        let mut census = Census::open(&store).unwrap();
+        for byte in 1..=16u8 {
+            census.admit(peer(byte.wrapping_mul(16)), Vec::new(), NOW);
+        }
+        census.record_answer(&peer(16), NOW, Some("node/0.23.0+ds.15".into()));
+        census.record_answer(&peer(32), NOW, Some("node/0.23.0+ds.14".into()));
+        let nodes = FeedNode::from_census(&census, |peer| *peer == PeerId::from_bytes([16; 32]));
+        assert_eq!(nodes.len(), 16);
+        for node in &nodes {
+            assert_eq!(node.range, census.leaf_of(node.peer.as_bytes()));
+            assert!(node.range.contains(node.peer.as_bytes()));
+            assert_eq!(node.feed, node.peer == peer(16));
+            assert_eq!(node.want_peers, node.peer == peer(16));
+        }
+        // 16 nodes split the space in two leaves.
+        assert!(nodes.iter().any(|node| node.range != AddressRange::ALL));
+    }
+
+    #[test]
+    fn entries_are_kept_as_they_were() {
+        for first_seen in [None, Some(1_791_324_000)] {
+            let entry = DigestEntry {
+                first_seen,
+                ..entry(address(3), 4)
+            };
+            assert_eq!(
+                decode_entry(entry.address, &encode_entry(&entry)),
+                Some(entry)
+            );
+        }
+        assert_eq!(decode_entry(address(3), &[0; ENTRY_LEN - 1]), None);
+        let key = entry_key(&peer(5), &address(6));
+        assert_eq!(split_key(&key), Some((peer(5), address(6))));
+    }
 }
