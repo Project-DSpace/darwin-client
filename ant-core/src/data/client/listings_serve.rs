@@ -90,10 +90,10 @@
 //! download does, and keeps the size it gives for good: an entry is
 //! published with its size once known, and until then without, and an
 //! entry published without it has it filled in once it is read (a put).
-//! The reading never holds up a cycle or a push: after each cycle, a task
-//! of its own reads at most [`SIZES_PER_CYCLE`] root maps, until the next
-//! cycle is due; one that can't be read is tried again after
-//! [`RETRY_INTERVAL`].
+//! The reading never holds up a cycle or a push: after each cycle, once
+//! what the last task read is taken, a task of its own reads at most
+//! [`SIZES_PER_CYCLE`] root maps, for at most a [`CYCLE`]; one that can't be
+//! read is tried again after [`RETRY_INTERVAL`].
 //!
 //! Between cycles, nodes push the new records of the leaves they are asked
 //! about: a push that brings a mirror to the node's new head is applied
@@ -605,7 +605,27 @@ impl Producer {
                 },
             }
             self.save_client_state().await;
-            if let Err(e) = self.start_sizes(next) {
+            // Sizes read while the cycle ran are taken first, so the next
+            // reads can start.
+            if self
+                .size_job
+                .as_ref()
+                .is_some_and(|job| job.task.is_finished())
+            {
+                let read = sizes_read(&mut self.size_job).await;
+                self.size_job = None;
+                let taken = Box::pin(self.take_sizes(read));
+                let result = tokio::select! {
+                    () = cancel.cancelled() => return Ok(()),
+                    result = taken => result,
+                };
+                match result {
+                    Ok(()) => {}
+                    Err(e @ Error::Storage(_)) => return Err(e),
+                    Err(e) => warn!("Publishing sizes failed: {e}"),
+                }
+            }
+            if let Err(e) = self.start_sizes() {
                 if matches!(e, Error::Storage(_)) {
                     return Err(e);
                 }
@@ -1782,17 +1802,20 @@ impl Producer {
     }
 
     /// Start reading the root maps of up to [`SIZES_PER_CYCLE`] listed files
-    /// whose sizes aren't known yet, in a task of its own, until `until`;
-    /// unless such a task is still reading. A root map that couldn't be read
-    /// before is read again only [`RETRY_INTERVAL`] after.
+    /// whose sizes aren't known yet, in a task of its own, for at most a
+    /// [`CYCLE`]; unless such a task is still reading, or what it read is
+    /// still to be taken. A root map that couldn't be read before is read
+    /// again only [`RETRY_INTERVAL`] after; one not read by the end is read
+    /// again by a later task.
     ///
     /// # Errors
     ///
     /// If the store can't be read.
-    fn start_sizes(&mut self, until: Instant) -> Result<()> {
+    fn start_sizes(&mut self) -> Result<()> {
         if self.size_job.is_some() {
             return Ok(());
         }
+        let until = Instant::now() + CYCLE;
         let now = unix_now();
         let mut due: Vec<(XorName, DataMap)> = Vec::new();
         {
@@ -1829,12 +1852,21 @@ impl Producer {
             let client = &client;
             let mut reads = stream::iter(due)
                 .map(|(address, map)| async move {
+                    let started = std::time::Instant::now();
                     match client.data_map_resolve_root(&map).await {
-                        Ok(root) => (address, root_size(&root)),
+                        Ok(root) => {
+                            debug!(
+                                "Read the root map of {} in {} ms",
+                                hex::encode(address),
+                                started.elapsed().as_millis()
+                            );
+                            (address, root_size(&root))
+                        }
                         Err(error) => {
                             debug!(
-                                "Could not read the root map of {}: {error}",
-                                hex::encode(address)
+                                "Could not read the root map of {} in {} ms: {error}",
+                                hex::encode(address),
+                                started.elapsed().as_millis()
                             );
                             (address, None)
                         }
@@ -4304,7 +4336,7 @@ mod tests {
         }
         producer.last_status = Some(Status::default());
         producer.take_sizes(vec![(x, None)]).await.unwrap();
-        producer.start_sizes(Instant::now() + CYCLE).unwrap();
+        producer.start_sizes().unwrap();
         assert!(producer.size_job.is_none(), "nothing is due yet");
         assert_eq!(producer.publisher.seq(), seq);
 
