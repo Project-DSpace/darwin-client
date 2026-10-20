@@ -96,6 +96,7 @@ use futures::stream::{self, StreamExt};
 use heed::byteorder::BigEndian;
 use heed::types::{Bytes, U64};
 use heed::Database;
+use self_encryption::DataMap;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use tokio_util::sync::CancellationToken;
@@ -147,6 +148,11 @@ const SINCE_DB: &str = "serve_since";
 /// The nodes whose copies counted when each address was last decided: the
 /// address, to their ids, 32 bytes each.
 const HOLDERS_DB: &str = "serve_holders";
+
+/// The size of each listed file whose data map is shrunk, as its root map
+/// gives it: the address, to the size in bytes. Kept for good, since an
+/// envelope's address fixes its data map.
+const SIZES_DB: &str = "serve_sizes";
 
 /// [`SINCE_DB`]: an address deferred since then.
 const DEFERRED_TAG: u8 = b'd';
@@ -212,6 +218,9 @@ struct Decided {
     forget: Vec<XorName>,
     /// Every address decided: settled in the mirrors once published.
     settle: Vec<XorName>,
+    /// The size of each file listed whose data map is shrunk, where its
+    /// root map could be read ([`Producer::shrunk_sizes`]).
+    sizes: HashMap<XorName, u64>,
 }
 
 /// The listings producer. See the module docs.
@@ -224,6 +233,7 @@ pub struct Producer {
     publisher: Publisher,
     since: Database<Bytes, U64<BigEndian>>,
     holders: Database<Bytes, Bytes>,
+    sizes: Database<Bytes, U64<BigEndian>>,
     /// Routes the answers to listings requests, and the nodes' pushes to
     /// `pushes`: started at the first cycle.
     requests: Option<ListingsRequests>,
@@ -276,6 +286,7 @@ impl Producer {
         let publisher = Publisher::open(out_dir, &store)?;
         let since: Database<Bytes, U64<BigEndian>> = store.database(SINCE_DB)?;
         let holders: Database<Bytes, Bytes> = store.database(HOLDERS_DB)?;
+        let sizes: Database<Bytes, U64<BigEndian>> = store.database(SIZES_DB)?;
         let (sink, pushes) = tokio::sync::mpsc::channel(PUSH_CAPACITY);
         let now = unix_now();
         Ok(Self {
@@ -287,6 +298,7 @@ impl Producer {
             publisher,
             since,
             holders,
+            sizes,
             requests: None,
             sink: Some(sink),
             pushes,
@@ -490,8 +502,15 @@ impl Producer {
                 .map(|key| (key, None))
                 .collect();
             let listed = BTreeMap::new();
-            let publication =
-                read_publication(&self.publisher, &index, &listed, &unlisted, at, &mut tally)?;
+            let publication = read_publication(
+                &self.publisher,
+                &index,
+                &listed,
+                &unlisted,
+                &HashMap::new(),
+                at,
+                &mut tally,
+            )?;
             self.update_since(&index, &listed, &publication, at, false, &mut tally)?;
             self.decided_all_at = None;
             (publication, None)
@@ -753,6 +772,7 @@ impl Producer {
             holders: Vec::new(),
             forget,
             settle: Vec::new(),
+            sizes: HashMap::new(),
         };
         let mut considered: Vec<(XorName, Vec<PeerId>, bool)> = Vec::new();
         for found in &pending {
@@ -817,8 +837,69 @@ impl Producer {
             }
         }
         drop(listed);
+        decided.sizes = Box::pin(self.shrunk_sizes(&index)).await?;
         decided.index = index;
         Ok(decided)
+    }
+
+    /// The size of each file `index` lists whose data map is shrunk, so that
+    /// its listing gives none: the sum of its root map's chunk sizes, as the
+    /// uploader gave them. The root map is fetched once, as a download
+    /// fetches it, and the size kept for good; one that can't be read now is
+    /// left out, and read again the next time its address is decided.
+    ///
+    /// # Errors
+    ///
+    /// If the store can't be read or written.
+    async fn shrunk_sizes(&self, index: &ListingsIndex) -> Result<HashMap<XorName, u64>> {
+        let mut sizes = HashMap::new();
+        let mut unread: Vec<(XorName, &DataMap)> = Vec::new();
+        {
+            let txn = self.store.env().read_txn().map_err(store_error)?;
+            for checked in &index.listings {
+                let Some(map) = shrunk_map(checked) else {
+                    continue;
+                };
+                let address = checked.listing.address;
+                match self.sizes.get(&txn, &address).map_err(store_error)? {
+                    Some(size) => {
+                        sizes.insert(address, size);
+                    }
+                    None => unread.push((address, map)),
+                }
+            }
+        }
+        if unread.is_empty() {
+            return Ok(sizes);
+        }
+        let client = &self.client;
+        let read: Vec<(XorName, Option<u64>)> = stream::iter(unread)
+            .map(|(address, map)| async move {
+                match client.data_map_resolve_root(map).await {
+                    Ok(root) => (address, root_size(&root)),
+                    Err(error) => {
+                        debug!(
+                            "Could not read the root map of {}: {error}",
+                            hex::encode(address)
+                        );
+                        (address, None)
+                    }
+                }
+            })
+            .buffer_unordered(CHECK_CONCURRENCY)
+            .collect()
+            .await;
+        let mut txn = self.store.env().write_txn().map_err(store_error)?;
+        for (address, size) in read {
+            if let Some(size) = size {
+                self.sizes
+                    .put(&mut txn, &address, &size)
+                    .map_err(store_error)?;
+                sizes.insert(address, size);
+            }
+        }
+        txn.commit().map_err(store_error)?;
+        Ok(sizes)
     }
 
     /// Fetch, with a `GetRequest` to the nodes holding it, the full listing
@@ -952,6 +1033,7 @@ impl Producer {
             &decided.index,
             &listed,
             &decided.unlisted,
+            &decided.sizes,
             at,
             tally,
         )?;
@@ -1415,9 +1497,10 @@ fn log_cycle(report: &CycleReport) {
 /// What `index`, the read of the cycle that began at `at`, changes in what
 /// `publisher` has published. `listed` is what the read listed, by address;
 /// `unlisted`, each entry published before that the read didn't list, with
-/// why it is removed, or `None` to keep it. A listed entry is put where it
-/// changed, with its support where that changed; a removed one goes, with
-/// its support; a kept one is marked carried in its support. Unless the read
+/// why it is removed, or `None` to keep it; `sizes`, the size of each listed
+/// file whose data map is shrunk, where it is known. A listed entry is put
+/// where it changed, with its support where that changed; a removed one goes,
+/// with its support; a kept one is marked carried in its support. Unless the read
 /// found too few nodes, its rejections and deferrals go to `rejected.json`
 /// ([`rejected_changes`]). What it does is counted into `tally`.
 ///
@@ -1429,6 +1512,7 @@ fn read_publication(
     index: &ListingsIndex,
     listed: &BTreeMap<XorName, &CheckedListing>,
     unlisted: &[(ListingKey, Option<RemoveReason>)],
+    sizes: &HashMap<XorName, u64>,
     at: u64,
     tally: &mut Tally,
 ) -> Result<Publication> {
@@ -1438,10 +1522,11 @@ fn read_publication(
     };
     for checked in &index.listings {
         let address = checked.listing.address;
-        let fresh = ShardEntry::new(
-            Entry::new(&checked.listing, checked.level, at),
-            &checked.envelope,
-        );
+        let mut entry = Entry::new(&checked.listing, checked.level, at);
+        if shrunk_map(checked).is_some() {
+            entry.listing.size = sizes.get(&address).copied();
+        }
+        let fresh = ShardEntry::new(entry, &checked.envelope);
         let unchanged = publisher
             .entry(&address)?
             .is_some_and(|old| same_entry(&old, &fresh));
@@ -1498,6 +1583,26 @@ fn same_entry(old: &ShardEntry, fresh: &ShardEntry) -> bool {
     old.entry.listing == fresh.entry.listing
         && old.entry.check == fresh.entry.check
         && old.data_map == fresh.data_map
+}
+
+/// The data map of `checked`'s envelope, if it is shrunk into a child map,
+/// so that the listing gives no size ([`Envelope::file_size`]).
+fn shrunk_map(checked: &CheckedListing) -> Option<&DataMap> {
+    checked
+        .envelope
+        .data_map()
+        .filter(|map| map.is_child() && checked.listing.size.is_none())
+}
+
+/// The sum of a root map's chunk sizes, or `None` if it overflows: the file's
+/// size, as its uploader gave it.
+fn root_size(root: &DataMap) -> Option<u64> {
+    if root.is_child() {
+        return None;
+    }
+    root.infos().iter().try_fold(0u64, |total, chunk| {
+        total.checked_add(u64::try_from(chunk.src_size).ok()?)
+    })
 }
 
 /// Why an address is rejected for good when every copy its nearest nodes
@@ -2084,8 +2189,16 @@ mod tests {
             .map(|key| (key, removal))
             .collect();
         let mut tally = Tally::default();
-        let publication =
-            read_publication(publisher, index, &listed, &unlisted, at, &mut tally).unwrap();
+        let publication = read_publication(
+            publisher,
+            index,
+            &listed,
+            &unlisted,
+            &HashMap::new(),
+            at,
+            &mut tally,
+        )
+        .unwrap();
         publisher.publish(&publication).unwrap();
         (publication, tally)
     }
@@ -2325,6 +2438,7 @@ mod tests {
             &quiet,
             &BTreeMap::new(),
             &[],
+            &HashMap::new(),
             AT + 60,
             &mut tally,
         )
@@ -2345,6 +2459,7 @@ mod tests {
             &quiet,
             &BTreeMap::new(),
             &[(key, None)],
+            &HashMap::new(),
             AT + 60,
             &mut tally,
         )
@@ -2353,6 +2468,90 @@ mod tests {
         assert_eq!(publication.support.len(), 1);
         assert!(publication.support[0].carried);
         assert_eq!(tally.carried, 1);
+    }
+
+    /// A data map of 3 chunks of `src_size` bytes, shrunk into a child map
+    /// when `child`.
+    fn three_chunks(src_size: usize, child: bool) -> DataMap {
+        let infos = (0..3u8)
+            .map(|n| self_encryption::ChunkInfo {
+                index: usize::from(n),
+                dst_hash: xor_name::XorName([n + 1; 32]),
+                src_hash: xor_name::XorName([n + 100; 32]),
+                src_size,
+            })
+            .collect();
+        if child {
+            DataMap::with_child(infos, 1)
+        } else {
+            DataMap::new(infos)
+        }
+    }
+
+    #[test]
+    fn a_shrunk_data_map_is_published_with_its_root_maps_size() {
+        // A readable listing whose data map is shrunk gives no size of its
+        // own: its entry takes the one its root map gives, once known.
+        let x: XorName = [0x4e; 32];
+        let mut shrunk = checked(x);
+        shrunk.envelope = Envelope::readable(
+            &three_chunks(1_024, true),
+            Metadata::default(),
+            shrunk.listing.flags.shown,
+            true,
+        )
+        .unwrap();
+        shrunk.listing.flags = shrunk.envelope.flags();
+        assert_eq!(shrunk.envelope.file_size(), None);
+        // One whose data map is withheld has no size, whatever `sizes` says.
+        let y: XorName = [0x4f; 32];
+        let mut index = ListingsIndex::default();
+        index.listings.push(shrunk);
+        index.listings.push(checked(y));
+        let listed: BTreeMap<XorName, &CheckedListing> = index
+            .listings
+            .iter()
+            .map(|checked| (checked.listing.address, checked))
+            .collect();
+        let (_dir, mut publisher) = publisher();
+        let publish = |publisher: &mut Publisher, sizes: &HashMap<XorName, u64>, at| {
+            let mut tally = Tally::default();
+            let publication =
+                read_publication(publisher, &index, &listed, &[], sizes, at, &mut tally).unwrap();
+            publisher.publish(&publication).unwrap();
+            tally.put
+        };
+        let size = |publisher: &Publisher, address| {
+            publisher
+                .entry(&address)
+                .unwrap()
+                .unwrap()
+                .entry
+                .listing
+                .size
+        };
+
+        // Before its root map is read, it is listed without a size.
+        assert_eq!(publish(&mut publisher, &HashMap::new(), AT), 2);
+        assert_eq!(size(&publisher, x), None);
+
+        // Once read, the entry changes to show it; the withheld one doesn't.
+        let sizes = HashMap::from([(x, 92_000_000), (y, 5)]);
+        assert_eq!(publish(&mut publisher, &sizes, AT + 60), 1);
+        assert_eq!(size(&publisher, x), Some(92_000_000));
+        assert_eq!(size(&publisher, y), None);
+
+        // Decided again with the size kept, nothing changes.
+        assert_eq!(publish(&mut publisher, &sizes, AT + 120), 0);
+    }
+
+    #[test]
+    fn a_root_maps_size_is_the_sum_of_its_chunks() {
+        assert_eq!(root_size(&three_chunks(1_024, false)), Some(3_072));
+        // A map still shrunk isn't a root map.
+        assert_eq!(root_size(&three_chunks(1_024, true)), None);
+        // Sizes that overflow give none.
+        assert_eq!(root_size(&three_chunks(usize::MAX, false)), None);
     }
 
     #[test]
