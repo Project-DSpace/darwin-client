@@ -1024,9 +1024,9 @@ impl Producer {
                 .entry(&address)?
                 .and_then(|entry| entry.entry.key())
             {
-                let removal = (index.carry(&address, &key) == Carry::Decided)
-                    .then_some(RemoveReason::Rejected);
-                decided.unlisted.push((key, removal));
+                decided
+                    .unlisted
+                    .push((key, removal(&index, &address, &key)));
             }
         }
         drop(listed);
@@ -2069,6 +2069,22 @@ fn root_size(root: &DataMap) -> Option<u64> {
     })
 }
 
+/// Why the published entry at `address`, with key `key`, that `index`
+/// didn't list goes, if it does: `rejected` when `index` decided the address
+/// and rejected it, or left it for later with every copy its nearest nodes
+/// serve showing a payment from before the payment vault was deployed
+/// ([`paid_before_vault`]), which can never count however many nodes come to
+/// serve it, so such a listing never shows. Otherwise (left for later) it is
+/// kept, carried.
+fn removal(index: &ListingsIndex, address: &XorName, key: &ListingKey) -> Option<RemoveReason> {
+    let rejected = index.carry(address, key) == Carry::Decided
+        || index
+            .pending_copies
+            .get(address)
+            .is_some_and(|copies| paid_before_vault(copies));
+    rejected.then_some(RemoveReason::Rejected)
+}
+
 /// Why an address is rejected for good when every copy its nearest nodes
 /// serve was paid before the payment vault was deployed
 /// ([`paid_before_vault`]).
@@ -2138,9 +2154,10 @@ fn rejected_changes(
             tally.for_good.insert(address);
         }
         if carried.contains(&address) {
-            // Still listed, unconfirmed, and counted above as deferred or,
-            // every copy paid before the vault, rejected for good: either
-            // way it gets no row, and any it has is cleared below.
+            // Still listed, unconfirmed, and counted above: it gets no row,
+            // and any it has is cleared below. (An address every copy of
+            // which was paid before the vault isn't kept carried: its entry
+            // goes, rejected ([`removal`]).)
             continue;
         }
         let unchanged = existing.get(&entry.listing.address).is_some_and(|old| {
@@ -2765,7 +2782,7 @@ mod tests {
     }
 
     #[test]
-    fn a_carried_address_paid_before_the_vault_stays_listed_without_a_row() {
+    fn a_listed_address_every_copy_of_which_was_paid_before_the_vault_is_removed() {
         // A listed address that the next cycle can't decide: 2 of its 7
         // nearest nodes serve it, and both copies were paid before the
         // payment vault was deployed.
@@ -2774,23 +2791,54 @@ mod tests {
         let mut listing = ListingsIndex::default();
         listing.listings.push(checked(x));
         publish_read(&mut publisher, &listing, None, AT);
+        let key = publisher.keys().unwrap()[0];
         let mut deferring = ListingsIndex::default();
         defer(&mut deferring, x, &[80_204_042, 80_204_042]);
-        let (publication, tally) = publish_read(&mut publisher, &deferring, None, AT + 60);
-        // It is rejected for good, so status.json leaves it out of its
-        // deferred groups and counts it as decided, and as carried.
+        // None of its copies can ever count, however many nodes come to
+        // serve them: its entry goes, rejected, rather than staying carried.
+        let reason = removal(&deferring, &x, &key);
+        assert_eq!(reason, Some(RemoveReason::Rejected));
+        let (publication, tally) = publish_read(&mut publisher, &deferring, reason, AT + 60);
+        assert_eq!(
+            publication.changes,
+            [IndexChange::Remove {
+                address: x,
+                reason: RemoveReason::Rejected
+            }]
+        );
+        assert_eq!((tally.removed, tally.carried), (1, 0));
+        // It is rejected for good: status.json leaves it out of its deferred
+        // groups and counts it as decided.
         assert!(tally.deferred.is_empty(), "deferred: {:?}", tally.deferred);
-        assert_eq!(tally.rejected_for_good, 1);
-        assert_eq!(tally.decided, 1);
-        assert_eq!(tally.carried, 1);
-        assert_eq!(tally.removed, 0);
-        // But its entry stays, marked carried, and rejected.json, which lists
-        // only what the producer doesn't list, has no row for it.
-        assert!(publication.rejected.is_empty());
-        assert!(publisher.rejected_entries().unwrap().is_empty());
-        assert!(publisher.entry(&x).unwrap().is_some());
-        let support = publisher.support(&x).unwrap().unwrap();
-        assert!(support.carried);
+        assert_eq!((tally.rejected_for_good, tally.decided), (1, 1));
+        assert!(publisher.entry(&x).unwrap().is_none());
+        assert!(publisher.support(&x).unwrap().is_none());
+        // rejected.json says why, with its copies.
+        let rows = publisher.rejected_entries().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].listing.address, hex::encode(x));
+        assert!(!rows[0].again);
+        assert_eq!(rows[0].problem, PAID_BEFORE_VAULT);
+        assert_eq!(rows[0].copies.len(), 2);
+        assert!(rows[0].copies.iter().all(|copy| copy.before_vault_deployment));
+
+        // One with a copy paid after the vault was deployed can still count
+        // once 4 nodes serve it: it stays, carried. So does one rejected for
+        // a reason a later cycle may undo, and one too few copies show
+        // anything of.
+        let mut mixed = ListingsIndex::default();
+        defer(&mut mixed, x, &[80_204_042, 81_950_000]);
+        assert_eq!(removal(&mixed, &x, &key), None);
+        let mut unread = ListingsIndex::default();
+        unread.rejected.push(RejectedListing {
+            listing: showing_block(x, 81_950_000),
+            problem: "could not read the payment chain: refused; try again".into(),
+            nodes: 4,
+            nearest: 7,
+            again: true,
+        });
+        assert_eq!(removal(&unread, &x, &key), None);
+        assert_eq!(removal(&ListingsIndex::default(), &x, &key), None);
     }
 
     #[test]
