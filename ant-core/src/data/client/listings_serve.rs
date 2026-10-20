@@ -1196,16 +1196,19 @@ impl Producer {
     /// or rejected for good. What `status.json` gives as the cycle's
     /// `decided`, as an index read counts what it decides.
     fn standing(&self, decided: &Decided) -> u64 {
-        let mut standing: HashMap<XorName, bool> = self
-            .known
-            .iter()
-            .filter(|(_, known)| known.decided)
-            .map(|(address, _)| (*address, true))
-            .collect();
+        let before = self.known.values().filter(|known| known.decided).count();
+        // Each address decided is in `decided.known` once.
+        let (mut gained, mut lost) = (0usize, 0usize);
         for (address, known) in &decided.known {
-            standing.insert(*address, known.is_some_and(|known| known.decided));
+            let was = self.known.get(address).is_some_and(|known| known.decided);
+            let is = known.is_some_and(|known| known.decided);
+            match (was, is) {
+                (false, true) => gained += 1,
+                (true, false) => lost += 1,
+                _ => {}
+            }
         }
-        standing.values().filter(|decided| **decided).count() as u64
+        (before + gained).saturating_sub(lost) as u64
     }
 
     /// Keep what `decided` decided, once published: what is known of each
