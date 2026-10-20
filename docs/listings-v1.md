@@ -26,7 +26,7 @@ All paths are relative to the directory the files are published in, such as
 | `pages.json` | The time pages that hold the whole index, in key order | When the index changes |
 | `pages/<first key>-<hash>.json` | One time page | Never: a page whose entries change gets a new name |
 | `feed/index.json` | The feed's segments | When the feed grows |
-| `feed/<first seq>.json` | Up to 1,000 of the feed's records | Until it holds 1,000, then never |
+| `feed/<first seq>.json` | Up to 1,000 of the feed's records | Until it holds 1,000, then not within its epoch |
 | `status.json` | How the producer is doing | Every cycle (each minute) |
 | `rejected.json` | Listings the producer didn't list, with why | When one changes |
 
@@ -80,10 +80,14 @@ compressed, which a server can send as they are to a reader that accepts
 gzip or zstd. A file is written only after every file it names is in place;
 `head.json` is written after the other files of a change.
 
-**Caching.** Time pages and closed feed segments never change: keep them
-(they are served to be cached for a day). Every other file can change at any
-time: revalidate it (`If-None-Match` or `If-Modified-Since`); an unchanged one
-is answered `304 Not Modified`, with no body.
+**Caching.** Time pages are named by their content, so they never change:
+keep them (they are served to be cached for a day). Every other file can
+change at any time: revalidate it (`If-None-Match` or `If-Modified-Since`);
+an unchanged one is answered `304 Not Modified`, with no body. That includes
+full feed segments: a full segment doesn't change within its epoch, but a new
+epoch (a producer that starts without its state begins one) writes its
+segments under the same names, so segments are served to be revalidated, not
+cached.
 
 ## The entry
 
@@ -326,8 +330,9 @@ Records are kept in segments of 1,000: `feed/1.json` holds records 1 to
 1,000, `feed/1001.json` records 1,001 to 2,000, and so on, so the segment
 holding record `s` starts at `⌊(s − 1) / 1,000⌋ × 1,000 + 1`. A segment is
 `{"epoch": "…", "first": 1001, "records": [...]}`. The latest grows until it
-holds 1,000 records; from then on it never changes. `feed/index.json` lists
-the segments: `{"epoch", "seq", "segments": [{"path", "first", "last"}]}`.
+holds 1,000 records; from then on it doesn't change within its epoch, though
+a new epoch writes its own segments under the same names. `feed/index.json`
+lists the segments: `{"epoch", "seq", "segments": [{"path", "first", "last"}]}`.
 
 ```json
 { "epoch": "8c1f0e2d3b4a5968", "first": 1, "records": [
@@ -431,9 +436,9 @@ find the type, and page from `first` or `last` as above.
    seconds costs a `304` while nothing changes). When its `epoch` differs
    from yours, start again at step 1.
 3. When its `seq` is past yours, fetch the segments holding the records after
-   yours (the latest one with revalidation), and apply those records in
-   order. A segment that is missing, or of another epoch, means starting
-   again at step 1.
+   yours, each with revalidation, and apply those records in order. A
+   segment that is missing, or of another epoch, means starting again at
+   step 1.
 4. Revalidate the support files you use about every 10 minutes.
 
 A reader can also follow the feed from record 1 without reading the pages.
