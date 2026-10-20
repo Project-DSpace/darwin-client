@@ -4422,6 +4422,10 @@ mod tests {
         assert_eq!(dated_by(&[0, 0, 0, hour]), Some(hour));
         assert_eq!(dated_by(&[0, 0, 0, hour, hour]), Some(hour));
         assert_eq!(dated_by(&[0, 0, 0, hour, hour - h]), Some(hour - h));
+        // Nor with a date that fails: two dating it in 1970 and one in the
+        // future leave three dates that pass, fewer than four, so the latest
+        // of them dates it. Their median would be 1970.
+        assert_eq!(dated_by(&[0, 0, hour + 100 * h, hour]), Some(hour));
         // Four answer and one dates it in the future: that date is dropped,
         // so one node can't fail a listing three others date honestly.
         assert_eq!(dated_by(&[hour, hour, hour, hour + 100 * h]), Some(hour));
@@ -4492,7 +4496,7 @@ mod tests {
         };
         let early = 0;
 
-        // Without a quorum each date is checked on its own and the median of
+        // Without a quorum each date is checked on its own and the latest of
         // those that pass taken: one too early or in the future neither
         // fails the listing nor moves its date.
         assert_eq!(
@@ -4505,10 +4509,18 @@ mod tests {
         );
         // With a quorum, dates that fail their own check are dropped first:
         // three dating it before its payment neither fail it nor date it.
-        // Fewer than four dates are left, so it takes their median.
+        // Fewer than four dates are left, so it takes the latest of them.
         assert_eq!(
             dated_by(&[early, early, early, paid, paid + h]),
             Some((Some(paid + h), 5, true))
+        );
+        // Nor can three date it earlier by sending a date that fails: two
+        // dating it as early as passes and one in the future leave three
+        // dates that pass, fewer than four, so the latest of them dates it,
+        // not their median, two hours before the payment.
+        assert_eq!(
+            dated_by(&[paid - 2 * h, paid - 2 * h, now + 100 * h, paid]),
+            Some((Some(paid), 4, true))
         );
         // Where every date passes, the latest of the earliest four.
         assert_eq!(
