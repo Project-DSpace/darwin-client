@@ -433,7 +433,7 @@ With `--json`, hidden payment fields are absent, and each listing carries `check
 $ darwin listings serve --state-dir /var/lib/listings --out-dir /var/www/listings/v1 --carry listings.json
 ```
 
-Runs until SIGINT or SIGTERM (the cycle in hand finishes writing first) and keeps the listings index published as the static files of `listings/v1/`: the newest entries (`head.json`), shards by address, name and content type, pages of the whole index in key order, a feed of every change, `status.json` (how the producer is doing, rewritten every cycle) and `rejected.json`. [docs/listings-v1.md](docs/listings-v1.md) specifies them for readers in any language. Each file is replaced whole, and only when its bytes change, with `.gz` and `.zst` copies of the same bytes beside it, so any static file server can serve the directory and a reader polling with conditional requests gets a `304` while nothing changed. Time pages and full feed segments never change. `darwin listings` without `serve` reads the index once, as above.
+Runs until SIGINT or SIGTERM (the cycle in hand finishes writing first) and keeps the listings index published as the static files of `listings/v1/`: the newest entries (`head.json`), shards by address, name and content type, pages of the whole index in key order, a feed of every change, `status.json` (how the producer is doing, rewritten every cycle) and `rejected.json`. [docs/listings-v1.md](docs/listings-v1.md) specifies them for readers in any language. Each file is replaced whole, and only when its bytes change, with `.gz` and `.zst` copies of the same bytes beside it, so any static file server can serve the directory and a reader polling with conditional requests gets a `304` while nothing changed. Time pages are named by their content and never change. A full feed segment doesn't change within its epoch, but a new epoch writes its segments under the same names, so serve segments to be revalidated rather than cached. `darwin listings` without `serve` reads the index once, as above.
 
 | Flag | Description |
 |------|-------------|
@@ -447,6 +447,7 @@ Runs until SIGINT or SIGTERM (the cycle in hand finishes writing first) and keep
 
 - **Removals.** An entry is removed when deciding its address again rejects it, or when all 7 of its nearest nodes read past where it would be, at least 2 hours after its time, without serving it, and a request for the address to each of the 7 nodes nearest it, sent after that read, finds none. Otherwise it stays, marked `carried` in its support file.
 - **Chain facts** (a transaction's receipt, a block's time, a quote's payments) are used as soon as they are read, and kept for good only once their block is at or below the RPC's `finalized` block and a second provider returns the same. A fact not found, an error, or a time in the future is never kept.
+- **Its log.** Nothing is logged by default. `RUST_LOG=ant_core=warn,ant_core::data::client::listings_serve=info` logs its warnings, such as a cycle that failed, and one line per cycle: nodes answering, addresses decided, entries put, removed and carried, the cycle's time, traffic and RPC calls.
 
 ### `darwin listing <ADDRESS>` — One Listing
 
