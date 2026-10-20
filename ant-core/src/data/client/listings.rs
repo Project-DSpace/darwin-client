@@ -5433,7 +5433,7 @@ mod tests {
         let payment = upload_payment(&envelope);
         let listing = Listing::new(&envelope, &payment, BLOCK_TIME);
         let nearest: Vec<PeerId> = (1..=7).map(peer).collect();
-        let liar = nearest[6];
+        let faulty = nearest[6];
         let mut chain = MockChain::with_blocks(200, 1_800_000_000);
         let quote: ant_protocol::evm::PaymentQuote = rmp_serde::from_slice(&payment.quote).unwrap();
         chain.add_receipt(PaymentReceipt {
@@ -5460,14 +5460,14 @@ mod tests {
             .map(|peer| (*peer, listing.clone()))
             .collect();
 
-        // An index read, where the liar's copy is another listing: the one
+        // An index read, where the faulty node's copy is another listing: the one
         // six serve is listed.
         let mut made_up = listing.clone();
         made_up.metadata.name = Some("made-up.txt".into());
-        let mut with_liar = honest.clone();
-        with_liar.push((liar, made_up));
+        let mut with_faulty = honest.clone();
+        with_faulty.push((faulty, made_up));
         let read = decide_found(
-            walk(with_liar),
+            walk(with_faulty),
             envelope.clone(),
             &context,
             &chain,
@@ -5476,13 +5476,13 @@ mod tests {
             never_asked,
         )
         .await;
-        // The producer, which couldn't have the liar's copy: the same.
+        // The producer, which couldn't have the faulty node's copy: the same.
         let produced = decide_found(
             walk(honest.clone()),
             envelope.clone(),
             &context,
             &chain,
-            &[liar],
+            &[faulty],
             now,
             never_asked,
         )
@@ -5494,12 +5494,20 @@ mod tests {
             assert_eq!((listed.nodes, listed.nearest, listed.quorum), (6, 7, true));
         }
 
-        // Three serve it and the liar's copy can't be had: no listing has a
-        // quorum, and it may if the liar serves the same, so it waits, as
-        // for a node that hasn't answered, without asking the liar again.
+        // Three serve it and the faulty node's copy can't be had: no listing has a
+        // quorum, and it may if the faulty node serves the same, so it waits, as
+        // for a node that hasn't answered, without asking the faulty node again.
         let three = walk(honest[..3].to_vec());
-        let waiting =
-            decide_found(three, envelope, &context, &chain, &[liar], now, never_asked).await;
+        let waiting = decide_found(
+            three,
+            envelope,
+            &context,
+            &chain,
+            &[faulty],
+            now,
+            never_asked,
+        )
+        .await;
         assert!(!waiting.decided);
         assert!(waiting.listing.is_none());
         assert!(waiting.rejected.iter().all(|row| row.again));

@@ -53,7 +53,8 @@
 //! (`ant_listings::Listing`) are taken from v2 pages, as
 //! [`merge_copies`](ant_listings::merge_copies) would leave the rest out.
 //!
-//! **Hostile nodes.** Nothing a node sends is taken on trust:
+//! **Faulty and out-of-spec nodes.** Nothing a node sends is taken on
+//! trust:
 //!
 //! - every answer and push is checked as `ant-listings` checks it, and one
 //!   the checks refuse ends that node's round and changes nothing;

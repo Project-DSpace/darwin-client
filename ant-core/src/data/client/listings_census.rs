@@ -2208,7 +2208,7 @@ mod tests {
     }
 
     /// The census simulation: closing every leaf of a network of `live`
-    /// nodes, with liars and nodes gone, finds every node that answers and
+    /// nodes, with faulty nodes and nodes gone, finds every node that answers and
     /// no other, and every address's nearest known nodes lie in its leaf.
     /// Then nodes leave and join, and closing the leaves the plan says to
     /// close again keeps it so.
@@ -2303,19 +2303,19 @@ mod tests {
             );
             to_close.extend(leaves);
         }
-        let liar = *sim
+        let faulty = *sim
             .nodes
             .iter()
             .find(|(_, node)| node.alive && node.behaviour == Behaviour::SlipsIn)
             .unwrap()
             .0;
-        let liar_peers = sim.peers_of(&liar);
-        let liar = PeerId::from_bytes(liar);
+        let faulty_peers = sim.peers_of(&faulty);
+        let faulty = PeerId::from_bytes(faulty);
         assert!(
-            !census.lacking(&liar, &liar_peers).is_empty(),
+            !census.lacking(&faulty, &faulty_peers).is_empty(),
             "made-up ids near it are lacking"
         );
-        to_close.extend(census.lacking(&liar, &liar_peers));
+        to_close.extend(census.lacking(&faulty, &faulty_peers));
 
         let mut left = BTreeSet::new();
         let mut joined = BTreeSet::new();
@@ -2337,7 +2337,7 @@ mod tests {
             assert!(joined.contains(&PeerId::from_bytes(*own)), "new nodes join");
         }
         assert_eq!(ids(&census), live_set);
-        for fake in liar_peers.iter().chain(&fakes) {
+        for fake in faulty_peers.iter().chain(&fakes) {
             assert!(
                 census.get(&PeerId::from_bytes(*fake)).is_none()
                     || live_set.contains(&PeerId::from_bytes(*fake))

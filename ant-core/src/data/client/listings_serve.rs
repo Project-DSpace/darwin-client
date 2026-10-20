@@ -3864,17 +3864,17 @@ mod tests {
         showing_block(address, 81_950_000)
     }
 
-    /// The fetches a node `liar` costs when it advertises `made_up` entries
+    /// The fetches a faulty node `faulty` costs when it advertises `made_up` entries
     /// no other node holds and never answers for them, beside an honest
     /// node's entry for `x`: what is fetched and who failed, how many
-    /// requests the liar got, and how long it took.
+    /// requests the faulty node got, and how long it took.
     async fn fetch_round(
         work: &[Work],
         failed: &HashMap<(PeerId, ListingId), u64>,
-        liar: PeerId,
+        faulty: PeerId,
         budget: &FetchBudget,
         deadline: Instant,
-        liar_hangs: bool,
+        faulty_hangs: bool,
     ) -> (
         Vec<(ListingId, Listing)>,
         Vec<(PeerId, ListingId)>,
@@ -3891,9 +3891,9 @@ mod tests {
         let asked_ref = &asked;
         let take = |peer: &PeerId| budget.take(peer, || 8);
         let ask = move |peer: PeerId, address: XorName| async move {
-            if peer == liar {
+            if peer == faulty {
                 asked_ref.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                if liar_hangs {
+                if faulty_hangs {
                     std::future::pending::<()>().await;
                 }
                 tokio::time::sleep(Duration::from_secs(10)).await;
@@ -3925,16 +3925,16 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn a_node_that_never_hands_over_listings_costs_only_its_allowance() {
-        let (liar, honest) = (PeerId::from_bytes([1; 32]), PeerId::from_bytes([2; 32]));
+        let (faulty, honest) = (PeerId::from_bytes([1; 32]), PeerId::from_bytes([2; 32]));
         let x: XorName = [0x3d; 32];
-        // The liar advertises 2,048 made-up addresses, each its own; an honest
+        // The faulty node advertises 2,048 made-up addresses, each its own; an honest
         // node and three others serve x.
         let mut work: Vec<Work> = (0..2_048u32)
             .map(|n| {
                 let mut address = [0x80; 32];
                 address[..4].copy_from_slice(&n.to_be_bytes());
                 let entry = DigestEntry::new(&stored(address));
-                (address, Vec::new(), vec![(liar, entry)])
+                (address, Vec::new(), vec![(faulty, entry)])
             })
             .collect();
         let entry = DigestEntry::new(&stored(x));
@@ -3952,7 +3952,7 @@ mod tests {
         let mut budget = FetchBudget::default();
         let deadline = Instant::now() + CYCLE;
         let (fetched, refused, asked, took) =
-            fetch_round(&work, &failed, liar, &budget, deadline, false).await;
+            fetch_round(&work, &failed, faulty, &budget, deadline, false).await;
         assert_eq!(fetched.len(), 1, "x is fetched");
         assert_eq!(fetched[0].0, (x, entry.digest));
         // Its allowance of 8 requests, all at once: one request's wait.
@@ -3961,12 +3961,12 @@ mod tests {
         assert!(took <= Duration::from_secs(11), "{took:?}");
         failed.extend(refused.into_iter().map(|failure| (failure, u64::MAX)));
 
-        // The next cycle: none of those 8 is asked again, and the liar gets
+        // The next cycle: none of those 8 is asked again, and the faulty node gets
         // its 8 requests, no more, whatever it advertises.
         budget.clear();
         let deadline = Instant::now() + CYCLE;
         let (_, refused, asked, took) =
-            fetch_round(&work, &failed, liar, &budget, deadline, false).await;
+            fetch_round(&work, &failed, faulty, &budget, deadline, false).await;
         assert_eq!(asked, 8);
         assert!(refused.iter().all(|failure| !failed.contains_key(failure)));
         assert!(took <= Duration::from_secs(11), "{took:?}");
@@ -3974,16 +3974,16 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn fetching_ends_at_its_deadline() {
-        let (liar, honest) = (PeerId::from_bytes([1; 32]), PeerId::from_bytes([2; 32]));
+        let (faulty, honest) = (PeerId::from_bytes([1; 32]), PeerId::from_bytes([2; 32]));
         let (x, y): (XorName, XorName) = ([0x3d; 32], [0x7e; 32]);
         let work: Vec<Work> = vec![
             (x, Vec::new(), vec![(honest, DigestEntry::new(&stored(x)))]),
-            (y, Vec::new(), vec![(liar, DigestEntry::new(&stored(y)))]),
+            (y, Vec::new(), vec![(faulty, DigestEntry::new(&stored(y)))]),
         ];
         let budget = FetchBudget::default();
         let deadline = Instant::now() + CYCLE;
         let (fetched, refused, asked, took) =
-            fetch_round(&work, &HashMap::new(), liar, &budget, deadline, true).await;
+            fetch_round(&work, &HashMap::new(), faulty, &budget, deadline, true).await;
         assert_eq!(fetched.len(), 1);
         assert_eq!(asked, 1);
         // Cut short, not refused: it is asked again next time.
