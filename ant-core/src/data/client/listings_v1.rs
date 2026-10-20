@@ -533,7 +533,8 @@ pub struct Rejected {
 /// A listing the producer didn't list.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RejectedEntry {
-    /// What the listing shows.
+    /// What the listing shows, with `first_seen` as the nodes nearest its
+    /// address date it before any check.
     #[serde(flatten)]
     pub listing: ListingFields,
     /// Why it doesn't count.

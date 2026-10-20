@@ -400,6 +400,12 @@ each address's latest rejection or deferral. Each has the entry's fields from
 | `decided_at` | The start of the cycle that decided this |
 | `copies` | For a listing too few of its nearest nodes serve yet, each of their copies: `node`, the `block_number`, `block_timestamp` and `first_seen` it shows (each absent when it doesn't), its `time`, and `before_vault_deployment: true` where the block or block timestamp it shows is earlier than the payment vault's deployment, so it paid something else. Absent otherwise |
 
+A rejected or deferred listing's `first_seen`, and so its `time`, is not
+dated as a listed entry's is: it is the date the nodes nearest its address
+give it before any check. That is the latest of the earliest 4 of their dates
+where at least 4 of them serve it, otherwise their median (of two dates, the
+later).
+
 ```json
 { "listings": [{ "address": "a0a0…", "…": "…", "time": 1791324000,
   "problem": "2 of the 7 nodes nearest its address serve it, needs 4; try again",
