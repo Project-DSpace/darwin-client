@@ -1328,8 +1328,13 @@ impl NodeState {
     /// again: it is read through its feed from now on, its range afresh. Any
     /// other answer leaves it read with v2 requests, its mirror and its pass
     /// kept, so its copies go on counting as they did, and its feed is
-    /// asked for again after [`V2_PASS_INTERVAL`]. Returns true: it has more
-    /// to send this round either way.
+    /// asked for again after [`V2_PASS_INTERVAL`]. No answer shows nothing
+    /// of its feed: a node that has answered a feed request since this
+    /// process began, so keeps one, is asked for it again next round, as a
+    /// node read through its feed that misses a round is; one never heard
+    /// from through its feed waits for [`V2_PASS_INTERVAL`] again, as a
+    /// silent node falls back ([`Self::take_answer`]). Returns true: it has
+    /// more to send this round either way.
     fn take_probe<C: NearestNodes + ?Sized>(
         &mut self,
         request: &ChangesRequest,
@@ -1352,7 +1357,7 @@ impl NodeState {
             self.feed_refused_at = None;
             self.feed_answered = true;
             self.switch(ReadKind::Feed, entries);
-        } else {
+        } else if answer.is_some() || !self.feed_answered {
             self.feed_refused_at = Some(now);
         }
         true
@@ -4382,6 +4387,70 @@ pub(crate) mod tests {
         // Three pages, a round each; then asked for its feed each hour.
         assert_eq!(complete_from, Some(3));
         assert_eq!(asked_for_feed, [61, 121]);
+    }
+
+    #[tokio::test]
+    async fn a_feed_probe_left_unanswered_is_sent_again_next_round_to_a_node_that_kept_a_feed() {
+        // Fault injection: two nodes read with v2 requests, as their feeds
+        // can't be read, fall silent just as their feeds are asked for
+        // again. `a` answered its feed before: no answer shows nothing of
+        // its feed, so it is asked for it again each round until it answers,
+        // and read through it from then on. `b` was never heard from through
+        // its feed: it waits the hour again, as a silent node falls back.
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        let mut feeds = Feeds::open(&store).unwrap();
+        let (a, b) = (peer(1), peer(2));
+        let net = FakeNet::with(vec![
+            (a, FakeNode::serving(Behaviour::Honest, entries(0, 20))),
+            (b, FakeNode::serving(Behaviour::Unsupported, entries(0, 20))),
+        ]);
+        let nodes = [feed_node(a), feed_node(b)];
+        poll(&mut feeds, &net, &nodes, NOW).await;
+        assert_eq!(feeds.read(&a).unwrap().kind, ReadKind::Feed);
+        assert_eq!(feeds.read(&b).unwrap().kind, ReadKind::V2);
+        net.take_asked(&a);
+        net.take_asked(&b);
+        net.node(&a, |node| node.behaviour = Behaviour::Unavailable);
+        let mut probed = BTreeMap::from([(a, Vec::new()), (b, Vec::new())]);
+        for round in 1..=130u64 {
+            let behaviour = |silent: bool, otherwise| {
+                if silent {
+                    Behaviour::Silent
+                } else {
+                    otherwise
+                }
+            };
+            let a_silent = (61..=62).contains(&round);
+            let b_silent = round == 60;
+            let a_otherwise = if round > 62 {
+                Behaviour::Honest
+            } else {
+                Behaviour::Unavailable
+            };
+            net.node(&a, |node| node.behaviour = behaviour(a_silent, a_otherwise));
+            net.node(&b, |node| {
+                node.behaviour = behaviour(b_silent, Behaviour::Unsupported);
+            });
+            let before: Vec<ReadKind> = [a, b]
+                .iter()
+                .map(|peer| feeds.read(peer).unwrap().kind)
+                .collect();
+            settle_all(&mut feeds);
+            poll(&mut feeds, &net, &nodes, NOW + 60 * round).await;
+            for (peer, kind) in [a, b].iter().zip(before) {
+                let asked = kinds(&net.take_asked(peer));
+                if kind == ReadKind::V2 && asked.first() == Some(&"changes") {
+                    probed.get_mut(peer).unwrap().push(round);
+                }
+            }
+        }
+        // `a` fell back at round 1, so is asked for its feed from round 61.
+        assert_eq!(probed[&a], [61, 62, 63]);
+        assert_eq!(feeds.read(&a).unwrap().kind, ReadKind::Feed);
+        assert!(net.mirrored(&feeds, &a));
+        assert_eq!(probed[&b], [60, 120]);
+        assert_eq!(feeds.read(&b).unwrap().kind, ReadKind::V2);
     }
 
     #[tokio::test]
