@@ -386,9 +386,9 @@ stopped, is stuck, or can't write its files.
 | `cycle` | The latest cycle: `started_at`; `millis`, how long it took; `bytes_in` and `bytes_out`, the listings messages received from nodes and sent to them (see below); `rpc_calls` and `rpc_errors`, to the payment chain's RPC providers; `decided`, addresses decided; `too_few_answered`, true when the cycle decided and removed nothing because too few of the nodes it knows answered (see below) |
 | `totals` | Since `started_at`: `cycles`, `bytes_in` and `bytes_out` (counted as the cycle's are, those between cycles, such as pushes, with the next cycle's), and `rpc`, for each provider its host name (`provider`), `calls` and `errors` |
 | `census` | The nodes the producer knows: `nodes`; `answering`, those that answered in the latest cycle; `leaves`, the parts the address space is split into; `versions`, how many nodes (`nodes`) give each `version` in their user agent (`null` when unknown); `silent`, each node that didn't answer (`node`, and `last_answered`, or `null` if never) |
-| `deferred` | Addresses left for a later cycle, grouped by `reason`, each group with `addresses`, how many, and `oldest_since`, since when the longest-waiting has waited. An entry kept unconfirmed (`carried`) whose address the cycle left for later counts too, though `rejected.json` doesn't list it |
+| `deferred` | Addresses left for a later cycle, grouped by `reason`, each group with `addresses`, how many, and `oldest_since`, since when the longest-waiting has waited: every address left so, by the reason it was last left for. An entry kept unconfirmed (`carried`) whose address was left for later counts too, though `rejected.json` doesn't list it |
 | `below_full` | Entries fewer than all of their nearest nodes serve: `listings`, how many, and `oldest_since`, since when the longest-standing has been (`null` if none) |
-| `drops` | `removed`, entries the latest cycle removed, with those removed between it and the cycle before (what pushes changed, decided at once); `carried`, entries kept unconfirmed (see the support files) |
+| `drops` | `removed`, entries the latest cycle removed, with those removed between it and the cycle before (what pushes changed, decided at once); `carried`, entries kept unconfirmed (see the support files) among those the cycle decided |
 | `resources` | What the producer uses, each `null` where it can't tell: `rss_bytes` (its own memory resident, not counting the pages of its store's file the system maps in and can drop at any time), `store_bytes`, `files_bytes` (what it publishes) and `disk_free_bytes` |
 
 `bytes_in` and `bytes_out` count only the listings messages the producer
@@ -397,16 +397,21 @@ lookups that find the nodes, nor envelope fetches, nor the transport's own
 overhead.
 
 `too_few_answered` is true when fewer than 7 of the census's nodes
-answered the cycle, or under three quarters of them. `census.answering`
-counts the nodes that answered the cycle's request with an answer the
-producer's checks took, and `silent` lists the others.
+answered the cycle, or under three quarters as many as in any of the 10
+cycles before it, as `darwin listings` measures the nodes a read finds
+against its recent reads: a sudden fall stops deciding, and one that lasts
+stops it until those cycles have all seen it. `census.answering` counts the
+nodes that answered the cycle's request with an answer the producer's checks
+took, and `silent` lists the others.
 
 `decided` counts the addresses whose decision stands: listed, or rejected for
 good. The producer decides every address again after it starts, a batch at a
 time, over more than one cycle where the index is large: until it has, the
-first cycles' `decided` and `deferred` count only the addresses decided since
-the start. Likewise, while more changed than a cycle's minute holds,
-`deferred` counts the addresses deferred among those the cycle decided.
+first cycles' `decided` counts only the addresses decided since the start.
+`deferred` counts every address left for later, by the reason it was last
+left for, whether or not the cycle decided it again; `drops.carried` counts
+among the addresses the cycle decided, so while more changed than a cycle's
+minute holds, it can count fewer than the support files mark.
 
 A deferral's `reason` is one of: `below_quorum` (fewer than 4 of the 7 nodes
 nearest the address serve it yet), `nodes_unanswered` (nodes nearest it have
@@ -458,7 +463,8 @@ A rejected or deferred listing's `first_seen`, and so its `time`, is not
 dated as a listed entry's is: it is the date the nodes nearest its address
 give it before any check. That is the latest of the earliest 4 of their dates
 where at least 4 of them serve it, otherwise their median (of two dates, the
-later).
+later). Its `size` is the listing's own: `null` for a data map shrunk into a
+child map, as only listed entries have their root maps read.
 
 A private file's listing that 2 of the 7 nodes nearest its address serve,
 left for a later cycle: both copies show the same payment, and the nodes
@@ -521,19 +527,24 @@ Files are fetched one at a time, so a file can be newer than the
 ## How the producer keeps the files
 
 - Each minute (a cycle), it asks every node it knows what changed in what
-  it serves, decides again the addresses whose copies, nearest nodes or
-  chain facts changed, and writes the files those decisions change, as
-  many as the cycle's minute holds (what doesn't fit, the next cycle
-  decides). It decides every address again after it starts and once a
-  day, a batch at a time for what is left of each cycle's minute, over as
-  many cycles as that takes. A node that stores a new listing pushes it, and the producer
-  publishes it within seconds, without waiting for the next cycle: it
-  decides the addresses pushes changed, and only those, as many as fit
-  before the next cycle is due (what doesn't fit, that cycle decides). While
-  a node is slow to answer a cycle's requests, a listing pushed meanwhile is
-  published with the cycle, and while every address is being decided again,
-  with the next. An address is decided only once at least 4 of its 7
-  nearest nodes serve a listing for it.
+  it serves (a node slow to answer is waited for no longer than two
+  requests' timeouts a cycle, and asked for the rest in the next), decides
+  again the addresses whose copies, nearest nodes or chain facts changed,
+  first those at least 4 of whose nearest nodes may serve a listing and
+  those published or in `rejected.json`, and writes the files those
+  decisions change, as many as a minute of deciding holds (what doesn't
+  fit, the next cycle decides). It decides every address again after it
+  starts and once a day, a batch at a time for what is left of each cycle's
+  minute of deciding, over as many cycles as that takes. A node that stores
+  a new listing pushes it, and the producer publishes it within seconds,
+  without waiting for the next cycle, once at least 4 of its nearest nodes
+  have pushed it: between cycles it decides the addresses pushes changed,
+  and only those, as many as fit before the next cycle is due, and only
+  from copies pushed since the cycle read the nodes (what doesn't fit, and
+  every other change, that cycle decides). While every address is being
+  decided again, a listing pushed during a cycle is published with the next.
+  An address is decided only once at least 4 of its 7 nearest nodes serve a
+  listing for it.
 - It removes an entry only when, in one cycle, every node nearest its
   address answers that it serves no listing there, and a witnessed lookup
   of the address and a request for it to each of those nodes and to the
