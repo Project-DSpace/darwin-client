@@ -540,10 +540,13 @@ Files are fetched one at a time, so a file can be newer than the
   minute of deciding, over as many cycles as that takes. A node that stores
   a new listing pushes it, and the producer publishes it within seconds,
   without waiting for the next cycle, once at least 4 of its nearest nodes
-  have pushed it: between cycles it decides the addresses pushes changed,
-  and only those, as many as fit before the next cycle is due, and only
-  from copies pushed since the cycle read the nodes (what doesn't fit, and
-  every other change, that cycle decides). While every address is being
+  have pushed it since the cycle read the nodes: between cycles it decides
+  the addresses pushes changed, and only those, as many as fit before the
+  next cycle is due, and only where at least 4 of the copies were pushed
+  since the cycle read the nodes; copies the cycle read, or that were pushed
+  before or while it read them, count toward the listing's support too,
+  which the next cycle measures again (what doesn't fit, and every other
+  change, that cycle decides). While every address is being
   decided again, a listing pushed during a cycle is published with the next.
   An address is decided only once at least 4 of its 7 nearest nodes serve a
   listing for it.

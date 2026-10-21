@@ -33,7 +33,8 @@ told apart by the commit `darwin --version` prints. Upstream's entries follow.
   copies, nearest nodes or chain facts changed (and every address once a day), those a quorum
   may serve or that are published first, for a minute from when deciding starts, and publishes a
   new listing a node pushes within seconds, deciding between cycles only the addresses pushes
-  change, until the next cycle is due, and only from copies pushed since the cycle read the nodes.
+  change, until the next cycle is due, and only once at least 4 of an address's nearest nodes
+  pushed their copies since the cycle read the nodes (copies the cycle read only add to support).
   A node's requests wait at most two requests' timeouts a cycle, so a slow node can't hold the
   cycle open, and a node whose push comes behind its mirror is asked again in the same cycle. A
   node whose feed can't be read is read with `listings.v2` requests meanwhile, its feed asked for

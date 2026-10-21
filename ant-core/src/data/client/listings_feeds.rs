@@ -3012,6 +3012,12 @@ pub(crate) mod tests {
             self.record(*address, None);
         }
 
+        /// The pushes its watch made since they were last taken, oldest
+        /// first.
+        pub(crate) fn take_pushes(&mut self) -> Vec<ChangesResponse> {
+            std::mem::take(&mut self.pushes)
+        }
+
         fn record(&mut self, address: XorName, entry: Option<DigestEntry>) {
             self.head += 1;
             let seq = self.head;
