@@ -101,7 +101,12 @@ pub struct ListingFields {
     pub content_type: Option<String>,
     /// The file's size in bytes, as its data map gives it. A listing gives
     /// none for a data map shrunk into a child map; the producer reads the
-    /// root map to find it. `None` when withheld, or not yet read.
+    /// root map to find it, and fills it in once read. `None` when
+    /// withheld, until read, and for good where the root map can't give
+    /// one. A map shrunk more than once gives the length of the root map
+    /// shrunk away, not the file's size (see `docs/listings-v1.md`). In a
+    /// row of `rejected.json`, the listing's own value: `None` for a shrunk
+    /// map, as only listed entries' root maps are read.
     pub size: Option<u64>,
     /// Whether anyone with the address can read the file: the envelope
     /// holds its data map, rather than withholding it.
@@ -202,15 +207,17 @@ pub struct Entry {
     /// shown fields are checked, and the listing rests on the nodes nearest
     /// its address.
     pub check: CheckLevel,
-    /// When the producer decided the entry as it stands: the start of that
-    /// cycle, in Unix seconds. A decision that finds the same entry again
-    /// leaves it as it is.
+    /// When the producer decided the entry as it stands: when the
+    /// publication that decided it began, a cycle's start or, for one
+    /// decided between cycles, when that publication began, in Unix
+    /// seconds. Deciding it again with the same result leaves it as it is,
+    /// and so does filling in its size.
     pub decided_at: u64,
 }
 
 impl Entry {
-    /// The entry for `listing`, checked to `check`, decided in the cycle
-    /// that began at `decided_at`.
+    /// The entry for `listing`, checked to `check`, decided by the
+    /// publication that began at `decided_at`.
     #[must_use]
     pub fn new(listing: &Listing, check: CheckLevel, decided_at: u64) -> Self {
         Self {
@@ -287,9 +294,9 @@ pub struct Head {
     pub seq: u64,
     /// How many entries the index holds.
     pub count: u64,
-    /// When the index last changed: the start of the cycle that wrote the
-    /// feed's latest record, or that began the epoch if it has none, in
-    /// Unix seconds.
+    /// When the index last changed: when the publication that wrote the
+    /// feed's latest record began (see [`FeedRecord::at`]), or the one that
+    /// began the epoch if it has none, in Unix seconds.
     pub generated_at: u64,
     /// The newest [`HEAD_LISTINGS`] entries, newest first, without data
     /// maps.
@@ -492,7 +499,10 @@ pub struct FeedSegment {
 pub struct FeedRecord {
     /// The record's number: 1 for the epoch's first, then one more for each.
     pub seq: u64,
-    /// When the change was made: the start of that cycle, in Unix seconds.
+    /// When the publication that made the change began, in Unix seconds: a
+    /// cycle's start, or for a change published between cycles (a listing
+    /// a node pushed, a size filled in), when that publication began. The
+    /// records of one publication share it.
     pub at: u64,
     /// The change.
     #[serde(flatten)]
@@ -556,8 +566,8 @@ pub struct RejectedEntry {
     pub nodes: usize,
     /// How many nearest nodes count.
     pub nearest: usize,
-    /// When the producer decided this: the start of that cycle, in Unix
-    /// seconds.
+    /// When the producer decided this: when the publication that decided it
+    /// began, as for an entry ([`Entry::decided_at`]), in Unix seconds.
     pub decided_at: u64,
     /// For a listing too few of its nearest nodes serve yet, each of their
     /// copies; empty otherwise.
@@ -567,7 +577,7 @@ pub struct RejectedEntry {
 
 impl RejectedEntry {
     /// `rejected`, with the copies its nearest nodes serve if it is
-    /// pending, decided in the cycle that began at `decided_at`.
+    /// pending, decided by the publication that began at `decided_at`.
     #[must_use]
     pub fn new(rejected: &RejectedListing, copies: &[PendingCopy], decided_at: u64) -> Self {
         Self {
@@ -619,7 +629,9 @@ impl From<&PendingCopy> for CopyFields {
     }
 }
 
-/// `status.json`: how the producer is doing, written every cycle.
+/// `status.json`: how the producer is doing, written last by every
+/// publication: each cycle's, and those between cycles, which give the
+/// latest cycle's again.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Status {
     /// The feed's epoch.
@@ -628,8 +640,8 @@ pub struct Status {
     pub seq: u64,
     /// How many entries the index holds.
     pub count: u64,
-    /// When this file was written, at the end of the latest cycle, in Unix
-    /// seconds.
+    /// When this file was written, by the latest publication (a cycle's, or
+    /// one between cycles), in Unix seconds.
     pub generated_at: u64,
     /// When the producer started, in Unix seconds: `totals` count from then.
     pub started_at: u64,
@@ -639,7 +651,8 @@ pub struct Status {
     pub totals: Totals,
     /// The nodes the producer knows.
     pub census: CensusStatus,
-    /// Addresses left for a later cycle, by why.
+    /// Every address left for a later cycle, by the reason it was last left
+    /// for, whether or not the latest cycle decided it again.
     pub deferred: Vec<DeferredGroup>,
     /// Entries that fewer than all of their nearest nodes serve.
     pub below_full: BelowFull,
@@ -669,14 +682,11 @@ pub struct CycleStatus {
     pub rpc_errors: u64,
     /// Addresses decided.
     pub decided: u64,
-    /// Whether the cycle decided and dropped nothing because its read found
-    /// too few nodes to trust. In this version that is an index read's
-    /// guard ([`ListingsIndex::too_few_nodes`]): the read found fewer than 7
-    /// nodes, or under three quarters of the most that any of the recent
-    /// reads found, however many of them answered, or none at all. A
-    /// version with the census counts the census's nodes that answered:
-    /// fewer than 7 of them, or under three quarters of the census
-    /// ([`Census::guard_ok`]).
+    /// Whether the cycle decided and dropped nothing because too few of the
+    /// nodes it knows answered: fewer than 7 of the census's nodes, or under
+    /// three quarters as many as in any of the 10 cycles before
+    /// ([`Census::guard_ok`]), as an index read's guard measures the nodes it
+    /// finds against its recent reads' ([`ListingsIndex::too_few_nodes`]).
     ///
     /// [`ListingsIndex::too_few_nodes`]: super::listings::ListingsIndex::too_few_nodes
     /// [`Census::guard_ok`]: super::listings_census::Census::guard_ok
@@ -689,10 +699,11 @@ pub struct Totals {
     /// Cycles run.
     pub cycles: u64,
     /// Bytes of the listings messages received from nodes, as
-    /// [`CycleStatus::bytes_in`] counts them.
+    /// [`CycleStatus::bytes_in`] counts them: those between cycles (pushes,
+    /// and what they led to fetch) with the next cycle's.
     pub bytes_in: u64,
-    /// Bytes of the listings messages sent to nodes, as
-    /// [`CycleStatus::bytes_out`] counts them.
+    /// Bytes of the listings messages sent to nodes, counted as
+    /// [`Self::bytes_in`] is.
     pub bytes_out: u64,
     /// Calls to each RPC provider, and how many failed.
     pub rpc: Vec<RpcCalls>,
@@ -769,7 +780,8 @@ pub struct BelowFull {
 /// Entries removed, and kept unconfirmed, in `status.json`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Drops {
-    /// Entries the latest cycle removed.
+    /// Entries the latest cycle removed, with those removed between it and
+    /// the cycle before.
     pub removed: u64,
     /// Entries kept though the producer's latest checks don't confirm them
     /// ([`Support::carried`]).
@@ -780,7 +792,9 @@ pub struct Drops {
 /// can't tell.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Resources {
-    /// Its resident memory, in bytes.
+    /// Its own resident memory, in bytes: its anonymous pages, not the
+    /// pages of its store's file the system maps in and can drop at any
+    /// time.
     pub rss_bytes: Option<u64>,
     /// The size of its store, in bytes.
     pub store_bytes: Option<u64>,

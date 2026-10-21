@@ -479,6 +479,33 @@ impl Publisher {
         Ok(addresses)
     }
 
+    /// Whether `address` is listed, or `rejected.json` has a row for it,
+    /// without reading either.
+    ///
+    /// # Errors
+    ///
+    /// If the store can't be read.
+    pub fn lists_or_rejects(&self, address: &XorName) -> Result<bool> {
+        let txn = self.store.env().read_txn().map_err(store_error)?;
+        let listed = self
+            .dbs
+            .entries
+            .remap_data_type::<heed::types::DecodeIgnore>()
+            .get(&txn, &address[..])
+            .map_err(store_error)?
+            .is_some();
+        if listed {
+            return Ok(true);
+        }
+        Ok(self
+            .dbs
+            .side
+            .remap_data_type::<heed::types::DecodeIgnore>()
+            .get(&txn, &tagged(REJECTED_TAG, address))
+            .map_err(store_error)?
+            .is_some())
+    }
+
     /// The latest rejection or deferral of `address`, if `rejected.json`
     /// has a row for it.
     ///

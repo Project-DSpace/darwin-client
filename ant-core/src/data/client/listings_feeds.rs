@@ -25,8 +25,10 @@
 //! Every `ChangesRequest` sets a watch, so the node pushes its new records in
 //! the range as they commit: a push that brings the mirror exactly to the
 //! node's new head is applied at once ([`Feeds::push`]); any other is left to
-//! the next request. Each request replaces the node's last watch, so there is
-//! one watch per node from the producer, renewed by the round's first
+//! the next request, which during a round is sent at once, as after an
+//! answer, so pushes that come out of order or not at all don't leave the
+//! node out of the round. Each request replaces the node's last watch, so
+//! there is one watch per node from the producer, renewed by the round's first
 //! request every [`CYCLE`](super::listings_serve::CYCLE), well within the
 //! node's [`WATCH_LEASE`](ant_listings::WATCH_LEASE). A node that already
 //! has [`MAX_WATCHERS`](ant_listings::MAX_WATCHERS) other watchers refuses
@@ -44,8 +46,11 @@
 //! feed request as `unsupported`, never answers one, or answers its feed
 //! requests only with errors (its feed can't be read, as until it starts
 //! again after failing to number or total it), is read this way too, from
-//! the same round on, and asked for its feed again after
-//! [`V2_PASS_INTERVAL`].
+//! the same round on. Once [`V2_PASS_INTERVAL`] has passed, it is asked for
+//! its feed again with one `ChangesRequest` that sets no watch, its mirror
+//! and its pass kept meanwhile: only once the checks take an answer to it
+//! is it read through its feed again, its range afresh; otherwise it goes
+//! on as it was, and is asked again after the interval.
 //!
 //! **What counts.** A node's copies count in a cycle ([`NodeRead::counts`])
 //! when it is in sync: it answered this round, and its mirror is at the head
@@ -69,6 +74,10 @@
 //!   entry it holds whose address at least [`QUORUM_THRESHOLD`] of the
 //!   census's [`NEAREST_NODES`] nodes nearest it serve, where it is among the
 //!   [`WALK_EARNING_RANKS`] nearest. Pushes count against the same pages;
+//! - a node's requests in a round wait at most `NODE_SHARE` for their
+//!   answers in all, what one that never answers costs: a node that answers
+//!   each just in time, and always has more, is asked for the rest in the
+//!   next round, so no one node holds the round open for the others;
 //! - a node's answers change only its own mirror, only within its own range;
 //!   what it says of other nodes (the `view` hash and `peers` of an answer)
 //!   is kept as a hint for the census ([`Feeds::view`],
@@ -77,12 +86,16 @@
 //!
 //! **What the producer calls.** Each cycle:
 //!
-//! 1. [`Feeds::poll`] with every census node ([`FeedNode`]: its leaf, whether
-//!    its user agent shows the feed release, whether to ask for its peers),
-//!    a deadline for the round, and the receiver of the pushes its
+//! 1. `Feeds::reconcile` with every census node ([`FeedNode`]: its leaf,
+//!    whether its user agent shows the feed release, whether to ask for its
+//!    peers), then [`Feeds::poll`] with them, a deadline for the round set
+//!    once that is done, and the receiver of the pushes its
 //!    `ListingsRequests` routes (pushes that come during the round are taken
 //!    as they come). It reads every node, at most
-//!    [`POLL_CONCURRENCY`] requests at once.
+//!    [`POLL_CONCURRENCY`] requests at once. When who is followed changed,
+//!    every address's backing, what nodes' allowances grow with, is counted
+//!    again: all at once the first time, and after that a batch at a time
+//!    ([`Feeds::recount_some`]), as the producer has time after deciding.
 //! 2. For the guard and support: [`Feeds::read`] says how each node's round
 //!    went (answered, counts, complete); [`Feeds::copies`] gives an address's
 //!    copies from those of its nearest nodes whose copies count, as digest
@@ -118,11 +131,12 @@ use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::future::Future;
 use std::ops::Bound;
+use std::time::Duration;
 
 use ant_listings::{
-    check_list_page, AddressRange, ChangesRequest, ChangesResponse, DigestEntry, FeedOutcome,
-    ListingKey, ListingsBody, Pushed, SetHash, MAX_LIST_LIMIT, NEAREST_NODES, QUORUM_THRESHOLD,
-    WALK_EARNING_RANKS, WALK_FREE_LISTINGS, WALK_PER_BACKED,
+    check_changes_page, check_list_page, AddressRange, ChangesRequest, ChangesResponse,
+    DigestEntry, FeedOutcome, ListingKey, ListingsBody, Pushed, SetHash, MAX_LIST_LIMIT,
+    NEAREST_NODES, QUORUM_THRESHOLD, WALK_EARNING_RANKS, WALK_FREE_LISTINGS, WALK_PER_BACKED,
 };
 use ant_protocol::transport::PeerId;
 use ant_protocol::XorName;
@@ -130,9 +144,10 @@ use futures::stream::{FuturesUnordered, StreamExt};
 use heed::types::Bytes;
 use heed::{Database, RoTxn, RwTxn};
 use serde::{Deserialize, Serialize};
+use tokio::time::Instant;
 use tracing::{debug, info};
 
-use super::listings::ListingsRequests;
+use super::listings::{ListingsRequests, REQUEST_TIMEOUT};
 use super::listings_census::Census;
 use super::listings_mirror::{Entries, MirrorSync};
 use super::listings_serve::{POLL_CONCURRENCY, V2_PASS_INTERVAL};
@@ -178,6 +193,15 @@ const SCAN: usize = PAGE;
 /// it has a `first_seen` (1 byte) and the `first_seen` (8 bytes, 0 if none),
 /// and the digest (32 bytes).
 const ENTRY_LEN: usize = 8 * 3 + 1 + 8 + 32;
+
+/// The longest one node's requests may wait for their answers in a round,
+/// in all: what a node that never answers costs, a request and its retry,
+/// each waiting [`REQUEST_TIMEOUT`]. A request is given no more than what is
+/// left of it, and a node with more to ask once it is used up is asked for
+/// the rest in the next round, as at the round's deadline. So a node that
+/// answers slowly, however much it has to page through, holds the round
+/// open no longer than one that doesn't answer at all.
+const NODE_SHARE: Duration = Duration::from_secs(REQUEST_TIMEOUT.as_secs() * 2);
 
 /// The receiving end of the pushes a producer's `ListingsRequests` routes,
 /// each with the node it came from.
@@ -1166,6 +1190,14 @@ struct NodeState {
     missed: bool,
     /// Whether it has answered a feed request since this process began.
     feed_answered: bool,
+    /// How long its requests this round waited for their answers, in all
+    /// ([`NODE_SHARE`]).
+    waited: Duration,
+    /// The request asking a node read with v2 requests for its feed again
+    /// ([`Self::next_request`]), while it waits for its answer.
+    probe: Option<ChangesRequest>,
+    /// Whether this round asked it for its feed so.
+    probed: bool,
     /// Its record as the store holds it, if known.
     written: Option<NodeRecord>,
 }
@@ -1185,6 +1217,9 @@ impl NodeState {
             errored: false,
             missed: false,
             feed_answered: false,
+            waited: Duration::ZERO,
+            probe: None,
+            probed: false,
             written: None,
         }
     }
@@ -1196,6 +1231,18 @@ impl NodeState {
         feed && self
             .feed_refused_at
             .is_none_or(|at| now >= at.saturating_add(V2_PASS_INTERVAL.as_secs()))
+    }
+
+    /// Whether it is to be asked for its feed again at `now`: it is read
+    /// with v2 requests although its user agent shows the feed release,
+    /// because it refused its feed, couldn't serve it or didn't answer for
+    /// it, and [`V2_PASS_INTERVAL`] has passed since.
+    fn feed_retry_due(&self, now: u64) -> bool {
+        self.claims_feed
+            && self.mirror.kind() == ReadKind::V2
+            && self
+                .feed_refused_at
+                .is_some_and(|at| now >= at.saturating_add(V2_PASS_INTERVAL.as_secs()))
     }
 
     /// Read it the `kind` way from now on, with an empty mirror: every
@@ -1234,6 +1281,9 @@ impl NodeState {
         self.errored = false;
         self.missed = false;
         self.behind = false;
+        self.waited = Duration::ZERO;
+        self.probe = None;
+        self.probed = false;
         self.read = NodeRead::new(self.mirror.kind());
         match &mut self.mirror {
             Mirror::Feed(sync) => {
@@ -1244,12 +1294,68 @@ impl NodeState {
         }
     }
 
+    /// The next request to send it this round, if any. A node read with v2
+    /// requests whose feed is due to be asked for again
+    /// ([`Self::feed_retry_due`]) is first sent a `ChangesRequest` for its
+    /// range from the start, setting no watch: a probe, whose answer decides
+    /// how it is read ([`Self::take_probe`]). Its mirror and its pass stay
+    /// as they are meanwhile.
     fn next_request(&mut self, now: u64) -> Option<ListingsBody> {
+        if !self.probed && self.feed_retry_due(now) {
+            self.probed = true;
+            let request = ChangesRequest {
+                epoch: 0,
+                after: 0,
+                prefix: self.range.prefix(),
+                bits: self.range.bits(),
+                limit: MAX_LIST_LIMIT,
+                want_peers: false,
+                watch: false,
+            };
+            self.probe = Some(request.clone());
+            return Some(ListingsBody::ChangesRequest(request));
+        }
         match &mut self.mirror {
             // Every feed request watches, so the node's watch stays set.
             Mirror::Feed(sync) => sync.next_request(self.want_peers, true),
             Mirror::V2(read) => read.next_request(now),
         }
+    }
+
+    /// Take the answer to a probe of the feed of a node read with v2
+    /// requests (`None`: it didn't answer in time). An answer the checks
+    /// take to `request` ([`check_changes_page`]) shows its feed can be read
+    /// again: it is read through its feed from now on, its range afresh. Any
+    /// other answer leaves it read with v2 requests, its mirror and its pass
+    /// kept, so its copies go on counting as they did, and its feed is
+    /// asked for again after [`V2_PASS_INTERVAL`]. Returns true: it has more
+    /// to send this round either way.
+    fn take_probe<C: NearestNodes + ?Sized>(
+        &mut self,
+        request: &ChangesRequest,
+        answer: Option<ListingsBody>,
+        now: u64,
+        entries: &mut StoreEntries<'_, C>,
+    ) -> bool {
+        match &answer {
+            Some(ListingsBody::Error { .. }) => self.errored = true,
+            Some(_) => self.answered = true,
+            None => self.missed = true,
+        }
+        let readable = matches!(
+            &answer,
+            Some(ListingsBody::ChangesResponse(response))
+                if check_changes_page(request, response).is_ok()
+        );
+        if readable {
+            debug!("A node read with listings v2 requests answers for its feed again");
+            self.feed_refused_at = None;
+            self.feed_answered = true;
+            self.switch(ReadKind::Feed, entries);
+        } else {
+            self.feed_refused_at = Some(now);
+        }
+        true
     }
 
     /// Take the node's answer (`None`: it didn't answer in time), applied to
@@ -1261,6 +1367,9 @@ impl NodeState {
         allowance: usize,
         entries: &mut StoreEntries<'_, C>,
     ) -> bool {
+        if let Some(request) = self.probe.take() {
+            return self.take_probe(&request, answer, now, entries);
+        }
         match &answer {
             Some(ListingsBody::Error { .. }) => self.errored = true,
             Some(_) => self.answered = true,
@@ -1494,6 +1603,9 @@ impl NodeRecord {
             errored: false,
             missed: false,
             feed_answered: false,
+            waited: Duration::ZERO,
+            probe: None,
+            probed: false,
             written: Some(self.clone()),
         })
     }
@@ -1505,6 +1617,22 @@ fn allowance(backed: usize) -> usize {
     WALK_FREE_LISTINGS.saturating_add(WALK_PER_BACKED.saturating_mul(backed))
 }
 
+/// A recount of every address's backing under way, after the nodes followed
+/// changed ([`Feeds::recount_some`]): from the first address held to the
+/// last, then, where the nodes changed again while one was under way, round
+/// from the first to where that one stood.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Recount {
+    /// The last address counted again, if any yet.
+    after: Option<XorName>,
+    /// Where the recount ends once it has gone round to the first address:
+    /// where the one under way stood when the nodes changed again. `None`:
+    /// it ends at the last address.
+    until: Option<XorName>,
+    /// Whether it has gone round to the first address.
+    round: bool,
+}
+
 /// The mirrors of every census node. See the module docs.
 pub struct Feeds {
     store: ListingsStore,
@@ -1513,6 +1641,8 @@ pub struct Feeds {
     backing: Backing,
     /// The nodes the backing was counted with, in id order.
     members: Option<Vec<PeerId>>,
+    /// The recount of every address's backing under way, if any.
+    recount: Option<Recount>,
     /// When the latest round began (Unix seconds): the time a node read
     /// through its feed was last read in full ([`Self::complete_since`]).
     round_at: u64,
@@ -1615,6 +1745,7 @@ impl Feeds {
             nodes,
             backing: Backing::default(),
             members: None,
+            recount: None,
             round_at: 0,
         };
         feeds.save()?;
@@ -1624,12 +1755,19 @@ impl Feeds {
     /// Read every node of `nodes` once, as the cycle's poll: see the module
     /// docs. At most [`POLL_CONCURRENCY`] requests are in flight at once,
     /// each through `io`; the round ends when no node has more to ask, or at
-    /// `deadline`, whichever is first. Pushes from `pushes` are taken as they
-    /// come. Nodes not in `nodes` leave, with their mirrors; `census` says
-    /// which nodes are nearest an address, for the nodes' allowances. Pass
-    /// every census node: a change in who is passed counts every address's
-    /// backing again. `now` is the cycle's time (Unix seconds). Each answer
-    /// is written to the store as it is taken.
+    /// `deadline`, whichever is first. A node's requests may wait twice a
+    /// request's timeout for their answers in all (`NODE_SHARE`): one with
+    /// more to ask after that is asked for it in the next round, so a node
+    /// that answers slowly holds the round open no longer than one that
+    /// never answers. Pushes
+    /// from `pushes` are taken as they come; one that comes behind its
+    /// node's mirror once the node has no request in flight has the node
+    /// asked again, within its allowance and share, to catch up, as its own
+    /// answer would. Nodes not in `nodes` leave, with their mirrors;
+    /// `census` says which nodes are nearest an address, for the nodes'
+    /// allowances. Pass every census node, as `Feeds::reconcile` takes
+    /// them. `now` is the cycle's time (Unix seconds). Each answer is
+    /// written to the store as it is taken.
     ///
     /// # Errors
     ///
@@ -1640,7 +1778,7 @@ impl Feeds {
         census: &C,
         nodes: &[FeedNode],
         now: u64,
-        deadline: tokio::time::Instant,
+        deadline: Instant,
         pushes: Option<&mut PushReceiver>,
     ) -> Result<PollReport>
     where
@@ -1657,6 +1795,8 @@ impl Feeds {
             }
         }
         let mut ready: VecDeque<PeerId> = peers.into();
+        // The nodes with a request in flight.
+        let mut asking: BTreeSet<PeerId> = BTreeSet::new();
         let mut running = FuturesUnordered::new();
         let mut pushes = pushes;
         let mut pushes_open = pushes.is_some();
@@ -1671,10 +1811,19 @@ impl Feeds {
                 let Some(node) = self.nodes.get_mut(&peer) else {
                     continue;
                 };
+                let share = NODE_SHARE.saturating_sub(node.waited);
+                if share.is_zero() {
+                    continue;
+                }
                 if let Some(body) = node.next_request(now) {
+                    asking.insert(peer);
                     running.push(async move {
-                        let answer = io.ask(&peer, body).await;
-                        (peer, answer)
+                        let sent = Instant::now();
+                        let answer = tokio::time::timeout(share, io.ask(&peer, body))
+                            .await
+                            .ok()
+                            .flatten();
+                        (peer, answer, sent.elapsed())
                     });
                 }
             }
@@ -1686,17 +1835,28 @@ impl Feeds {
                     debug!("The feed poll reached its deadline");
                     break;
                 }
-                Some((peer, answer)) = running.next() => {
+                Some((peer, answer, waited)) = running.next() => {
+                    asking.remove(&peer);
+                    if let Some(node) = self.nodes.get_mut(&peer) {
+                        node.waited = node.waited.saturating_add(waited);
+                    }
                     if self.take_answer(census, &peer, answer, now)? {
                         ready.push_back(peer);
                     }
                 }
                 push = next_push(&mut pushes), if pushes_open => match push {
-                    Some((source, push)) => {
-                        if matches!(self.push(census, &source, &push)?, Pushed::Applied(_)) {
-                            pushed += 1;
+                    Some((source, push)) => match self.push(census, &source, &push)? {
+                        Pushed::Applied(_) => pushed += 1,
+                        // The node holds records its mirror lacks: as after
+                        // an answer, it is asked again from its mirror's
+                        // head ([`MirrorSync::next_request`]).
+                        Pushed::Behind
+                            if !asking.contains(&source) && !ready.contains(&source) =>
+                        {
+                            ready.push_back(source);
                         }
-                    }
+                        _ => {}
+                    },
                     None => pushes_open = false,
                 },
             }
@@ -1922,6 +2082,25 @@ impl Feeds {
         Ok(copies)
     }
 
+    /// Whether at least [`QUORUM_THRESHOLD`] of the [`NEAREST_NODES`] census
+    /// nodes nearest `address` hold an entry for it in their mirrors,
+    /// counting or not, as its backing was last counted: an address a quorum
+    /// may serve a listing for, rather than one only a few nodes name.
+    ///
+    /// # Errors
+    ///
+    /// If the store can't be read.
+    pub fn is_backed(&self, address: &XorName) -> Result<bool> {
+        let txn = self.store.env().read_txn().map_err(store_error)?;
+        Ok(self
+            .dbs
+            .backing
+            .remap_data_type::<heed::types::DecodeIgnore>()
+            .get(&txn, address)
+            .map_err(store_error)?
+            .is_some())
+    }
+
     /// Every node whose mirror holds `address`, counting or not, in id
     /// order.
     ///
@@ -2073,11 +2252,28 @@ impl Feeds {
         }
     }
 
-    /// Bring the nodes followed in line with `nodes`: drop those not in it,
-    /// take in new ones, switch the way a node is read, and follow its new
-    /// range, each in a transaction of its own. Counts the backing again if
-    /// who is followed changed.
-    fn reconcile<C: NearestNodes + ?Sized>(
+    /// Bring the nodes followed in line with `nodes`, every census node as
+    /// [`FeedNode::from_census`] gives them: drop those not in it, take in
+    /// new ones, switch the way a node is read, and follow its new range,
+    /// each in a transaction of its own. [`Self::poll`] does this first; the
+    /// producer does it before the poll's time starts, so that this work,
+    /// which grows with the index when nodes leave, never takes the nodes'
+    /// time. When who is followed changed, every address's backing is
+    /// counted again: all of it before any request the first time (each
+    /// node's allowance rests on it, and none is counted yet), and after
+    /// that by [`Self::recount_some`], a batch at a time, as the producer has
+    /// time, the counts kept as they were meanwhile (a node's mirror counts
+    /// what changes in it at once).
+    ///
+    /// A node read with listings v2 requests although its user agent shows
+    /// the feed release, because it refused its feed or couldn't serve it,
+    /// stays read that way, its mirror and its pass kept, until it answers
+    /// a probe of its feed ([`NodeState::next_request`]).
+    ///
+    /// # Errors
+    ///
+    /// If the store can't be read or written.
+    pub(crate) fn reconcile<C: NearestNodes + ?Sized>(
         &mut self,
         census: &C,
         nodes: &[FeedNode],
@@ -2121,7 +2317,11 @@ impl Feeds {
             });
             node.want_peers = wanted.want_peers;
             node.claims_feed = wanted.feed;
-            let kind = if node.wants_feed(wanted.feed, now) {
+            let fell_back = node.mirror.kind() == ReadKind::V2 && node.feed_refused_at.is_some();
+            let kind = if wanted.feed && fell_back {
+                // A probe of its feed, once due, decides.
+                ReadKind::V2
+            } else if node.wants_feed(wanted.feed, now) {
                 ReadKind::Feed
             } else {
                 ReadKind::V2
@@ -2150,11 +2350,96 @@ impl Feeds {
         }
         let members: Vec<PeerId> = self.nodes.keys().copied().collect();
         if self.members.as_ref() != Some(&members) {
+            let first = self.members.is_none();
             self.members = Some(members);
-            self.recount_all(census)?;
+            if first {
+                self.recount_all(census)?;
+            } else {
+                // Every address again, from where a recount under way
+                // stands, round to there.
+                self.recount = Some(match self.recount {
+                    Some(Recount {
+                        after: Some(after), ..
+                    }) => Recount {
+                        after: Some(after),
+                        until: Some(after),
+                        round: false,
+                    },
+                    _ => Recount {
+                        after: None,
+                        until: None,
+                        round: false,
+                    },
+                });
+            }
         }
         self.apply_backing();
         Ok(())
+    }
+
+    /// Go on with the recount of every address's backing under way, if any,
+    /// as after the nodes followed changed: a batch of addresses at a time, each in a
+    /// transaction of its own, until `deadline`, at least a batch. Returns
+    /// how many addresses it counted again.
+    ///
+    /// # Errors
+    ///
+    /// If the store can't be read or written.
+    pub fn recount_some<C: NearestNodes + ?Sized>(
+        &mut self,
+        census: &C,
+        deadline: Instant,
+    ) -> Result<usize> {
+        let mut counted = 0;
+        let mut first = true;
+        while let Some(mut recount) = self.recount {
+            if !first && Instant::now() >= deadline {
+                break;
+            }
+            first = false;
+            let env = self.store.env();
+            let mut txn = env.write_txn().map_err(store_error)?;
+            let batch = self
+                .dbs
+                .held_after(&txn, recount.after.as_ref(), SCAN)
+                .map_err(store_error)?;
+            // Gone round to the first address, it ends where it began.
+            let end = recount.until.filter(|_| recount.round);
+            let mut ended = batch.len() < SCAN;
+            for address in &batch {
+                if end.is_some_and(|end| *address > end) {
+                    ended = true;
+                    break;
+                }
+                self.backing
+                    .recount(&mut txn, self.dbs, census, address)
+                    .map_err(store_error)?;
+                recount.after = Some(*address);
+                counted += 1;
+            }
+            txn.commit().map_err(store_error)?;
+            ended |= end.is_some_and(|end| recount.after.is_some_and(|after| after >= end));
+            self.recount = if !ended {
+                Some(recount)
+            } else if recount.until.is_some() && !recount.round {
+                Some(Recount {
+                    after: None,
+                    round: true,
+                    ..recount
+                })
+            } else {
+                None
+            };
+        }
+        self.apply_backing();
+        Ok(counted)
+    }
+
+    /// Whether a recount of every address's backing is under way
+    /// ([`Self::recount_some`]).
+    #[must_use]
+    pub fn recounting(&self) -> bool {
+        self.recount.is_some()
     }
 
     /// Count every address's backing again, as after a change in who is
@@ -2195,6 +2480,7 @@ impl Feeds {
             }
         }
         self.backing.affected.clear();
+        self.recount = None;
         Ok(())
     }
 
@@ -2328,8 +2614,10 @@ impl Feeds {
     }
 
     /// Take `peer` as if a push from it had come behind its mirror
-    /// ([`Self::behind`]): for tests of what is decided between cycles.
-    #[cfg(test)]
+    /// ([`Self::behind`]), until its next round: as when a push it sent was
+    /// dropped before it could be taken, so its mirror is known to lack a
+    /// record it holds. Its copies don't count meanwhile, and its mirror
+    /// isn't complete.
     pub(crate) fn mark_behind(&mut self, peer: &PeerId) {
         if let Some(node) = self.nodes.get_mut(peer) {
             node.behind = true;
@@ -3909,5 +4197,339 @@ pub(crate) mod tests {
         assert_eq!(decode_entry(address(3), &[0; ENTRY_LEN - 1]), None);
         let key = entry_key(&peer(5), &address(6));
         assert_eq!(split_key(&key), Some((peer(5), address(6))));
+    }
+
+    /// Fake nodes, of which `slow` answers each request only after `delay`,
+    /// replacing 300 of the entries it serves before each answer: it always
+    /// has more to page through, within its allowance.
+    struct SlowNet<'a> {
+        net: &'a FakeNet,
+        slow: PeerId,
+        delay: Duration,
+    }
+
+    impl FeedIo for SlowNet<'_> {
+        async fn ask(&self, peer: &PeerId, body: ListingsBody) -> Option<ListingsBody> {
+            if *peer == self.slow {
+                tokio::time::sleep(self.delay).await;
+                self.net.node(peer, |node| {
+                    let held: Vec<XorName> = node.served.keys().copied().collect();
+                    node.made_up += 1;
+                    let base = 5_000_000 + node.made_up * 1_000;
+                    for n in 0..300 {
+                        node.put(entry(address(base + n), 9));
+                    }
+                    for address in held {
+                        node.remove(&address);
+                    }
+                });
+            }
+            self.net.ask(peer, body).await
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_slow_node_holds_the_poll_no_longer_than_one_that_never_answers() {
+        // Fault injection: seven healthy nodes, and one that answers every
+        // request just inside a request's timeout and always has more to
+        // page through. Its requests wait at most twice a request's timeout
+        // a round, what a node that never answers costs; the rest of what it
+        // has waits for the next round, and the others are read as ever.
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        let mut feeds = Feeds::open(&store).unwrap();
+        let peers: Vec<PeerId> = (1..=8).map(peer).collect();
+        let slow = peers[7];
+        let net = FakeNet::with(
+            peers
+                .iter()
+                .map(|p| {
+                    let from = u32::from(p.as_bytes()[0]) * 100;
+                    (*p, FakeNode::serving(Behaviour::Honest, entries(from, 50)))
+                })
+                .collect(),
+        );
+        let nodes: Vec<FeedNode> = peers.iter().map(|p| feed_node(*p)).collect();
+        let ids = Ids(peers.clone());
+        let io = SlowNet {
+            net: &net,
+            slow,
+            delay: Duration::from_millis(9_900),
+        };
+        for round in 0..4u64 {
+            net.take_asked(&slow);
+            let started = tokio::time::Instant::now();
+            let deadline = started + Duration::from_secs(60);
+            let report = feeds
+                .poll(&io, &ids, &nodes, NOW + 60 * round, deadline, None)
+                .await
+                .unwrap();
+            let took = started.elapsed();
+            assert!(
+                took <= NODE_SHARE + Duration::from_secs(1),
+                "round {round} took {took:?}"
+            );
+            assert!(net.take_asked(&slow).len() <= 3, "round {round}");
+            for peer in &peers[..7] {
+                assert!(feeds.read(peer).unwrap().counts, "round {round}: {peer}");
+            }
+            assert_eq!(report.counting, 7, "round {round}");
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_push_behind_its_mirror_during_the_poll_has_its_node_asked_again() {
+        // A healthy node, in sync, and one that holds the poll open. After
+        // the healthy node's round has ended, it stores two listings, and
+        // its pushes come in either order, as two pushes sent by tasks of
+        // their own can. It is asked again within the round: it counts this
+        // cycle, and only the two new addresses are pending, not every one
+        // it holds.
+        for reversed in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let store = store(dir.path());
+            let mut feeds = Feeds::open(&store).unwrap();
+            let (a, hang) = (peer(1), peer(2));
+            let net = std::sync::Arc::new(FakeNet::with(vec![
+                (a, FakeNode::serving(Behaviour::Honest, entries(0, 300))),
+                (hang, FakeNode::serving(Behaviour::Hang, Vec::new())),
+            ]));
+            let nodes = [feed_node(a), feed_node(hang)];
+            let ids = Ids(vec![a, hang]);
+            let (sink, mut receiver) = crate::data::client::listings::push_channel(64);
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            feeds
+                .poll(&*net, &ids, &nodes, NOW, deadline, Some(&mut receiver))
+                .await
+                .unwrap();
+            assert!(feeds.read(&a).unwrap().counts);
+            settle_all(&mut feeds);
+            let later = std::sync::Arc::clone(&net);
+            let task = tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                let mut pushes = later.node(&a, |node| {
+                    node.put(entry(address(500), 1));
+                    node.put(entry(address(501), 1));
+                    std::mem::take(&mut node.pushes)
+                });
+                assert_eq!(pushes.len(), 2);
+                if reversed {
+                    pushes.reverse();
+                }
+                for push in pushes {
+                    assert!(sink.offer(a, push));
+                }
+            });
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            feeds
+                .poll(&*net, &ids, &nodes, NOW + 60, deadline, Some(&mut receiver))
+                .await
+                .unwrap();
+            task.await.unwrap();
+            assert!(feeds.read(&a).unwrap().counts, "reversed {reversed}");
+            assert_eq!(
+                feeds.pending_set(),
+                BTreeSet::from([address(500), address(501)]),
+                "reversed {reversed}"
+            );
+            assert!(net.mirrored(&feeds, &a), "reversed {reversed}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_node_whose_feed_cant_be_read_keeps_its_mirror_while_its_feed_is_asked_for_again() {
+        // A node serving more than a page whose feed can't be read: read the
+        // old way, a page a round, its mirror complete once a pass is done.
+        // Asking for its feed again, each hour, takes one request and costs
+        // neither its mirror nor its pass: what it holds never drops.
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        let mut feeds = Feeds::open(&store).unwrap();
+        let a = peer(1);
+        let listings: Vec<Listing> = (0..600)
+            .map(|n| listing(address(n), 1_791_324_000))
+            .collect();
+        let served: Vec<DigestEntry> = listings.iter().map(DigestEntry::new).collect();
+        let mut node = FakeNode::serving(Behaviour::Honest, served);
+        for listing in &listings {
+            node.listings.insert(listing.key(), listing.clone());
+        }
+        let net = FakeNet::with(vec![(a, node)]);
+        let nodes = [feed_node(a)];
+        poll(&mut feeds, &net, &nodes, NOW).await;
+        net.take_asked(&a);
+        net.node(&a, |node| node.behaviour = Behaviour::Unavailable);
+        let mut complete_from = None;
+        let mut asked_for_feed = Vec::new();
+        for round in 1..=130u64 {
+            settle_all(&mut feeds);
+            poll(&mut feeds, &net, &nodes, NOW + 60 * round).await;
+            let asked = kinds(&net.take_asked(&a));
+            let read = feeds.read(&a).unwrap();
+            assert_eq!(read.kind, ReadKind::V2, "round {round}");
+            if read.complete && complete_from.is_none() {
+                complete_from = Some(round);
+            }
+            if complete_from.is_some() {
+                assert!(read.complete && read.counts, "round {round}");
+                assert_eq!(read.entries, 600, "round {round}");
+            }
+            if round > 1 && asked.first() == Some(&"changes") {
+                assert_eq!(asked, ["changes", "list"], "round {round}");
+                asked_for_feed.push(round);
+            }
+        }
+        // Three pages, a round each; then asked for its feed each hour.
+        assert_eq!(complete_from, Some(3));
+        assert_eq!(asked_for_feed, [61, 121]);
+    }
+
+    #[tokio::test]
+    async fn a_push_dropped_for_want_of_room_names_its_node() {
+        // Fault injection: a node stores 8 listings and then stops serving
+        // one it held, while nothing takes its pushes: its 9th push doesn't
+        // fit and is dropped. Its node is named, and once taken as behind its
+        // mirror, its copies don't count until its next round reads it.
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        let mut feeds = Feeds::open(&store).unwrap();
+        let a = peer(1);
+        let net = FakeNet::with(vec![(
+            a,
+            FakeNode::serving(Behaviour::Honest, entries(0, 20)),
+        )]);
+        let nodes = [feed_node(a)];
+        let ids = Ids(vec![a]);
+        poll(&mut feeds, &net, &nodes, NOW).await;
+        settle_all(&mut feeds);
+        let gone = address(3);
+        let pushes = net.node(&a, |node| {
+            for n in 0..8 {
+                node.put(entry(address(500 + n), 1));
+            }
+            node.remove(&gone);
+            std::mem::take(&mut node.pushes)
+        });
+        let (sink, mut receiver) = crate::data::client::listings::push_channel(1_024);
+        let offered: Vec<bool> = pushes.into_iter().map(|push| sink.offer(a, push)).collect();
+        assert_eq!(offered.iter().filter(|kept| !**kept).count(), 1);
+        while let Some((source, push)) = receiver.try_recv() {
+            feeds.push(&ids, &source, &push).unwrap();
+        }
+        // The pushes taken fit: nothing shows the mirror lacks the removal.
+        assert!(!feeds.behind(&a));
+        assert_eq!(feeds.copies(&gone, &[a]).unwrap().len(), 1);
+        assert_eq!(receiver.take_dropped(), BTreeSet::from([a]));
+        assert!(receiver.take_dropped().is_empty());
+        feeds.mark_behind(&a);
+        assert!(feeds.behind(&a));
+        assert!(feeds.copies(&gone, &[a]).unwrap().is_empty());
+        // Its next round reads it again: it counts, without the copy.
+        poll(&mut feeds, &net, &nodes, NOW + 60).await;
+        assert!(!feeds.behind(&a) && feeds.read(&a).unwrap().counts);
+        assert!(feeds.copies(&gone, &[a]).unwrap().is_empty());
+        assert!(net.mirrored(&feeds, &a));
+    }
+
+    #[tokio::test]
+    async fn after_the_nodes_change_the_backing_is_counted_again_a_batch_at_a_time() {
+        // Nine nodes, four of which serve the same 600 listings, and one,
+        // serving none, leaves: the addresses it was among the nearest of
+        // have other nearest nodes now, though no mirror changed there.
+        // Their backing is counted again a batch at a time, as there is time,
+        // not all at once before the poll, the counts kept meanwhile; once
+        // done, the counts are what counting afresh gives.
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        let mut feeds = Feeds::open(&store).unwrap();
+        let peers: Vec<PeerId> = (1..=9).map(peer).collect();
+        let net = FakeNet::with(
+            peers
+                .iter()
+                .enumerate()
+                .map(|(n, p)| {
+                    let served = if n < 4 { entries(0, 600) } else { Vec::new() };
+                    (*p, FakeNode::serving(Behaviour::Honest, served))
+                })
+                .collect(),
+        );
+        let all: Vec<FeedNode> = peers.iter().copied().map(feed_node).collect();
+        for round in 0..3 {
+            poll(&mut feeds, &net, &all, NOW + 60 * round).await;
+        }
+        assert!(!feeds.recounting());
+        let staying: Vec<FeedNode> = all[..8].to_vec();
+        let ids = Ids(peers[..8].to_vec());
+        feeds.reconcile(&ids, &staying, NOW + 180).unwrap();
+        assert!(feeds.recounting());
+        poll(&mut feeds, &net, &staying, NOW + 180).await;
+        assert!(feeds.recounting());
+        let mut calls = 0;
+        while feeds.recounting() {
+            let counted = feeds
+                .recount_some(&ids, tokio::time::Instant::now())
+                .unwrap();
+            assert!(counted <= SCAN, "{counted}");
+            calls += 1;
+        }
+        assert_eq!(calls, 600_usize.div_ceil(SCAN));
+        let counted: Vec<usize> = peers.iter().map(|p| feeds.backing.count(p)).collect();
+        feeds.recount_all(&ids).unwrap();
+        let afresh: Vec<usize> = peers.iter().map(|p| feeds.backing.count(p)).collect();
+        assert_eq!(counted, afresh);
+    }
+
+    /// The census, as [`Ids`], each search for nearest nodes taking `delay`:
+    /// as with a census and an index large enough that counting every
+    /// address's backing again takes a while.
+    struct SlowIds {
+        ids: Ids,
+        delay: Duration,
+    }
+
+    impl NearestNodes for SlowIds {
+        fn nearest(&self, address: &XorName, n: usize) -> Vec<PeerId> {
+            std::thread::sleep(self.delay);
+            self.ids.nearest(address, n)
+        }
+    }
+
+    #[tokio::test]
+    async fn the_work_of_a_node_leaving_takes_none_of_the_polls_time() {
+        // A node holding many entries leaves the census. Its mirror going,
+        // and the backing of every address it held counted again, is work
+        // that grows with the index: done by reconcile, as the producer does
+        // before it sets the poll's deadline, it takes none of the poll's
+        // time, and the poll that follows, with a deadline far shorter than
+        // that work took, hears every node.
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        let mut feeds = Feeds::open(&store).unwrap();
+        let peers: Vec<PeerId> = (1..=8).map(peer).collect();
+        let net = FakeNet::with(
+            peers
+                .iter()
+                .map(|p| (*p, FakeNode::serving(Behaviour::Honest, entries(0, 400))))
+                .collect(),
+        );
+        let all: Vec<FeedNode> = peers.iter().copied().map(feed_node).collect();
+        for round in 0..3 {
+            poll(&mut feeds, &net, &all, NOW + 60 * round).await;
+        }
+        let staying = &all[1..];
+        let census = SlowIds {
+            ids: Ids(peers[1..].to_vec()),
+            delay: Duration::from_millis(5),
+        };
+        let started = std::time::Instant::now();
+        feeds.reconcile(&census, staying, NOW + 180).unwrap();
+        let reconciling = started.elapsed();
+        assert!(reconciling >= Duration::from_secs(2), "{reconciling:?}");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+        let report = feeds
+            .poll(&net, &census, staying, NOW + 180, deadline, None)
+            .await
+            .unwrap();
+        assert_eq!((report.answered, report.counting), (7, 7));
     }
 }
