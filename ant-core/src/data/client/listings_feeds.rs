@@ -30,7 +30,9 @@
 //! request every [`CYCLE`](super::listings_serve::CYCLE), well within the
 //! node's [`WATCH_LEASE`](ant_listings::WATCH_LEASE). A node that already
 //! has [`MAX_WATCHERS`](ant_listings::MAX_WATCHERS) other watchers refuses
-//! the watch without saying so; its next poll finds every change anyway.
+//! the watch without saying so; its next poll finds every change anyway. On
+//! a stop, the producer ends its watches ([`Feeds::unwatch_requests`]), so
+//! they don't hold a place among each node's watchers until they lapse.
 //!
 //! **Nodes without it** are read with listings v2 requests
 //! (`ListRequest`), one a round: the next page of a full pass of their index,
@@ -39,8 +41,10 @@
 //! Copies from a pass's pages count at once; one the node no longer serves
 //! leaves the mirror when a pass that reached the end of its index didn't
 //! see it. A node whose user agent shows the feed release but that refuses a
-//! feed request as `unsupported`, or never answers one, is read this way too,
-//! from the same round on, and asked for its feed again after
+//! feed request as `unsupported`, never answers one, or answers its feed
+//! requests only with errors (its feed can't be read, as until it starts
+//! again after failing to number or total it), is read this way too, from
+//! the same round on, and asked for its feed again after
 //! [`V2_PASS_INTERVAL`].
 //!
 //! **What counts.** A node's copies count in a cycle ([`NodeRead::counts`])
@@ -116,8 +120,8 @@ use std::future::Future;
 use std::ops::Bound;
 
 use ant_listings::{
-    check_list_page, AddressRange, ChangesResponse, DigestEntry, FeedOutcome, ListingKey,
-    ListingsBody, Pushed, SetHash, MAX_LIST_LIMIT, NEAREST_NODES, QUORUM_THRESHOLD,
+    check_list_page, AddressRange, ChangesRequest, ChangesResponse, DigestEntry, FeedOutcome,
+    ListingKey, ListingsBody, Pushed, SetHash, MAX_LIST_LIMIT, NEAREST_NODES, QUORUM_THRESHOLD,
     WALK_EARNING_RANKS, WALK_FREE_LISTINGS, WALK_PER_BACKED,
 };
 use ant_protocol::transport::PeerId;
@@ -1141,8 +1145,9 @@ struct NodeState {
     want_peers: bool,
     /// Whether its user agent shows the feed release.
     claims_feed: bool,
-    /// When it last refused a feed request, or answered none when nothing
-    /// of its feed was known (Unix seconds).
+    /// When it last refused a feed request, answered its feed requests
+    /// only with errors, or answered none when nothing of its feed was known
+    /// (Unix seconds).
     feed_refused_at: Option<u64>,
     /// Whether its copies counted in the last round.
     counted: bool,
@@ -1150,8 +1155,14 @@ struct NodeState {
     /// copies don't count until it is read again ([`Feeds::behind`]).
     behind: bool,
     read: NodeRead,
-    /// Whether it answered a request this round.
+    /// Whether it answered a request this round, other than with an
+    /// [`Error`](ListingsBody::Error).
     answered: bool,
+    /// Whether it answered a request this round with an
+    /// [`Error`](ListingsBody::Error).
+    errored: bool,
+    /// Whether a request to it this round went unanswered.
+    missed: bool,
     /// Whether it has answered a feed request since this process began.
     feed_answered: bool,
     /// Its record as the store holds it, if known.
@@ -1170,6 +1181,8 @@ impl NodeState {
             behind: false,
             read: NodeRead::new(kind),
             answered: false,
+            errored: false,
+            missed: false,
             feed_answered: false,
             written: None,
         }
@@ -1217,6 +1230,8 @@ impl NodeState {
 
     fn begin_round(&mut self, backed: usize) {
         self.answered = false;
+        self.errored = false;
+        self.missed = false;
         self.behind = false;
         self.read = NodeRead::new(self.mirror.kind());
         match &mut self.mirror {
@@ -1245,11 +1260,10 @@ impl NodeState {
         allowance: usize,
         entries: &mut StoreEntries<'_, C>,
     ) -> bool {
-        if matches!(
-            &answer,
-            Some(body) if !matches!(body, ListingsBody::Error { .. })
-        ) {
-            self.answered = true;
+        match &answer {
+            Some(ListingsBody::Error { .. }) => self.errored = true,
+            Some(_) => self.answered = true,
+            None => self.missed = true,
         }
         let range = self.range;
         match &mut self.mirror {
@@ -1267,8 +1281,15 @@ impl NodeState {
                 // kept of it, may not keep one: older nodes drop a request
                 // they don't know.
                 let never_followed = !self.feed_answered && sync.epoch() == 0 && sync.is_empty();
-                let silent = sync.outcome() == Some(FeedOutcome::NoAnswer) && never_followed;
-                if refused || silent {
+                let no_answer = sync.outcome() == Some(FeedOutcome::NoAnswer);
+                let silent = no_answer && never_followed;
+                // One that answers its feed requests only with errors can't
+                // have its feed read now, as until it starts again after
+                // failing to number or total it, but may serve listings v2
+                // requests still. (One that also lets a request go
+                // unanswered may only be slow: it is asked again next round.)
+                let unavailable = no_answer && self.errored && !self.answered && !self.missed;
+                if refused || silent || unavailable {
                     self.fall_back(now, entries);
                     return true;
                 }
@@ -1303,7 +1324,7 @@ impl NodeState {
                 NodeRead {
                     kind: ReadKind::Feed,
                     answered: self.answered && sync.problem().is_none(),
-                    replied: self.answered,
+                    replied: self.answered || self.errored,
                     counts: in_sync,
                     complete: in_sync,
                     outcome: sync.outcome(),
@@ -1319,7 +1340,7 @@ impl NodeState {
                     // A page the checks took: an answer of another kind, or
                     // a page they refused, isn't one.
                     answered: read.answered && read.problem.is_none(),
-                    replied: self.answered,
+                    replied: self.answered || self.errored,
                     counts: read.answered,
                     complete: read.answered && read.complete,
                     outcome: None,
@@ -1460,6 +1481,8 @@ impl NodeRecord {
             counted: false,
             behind: false,
             answered: false,
+            errored: false,
+            missed: false,
             feed_answered: false,
             written: Some(self.clone()),
         })
@@ -1967,6 +1990,36 @@ impl Feeds {
             Mirror::Feed(_) => Some(self.round_at),
             Mirror::V2(read) => read.finished_began,
         }
+    }
+
+    /// The requests that end this reader's watch on each node read through
+    /// its feed: for each, a `ChangesRequest` for its range from where its
+    /// mirror stands, setting no watch. A node keeps one watch per reader,
+    /// for at most [`MAX_WATCHERS`](ant_listings::MAX_WATCHERS) readers, and
+    /// a request that sets none ends the reader's at once. A reader that
+    /// stops without sending them keeps its place among each node's watchers
+    /// until its watch lapses ([`WATCH_LEASE`](ant_listings::WATCH_LEASE)),
+    /// and the same reader started again comes back as another.
+    #[must_use]
+    pub fn unwatch_requests(&self) -> Vec<(PeerId, ListingsBody)> {
+        self.nodes
+            .iter()
+            .filter_map(|(peer, node)| match &node.mirror {
+                Mirror::Feed(sync) => Some((
+                    *peer,
+                    ListingsBody::ChangesRequest(ChangesRequest {
+                        epoch: sync.epoch(),
+                        after: sync.head(),
+                        prefix: node.range.prefix(),
+                        bits: node.range.bits(),
+                        limit: MAX_LIST_LIMIT,
+                        want_peers: false,
+                        watch: false,
+                    }),
+                )),
+                Mirror::V2(_) => None,
+            })
+            .collect()
     }
 
     /// `peer`'s allowance in pages a round: what it may be asked for in one,
@@ -2595,6 +2648,9 @@ pub(crate) mod tests {
         OutOfRange,
         /// Makes up new records before each answer, so it always has more.
         Endless,
+        /// Answers feed requests with an error, as a node does while its
+        /// feed can't be read, and listings v2 requests as it should.
+        Unavailable,
     }
 
     /// A node, as a change feed and a listings v2 index.
@@ -2717,10 +2773,16 @@ pub(crate) mod tests {
             let unsupported = Some(ListingsBody::Error {
                 message: UNSUPPORTED.into(),
             });
+            let unavailable = Some(ListingsBody::Error {
+                message: "the change feed is unavailable".into(),
+            });
             match body {
                 ListingsBody::ChangesRequest(request) => {
                     if self.behaviour == Behaviour::Unsupported {
                         return unsupported;
+                    }
+                    if self.behaviour == Behaviour::Unavailable {
+                        return unavailable;
                     }
                     self.watch = request.watch.then(|| request.range());
                     Some(ListingsBody::ChangesResponse(self.changes(&request)))
@@ -2728,6 +2790,9 @@ pub(crate) mod tests {
                 ListingsBody::RangeListRequest(request) => {
                     if self.behaviour == Behaviour::Unsupported {
                         return unsupported;
+                    }
+                    if self.behaviour == Behaviour::Unavailable {
+                        return unavailable;
                     }
                     Some(ListingsBody::RangeListResponse(self.range_list(&request)))
                 }
@@ -3372,6 +3437,54 @@ pub(crate) mod tests {
         // Its feed is tried again after the interval.
         poll(&mut feeds, &net, &nodes, NOW + V2_PASS_INTERVAL.as_secs()).await;
         assert_eq!(kinds(&net.take_asked(&a)), ["changes", "list"]);
+    }
+
+    #[tokio::test]
+    async fn a_node_whose_feed_cant_be_read_is_read_the_old_way() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        let mut feeds = Feeds::open(&store).unwrap();
+        let a = peer(1);
+        let listings: Vec<Listing> = (0..10)
+            .map(|n| listing(address(n), 1_791_324_000))
+            .collect();
+        let served: Vec<DigestEntry> = listings.iter().map(DigestEntry::new).collect();
+        let mut node = FakeNode::serving(Behaviour::Honest, served);
+        for listing in &listings {
+            node.listings.insert(listing.key(), listing.clone());
+        }
+        let net = FakeNet::with(vec![(a, node)]);
+        let nodes = [feed_node(a)];
+        poll(&mut feeds, &net, &nodes, NOW).await;
+        assert!(feeds.read(&a).unwrap().counts);
+        net.take_asked(&a);
+
+        // Its feed can't be read any more, as until it starts again, but it
+        // still serves listings v2 requests: once its feed requests are
+        // answered only with errors, it is read the old way, that round.
+        net.node(&a, |node| node.behaviour = Behaviour::Unavailable);
+        poll(&mut feeds, &net, &nodes, NOW + 60).await;
+        assert_eq!(kinds(&net.take_asked(&a)), ["changes", "changes", "list"]);
+        let read = feeds.read(&a).unwrap();
+        assert_eq!(read.kind, ReadKind::V2);
+        assert!(read.fell_back && read.replied && read.answered && read.counts);
+        assert_eq!(feeds.copies(&address(0), &[a]).unwrap().len(), 1);
+        poll(&mut feeds, &net, &nodes, NOW + 120).await;
+        assert_eq!(kinds(&net.take_asked(&a)), ["list"]);
+
+        // Its feed is asked for again once V2_PASS_INTERVAL has passed.
+        net.node(&a, |node| node.behaviour = Behaviour::Honest);
+        poll(
+            &mut feeds,
+            &net,
+            &nodes,
+            NOW + 60 + V2_PASS_INTERVAL.as_secs(),
+        )
+        .await;
+        assert_eq!(kinds(&net.take_asked(&a))[0], "changes");
+        let read = feeds.read(&a).unwrap();
+        assert_eq!(read.kind, ReadKind::Feed);
+        assert!(read.counts);
     }
 
     #[tokio::test]

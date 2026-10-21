@@ -79,7 +79,7 @@ use tokio::time::Instant;
 use tracing::debug;
 
 /// How long to wait for a node to answer a listings request.
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+pub(crate) const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Random lookups made to find nodes beyond those in the routing table.
 const CRAWL_LOOKUPS: usize = 8;

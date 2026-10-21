@@ -26,7 +26,8 @@
 //!    request: the next page of a full pass of its index (a new pass starts
 //!    at most once every [`V2_PASS_INTERVAL`]), or between passes a read
 //!    from the key after the newest listing seen from it. A node that claims
-//!    the release but doesn't answer one is read the v2 way.
+//!    the release but doesn't answer one, or answers its feed requests only
+//!    with errors, is read the v2 way.
 //! 3. **Guard.** If fewer than 7 census nodes answered with answers the
 //!    checks took, or under three quarters of them ([`Census::guard_ok`]),
 //!    the cycle decides and drops nothing, and every entry is kept, marked
@@ -168,7 +169,7 @@ use tracing::{debug, info, warn};
 use super::listings::{
     listings_traffic, push_channel, unix_now, Carry, CheckedListing, Decision, ListingChain,
     ListingsIndex, ListingsRequests, PendingCopy, PushReceiver, PushSink, ReadContext,
-    RejectedListing, CHECK_CONCURRENCY,
+    RejectedListing, CHECK_CONCURRENCY, REQUEST_TIMEOUT,
 };
 use super::listings_census::{user_agent_of, Census};
 use super::listings_feeds::{FeedNode, Feeds, PollReport};
@@ -687,7 +688,12 @@ impl Producer {
     /// its files finishes first. After each cycle, and once it stops, the
     /// client's peer cache and adaptive snapshot are saved
     /// ([`Client::save_peer_cache`]), so a restart, even after the process
-    /// was killed, joins through the peers it knew.
+    /// was killed, joins through the peers it knew. Once it stops, it also
+    /// ends its watch on each node read through its feed
+    /// ([`Feeds::unwatch_requests`]), waiting at most a request's timeout
+    /// for the answers: a node keeps only so many watchers, and the next
+    /// start comes back as another reader, which would otherwise wait for
+    /// these watches to lapse.
     ///
     /// # Errors
     ///
@@ -696,8 +702,34 @@ impl Producer {
     pub async fn run(&mut self, cancel: CancellationToken) -> Result<()> {
         let result = self.run_cycles(&cancel).await;
         self.size_job = None;
+        self.end_watches().await;
         self.save_client_state().await;
         result
+    }
+
+    /// End this process's watch on each node read through its feed
+    /// ([`Feeds::unwatch_requests`]), all at once, waiting at most a
+    /// request's timeout for the answers, which change nothing.
+    async fn end_watches(&self) {
+        let Some(requests) = self.requests.as_ref() else {
+            return;
+        };
+        let asks = self.feeds.unwatch_requests();
+        if asks.is_empty() {
+            return;
+        }
+        let count = asks.len();
+        let sent = futures::future::join_all(
+            asks.into_iter()
+                .map(|(peer, body)| async move { requests.ask(&peer, body).await }),
+        );
+        match tokio::time::timeout(REQUEST_TIMEOUT, sent).await {
+            Ok(answers) => debug!(
+                "Ended the watches on {count} nodes: {} answered",
+                answers.iter().filter(|answer| answer.is_some()).count()
+            ),
+            Err(_) => debug!("Ended the watches on {count} nodes: not all answered in time"),
+        }
     }
 
     async fn run_cycles(&mut self, cancel: &CancellationToken) -> Result<()> {
