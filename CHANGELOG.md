@@ -61,9 +61,10 @@ told apart by the commit `darwin --version` prints. Upstream's entries follow.
   the producer's memory doesn't grow with the index, but for a name's shard, built whole (about
   1.6 KB an entry while it is written: one name with about 550,000 entries would take 1 GiB).
   An earlier version can run on the same state, and this one after it again: a deferral's time is
-  kept as Unix seconds alone, its reason in a row of its own (rows kept the earlier way are read
-  and rewritten), and each start makes the order `rejected.json` lists its rows in, and the
-  deferrals' reasons, match the rows an earlier version left.
+  kept as Unix seconds alone, its reason in a row of its own with that time, so a deferral an
+  earlier version ended and began again isn't given the reason of the one before (rows kept the
+  earlier way are read and rewritten), and each start makes the order `rejected.json` lists its
+  rows in, and the deferrals' reasons, match the rows an earlier version left.
 - Envelopes are darwin's default: `darwin file upload`, `darwin manifest create` and the
   library's file upload shortcuts store each upload in an envelope, with its payment record, a
   listing when listed, and a `.record`. The other ways of using the network remain, with no
