@@ -239,9 +239,10 @@ const SHRUNK_CHUNKS: usize = 3;
 
 /// The most bytes of root map read for a file's size: what a map shrunk
 /// once holds in its [`SHRUNK_CHUNKS`] chunks, the root map of a file of up
-/// to about 650 GB. A file whose data map is shrunk more than once, or
-/// whose map declares more, keeps no size: its root map isn't read. The
-/// root maps being read at once hold this much between them at most.
+/// to about 658 GB. A file whose map declares more, or holds more chunks,
+/// keeps no size: its root map isn't read. (Self-encryption labels a map
+/// shrunk more than once as shrunk once: see [`read_root_size`].) The root
+/// maps being read at once hold this much between them at most.
 const MAX_ROOT_MAP_BYTES: usize = SHRUNK_CHUNKS * MAX_CHUNK_SIZE;
 
 /// The store's directory inside the state directory.
@@ -335,6 +336,9 @@ type ListingId = (XorName, [u8; 32]);
 
 /// An address's copies as digest entries, each with its node.
 type DigestCopies = Vec<(PeerId, DigestEntry)>;
+
+/// A range of a table's keys.
+type KeyRange<'a> = (Bound<&'a [u8]>, Bound<&'a [u8]>);
 
 /// An address to decide, the census's nodes nearest it, and the copies of
 /// those whose copies count.
@@ -497,8 +501,8 @@ struct Decided {
 enum SizeRead {
     /// The file's size.
     Sized(u64),
-    /// The map can't give one, however often it is read: malformed, shrunk
-    /// more than once, or more than [`MAX_ROOT_MAP_BYTES`].
+    /// The map can't give one, however often it is read: malformed, or of
+    /// more than [`SHRUNK_CHUNKS`] chunks or [`MAX_ROOT_MAP_BYTES`].
     Never,
     /// It couldn't be read this time: a chunk wasn't handed over.
     Later,
@@ -578,6 +582,10 @@ pub struct Producer {
     removed_between: u64,
     /// The root maps being read, if any.
     size_job: Option<SizeJob>,
+    /// The last row of [`SIZE_WANTED_DB`] the latest reading took: the next
+    /// goes on after it, round to the first, so every row due gets its
+    /// turn, however the rows before it fare.
+    size_after: Option<XorName>,
     /// Room for the root maps being read at once: [`MAX_ROOT_MAP_BYTES`],
     /// in permits of a KiB.
     size_room: Arc<Semaphore>,
@@ -652,6 +660,7 @@ impl Producer {
             published_between: 0,
             removed_between: 0,
             size_job: None,
+            size_after: None,
             size_room: Arc::new(Semaphore::new(MAX_ROOT_MAP_BYTES.div_ceil(1024))),
             started_at: now,
             totals: Totals::default(),
@@ -2290,10 +2299,13 @@ impl Producer {
     /// Start reading the root maps of up to [`SIZES_PER_CYCLE`] listed files
     /// whose sizes aren't known yet ([`read_root_size`]), in a task of its
     /// own, for at most a [`CYCLE`]; unless such a task is still reading, or
-    /// what it read is still to be taken. Each read is marked before it
-    /// begins, so the map isn't read again for [`RETRY_INTERVAL`] unless it
-    /// gives a size: one that couldn't be read, that the end cut short, or
-    /// that a stop of the process cut short waits as long.
+    /// what it read is still to be taken. The files are taken in address
+    /// order, going on after the last one the latest reading took, round to
+    /// the first, so files whose maps keep failing can't keep the others
+    /// from their turn. Each read is marked before it begins, so the map
+    /// isn't read again for [`RETRY_INTERVAL`] unless it gives a size: one
+    /// that couldn't be read, that the end cut short, or that a stop of the
+    /// process cut short waits as long.
     ///
     /// # Errors
     ///
@@ -2308,22 +2320,9 @@ impl Producer {
         let mut due: Vec<(XorName, DataMap)> = Vec::new();
         {
             let mut txn = self.store.env().write_txn().map_err(store_error)?;
-            let mut rows: Vec<(XorName, Vec<u8>)> = Vec::new();
-            for row in self.size_wanted.iter(&txn).map_err(store_error)? {
-                if rows.len() == SIZES_PER_CYCLE {
-                    break;
-                }
-                let (key, value) = row.map_err(store_error)?;
-                let Ok(address) = XorName::try_from(key) else {
-                    continue;
-                };
-                let Some((retry_at, map)) = value.split_first_chunk::<8>() else {
-                    continue;
-                };
-                if u64::from_be_bytes(*retry_at) > now {
-                    continue;
-                }
-                rows.push((address, map.to_vec()));
+            let rows = self.sizes_due(&txn, now)?;
+            if let Some((last, _)) = rows.last() {
+                self.size_after = Some(*last);
             }
             for (address, map) in rows {
                 // A map that can't be decoded never gives a size.
@@ -2370,6 +2369,45 @@ impl Producer {
         });
         self.size_job = Some(SizeJob { results, task });
         Ok(())
+    }
+
+    /// Up to [`SIZES_PER_CYCLE`] rows of [`SIZE_WANTED_DB`] that may be read
+    /// at `now` (Unix seconds), each the address and its data map's bytes:
+    /// from after the last row the latest reading took, round to the first
+    /// and on to that row.
+    ///
+    /// # Errors
+    ///
+    /// If the store can't be read.
+    fn sizes_due(&self, txn: &RoTxn, now: u64) -> Result<Vec<(XorName, Vec<u8>)>> {
+        let after = self.size_after;
+        let ranges: Vec<KeyRange<'_>> = match &after {
+            Some(after) => vec![
+                (Bound::Excluded(&after[..]), Bound::Unbounded),
+                (Bound::Unbounded, Bound::Included(&after[..])),
+            ],
+            None => vec![(Bound::Unbounded, Bound::Unbounded)],
+        };
+        let mut rows: Vec<(XorName, Vec<u8>)> = Vec::new();
+        for range in &ranges {
+            for row in self.size_wanted.range(txn, range).map_err(store_error)? {
+                if rows.len() == SIZES_PER_CYCLE {
+                    return Ok(rows);
+                }
+                let (key, value) = row.map_err(store_error)?;
+                let Ok(address) = XorName::try_from(key) else {
+                    continue;
+                };
+                let Some((retry_at, map)) = value.split_first_chunk::<8>() else {
+                    continue;
+                };
+                if u64::from_be_bytes(*retry_at) > now {
+                    continue;
+                }
+                rows.push((address, map.to_vec()));
+            }
+        }
+        Ok(rows)
     }
 
     /// Take what the root maps `read` gave: keep each size read, and fill it
@@ -3458,6 +3496,13 @@ fn root_size(root: &DataMap) -> Option<u64> {
 /// gives. A map that breaks any of this never gives a size
 /// ([`SizeRead::Never`]); one whose chunk wasn't handed over, or not as its
 /// address says, may later ([`SizeRead::Later`]).
+///
+/// A map shrunk more than once (a file over about 658 GB) comes from
+/// self-encryption (0.36) labelled as shrunk once, and the map in between,
+/// whose chunks are encrypted as a child's, labelled a root: it decodes as
+/// a root map, and gives what self-encryption itself resolves the map to,
+/// the length of the root map shrunk away rather than the file's size.
+/// Such a file can't be downloaded either.
 async fn read_root_size<F, Fut>(map: &DataMap, fetch: F, room: &Semaphore) -> SizeRead
 where
     F: Fn([u8; 32]) -> Fut,
