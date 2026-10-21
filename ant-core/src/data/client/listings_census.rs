@@ -59,8 +59,14 @@
 //!   ([`Census::supports_feed`]), and older ones are read with the listings
 //!   v2 requests.
 //! - **Guard.** A cycle in which fewer than [`NEAREST_NODES`] of the
-//!   census answered, or under three quarters of it, decides and drops
-//!   nothing ([`Census::guard_ok`]).
+//!   census answered, or under three quarters as many as in any of the
+//!   cycles before it that are kept (as many as an index read keeps of its
+//!   recent reads), decides and drops nothing ([`Census::guard_ok`]): an
+//!   index read's guard, counting the nodes that answered the poll as a read
+//!   counts the nodes it finds. A sudden fall, as when the producer is cut
+//!   off from much of the network, stops deciding; a fall that lasts, such
+//!   as nodes whose listings service is down while they still answer
+//!   lookups, stops it only until the cycles kept have all seen it.
 //!
 //! The census is kept in the producer's store
 //! ([`ListingsStore`], databases [`NODES_DB`], [`QUEUE_DB`] and
@@ -74,7 +80,8 @@
 //!    notes each answer ([`Census::record_answer`], [`Census::record_view`],
 //!    and [`Census::note_peers`] for a list of peers asked for after a
 //!    changed view) or miss ([`Census::record_miss`]);
-//! 3. decides only if [`Census::guard_ok`] for the nodes that answered;
+//! 3. decides only if [`Census::guard_ok`] for the nodes that answered, and
+//!    notes how many did ([`Census::note_answered`]);
 //! 4. counts an address's support among [`Census::nearest`];
 //! 5. drops a listing only through [`Census::confirm_drop`];
 //! 6. writes the census ([`Census::save`]) and its status
@@ -98,7 +105,7 @@ use rand::{Rng, SeedableRng};
 use serde::{Deserialize, Serialize};
 use tracing::debug;
 
-use crate::data::client::listings::{unix_now, ListingsRequests};
+use crate::data::client::listings::{unix_now, ListingsRequests, RECENT_READS};
 use crate::data::client::listings_store::{store_error, ListingsStore};
 use crate::data::client::listings_v1::{CensusStatus, SilentNode, VersionCount};
 use crate::data::client::Client;
@@ -139,6 +146,10 @@ pub const META_DB: &str = "census_meta";
 
 /// The key in [`META_DB`] of when every leaf was last closed (Unix seconds).
 const REFRESHED_AT: &str = "refreshed_at";
+
+/// The key in [`META_DB`] of how many census nodes answered each of the
+/// latest cycles, the latest last ([`Census::note_answered`]), as JSON.
+const RECENT_ANSWERED: &str = "recent_answered";
 
 /// What a node's user agent starts with: clients' don't.
 const NODE_AGENT: &str = "node/";
@@ -367,6 +378,34 @@ impl DropCheck {
     }
 }
 
+/// Why a drop wasn't confirmed ([`Census::confirm_drop`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Refusal {
+    /// Why, as text for the log.
+    pub why: String,
+    /// Whether what was heard refuses it: a node asked serves a listing for
+    /// the address, or the witnessed lookup found other nodes nearest it
+    /// than the cycle did. Otherwise only what wasn't heard keeps it: nodes
+    /// that didn't answer, a lookup that failed, or a check made too soon.
+    pub evidence: bool,
+}
+
+impl std::fmt::Display for Refusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.why)
+    }
+}
+
+impl Refusal {
+    /// Kept by what wasn't heard.
+    fn unheard(why: String) -> Self {
+        Self {
+            why,
+            evidence: false,
+        }
+    }
+}
+
 /// The census's nodes in id order, with their leaves: worked out once after
 /// each change to who is in the census.
 #[derive(Debug)]
@@ -430,6 +469,11 @@ pub struct Census {
     /// The ranges closed in full in the current cycle: a drop in one shares
     /// that closing.
     closed_this_cycle: Vec<AddressRange>,
+    /// How many census nodes answered each of the latest cycles, up to
+    /// [`RECENT_READS`] of them, the latest last ([`Self::guard_ok`]).
+    recent_answered: Vec<u64>,
+    /// Whether `recent_answered` changed since the last save.
+    recent_dirty: bool,
 }
 
 impl std::fmt::Debug for Census {
@@ -467,6 +511,14 @@ impl Census {
             }
         }
         let refreshed_at = meta_db.get(&txn, REFRESHED_AT).map_err(store_error)?;
+        // Counts that can't be read are as none: the guard then needs only
+        // its 7 until cycles have been counted again.
+        let recent_answered = meta_db
+            .remap_data_type::<SerdeJson<Vec<u64>>>()
+            .get(&txn, RECENT_ANSWERED)
+            .ok()
+            .flatten()
+            .unwrap_or_default();
         drop(txn);
         Ok(Self {
             store: store.clone(),
@@ -487,6 +539,8 @@ impl Census {
             cycles: 0,
             view_closes: BTreeMap::new(),
             closed_this_cycle: Vec::new(),
+            recent_answered,
+            recent_dirty: false,
         })
     }
 
@@ -788,7 +842,8 @@ impl Census {
     ///
     /// # Errors
     ///
-    /// When the listing stays: why, as text for the log.
+    /// When the listing stays: why, and whether what was heard refuses the
+    /// drop or only what wasn't heard keeps it ([`Refusal`]).
     pub(crate) async fn confirm_drop(
         &mut self,
         client: &Client,
@@ -797,7 +852,7 @@ impl Census {
         key_time: u64,
         expected: &[PeerId],
         last_holders: &[PeerId],
-    ) -> std::result::Result<(), String> {
+    ) -> std::result::Result<(), Refusal> {
         let mut rng = StdRng::from_entropy();
         self.confirm_drop_with(
             &NetworkLookups(client.network()),
@@ -822,24 +877,37 @@ impl Census {
         expected: &[PeerId],
         last_holders: &[PeerId],
         rng: &mut StdRng,
-    ) -> std::result::Result<(), String> {
+    ) -> std::result::Result<(), Refusal> {
         let ask_from = key_time.saturating_add(FIRST_SEEN_ROUNDING + CLOCK_MARGIN);
         if gets.now() < ask_from {
-            return Err(format!(
+            return Err(Refusal::unheard(format!(
                 "too soon: not every node that stored it has keyed it before {ask_from}"
-            ));
+            )));
         }
         let witness = self
             .witness_with(lookups, address, gets.now(), rng)
             .await
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| Refusal::unheard(e.to_string()))?;
         let check = self.drop_check(&witness, expected, last_holders, key_time);
         if let Some(refused) = check.refused {
-            return Err(refused);
+            // A leaf not closed in full is a lookup that failed; a closed
+            // one that gives other nodes refuses it.
+            return Err(Refusal {
+                why: refused,
+                evidence: witness.closed,
+            });
         }
         let asked_at = gets.now();
         let answers = gets.get(address, &check.ask).await;
-        check.verdict(asked_at, &answers)
+        check.verdict(asked_at, &answers).map_err(|why| {
+            let serving = answers
+                .iter()
+                .any(|(peer, served)| *served == Served::Listing && check.ask.contains(peer));
+            Refusal {
+                why,
+                evidence: serving,
+            }
+        })
     }
 
     /// Close every leaf: the whole address space, closed part by part with
@@ -1175,6 +1243,7 @@ impl Census {
             && self.removed.is_empty()
             && !self.refreshed_dirty
             && !self.queue_dirty
+            && !self.recent_dirty
         {
             return Ok(());
         }
@@ -1204,11 +1273,18 @@ impl Census {
                 .put(&mut txn, REFRESHED_AT, &at)
                 .map_err(store_error)?;
         }
+        if self.recent_dirty {
+            self.meta_db
+                .remap_data_type::<SerdeJson<Vec<u64>>>()
+                .put(&mut txn, RECENT_ANSWERED, &self.recent_answered)
+                .map_err(store_error)?;
+        }
         txn.commit().map_err(store_error)?;
         self.dirty.clear();
         self.removed.clear();
         self.refreshed_dirty = false;
         self.queue_dirty = false;
+        self.recent_dirty = false;
         Ok(())
     }
 
@@ -1241,9 +1317,10 @@ impl Census {
     #[must_use]
     pub fn nearest(&self, address: &XorName, n: usize) -> Vec<PeerId> {
         let index = self.index();
-        // Every node in the leaf holding `address` is nearer it than every
-        // node outside, so the leaf's nearest are the census's while the
-        // leaf holds enough of them.
+        // Every node in a range of addresses sharing their leading bits with
+        // `address` is nearer it than every node outside, so the nearest are
+        // those of the narrowest such range holding enough of them: the
+        // leaf holding `address`, or a range around the leaf.
         if let Some(leaf) = leaf_index(&index.leaves, address).map(|at| &index.leaves[at]) {
             if n <= leaf.nodes.len() {
                 let ids: Vec<[u8; 32]> = leaf.nodes.iter().map(|&at| index.ids[at]).collect();
@@ -1251,6 +1328,17 @@ impl Census {
                     .into_iter()
                     .map(|at| index.peers[leaf.nodes[at]])
                     .collect();
+            }
+            let mut range = leaf.range;
+            loop {
+                let span = index.span(&range);
+                if span.len() >= n || range.bits() == 0 {
+                    return nearest_by_distance(address, &index.ids[span.clone()], n)
+                        .into_iter()
+                        .map(|at| index.peers[span.start + at])
+                        .collect();
+                }
+                range = AddressRange::new(range.prefix(), range.bits() - 1);
             }
         }
         nearest_by_distance(address, &index.ids, n)
@@ -1337,12 +1425,30 @@ impl Census {
     }
 
     /// Whether a cycle in which `answered` census nodes answered may decide
-    /// and drop listings: at least [`NEAREST_NODES`] of them, and at
-    /// least three quarters of the census.
+    /// and drop listings: at least [`NEAREST_NODES`] of them, and at least
+    /// three quarters of the most that answered in any of the latest cycles
+    /// noted ([`Self::note_answered`]), as an index read's guard measures
+    /// the nodes it finds against its recent reads'. So a sudden fall stops
+    /// deciding, and one that lasts stops it only until every cycle noted
+    /// has seen it; nodes that answer lookups but not polls, as while their
+    /// listings service is down, don't stop it for good.
     #[must_use]
     pub fn guard_ok(&self, answered: usize) -> bool {
-        answered >= NEAREST_NODES
-            && answered.saturating_mul(4) >= self.nodes.len().saturating_mul(3)
+        let recent = self.recent_answered.iter().copied().max().unwrap_or(0);
+        let answered_count = u64::try_from(answered).unwrap_or(u64::MAX);
+        answered >= NEAREST_NODES && answered_count.saturating_mul(4) >= recent.saturating_mul(3)
+    }
+
+    /// Note that `answered` census nodes answered the latest cycle's poll,
+    /// for the guards of the cycles after it ([`Self::guard_ok`]): the counts
+    /// of the latest [`RECENT_READS`] cycles are kept, across starts too, as
+    /// an index read keeps its recent reads'.
+    pub fn note_answered(&mut self, answered: usize) {
+        self.recent_answered
+            .push(u64::try_from(answered).unwrap_or(u64::MAX));
+        let excess = self.recent_answered.len().saturating_sub(RECENT_READS);
+        self.recent_answered.drain(..excess);
+        self.recent_dirty = true;
     }
 
     /// The census as `status.json` gives it, for a cycle that started at
@@ -2622,7 +2728,7 @@ mod tests {
         for (n, own) in ids.iter().enumerate() {
             census.admit(PeerId::from_bytes(*own), Vec::new(), 0);
             if n % 50 == 49 {
-                for n in [1, 7, 8, 20, 300] {
+                for n in [1, 7, 8, 20, 21, 50, 300] {
                     for at in 0..40u64 {
                         let address = id(at * 13 + n as u64);
                         let expected: Vec<PeerId> =
@@ -2972,14 +3078,76 @@ mod tests {
         for byte in 0..20u8 {
             census.admit(peer(byte), Vec::new(), 0);
         }
+        // With no cycle noted yet, only the 7.
+        assert!(!census.guard_ok(6));
+        assert!(census.guard_ok(7));
+        census.note_answered(20);
         assert!(!census.guard_ok(14));
         assert!(census.guard_ok(15));
+        // A fall that lasts stops deciding only until every cycle kept has
+        // seen it, as an index read's recent reads.
+        for _ in 1..RECENT_READS {
+            assert!(!census.guard_ok(14));
+            census.note_answered(14);
+        }
+        assert!(!census.guard_ok(14));
+        census.note_answered(14);
+        assert!(census.guard_ok(14));
+        // Kept across opens.
+        census.save().unwrap();
+        drop(census);
+        let census = super::tests::census(dir.path());
+        assert!(census.guard_ok(14));
+        assert!(!census.guard_ok(10));
         let small_dir = tempfile::tempdir().unwrap();
         let mut small = super::tests::census(small_dir.path());
         for byte in 0..6u8 {
             small.admit(peer(byte), Vec::new(), 0);
         }
+        small.note_answered(6);
         assert!(!small.guard_ok(6));
+    }
+
+    #[test]
+    fn nodes_that_answer_lookups_but_never_a_poll_dont_stop_deciding_for_good() {
+        // Fault injection: 7 of 24 census nodes answer lookups but never a
+        // listings poll (their listings service is down, or out of spec).
+        // They stay members, as found answering; the guard measures the
+        // nodes that answer polls against recent cycles', as an index read
+        // measures the nodes it finds, so they hold it shut only for the
+        // cycles kept after they stop at once.
+        let dir = tempfile::tempdir().unwrap();
+        let (mut census, sim) = closed_census(dir.path(), 24, 21);
+        let _ = census.take_changes();
+        let members: Vec<PeerId> = ids(&census).into_iter().collect();
+        assert_eq!(members.len(), 24);
+        let quiet: Vec<PeerId> = members.iter().step_by(3).take(7).copied().collect();
+        let mut now = 100;
+        let mut shut = Vec::new();
+        for cycle in 0..40u64 {
+            run(census.maintain_with(&sim, now, &mut rng(100 + cycle))).unwrap();
+            let change = census.take_changes();
+            assert!(change.left.is_empty(), "cycle {cycle}: nobody leaves");
+            let mut answered = 0;
+            for peer in ids(&census) {
+                // From cycle 5 on, the 7 stop answering polls.
+                if cycle >= 5 && quiet.contains(&peer) {
+                    census.record_miss(&peer);
+                } else {
+                    census.record_answer(&peer, now, None);
+                    answered += 1;
+                }
+            }
+            if !census.guard_ok(answered) {
+                shut.push(cycle);
+            }
+            census.note_answered(answered);
+            now += 60;
+        }
+        // Shut for the cycles kept after the fall, then open for good.
+        let expected: Vec<u64> = (5..5 + RECENT_READS as u64).collect();
+        assert_eq!(shut, expected);
+        assert!(quiet.iter().all(|peer| census.get(peer).is_some()));
     }
 
     /// `GetRequest` answers of a synthetic network: every node serves
@@ -3229,7 +3397,14 @@ mod tests {
                 &[holder],
                 &mut rng,
             ));
-            assert!(confirmation.is_err(), "{peer} {served:?}");
+            // A node serving a listing refuses it; one that didn't answer
+            // only keeps it.
+            let refusal = confirmation.unwrap_err();
+            assert_eq!(
+                refusal.evidence,
+                served == Served::Listing,
+                "{peer} {served:?}"
+            );
         }
 
         // Too soon: nothing is looked up or asked.
@@ -3245,7 +3420,8 @@ mod tests {
             &mut rng,
         ));
         let kept = confirmation.unwrap_err();
-        assert!(kept.contains("too soon"), "{kept}");
+        assert!(kept.why.contains("too soon"), "{kept}");
+        assert!(!kept.evidence);
         assert_eq!(sim.lookups.load(Ordering::Relaxed), lookups);
         assert!(gets.asked().is_empty());
 
@@ -3255,7 +3431,7 @@ mod tests {
         let gets = FakeGets::at(ASK_FROM);
         let confirmation =
             run(census.confirm_drop_with(&sim, &gets, &address, KEY_TIME, &wrong, &[], &mut rng));
-        assert!(confirmation.is_err());
+        assert!(confirmation.unwrap_err().evidence);
         assert!(gets.asked().is_empty());
 
         // The lookup fails: kept.
@@ -3271,7 +3447,7 @@ mod tests {
             &[],
             &mut rng,
         ));
-        assert!(confirmation.is_err());
+        assert!(!confirmation.unwrap_err().evidence);
     }
 
     #[test]
