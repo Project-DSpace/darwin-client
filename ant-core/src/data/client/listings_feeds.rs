@@ -1149,7 +1149,8 @@ struct NodeState {
     /// only with errors, or answered none when nothing of its feed was known
     /// (Unix seconds).
     feed_refused_at: Option<u64>,
-    /// Whether its copies counted in the last round.
+    /// Whether its copies counted in the last round, this process's or, for
+    /// its first, the last before it stopped ([`NodeRecord::counted`]).
     counted: bool,
     /// Whether a push since its last round showed its mirror to lag it: its
     /// copies don't count until it is read again ([`Feeds::behind`]).
@@ -1381,6 +1382,7 @@ impl NodeState {
             v2,
             count: Some(self.mirror.len()),
             set_hash,
+            counted: self.counted,
         }
     }
 }
@@ -1409,6 +1411,14 @@ struct NodeRecord {
     /// hex.
     #[serde(default)]
     set_hash: Option<String>,
+    /// Whether its copies counted in its last round. After a restart, its
+    /// copies starting or ceasing to count is reckoned from this, so a node
+    /// whose copies counted before the stop and count again doesn't make
+    /// every address it holds pending: deciding every address again after a
+    /// start is the producer's sweep. A record without it counts as not
+    /// counting.
+    #[serde(default)]
+    counted: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1478,7 +1488,7 @@ impl NodeRecord {
             want_peers: false,
             claims_feed: self.kind == ReadKind::Feed,
             feed_refused_at: self.feed_refused_at,
-            counted: false,
+            counted: self.counted,
             behind: false,
             answered: false,
             errored: false,
@@ -3088,9 +3098,90 @@ pub(crate) mod tests {
         assert_eq!((request.epoch, request.after), (7, head));
         assert!(net.mirrored(&feeds, &a));
         assert!(feeds.read(&a).unwrap().counts);
-        // Its copies count again after the restart: every address it holds
-        // is pending, to be decided afresh.
-        assert_eq!(feeds.pending_set().len(), 301);
+        // Its copies counted before the stop and count again: what wasn't
+        // settled, and what changed, are pending, not every address it holds.
+        assert_eq!(feeds.pending_set().len(), 201);
+        assert!(feeds.is_pending(&address(5_000)).unwrap());
+    }
+
+    #[tokio::test]
+    async fn after_a_restart_only_nodes_whose_copies_start_or_stop_counting_make_their_addresses_pending(
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let (a, b) = (peer(1), peer(2));
+        let net = FakeNet::with(vec![
+            (a, FakeNode::serving(Behaviour::Honest, entries(0, 300))),
+            (b, FakeNode::serving(Behaviour::Honest, entries(1_000, 50))),
+        ]);
+        let nodes = [feed_node(a), feed_node(b)];
+        {
+            let store = store(dir.path());
+            let mut feeds = Feeds::open(&store).unwrap();
+            poll(&mut feeds, &net, &nodes, NOW).await;
+            settle_all(&mut feeds);
+            // B misses a poll: its copies stop counting, and every address
+            // it holds is pending.
+            net.node(&b, |node| node.behaviour = Behaviour::Silent);
+            poll(&mut feeds, &net, &nodes, NOW + 60).await;
+            assert!(!feeds.read(&b).unwrap().counts);
+            assert_eq!(feeds.pending_set().len(), 50);
+            settle_all(&mut feeds);
+        }
+
+        // A restart: nothing pending. B answers again, and A serves one more.
+        net.node(&b, |node| node.behaviour = Behaviour::Honest);
+        net.node(&a, |node| node.put(entry(address(5_000), 1)));
+        let store = store(dir.path());
+        let mut feeds = Feeds::open(&store).unwrap();
+        assert!(feeds.pending_set().is_empty());
+        poll(&mut feeds, &net, &nodes, NOW + 120).await;
+        assert!(feeds.read(&a).unwrap().counts && feeds.read(&b).unwrap().counts);
+        // A's copies counted before the stop and still do: only what it
+        // changed is pending. B's start to count again: all it holds.
+        let mut expected: BTreeSet<XorName> = (1_000..1_050).map(address).collect();
+        expected.insert(address(5_000));
+        assert_eq!(feeds.pending_set(), expected);
+    }
+
+    #[tokio::test]
+    async fn a_stop_ends_the_watch_on_each_node_read_through_its_feed() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        let mut feeds = Feeds::open(&store).unwrap();
+        let (a, b) = (peer(1), peer(2));
+        let net = FakeNet::with(vec![
+            (a, FakeNode::serving(Behaviour::Honest, entries(0, 20))),
+            (b, FakeNode::listing(Behaviour::Honest, Vec::new())),
+        ]);
+        let nodes = [feed_node(a), v2_node(b)];
+        poll(&mut feeds, &net, &nodes, NOW).await;
+        // A is watched: what it stores next is pushed.
+        net.node(&a, |node| node.put(entry(address(500), 1)));
+        assert_eq!(
+            net.node(&a, |node| std::mem::take(&mut node.pushes)).len(),
+            1
+        );
+        poll(&mut feeds, &net, &nodes, NOW + 60).await;
+        let head = net.node(&a, |node| node.head);
+
+        // B, read with v2 requests, has no watch to end.
+        let unwatch = feeds.unwatch_requests();
+        assert_eq!(unwatch.len(), 1);
+        let (peer, body) = &unwatch[0];
+        assert_eq!(*peer, a);
+        let ListingsBody::ChangesRequest(request) = body else {
+            panic!("{body:?}");
+        };
+        assert!(!request.watch && !request.want_peers);
+        assert_eq!((request.epoch, request.after), (7, head));
+        assert_eq!(request.range(), AddressRange::ALL);
+        // Sent, it ends the watch: nothing more is pushed.
+        assert!(matches!(
+            net.ask(peer, body.clone()).await,
+            Some(ListingsBody::ChangesResponse(_))
+        ));
+        net.node(&a, |node| node.put(entry(address(501), 1)));
+        assert!(net.node(&a, |node| node.pushes.is_empty()));
     }
 
     #[tokio::test]
