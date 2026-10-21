@@ -4868,9 +4868,9 @@ mod tests {
     fn rejections_changed_by_a_version_without_their_order_are_ordered_at_the_next_open() {
         // The producer rolled back to a version that keeps the rejections
         // without their order rows, and forward again. That version cleared
-        // one rejection and set a new one, so their count is as it was,
-        // moved one in key order, changed one in place, and set one with no
-        // key. The next open makes the order the rows' own again, and
+        // two rejections and set two new ones, one with no key, so their
+        // count is as it was; it moved one in key order, and changed one in
+        // place. The next open makes the order the rows' own again, and
         // rejected.json lists every row, in key order, once.
         let mut f = Fixture::new();
         let rejected = (0..50u64)
@@ -4894,6 +4894,7 @@ mod tests {
             &f,
             &[
                 RejectedChange::Clear(address(7)),
+                RejectedChange::Clear(address(9)),
                 RejectedChange::Set(Box::new(deferral(500, 1_790_000_000))),
                 RejectedChange::Set(Box::new(moved.clone())),
                 RejectedChange::Set(Box::new(in_place.clone())),
@@ -4913,7 +4914,7 @@ mod tests {
             txn.commit().unwrap();
         }
         let (kept, given) = order_rows(&f);
-        assert_eq!((kept.len(), given.len()), (50, 51));
+        assert_eq!((kept.len(), given.len()), (50, 50));
         assert_ne!(kept, given);
 
         f.reopen();
@@ -4929,22 +4930,24 @@ mod tests {
         });
         assert_lists_built_whole(&f);
         let after: Rejected = f.file(REJECTED_FILE);
-        assert_eq!(after.listings.len(), 50);
+        assert_eq!(after.listings.len(), 49);
         let addresses: BTreeSet<&str> = after
             .listings
             .iter()
             .map(|row| row.listing.address.as_str())
             .collect();
-        assert_eq!(addresses.len(), 50);
+        assert_eq!(addresses.len(), 49);
         assert!(addresses.contains(hex::encode(address(500)).as_str()));
-        assert!(!addresses.contains(hex::encode(address(7)).as_str()));
+        for gone in [7, 8, 9] {
+            assert!(!addresses.contains(hex::encode(address(gone)).as_str()));
+        }
         assert!(after.listings.contains(&moved));
         assert!(after.listings.contains(&in_place));
         assert_eq!(after.listings[0], keyless);
         assert_eq!(after.listings.last(), Some(&moved));
         // Opened again with nothing changed, the order rows stay as they are.
         let (kept, given) = order_rows(&f);
-        assert_eq!((kept.len(), &kept), (50, &given));
+        assert_eq!((kept.len(), &kept), (49, &given));
         f.reopen();
         assert_eq!(order_rows(&f), (kept, given));
     }
