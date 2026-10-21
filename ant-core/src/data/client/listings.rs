@@ -116,8 +116,10 @@ const WALK_PHASE_MAX: Duration = Duration::from_secs(30 * 60);
 const ENVELOPE_HEDGE: Duration = Duration::from_secs(1);
 
 /// How many recent reads' node counts [`WalkState`] keeps: a read that finds
-/// far fewer nodes than recent ones decides nothing.
-const RECENT_READS: usize = 10;
+/// far fewer nodes than recent ones decides nothing. The producer's census
+/// keeps as many cycles' counts of the nodes that answered, for the same
+/// guard.
+pub(crate) const RECENT_READS: usize = 10;
 
 /// How many nodes nearest an address count for its listing.
 pub const NEAREST_NODES: usize = CLOSE_GROUP_SIZE;
@@ -1604,21 +1606,38 @@ pub(crate) const PUSHES_WAITING_PER_NODE: usize = WALK_FREE_LISTINGS / MAX_LIST_
 /// How many pushes from each node wait to be taken.
 type PushesWaiting = Arc<Mutex<HashMap<PeerId, usize>>>;
 
+/// The nodes a push from which was dropped since they were last taken.
+type PushesDropped = Arc<Mutex<BTreeSet<PeerId>>>;
+
 /// Where pushes from nodes' watches go, each with the node it came from: a
 /// channel of a fixed size, of which each node may fill at most
 /// [`PUSHES_WAITING_PER_NODE`]. The router never waits for room: a push that
 /// doesn't fit is dropped, as pushes may be, and the next `ChangesRequest` to
-/// the node catches up. Made with [`push_channel`].
+/// the node catches up. The node it came from is noted
+/// ([`PushReceiver::take_dropped`]): its mirror lacks a record it holds
+/// until then. Made with [`push_channel`].
 pub(crate) struct PushSink {
     sender: tokio::sync::mpsc::Sender<(PeerId, ChangesResponse)>,
     waiting: PushesWaiting,
+    dropped: PushesDropped,
 }
 
 impl PushSink {
     /// Queue `push` from `source`, unless the channel is full or `source`
     /// already has [`PUSHES_WAITING_PER_NODE`] pushes waiting. Returns
-    /// whether it was queued.
+    /// whether it was queued; one that isn't is dropped, and `source` noted
+    /// as having had one dropped.
     pub(crate) fn offer(&self, source: PeerId, push: ChangesResponse) -> bool {
+        let queued = self.queue(source, push);
+        if !queued {
+            if let Ok(mut dropped) = self.dropped.lock() {
+                dropped.insert(source);
+            }
+        }
+        queued
+    }
+
+    fn queue(&self, source: PeerId, push: ChangesResponse) -> bool {
         let Ok(mut waiting) = self.waiting.lock() else {
             return false;
         };
@@ -1643,9 +1662,20 @@ impl PushSink {
 pub struct PushReceiver {
     receiver: tokio::sync::mpsc::Receiver<(PeerId, ChangesResponse)>,
     waiting: PushesWaiting,
+    dropped: PushesDropped,
 }
 
 impl PushReceiver {
+    /// The nodes a push from which was dropped, for want of room, since this
+    /// was last called: each holds a record its mirror lacks until it is
+    /// read again.
+    pub fn take_dropped(&mut self) -> BTreeSet<PeerId> {
+        self.dropped
+            .lock()
+            .map(|mut dropped| std::mem::take(&mut *dropped))
+            .unwrap_or_default()
+    }
+
     /// The next push, waiting for one; `None` once no sink is left.
     pub async fn recv(&mut self) -> Option<(PeerId, ChangesResponse)> {
         let push = self.receiver.recv().await?;
@@ -1676,12 +1706,18 @@ impl PushReceiver {
 pub(crate) fn push_channel(capacity: usize) -> (PushSink, PushReceiver) {
     let (sender, receiver) = tokio::sync::mpsc::channel(capacity);
     let waiting = PushesWaiting::default();
+    let dropped = PushesDropped::default();
     (
         PushSink {
             sender,
             waiting: Arc::clone(&waiting),
+            dropped: Arc::clone(&dropped),
         },
-        PushReceiver { receiver, waiting },
+        PushReceiver {
+            receiver,
+            waiting,
+            dropped,
+        },
     )
 }
 
@@ -2425,6 +2461,28 @@ pub struct ListingChain {
     /// Where envelopes and chain facts are kept, if anywhere
     /// ([`Self::with_store`]).
     facts: Option<Facts>,
+    /// How far each search for a quote's payments that found none went,
+    /// through final blocks, so a search made again goes on from there
+    /// ([`Self::fetch`]). Only with a store, which says which blocks are
+    /// final; in memory, for this reader's life.
+    searched: Mutex<HashMap<SearchKey, Searched>>,
+}
+
+/// What a search for a quote's payments looks through: the quote's hash,
+/// and the search's `search_from`, `not_after` and shown block timestamp
+/// ([`ListingChain::fetch`]).
+type SearchKey = ([u8; 32], u64, Option<u64>, Option<u64>);
+
+/// How far a search for a quote's payments that found none went
+/// ([`ListingChain::search_quote_logs`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Searched {
+    /// The last block searched forwards from the quote's time, with every
+    /// block before it from there: none of them holds a payment of the
+    /// quote. Final blocks only, once kept: a final block can't gain one.
+    through: Option<u64>,
+    /// Whether the search back from the quote's time was made.
+    back: bool,
 }
 
 /// A fact a lookup read, to be confirmed by another provider before it is
@@ -2577,6 +2635,7 @@ impl ListingChain {
             vault_first_payment_time: None,
             known_blocks: Mutex::new(BTreeMap::new()),
             facts: None,
+            searched: Mutex::new(HashMap::new()),
         })
     }
 
@@ -2848,7 +2907,14 @@ impl ListingChain {
     /// time are found as darwin-node finds them: between the nearest blocks
     /// already read, guessed from their timestamps. A quote's payments, once
     /// found and final, are kept with a store, and the search is not made
-    /// again: the vault records a quote's payment once.
+    /// again: the vault records a quote's payment once. With a store, a
+    /// search that found none is kept, for this reader's life, as far as it
+    /// went through final blocks, which can't gain a payment: searched
+    /// again, as each time a listing whose payment isn't on the chain yet is
+    /// decided again, it goes on forwards from there through the blocks
+    /// since, and doesn't look back from the quote's time again. So a
+    /// payment that lands later is found as soon as it does, and a quote
+    /// paid nowhere costs a log query or two a time, not a search.
     ///
     /// # Errors
     ///
@@ -2889,8 +2955,24 @@ impl ListingChain {
                                 (at_log_index(seen.clone(), shown.log_index), seen)
                             }
                             None => {
-                                self.search_quote_logs(&topics, search_from, not_after, shown)
-                                    .await?
+                                let key =
+                                    (quote_hash, search_from, not_after, shown.block_timestamp);
+                                let before = self.searched_before(&key);
+                                let (logs, seen, searched) = self
+                                    .search_quote_logs(
+                                        &topics,
+                                        search_from,
+                                        not_after,
+                                        shown,
+                                        before,
+                                    )
+                                    .await?;
+                                if seen.is_empty() {
+                                    self.keep_searched(key, searched).await;
+                                } else {
+                                    self.forget_searched(&key);
+                                }
+                                (logs, seen)
                             }
                         };
                         if let Some(facts) = &self.facts {
@@ -3490,21 +3572,28 @@ impl ListingChain {
 
     /// The payments of a quote that could be the one a listing showing
     /// `shown` describes, searched for from the block at `search_from`, or in
-    /// the blocks of the shown timestamp (see [`Self::fetch`]); and every
+    /// the blocks of the shown timestamp (see [`Self::fetch`]); every
     /// payment of the quote the search's log queries came across, at any log
-    /// index.
+    /// index; and how far it went. A search made before that found none
+    /// (`before`) is gone on with: forwards from the block after the last it
+    /// searched, and not back from the quote's time once that was done.
     async fn search_quote_logs(
         &self,
         topics: &[Option<[u8; 32]>; 4],
         search_from: u64,
         not_after: Option<u64>,
         shown: &ListingPayment,
-    ) -> std::result::Result<(Vec<VaultLog>, Vec<VaultLog>), String> {
+        before: Option<Searched>,
+    ) -> std::result::Result<(Vec<VaultLog>, Vec<VaultLog>, Searched), String> {
         let mut seen = Vec::new();
+        let mut searched = before.unwrap_or(Searched {
+            through: None,
+            back: false,
+        });
         let latest = self.latest_block().await?;
         let (first, last) = if let Some(time) = shown.block_timestamp {
             let Some(blocks) = self.blocks_at(time, latest).await? else {
-                return Ok((Vec::new(), seen));
+                return Ok((Vec::new(), seen, searched));
             };
             blocks
         } else {
@@ -3515,10 +3604,13 @@ impl ListingChain {
             (self.block_at(search_from, last).await?, last)
         };
         let mut budget = MAX_LOG_CALLS;
-        let mut range = last - first + 1;
+        // Forwards from the quote's time, or from where a search before
+        // stopped: the blocks it searched hold none.
+        let mut from = searched
+            .through
+            .map_or(first, |through| first.max(through.saturating_add(1)));
+        let mut range = last.saturating_sub(from).saturating_add(1);
         let mut narrowed = false;
-        // Forwards from the quote's time.
-        let mut from = first;
         while from <= last && budget > 0 {
             let to = from.saturating_add(range - 1).min(last);
             budget -= 1;
@@ -3527,8 +3619,9 @@ impl ListingChain {
                     seen.extend(logs.iter().copied());
                     let logs = at_log_index(logs, shown.log_index);
                     if !logs.is_empty() {
-                        return Ok((logs, seen));
+                        return Ok((logs, seen, searched));
                     }
+                    searched.through = Some(to);
                     match to.checked_add(1) {
                         Some(next) => from = next,
                         None => break,
@@ -3542,14 +3635,16 @@ impl ListingChain {
                 Err(e) => return Err(e),
             }
         }
-        if shown.block_timestamp.is_some() {
-            // The payment is in one of those blocks, or not on chain.
-            return Ok((Vec::new(), seen));
+        if shown.block_timestamp.is_some() || searched.back || budget == 0 {
+            // With a timestamp, the payment is in one of those blocks, or
+            // not on chain; otherwise the search back was made already, or
+            // there is no budget left for it this time.
+            return Ok((Vec::new(), seen, searched));
         }
         // The quote's time is its signer's word: look back from it too, as
         // widely as the chain allows.
         if !narrowed {
-            range = range.max(BACK_LOG_RANGE);
+            range = range.max(last - first + 1).max(BACK_LOG_RANGE);
         }
         let mut to = first;
         while to > 0 && budget > 0 {
@@ -3561,7 +3656,7 @@ impl ListingChain {
                     seen.extend(logs.iter().copied());
                     let logs = at_log_index(logs, shown.log_index);
                     if !logs.is_empty() {
-                        return Ok((logs, seen));
+                        return Ok((logs, seen, searched));
                     }
                     to = from_block;
                 }
@@ -3572,7 +3667,47 @@ impl ListingChain {
                 Err(e) => return Err(e),
             }
         }
-        Ok((Vec::new(), seen))
+        searched.back = true;
+        Ok((Vec::new(), seen, searched))
+    }
+
+    /// How far a search for `key` that found none went before, if one did
+    /// ([`Self::keep_searched`]).
+    fn searched_before(&self, key: &SearchKey) -> Option<Searched> {
+        self.searched
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(key)
+            .copied()
+    }
+
+    /// Keep how far a search for `key` that found none went, through final
+    /// blocks only: what it searched past the finalized block may yet gain
+    /// a payment, and is searched again. Nothing is kept without a store,
+    /// which says which block is final.
+    async fn keep_searched(&self, key: SearchKey, mut searched: Searched) {
+        if self.facts.is_none() {
+            return;
+        }
+        if let Some(through) = searched.through {
+            let Some(finalized) = self.finalized_for(through).await else {
+                return;
+            };
+            searched.through = Some(through.min(finalized));
+        }
+        self.searched
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(key, searched);
+    }
+
+    /// Forget a search for `key` that found none: one found a payment of
+    /// its quote, which is held with the quote's facts from now on.
+    fn forget_searched(&self, key: &SearchKey) {
+        self.searched
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(key);
     }
 
     /// The vault's logs matching `topics` (`None` = any) in blocks
@@ -7076,6 +7211,76 @@ mod tests {
         assert_eq!(chain.fetch(&lookup, &elsewhere).await.unwrap(), Vec::new());
         assert_eq!(calls(&first), before_first);
         assert_eq!(calls(&second), before_second);
+    }
+
+    #[tokio::test]
+    async fn a_quote_paid_nowhere_is_searched_on_from_where_the_last_search_stopped() {
+        // Fault injection: a listing showing only its quote, whose payment
+        // isn't on the chain (never paid, or a provider that hasn't indexed
+        // it), decided again every cycle. A search after the first goes on
+        // forwards from the last final block the one before searched, and
+        // doesn't look back from the quote's time again: a log query, not a
+        // whole search. A payment that lands later is found as soon as it
+        // does.
+        let (quote, mut receipt) = paid_receipt();
+        let mut mock = MockChain::with_blocks(1_000, PAST);
+        mock.finalized = Some(900);
+        let mock = Arc::new(Mutex::new(mock));
+        let dir = tempfile::tempdir().unwrap();
+        let store = test_store(dir.path());
+        let chain = reader(serve(Arc::clone(&mock)).await)
+            .unpaced()
+            .with_store(&store)
+            .unwrap();
+        let lookup = Lookup::Quote {
+            quote_hash: quote.hash().0,
+            block_number: None,
+            search_from: PAST + 400,
+            not_after: None,
+        };
+        let shown = ListingPayment {
+            log_index: Some(4),
+            ..ListingPayment::default()
+        };
+        let log_queries = || mock.lock().unwrap().calls_to("eth_getLogs");
+        assert_eq!(chain.fetch(&lookup, &shown).await.unwrap(), Vec::new());
+        // Forwards from the quote's time, then back from it.
+        assert_eq!(log_queries(), 2);
+        for _ in 0..3 {
+            let before = log_queries();
+            assert_eq!(chain.fetch(&lookup, &shown).await.unwrap(), Vec::new());
+            // The blocks after the finalized one it went through, forwards.
+            assert_eq!(log_queries() - before, 1);
+        }
+        // The payment lands in a block after them all: found at once.
+        {
+            let mut mock = mock.lock().unwrap();
+            for number in 1_000..1_100 {
+                mock.blocks.insert(number, PAST + number * 2);
+            }
+            receipt.block_number = 1_050;
+            mock.add_receipt(receipt.clone());
+        }
+        let before = log_queries();
+        assert_eq!(
+            chain.fetch(&lookup, &shown).await.unwrap(),
+            vec![(Some(receipt), Some(PAST + 2_100))]
+        );
+        assert_eq!(log_queries() - before, 1);
+        // Without a store, which says which blocks are final, every search
+        // is made whole, as before.
+        let unkept = reader(serve(Arc::clone(&mock)).await).unpaced();
+        let other = Lookup::Quote {
+            quote_hash: [0xce; 32],
+            block_number: None,
+            search_from: PAST + 400,
+            not_after: None,
+        };
+        for _ in 0..2 {
+            let before = log_queries();
+            assert_eq!(unkept.fetch(&other, &shown).await.unwrap(), Vec::new());
+            assert_eq!(log_queries() - before, 2);
+        }
     }
 
     #[tokio::test]
