@@ -113,8 +113,11 @@
 //! about: a push that brings a mirror to the node's new head is applied
 //! ([`Feeds::push`]), and the addresses it changes are decided and
 //! published at once, after the guard of the latest cycle, with that
-//! cycle's `status.json`; one near a node whose push came behind its mirror
-//! waits for the next cycle ([`Feeds::behind`]). A node can have only so
+//! cycle's `status.json`: only those, a batch at a time until the next
+//! cycle is due, at least a batch, so what else waits to be decided, or
+//! what doesn't fit, is left to the cycles' bounded passes. One near a node
+//! whose push came behind its mirror waits for the next cycle
+//! ([`Feeds::behind`]). A node can have only so
 //! many pushes waiting (`PUSHES_WAITING_PER_NODE`, in `listings`). Pushes
 //! that come during a cycle's poll are decided with the cycle, so while a
 //! node is slow to answer the poll, they wait for it, and while a sweep
@@ -322,7 +325,8 @@ pub struct CycleReport {
     pub considered: u64,
     /// Pushes taken between the previous cycle and this one.
     pub pushes_between: u64,
-    /// Publications those pushes led to.
+    /// Publications made between the previous cycle and this one: for
+    /// pushes taken, or sizes filled in.
     pub published_between: u64,
 }
 
@@ -437,7 +441,7 @@ impl DropBackoff {
     }
 }
 
-/// Which addresses a cycle, or what pushes changed, works on.
+/// Which addresses a cycle works on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Source {
     /// Every address a mirror holds, that is published, has a row in
@@ -569,6 +573,9 @@ pub struct Producer {
     pushes_between: u64,
     /// Publications made between cycles since the latest one.
     published_between: u64,
+    /// Entries those publications removed: counted into the next cycle's
+    /// `status.json`, as a cycle that found them gone would count them.
+    removed_between: u64,
     /// The root maps being read, if any.
     size_job: Option<SizeJob>,
     /// Room for the root maps being read at once: [`MAX_ROOT_MAP_BYTES`],
@@ -643,6 +650,7 @@ impl Producer {
             published_second: now,
             pushes_between: 0,
             published_between: 0,
+            removed_between: 0,
             size_job: None,
             size_room: Arc::new(Semaphore::new(MAX_ROOT_MAP_BYTES.div_ceil(1024))),
             started_at: now,
@@ -941,6 +949,8 @@ impl Producer {
             self.decided_all_at = None;
             self.sweep = None;
         }
+        // Removals published between cycles count with this cycle's.
+        tally.removed += std::mem::take(&mut self.removed_between);
         // A cycle that decides nothing counts no decision, as an index read
         // that finds too few nodes counts none.
         let decided = if guard_ok { self.standing } else { 0 };
@@ -1086,11 +1096,7 @@ impl Producer {
     }
 
     /// The next batch of `source` after `after` ([`Self::next_batch`]), with
-    /// the address to go on from and whether it was the last. Between
-    /// cycles (`Source::Pending { again: false }`), an address one of whose
-    /// nearest nodes' mirrors a push showed to lag the node is left out,
-    /// pending, for the next cycle to decide once the node is read again
-    /// ([`Feeds::behind`]).
+    /// the address to go on from and whether it was the last.
     ///
     /// # Errors
     ///
@@ -1103,33 +1109,17 @@ impl Producer {
         let batch = self.next_batch(source, after)?;
         let last = batch.last().map(|(address, _)| *address);
         let done = batch.len() < DECIDE_BATCH;
-        let batch = if source == (Source::Pending { again: false }) && self.feeds.any_behind() {
-            batch
-                .into_iter()
-                .filter(|(address, _)| {
-                    !self
-                        .census
-                        .nearest(address, NEAREST_NODES)
-                        .iter()
-                        .any(|peer| self.feeds.behind(peer))
-                })
-                .collect()
-        } else {
-            batch
-        };
         Ok((batch, last, done))
     }
 
     /// Decide every address of `source`, a batch at a time
-    /// ([`Self::decide_batch`]). With `drops`, published addresses no node
-    /// serves any more are checked for dropping, within its time. With
-    /// `alert`, a change no input explains is logged. What is published is
-    /// counted into `tally`. Returns how many addresses were decided, and
-    /// whether any batch staged a change.
+    /// ([`Self::decide_batch`]), whatever the time: for tests. Returns how
+    /// many addresses were decided, and whether any batch staged a change.
     ///
     /// # Errors
     ///
     /// If the store can't be read or written.
+    #[cfg(test)]
     async fn decide_all(
         &mut self,
         source: Source,
@@ -1157,9 +1147,11 @@ impl Producer {
     /// Decide `batch`, addresses each with whether a change of its inputs
     /// explains deciding it ([`Self::next_batch`]): decided
     /// ([`Self::decide`]), its publication staged at `at`
-    /// ([`Publisher::stage`]) and what it decided kept ([`Self::keep`]). See
-    /// [`Self::decide_all`] for `drops`, `alert` and `tally`. Returns
-    /// whether it staged a change.
+    /// ([`Publisher::stage`]) and what it decided kept ([`Self::keep`]).
+    /// With `drops`, published addresses no node serves any more are checked
+    /// for dropping, within its time. With `alert`, a change no input
+    /// explains is logged. What is published is counted into `tally`.
+    /// Returns whether it staged a change.
     ///
     /// # Errors
     ///
@@ -1200,7 +1192,7 @@ impl Producer {
     /// Decide what changed (`Source::Pending { again: true }`): a batch at a
     /// time in address order, from where the latest cycle's pass stopped,
     /// past the last address round to the first and on to there, until
-    /// `until`, at least a batch, as [`Self::decide_all`] decides one. A
+    /// `until`, at least a batch, each as [`Self::decide_batch`] decides it. A
     /// pass cut short is gone on with by the next cycle, so every address
     /// in it comes in turn, however much changed. Returns how many
     /// addresses it decided.
@@ -1253,7 +1245,7 @@ impl Producer {
     /// Go on with the sweep under way, if any, until `until`, at least a
     /// batch: each batch of every address ([`Source::All`]) from where it
     /// stopped, its full listings fetched, then decided at `at` as
-    /// [`Self::decide_all`] decides one, but for the addresses this cycle
+    /// [`Self::decide_batch`] decides one, but for the addresses this cycle
     /// decided already. A sweep that reaches the last address is done:
     /// every address has been decided again since it began. Returns how many
     /// addresses it decided.
@@ -2179,10 +2171,13 @@ impl Producer {
     }
 
     /// Take `first`, a push from a node's watch, and every other push that
-    /// comes before the latest publication's second is out; decide what they
-    /// changed at once, after the latest cycle's guard, fetching what it
-    /// needs until `deadline`, and publish it with the latest cycle's
-    /// `status.json`.
+    /// comes before the latest publication's second is out; decide the
+    /// addresses they changed at once, after the latest cycle's guard,
+    /// fetching what they need, until `deadline` ([`Self::decide_pushed`]),
+    /// and publish it with the latest cycle's `status.json`. Only those
+    /// addresses: any other address waiting to be decided, such as what the
+    /// latest cycle had no time for, is left to the next cycle, so the time
+    /// this takes follows what the pushes changed, not what waits.
     ///
     /// # Errors
     ///
@@ -2192,13 +2187,14 @@ impl Producer {
         first: (PeerId, ChangesResponse),
         deadline: Instant,
     ) -> Result<()> {
-        let mut applied = self.take_push(first)?;
+        let mut changed: BTreeSet<XorName> = BTreeSet::new();
+        self.take_push(first, &mut changed)?;
         wait_past(self.published_second).await;
         while let Some(push) = self.pushes.try_recv() {
-            applied |= self.take_push(push)?;
+            self.take_push(push, &mut changed)?;
         }
         self.feeds.save()?;
-        if !applied {
+        if changed.is_empty() {
             return Ok(());
         }
         let Some(status) = self.last_status.clone() else {
@@ -2208,32 +2204,87 @@ impl Producer {
             return Ok(());
         }
         let at = unix_now();
-        let source = Source::Pending { again: false };
-        Box::pin(self.fetch_for(source, deadline)).await?;
         let mut tally = Tally::default();
-        let (_, staged) = Box::pin(self.decide_all(source, at, None, false, &mut tally)).await?;
+        let (decided, staged) =
+            Box::pin(self.decide_pushed(&changed, at, deadline, &mut tally)).await?;
         if staged {
             self.write_spaced(at, &status).await?;
             self.published_between += 1;
-            debug!(
-                "Published what pushes changed: {} put, {} removed",
-                tally.put, tally.removed
-            );
+            // Counted with the next cycle's, as a read would count them.
+            self.removed_between += tally.removed;
         }
+        debug!(
+            "Pushes changed {} addresses: {decided} decided, {} put, {} removed",
+            changed.len(),
+            tally.put,
+            tally.removed
+        );
         Ok(())
     }
 
-    /// Take one push: whether it was applied to its node's mirror.
+    /// Take one push, and if it was applied to its node's mirror, note the
+    /// addresses it changed in `changed`.
     ///
     /// # Errors
     ///
     /// If the store can't be written.
-    fn take_push(&mut self, (source, push): (PeerId, ChangesResponse)) -> Result<bool> {
+    fn take_push(
+        &mut self,
+        (source, push): (PeerId, ChangesResponse),
+        changed: &mut BTreeSet<XorName>,
+    ) -> Result<()> {
         self.pushes_between += 1;
-        Ok(matches!(
-            self.feeds.push(&self.census, &source, &push)?,
-            Pushed::Applied(_)
-        ))
+        if let Pushed::Applied(addresses) = self.feeds.push(&self.census, &source, &push)? {
+            changed.extend(addresses);
+        }
+        Ok(())
+    }
+
+    /// Decide `addresses`, those pushes changed between cycles, at `at`: a
+    /// batch of [`DECIDE_BATCH`] at a time in address order, each batch's
+    /// full listings fetched first ([`Self::fetch_addresses`]), until
+    /// `deadline`, at least a batch, as [`Self::decide_batch`] decides one,
+    /// without drops. An address one of whose nearest nodes' pushes came
+    /// behind its mirror is left out, for the next cycle to decide once the
+    /// node is read again ([`Feeds::behind`]); so is what doesn't fit before
+    /// `deadline`. Both stay pending. What is published is counted into
+    /// `tally`. Returns how many addresses were decided, and whether any
+    /// batch staged a change.
+    ///
+    /// # Errors
+    ///
+    /// If the store can't be read or written.
+    async fn decide_pushed(
+        &mut self,
+        addresses: &BTreeSet<XorName>,
+        at: u64,
+        deadline: Instant,
+        tally: &mut Tally,
+    ) -> Result<(u64, bool)> {
+        let ready: Vec<XorName> = addresses
+            .iter()
+            .filter(|address| {
+                !self.feeds.any_behind()
+                    || !self
+                        .census
+                        .nearest(address, NEAREST_NODES)
+                        .iter()
+                        .any(|peer| self.feeds.behind(peer))
+            })
+            .copied()
+            .collect();
+        let mut decided = 0;
+        let mut staged = false;
+        for (n, chunk) in ready.chunks(DECIDE_BATCH).enumerate() {
+            if n > 0 && Instant::now() >= deadline {
+                break;
+            }
+            Box::pin(self.fetch_addresses(chunk, deadline)).await?;
+            let batch: Batch = chunk.iter().map(|address| (*address, true)).collect();
+            decided += batch.len() as u64;
+            staged |= Box::pin(self.decide_batch(batch, at, None, false, tally)).await?;
+        }
+        Ok((decided, staged))
     }
 
     /// Start reading the root maps of up to [`SIZES_PER_CYCLE`] listed files
@@ -6211,14 +6262,9 @@ mod tests {
             .collect();
         assert!(!near_behind.is_empty() && near_behind.len() < addresses.len());
         let mut tally = Tally::default();
+        let pushed: BTreeSet<XorName> = addresses.iter().copied().collect();
         let (decided, _) = producer
-            .decide_all(
-                Source::Pending { again: false },
-                AT,
-                None,
-                false,
-                &mut tally,
-            )
+            .decide_pushed(&pushed, AT, Instant::now() + CYCLE, &mut tally)
             .await
             .unwrap();
         assert_eq!(decided as usize, addresses.len() - near_behind.len());
@@ -6228,6 +6274,161 @@ mod tests {
                 near_behind.contains(address)
             );
         }
+    }
+
+    /// The entries `serve` gave `peer`'s mirror, of `listings` served by
+    /// `holders` of each one's nearest nodes, in address order.
+    fn mirror_of(
+        producer: &Producer,
+        peer: &PeerId,
+        listings: &[Listing],
+        holders: usize,
+    ) -> Vec<DigestEntry> {
+        let mut entries: Vec<DigestEntry> = listings
+            .iter()
+            .filter(|listing| {
+                producer
+                    .census
+                    .nearest(&listing.address, NEAREST_NODES)
+                    .iter()
+                    .take(holders)
+                    .any(|near| near == peer)
+            })
+            .map(DigestEntry::new)
+            .collect();
+        entries.sort_by_key(|entry| entry.address);
+        entries
+    }
+
+    /// A push from a node whose mirror `serve` seeded with `mirrored`, at
+    /// record 1 of epoch 7: `change`, as record 2, with the node's count and
+    /// set hash after it.
+    fn push_after(mirrored: &[DigestEntry], change: ant_listings::FeedChange) -> ChangesResponse {
+        let mut served: BTreeMap<XorName, DigestEntry> = mirrored
+            .iter()
+            .map(|entry| (entry.address, *entry))
+            .collect();
+        match change {
+            ant_listings::FeedChange::Entry { entry, .. } => {
+                served.insert(entry.address, entry);
+            }
+            ant_listings::FeedChange::Removed { address, .. } => {
+                served.remove(&address);
+            }
+        }
+        ChangesResponse {
+            epoch: 7,
+            head: 2,
+            next: 2,
+            count: served.len() as u64,
+            set_hash: ant_listings::SetHash::of(served.values()),
+            changes: vec![change],
+            more: false,
+            view: [0; 32],
+            peers: Vec::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_push_between_cycles_decides_only_what_it_changed() {
+        // What changed waits, more than the latest cycle had time for: its
+        // pass over what changed decided a batch, and goes on next cycle.
+        let dir = tempfile::tempdir().unwrap();
+        let (mut producer, _node) = offline_producer(dir.path()).await;
+        census_nodes(&mut producer, 8);
+        let count = 4 * DECIDE_BATCH as u32;
+        let mut addresses: Vec<XorName> = (0..count).map(numbered).collect();
+        addresses.sort_unstable();
+        let listings: Vec<Listing> = addresses
+            .iter()
+            .map(|address| showing_block(*address, 81_950_000))
+            .collect();
+        serve(&mut producer, &listings, 2);
+        producer.start_requests();
+        producer.feeds.mark_pending(&addresses).unwrap();
+        producer.guard_ok = true;
+        producer.last_status = Some(Status::default());
+        producer.cycles += 1;
+        let mut drops = DropCheck {
+            checked: false,
+            deadline: Instant::now(),
+        };
+        let in_cycle = producer
+            .decide_changed(AT, Instant::now(), &mut drops, &mut Tally::default())
+            .await
+            .unwrap();
+        assert_eq!(in_cycle, DECIDE_BATCH as u64);
+        let waiting = producer.feeds.pending_count().unwrap();
+        assert_eq!(waiting, u64::from(count) - DECIDE_BATCH as u64);
+
+        // Between cycles, a node pushes one new record, and the next cycle
+        // is due already: the push's address is decided, and nothing else.
+        let peer = producer.census.nearest(&addresses[0], NEAREST_NODES)[0];
+        let mirrored = mirror_of(&producer, &peer, &listings, 2);
+        let new = DigestEntry::new(&showing_block(numbered(count + 1), 81_950_000));
+        let push = push_after(
+            &mirrored,
+            ant_listings::FeedChange::Entry { seq: 2, entry: new },
+        );
+        let started = std::time::Instant::now();
+        producer
+            .take_pushes((peer, push), Instant::now())
+            .await
+            .unwrap();
+        assert!(started.elapsed() < CYCLE, "{:?}", started.elapsed());
+        assert_eq!(
+            producer.feeds.entry(&peer, &new.address).unwrap(),
+            Some(new)
+        );
+        assert!(!producer.feeds.is_pending(&new.address).unwrap());
+        assert_eq!(producer.feeds.pending_count().unwrap(), waiting);
+        assert_eq!(producer.pushes_between, 1);
+
+        // What many pushes changed is decided a batch at a time, until the
+        // next cycle is due, at least one batch: the rest waits for it.
+        let many: BTreeSet<XorName> = addresses[DECIDE_BATCH..].iter().copied().collect();
+        let (decided, _) = producer
+            .decide_pushed(&many, AT + 30, Instant::now(), &mut Tally::default())
+            .await
+            .unwrap();
+        assert_eq!(decided, DECIDE_BATCH as u64);
+        assert_eq!(
+            producer.feeds.pending_count().unwrap(),
+            waiting - DECIDE_BATCH as u64
+        );
+    }
+
+    #[tokio::test]
+    async fn a_removal_between_cycles_counts_with_the_next_cycle() {
+        // A published entry showing a payment from before the vault, served
+        // by 2 of its nearest nodes. Between cycles one of them stops
+        // serving it: decided at once, it is removed, and the next cycle's
+        // status.json counts the removal, as a cycle that removed it would.
+        let dir = tempfile::tempdir().unwrap();
+        let (mut producer, _node) = offline_producer(dir.path()).await;
+        census_nodes(&mut producer, 8);
+        let x = numbered(7);
+        let mut listed = ListingsIndex::default();
+        listed.listings.push(checked_at(x, 80_204_042));
+        publish_read(&mut producer.publisher, &listed, None, AT);
+        let listing = showing_block(x, 80_204_042);
+        serve(&mut producer, std::slice::from_ref(&listing), 2);
+        producer.start_requests();
+        producer.guard_ok = true;
+        producer.last_status = Some(Status::default());
+        let peer = producer.census.nearest(&x, NEAREST_NODES)[0];
+        let mirrored = mirror_of(&producer, &peer, std::slice::from_ref(&listing), 2);
+        let push = push_after(
+            &mirrored,
+            ant_listings::FeedChange::Removed { seq: 2, address: x },
+        );
+        producer
+            .take_pushes((peer, push), Instant::now() + CYCLE)
+            .await
+            .unwrap();
+        assert!(producer.publisher.entry(&x).unwrap().is_none());
+        assert_eq!(producer.published_between, 1);
+        assert_eq!(producer.removed_between, 1);
     }
 
     #[tokio::test]

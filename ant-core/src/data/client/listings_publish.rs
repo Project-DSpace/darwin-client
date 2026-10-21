@@ -172,8 +172,9 @@ const _: () = assert!(PREFIX_DIGITS == 3 && SHARDS == 1 << 12);
 /// What one cycle changed, for the [`Publisher`] to publish.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Publication {
-    /// When the cycle (or the push it handled) began, in Unix seconds: the
-    /// `at` of the feed records it makes.
+    /// When the cycle, or the publication between cycles (pushes taken,
+    /// sizes filled in), began, in Unix seconds: the `at` of the feed
+    /// records it makes.
     pub at: u64,
     /// Changes to the index, in the order they were decided; each becomes
     /// one record of the feed, numbered in this order. A put of the entry
@@ -394,7 +395,8 @@ impl Publisher {
 
     /// Write every file the publications staged since the last write left
     /// to write ([`stage`](Self::stage)), then `status.json` with `status`,
-    /// as [`publish`](Self::publish) does; `at` is when the cycle that
+    /// as [`publish`](Self::publish) does; `at` is when the cycle, or the
+    /// publication between cycles (pushes taken, sizes filled in), that
     /// staged them began.
     ///
     /// # Errors
