@@ -67,7 +67,10 @@
 //!    for any of its listings, a time in the future, left it for later or
 //!    kept it unconfirmed, rests on nodes that serve none of its listings
 //!    having been heard (no listing of it has a quorum), or while a chain
-//!    fact it was decided on isn't final ([`ListingChain::settled`]). What
+//!    fact it was decided on isn't final ([`ListingChain::settled`]); and
+//!    once more when a date of one of its copies that the checks left out
+//!    for being in the future (later than the clock plus `CLOCK_MARGIN`)
+//!    stops being so. What
 //!    changed is decided a batch at a time in address order, for what is
 //!    left of the cycle's time (at least a batch); a pass cut short goes on
 //!    from where it stopped in the next cycle. Every address is decided
@@ -276,8 +279,8 @@ const SIZES_DB: &str = "serve_sizes";
 const SIZE_WANTED_DB: &str = "serve_size_wanted";
 
 /// What this process knows of the addresses it works on, by a tag and the
-/// address ([`KNOWN_TAG`], [`AGAIN_TAG`], [`BACKOFF_TAG`], [`FAILED_TAG`]).
-/// Cleared at each start.
+/// address ([`KNOWN_TAG`], [`AGAIN_TAG`], [`BACKOFF_TAG`], [`FAILED_TAG`],
+/// [`FUTURE_TAG`]). Cleared at each start.
 const KNOWN_DB: &str = "serve_known";
 
 /// [`SINCE_DB`]: an address deferred since then.
@@ -303,6 +306,12 @@ const BACKOFF_TAG: u8 = b'r';
 /// (Unix seconds). It isn't asked before then while its entry stays the
 /// same.
 const FAILED_TAG: u8 = b'f';
+
+/// [`KNOWN_DB`]: when (Unix seconds, 8 bytes big-endian), then an address,
+/// that the address is to be decided again (no value): a copy deciding it
+/// left out was dated later than the clock plus `CLOCK_MARGIN`, and is no
+/// longer from then on ([`Producer::mark_due`]).
+const FUTURE_TAG: u8 = b't';
 
 /// How [`Client::decide_backed`] begins the problem of a listing it rejects
 /// without looking it up, because another one a quorum serves counts: its
@@ -394,6 +403,11 @@ struct Seen {
     nearest: u64,
     /// The nodes whose copies counted.
     holders: Vec<PeerId>,
+    /// When the earliest date of its copies that is in the future, later
+    /// than the clock plus `CLOCK_MARGIN`, stops being so, if one is: until
+    /// then a check leaves it out, and once it is in, deciding the address
+    /// may give another listing or date.
+    future: Option<u64>,
 }
 
 /// Every address decided again, a batch at a time in address order, over as
@@ -494,6 +508,10 @@ struct Decided {
     /// Full listings kept that couldn't be read back: they go, to be fetched
     /// again.
     unreadable: Vec<ListingId>,
+    /// Addresses decided with a copy dated in the future, not to be decided
+    /// again before: each with when its date stops being in the future
+    /// ([`FUTURE_TAG`]).
+    future: Vec<(XorName, u64)>,
 }
 
 /// What reading a file's root map gave ([`read_root_size`]).
@@ -936,6 +954,7 @@ impl Producer {
             if !change.is_empty() {
                 self.mark_moved()?;
             }
+            self.mark_due(at)?;
             // What changed first, then the sweep, each for what is left of
             // the cycle's time and at least a batch. However long the poll
             // took, fetching gets as long as a poll may take, and drops as
@@ -1059,6 +1078,53 @@ impl Producer {
             }
         }
         Ok(())
+    }
+
+    /// Make pending every address to be decided again by `now` (Unix
+    /// seconds), as a date of its copies in the future then no longer is
+    /// ([`FUTURE_TAG`]), and forget that it was to be.
+    ///
+    /// # Errors
+    ///
+    /// If the store can't be read or written.
+    fn mark_due(&mut self, now: u64) -> Result<()> {
+        let from = [FUTURE_TAG];
+        let mut through = vec![FUTURE_TAG];
+        through.extend_from_slice(&now.to_be_bytes());
+        through.extend_from_slice(&[0xff; 32]);
+        loop {
+            let keys: Vec<Vec<u8>> = {
+                let txn = self.store.env().read_txn().map_err(store_error)?;
+                let range = (Bound::Included(&from[..]), Bound::Included(&through[..]));
+                let mut keys = Vec::new();
+                for row in self
+                    .known
+                    .remap_data_type::<DecodeIgnore>()
+                    .range(&txn, &range)
+                    .map_err(store_error)?
+                {
+                    if keys.len() == DECIDE_BATCH {
+                        break;
+                    }
+                    let (key, ()) = row.map_err(store_error)?;
+                    keys.push(key.to_vec());
+                }
+                keys
+            };
+            if keys.is_empty() {
+                return Ok(());
+            }
+            let due: Vec<XorName> = keys
+                .iter()
+                .filter_map(|key| key.get(9..).and_then(|rest| XorName::try_from(rest).ok()))
+                .collect();
+            self.feeds.mark_pending(&due)?;
+            let mut txn = self.store.env().write_txn().map_err(store_error)?;
+            for key in &keys {
+                self.known.delete(&mut txn, key).map_err(store_error)?;
+            }
+            txn.commit().map_err(store_error)?;
+        }
     }
 
     /// What is known of `address`, if it was decided ([`KNOWN_TAG`]).
@@ -1445,8 +1511,12 @@ impl Producer {
         // Some node serves a copy: no drop to back off from.
         self.forget_backoffs(with_copies.iter())?;
         index.defer(&pending, &self.chain);
-        let pending_seen: Vec<Seen> = pending.iter().map(Seen::of).collect();
-        let backed_seen: Vec<Seen> = backed.iter().map(|(found, _)| Seen::of(found)).collect();
+        let now = unix_now();
+        let pending_seen: Vec<Seen> = pending.iter().map(|found| Seen::of(found, now)).collect();
+        let backed_seen: Vec<Seen> = backed
+            .iter()
+            .map(|(found, _)| Seen::of(found, now))
+            .collect();
         drop(pending);
         let mut decisions: Vec<Decision> = Vec::new();
         if !backed.is_empty() {
@@ -1530,6 +1600,7 @@ impl Producer {
             settle: Vec::new(),
             waiting: Vec::new(),
             unreadable,
+            future: Vec::new(),
         };
         let mut considered: Vec<(XorName, u64, bool)> = Vec::new();
         for seen in pending_seen {
@@ -1549,6 +1620,12 @@ impl Producer {
                 || listed
                     .get(&address)
                     .is_some_and(|checked| !self.chain.settled(&checked.listing));
+            // A copy's date that was in the future, and left out, is in once
+            // the clock passes it: the address is decided again then, as a
+            // read would decide it then, and not every cycle until.
+            if !again {
+                decided.future.extend(seen.future.map(|due| (address, due)));
+            }
             considered.push((address, seen.nearest, again));
             decided.holders.push((address, seen.holders));
         }
@@ -2080,6 +2157,11 @@ impl Producer {
                 .map_err(store_error)?;
             self.known
                 .delete(&mut txn, &tagged(BACKOFF_TAG, address))
+                .map_err(store_error)?;
+        }
+        for (address, due) in &decided.future {
+            self.known
+                .put(&mut txn, &future_key(*due, address), &[])
                 .map_err(store_error)?;
         }
         // A kept listing that can't be read back goes, to be fetched again.
@@ -3139,6 +3221,17 @@ fn failed_key(address: &XorName, peer: &PeerId, digest: &[u8; 32]) -> [u8; 97] {
     key
 }
 
+/// The key in [`KNOWN_DB`] ([`FUTURE_TAG`]) of `address`, to be decided
+/// again at `due` (Unix seconds): the tag, the time, then the address, so
+/// the rows due come first.
+fn future_key(due: u64, address: &XorName) -> [u8; 41] {
+    let mut key = [0u8; 41];
+    key[0] = FUTURE_TAG;
+    key[1..9].copy_from_slice(&due.to_be_bytes());
+    key[9..].copy_from_slice(address);
+    key
+}
+
 /// Up to `limit` of the addresses of `db`'s rows tagged `tag` (the tag, then
 /// the address), after `after` (or from the first), in address order.
 ///
@@ -3221,12 +3314,23 @@ fn unsettled(chain: &ListingChain, row: &RejectedListing) -> bool {
 }
 
 impl Seen {
-    /// What deciding keeps of `found`, whose copies were taken.
-    fn of(found: &AddressWalk<PeerId>) -> Self {
+    /// What deciding at `now` (Unix seconds) keeps of `found`, whose copies
+    /// were taken.
+    fn of(found: &AddressWalk<PeerId>, now: u64) -> Self {
+        let latest = now.saturating_add(CLOCK_MARGIN);
+        let future = found
+            .copies
+            .iter()
+            .flat_map(|(_, copy)| [copy.first_seen, copy.payment.block_timestamp])
+            .flatten()
+            .filter(|time| *time > latest)
+            .min()
+            .map(|time| time - CLOCK_MARGIN);
         Self {
             address: found.address,
             nearest: nearest_hash(&found.nearest),
             holders: found.copies.iter().map(|(peer, _)| *peer).collect(),
+            future,
         }
     }
 }
@@ -5367,6 +5471,7 @@ mod tests {
                 settle: Vec::new(),
                 waiting: Vec::new(),
                 unreadable: Vec::new(),
+                future: Vec::new(),
             }
         }
     }
@@ -5775,6 +5880,113 @@ mod tests {
                 .is_some(),
             "decided again next cycle"
         );
+    }
+
+    #[tokio::test]
+    async fn an_address_is_decided_again_once_a_copy_dated_in_the_future_no_longer_is() {
+        // 4 of an address's 7 nearest nodes serve its listing: 3 dated 10 h
+        // ago, the 4th 3 h ahead of the producer's clock. That date is left
+        // out, and the listing is listed by the others'. Once the clock
+        // passes it, a read would take it in: the address is decided again
+        // then, and not every cycle until.
+        let now = unix_now();
+        let dir = tempfile::tempdir().unwrap();
+        let (mut producer, _node) = offline_producer(dir.path()).await;
+        let peers = census_nodes(&mut producer, 8);
+        producer.start_requests();
+        let envelope = hidden_envelope(0x72);
+        let a = envelope.address();
+        let early = hidden_listing(&envelope, now - 10 * 3_600, None);
+        let ahead = hidden_listing(&envelope, now + 3 * 3_600, None);
+        producer.chain.keep_envelope(&a, &envelope.to_bytes());
+        keep_listing(&producer, &early);
+        let nearest = producer.census.nearest(&a, NEAREST_NODES);
+        let net = FakeNet::with(
+            peers
+                .iter()
+                .map(|peer| {
+                    let entries = match nearest.iter().position(|near| near == peer) {
+                        Some(0..=2) => vec![DigestEntry::new(&early)],
+                        Some(3) => vec![DigestEntry::new(&ahead)],
+                        _ => Vec::new(),
+                    };
+                    (*peer, FakeNode::serving(Behaviour::Honest, entries))
+                })
+                .collect(),
+        );
+        fake_cycle(&mut producer, &net, now, Source::All).await;
+        let listed = producer.publisher.entry(&a).unwrap().unwrap();
+        assert_eq!(listed.entry.listing.first_seen, early.first_seen);
+        let again = |producer: &Producer| {
+            let txn = producer.store.env().read_txn().unwrap();
+            producer
+                .known
+                .get(&txn, &tagged(AGAIN_TAG, &a))
+                .unwrap()
+                .is_some()
+        };
+        assert!(!again(&producer), "not decided again every cycle");
+        assert!(!producer.feeds.is_pending(&a).unwrap());
+        let due = ahead.first_seen.unwrap() - CLOCK_MARGIN;
+        producer.mark_due(due - 1).unwrap();
+        assert!(!producer.feeds.is_pending(&a).unwrap(), "not yet");
+        producer.mark_due(due).unwrap();
+        assert!(producer.feeds.is_pending(&a).unwrap(), "decided again then");
+        // Once.
+        producer.feeds.settle(&[a]).unwrap();
+        producer.mark_due(due + 3_600).unwrap();
+        assert!(!producer.feeds.is_pending(&a).unwrap());
+    }
+
+    #[tokio::test]
+    async fn every_size_due_gets_its_turn_whatever_the_rows_before_it_give() {
+        // Rows to read at the lowest addresses that keep failing, due again
+        // each time, and one never read at a high address: the reading goes
+        // on after the last row taken, so that one is taken in its turn.
+        let dir = tempfile::tempdir().unwrap();
+        let (mut producer, _node) = offline_producer(dir.path()).await;
+        let map = rmp_serde::to_vec(&three_chunks(1_024, true)).unwrap();
+        let row = |retry_at: u64| {
+            let mut value = retry_at.to_be_bytes().to_vec();
+            value.extend_from_slice(&map);
+            value
+        };
+        let fresh: XorName = [0xf0; 32];
+        let failing: Vec<XorName> = (0..SIZES_PER_CYCLE as u8)
+            .map(|n| {
+                let mut address = [0u8; 32];
+                address[1] = n;
+                address
+            })
+            .collect();
+        let fail_again = |producer: &Producer| {
+            let mut txn = producer.store.env().write_txn().unwrap();
+            for address in &failing {
+                producer
+                    .size_wanted
+                    .put(&mut txn, address, &row(unix_now() - 1))
+                    .unwrap();
+            }
+            txn.commit().unwrap();
+        };
+        fail_again(&producer);
+        {
+            let mut txn = producer.store.env().write_txn().unwrap();
+            producer.size_wanted.put(&mut txn, &fresh, &row(0)).unwrap();
+            txn.commit().unwrap();
+        }
+        let retry_at = |producer: &Producer, address: &XorName| {
+            let txn = producer.store.env().read_txn().unwrap();
+            let value = producer.size_wanted.get(&txn, address).unwrap().unwrap();
+            u64::from_be_bytes(value[..8].try_into().unwrap())
+        };
+        producer.start_sizes().unwrap();
+        producer.size_job = None;
+        assert_eq!(retry_at(&producer, &fresh), 0, "the first rows' turn");
+        fail_again(&producer);
+        producer.start_sizes().unwrap();
+        producer.size_job = None;
+        assert!(retry_at(&producer, &fresh) > unix_now(), "its turn");
     }
 
     #[tokio::test]
