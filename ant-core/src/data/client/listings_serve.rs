@@ -193,7 +193,7 @@ use ant_protocol::{XorName, MAX_WIRE_MESSAGE_SIZE};
 use futures::stream::{self, StreamExt};
 use heed::byteorder::BigEndian;
 use heed::types::{Bytes, DecodeIgnore, U64};
-use heed::{Database, RoTxn};
+use heed::{Database, RoTxn, RwTxn};
 use self_encryption::{DataMap, DataMapIndex, MAX_CHUNK_SIZE};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -285,8 +285,9 @@ pub const STORE_DIR: &str = "listings.mdb";
 
 /// Since when each address has been deferred, or listed below full
 /// support: a tag ([`DEFERRED_TAG`] or [`BELOW_FULL_TAG`]) and the
-/// address, to Unix seconds; for a deferral, with the code of its latest
-/// reason in the top byte ([`deferred_value`]).
+/// address, to Unix seconds, and nothing else, as every version of the
+/// producer reads them; and the code of each deferral's latest reason, in a
+/// row of its own ([`REASON_TAG`]).
 const SINCE_DB: &str = "serve_since";
 
 /// The nodes whose copies counted when each address was last decided: the
@@ -320,9 +321,17 @@ const KNOWN_DB: &str = "serve_known";
 /// [`SINCE_DB`]: an address deferred since then.
 const DEFERRED_TAG: u8 = b'd';
 
+/// [`SINCE_DB`]: a deferred address, to the code of the reason it was last
+/// deferred for ([`reason_code`]). Kept apart from its [`DEFERRED_TAG`]
+/// row, which holds the time alone: a version of the producer that keeps no
+/// reasons reads that row as Unix seconds, and leaves these rows be (so one
+/// whose address is no longer deferred goes at the next open,
+/// [`settle_deferrals`]).
+const REASON_TAG: u8 = b'r';
+
 /// The reasons a deferral can have, as `status.json` gives them
-/// ([`deferral_reason`]): a deferral's row keeps its reason's place here,
-/// plus one, as its code ([`deferred_value`]).
+/// ([`deferral_reason`]): a deferral's reason row keeps its reason's place
+/// here, plus one, as its code ([`reason_code`]).
 const DEFERRAL_REASONS: [&str; 7] = [
     "below_quorum",
     "nodes_unanswered",
@@ -333,8 +342,11 @@ const DEFERRAL_REASONS: [&str; 7] = [
     "other",
 ];
 
-/// The bits of a deferral's row that hold its time; the byte above holds
-/// its reason's code.
+/// The bits of a [`DEFERRED_TAG`] row that hold its time. An earlier
+/// version of the producer kept the deferral's reason's code in the byte
+/// above; such a row is read as the time and that code
+/// ([`deferral_of`]), and is written again as the time alone, with the code
+/// in its reason row, when the producer opens ([`settle_deferrals`]).
 const SINCE_TIME: u64 = (1 << 56) - 1;
 
 /// [`SINCE_DB`]: a listed address fewer than all of its nearest nodes have
@@ -809,6 +821,7 @@ impl Producer {
         // one decides every address again, starting in its first cycle.
         let mut txn = store.env().write_txn().map_err(store_error)?;
         known.clear(&mut txn).map_err(store_error)?;
+        settle_deferrals(since, &mut txn)?;
         txn.commit().map_err(store_error)?;
         let (sink, pushes) = push_channel(PUSH_CAPACITY);
         let now = unix_now();
@@ -2959,8 +2972,9 @@ impl Producer {
     }
 
     /// Note since when each address of `addresses`, a batch, has been
-    /// deferred, and each listed one below full support, and count them into
-    /// `tally`: an address of the batch not deferred loses its row.
+    /// deferred, and why, and each listed one below full support, and count
+    /// them into `tally`: an address of the batch not deferred loses its
+    /// rows.
     ///
     /// # Errors
     ///
@@ -2977,17 +2991,27 @@ impl Producer {
         let mut txn = self.store.env().write_txn().map_err(store_error)?;
         for address in addresses {
             let row = tagged(DEFERRED_TAG, address);
+            let reason_row = tagged(REASON_TAG, address);
             let Some(reason) = deferred.get(address) else {
                 self.since.delete(&mut txn, &row).map_err(store_error)?;
+                self.since
+                    .delete(&mut txn, &reason_row)
+                    .map_err(store_error)?;
                 continue;
             };
-            // Since it was first deferred, with its latest reason.
+            // Since it was first deferred, as Unix seconds alone, and its
+            // latest reason in a row of its own.
             let old = self.since.get(&txn, &row).map_err(store_error)?;
-            let since = old.map_or(at, |old| deferred_of(old).0);
-            let value = deferred_value(since, reason);
-            if old != Some(value) {
+            let since = old.map_or(at, |old| deferral_of(old, None).0);
+            if old != Some(since) {
                 self.since
-                    .put(&mut txn, &row, &value)
+                    .put(&mut txn, &row, &since)
+                    .map_err(store_error)?;
+            }
+            let code = reason_code(reason);
+            if self.since.get(&txn, &reason_row).map_err(store_error)? != Some(code) {
+                self.since
+                    .put(&mut txn, &reason_row, &code)
                     .map_err(store_error)?;
             }
             let group = tally.groups.entry(reason).or_insert((0, since));
@@ -3053,8 +3077,15 @@ impl Producer {
                     .prefix_iter(&txn, &[DEFERRED_TAG])
                     .map_err(store_error)?
                 {
-                    let (_, value) = row.map_err(store_error)?;
-                    let (since, reason) = deferred_of(value);
+                    let (key, value) = row.map_err(store_error)?;
+                    let code = match key.get(1..).and_then(|rest| XorName::try_from(rest).ok()) {
+                        Some(address) => self
+                            .since
+                            .get(&txn, &tagged(REASON_TAG, &address))
+                            .map_err(store_error)?,
+                        None => None,
+                    };
+                    let (since, reason) = deferral_of(value, code);
                     let group = groups.entry(reason).or_insert((0, since));
                     group.0 += 1;
                     group.1 = group.1.min(since);
@@ -4253,27 +4284,94 @@ fn rejected_changes(
     changes
 }
 
-/// The value of a deferral's row in [`SINCE_DB`]: since when (Unix
-/// seconds), with its reason's code ([`DEFERRAL_REASONS`]) in the top byte.
-fn deferred_value(since: u64, reason: &str) -> u64 {
+/// The code a deferral's reason row keeps ([`REASON_TAG`]) for `reason`:
+/// its place in [`DEFERRAL_REASONS`], plus one; a reason not among them is
+/// kept as `other`.
+fn reason_code(reason: &str) -> u64 {
     let code = DEFERRAL_REASONS
         .iter()
         .position(|known| *known == reason)
         .map_or(DEFERRAL_REASONS.len(), |at| at + 1);
-    (since & SINCE_TIME) | (u64::try_from(code).unwrap_or(0) << 56)
+    u64::try_from(code).unwrap_or(0)
 }
 
-/// A deferral's row read back ([`deferred_value`]): since when, and its
-/// reason. A row from before reasons were kept gives `other`, until its
-/// address is decided again.
-fn deferred_of(value: u64) -> (u64, &'static str) {
-    let code = usize::try_from(value >> 56).unwrap_or(0);
-    let reason = code
-        .checked_sub(1)
+/// A deferral read back: since when, from `value`, its [`DEFERRED_TAG`]
+/// row, and its latest reason, from `code`, what its reason row holds
+/// ([`reason_code`]). A row an earlier version of the producer wrote holds
+/// the time with the code in its top byte ([`SINCE_TIME`]), newer than any
+/// reason row then; a deferral with no code, as a version that keeps no
+/// reasons left it, gives `other` until its address is decided again.
+fn deferral_of(value: u64, code: Option<u64>) -> (u64, &'static str) {
+    let code = match value >> 56 {
+        0 => code.unwrap_or(0),
+        top => top,
+    };
+    let reason = usize::try_from(code)
+        .ok()
+        .and_then(|code| code.checked_sub(1))
         .and_then(|at| DEFERRAL_REASONS.get(at))
         .copied()
         .unwrap_or("other");
     (value & SINCE_TIME, reason)
+}
+
+/// Bring the deferrals' rows in `since` ([`SINCE_DB`]) to the form this
+/// version keeps, in `txn`, as the producer opens: [`DECIDE_BATCH`] rows
+/// at a time, every row read once. A [`DEFERRED_TAG`] row an earlier
+/// version wrote with its reason's code in its top byte ([`SINCE_TIME`]) is
+/// written again as the time alone, with the code in its reason row
+/// ([`REASON_TAG`]): so it reads as Unix seconds to every version, the one
+/// before reasons were kept among them. A reason row whose address is no
+/// longer deferred goes: a version that keeps no reason rows ended the
+/// deferral without it.
+///
+/// # Errors
+///
+/// If the store can't be read or written.
+fn settle_deferrals(since: Database<Bytes, U64<BigEndian>>, txn: &mut RwTxn) -> Result<()> {
+    let mut after: Option<XorName> = None;
+    loop {
+        let batch = tagged_after(since, txn, DEFERRED_TAG, after.as_ref(), DECIDE_BATCH)?;
+        for address in &batch {
+            let row = tagged(DEFERRED_TAG, address);
+            let Some(value) = since.get(txn, &row).map_err(store_error)? else {
+                continue;
+            };
+            let code = value >> 56;
+            if code != 0 {
+                since
+                    .put(txn, &row, &(value & SINCE_TIME))
+                    .map_err(store_error)?;
+                since
+                    .put(txn, &tagged(REASON_TAG, address), &code)
+                    .map_err(store_error)?;
+            }
+        }
+        match batch.last() {
+            Some(last) if batch.len() == DECIDE_BATCH => after = Some(*last),
+            _ => break,
+        }
+    }
+    let mut after: Option<XorName> = None;
+    loop {
+        let batch = tagged_after(since, txn, REASON_TAG, after.as_ref(), DECIDE_BATCH)?;
+        for address in &batch {
+            let deferred = since
+                .get(txn, &tagged(DEFERRED_TAG, address))
+                .map_err(store_error)?
+                .is_some();
+            if !deferred {
+                since
+                    .delete(txn, &tagged(REASON_TAG, address))
+                    .map_err(store_error)?;
+            }
+        }
+        match batch.last() {
+            Some(last) if batch.len() == DECIDE_BATCH => after = Some(*last),
+            _ => break,
+        }
+    }
+    Ok(())
 }
 
 /// A deferral's reason, as `status.json` gives it, from the problem the read
@@ -7851,10 +7949,207 @@ mod tests {
             groups(&status),
             [("nodes_unanswered".to_string(), 5, AT + 180)]
         );
-        // Every reason is kept as it is.
+        // Every reason is kept as it is, in its row or, as an earlier version
+        // kept it, in the top byte of the time's.
         for reason in DEFERRAL_REASONS {
-            assert_eq!(deferred_of(deferred_value(AT, reason)), (AT, reason));
+            let code = reason_code(reason);
+            assert_eq!(deferral_of(AT, Some(code)), (AT, reason));
+            assert_eq!(deferral_of(AT | (code << 56), None), (AT, reason));
+            assert_eq!(deferral_of(AT | (code << 56), Some(1)), (AT, reason));
         }
+        assert_eq!(reason_code("not a reason"), reason_code("other"));
+        assert_eq!(deferral_of(AT, None), (AT, "other"));
+    }
+
+    /// The deferrals' rows ([`DEFERRED_TAG`]) and their reason rows
+    /// ([`REASON_TAG`]), each by address, with their values.
+    fn deferral_rows(producer: &Producer) -> (BTreeMap<XorName, u64>, BTreeMap<XorName, u64>) {
+        let txn = producer.store.env().read_txn().unwrap();
+        let rows = |tag: u8| -> BTreeMap<XorName, u64> {
+            producer
+                .since
+                .prefix_iter(&txn, &[tag])
+                .unwrap()
+                .map(|row| {
+                    let (key, value) = row.unwrap();
+                    (XorName::try_from(&key[1..]).unwrap(), value)
+                })
+                .collect()
+        };
+        (rows(DEFERRED_TAG), rows(REASON_TAG))
+    }
+
+    /// What the version of the producer from before reasons were kept does
+    /// with the deferrals' rows after a cycle at `at` that deferred
+    /// `deferred` and nothing else, as its `update_since` does: each of them
+    /// keeps the time its row holds, or is given `at`, and every other
+    /// deferral's row goes; it knows of no reason rows. Returns the oldest of
+    /// their times, as it publishes it (`oldest_since`): the rows read as
+    /// Unix seconds.
+    fn defer_without_reasons(producer: &Producer, deferred: &[XorName], at: u64) -> u64 {
+        let (rows, _) = deferral_rows(producer);
+        let mut txn = producer.store.env().write_txn().unwrap();
+        for address in rows.keys().filter(|address| !deferred.contains(address)) {
+            producer
+                .since
+                .delete(&mut txn, &tagged(DEFERRED_TAG, address))
+                .unwrap();
+        }
+        let mut oldest = u64::MAX;
+        for address in deferred {
+            let row = tagged(DEFERRED_TAG, address);
+            let since = if let Some(since) = producer.since.get(&txn, &row).unwrap() {
+                since
+            } else {
+                producer.since.put(&mut txn, &row, &at).unwrap();
+                at
+            };
+            oldest = oldest.min(since);
+        }
+        txn.commit().unwrap();
+        oldest
+    }
+
+    /// `status.json`'s deferrals for a cycle at `at` that decided none of
+    /// them: each reason, how many and since when.
+    fn deferred_groups(producer: &mut Producer, at: u64) -> Vec<(String, u64, u64)> {
+        let before = Counters::now(&producer.chain);
+        producer
+            .status(
+                at,
+                std::time::Instant::now(),
+                before,
+                false,
+                0,
+                &Tally::default(),
+            )
+            .unwrap()
+            .deferred
+            .iter()
+            .map(|group| (group.reason.clone(), group.addresses, group.oldest_since))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn deferrals_are_read_as_seconds_by_a_version_without_reasons_and_back() {
+        // Deferrals as this producer's earlier version kept them, each with
+        // its reason's code in the top byte of its time, are read in that form
+        // too, and kept as the time alone once the producer opens, the code in
+        // a row of its own. Then a rollback to the version from before reasons
+        // were kept, which reads every row as Unix seconds, and forward again.
+        let dir = tempfile::tempdir().unwrap();
+        let (mut producer, _node) = offline_producer(dir.path()).await;
+        census_nodes(&mut producer, 8);
+        let mut addresses: Vec<XorName> = (0..300).map(numbered).collect();
+        addresses.sort_unstable();
+        let listings: Vec<Listing> = addresses
+            .iter()
+            .map(|address| showing_block(*address, 81_950_000))
+            .collect();
+        serve(&mut producer, &listings, 2);
+        producer.start_requests();
+        producer.cycles += 1;
+        producer
+            .decide_all(Source::All, AT, None, false, &mut Tally::default())
+            .await
+            .unwrap();
+        let below_quorum = reason_code("below_quorum");
+        let (rows, reasons) = deferral_rows(&producer);
+        assert_eq!((rows.len(), reasons.len()), (300, 300));
+        assert!(rows.values().all(|since| *since == AT));
+        assert!(reasons.values().all(|code| *code == below_quorum));
+
+        // As the earlier version wrote them: the code in the top byte, and no
+        // reason rows; a third deferred for another reason.
+        let chain_unread = reason_code("chain_unread");
+        let code_of = |n: usize| {
+            if n.is_multiple_of(3) {
+                chain_unread
+            } else {
+                below_quorum
+            }
+        };
+        {
+            let mut txn = producer.store.env().write_txn().unwrap();
+            for (n, address) in addresses.iter().enumerate() {
+                producer
+                    .since
+                    .put(
+                        &mut txn,
+                        &tagged(DEFERRED_TAG, address),
+                        &(AT | (code_of(n) << 56)),
+                    )
+                    .unwrap();
+                producer
+                    .since
+                    .delete(&mut txn, &tagged(REASON_TAG, address))
+                    .unwrap();
+            }
+            txn.commit().unwrap();
+        }
+        let both = vec![
+            ("below_quorum".to_string(), 200, AT),
+            ("chain_unread".to_string(), 100, AT),
+        ];
+        assert_eq!(deferred_groups(&mut producer, AT + 60), both);
+        // Opened again, each row holds the time alone, and its reason is in
+        // its own row.
+        drop(producer);
+        let (mut producer, _node) = offline_producer(dir.path()).await;
+        let (rows, reasons) = deferral_rows(&producer);
+        assert_eq!(rows.len(), 300);
+        assert!(rows.values().all(|since| *since == AT));
+        for (n, address) in addresses.iter().enumerate() {
+            assert_eq!(reasons.get(address), Some(&code_of(n)));
+        }
+        assert_eq!(deferred_groups(&mut producer, AT + 120), both);
+
+        // Rolled back to the version from before reasons were kept: it reads
+        // each row as Unix seconds. Its cycle defers the first half of them,
+        // and an address of its own, and ends every other deferral.
+        let other = numbered(9_999);
+        let mut deferred = addresses[..150].to_vec();
+        deferred.push(other);
+        assert_eq!(defer_without_reasons(&producer, &deferred, AT + 600), AT);
+        drop(producer);
+
+        // Forward again: the reasons of the deferrals it ended go, and its
+        // own deferral reads as `other` until its address is decided again.
+        let (mut producer, _node) = offline_producer(dir.path()).await;
+        let (rows, reasons) = deferral_rows(&producer);
+        assert_eq!((rows.len(), reasons.len()), (151, 150));
+        assert!(reasons.keys().all(|address| rows.contains_key(address)));
+        assert_eq!(rows.get(&other), Some(&(AT + 600)));
+        assert_eq!(
+            deferred_groups(&mut producer, AT + 660),
+            [
+                ("below_quorum".to_string(), 100, AT),
+                ("chain_unread".to_string(), 50, AT),
+                ("other".to_string(), 1, AT + 600),
+            ]
+        );
+        // Deciding every address again: each is below a quorum, since it was
+        // first deferred, those deferred throughout since then; and the
+        // address no node serves is deferred no more.
+        census_nodes(&mut producer, 8);
+        serve(&mut producer, &listings, 2);
+        producer.start_requests();
+        producer.cycles += 1;
+        producer
+            .decide_all(Source::All, AT + 720, None, false, &mut Tally::default())
+            .await
+            .unwrap();
+        let (rows, reasons) = deferral_rows(&producer);
+        assert_eq!((rows.len(), reasons.len()), (300, 300));
+        assert!(reasons.values().all(|code| *code == below_quorum));
+        for (n, address) in addresses.iter().enumerate() {
+            let since = if n < 150 { AT } else { AT + 720 };
+            assert_eq!(rows.get(address), Some(&since));
+        }
+        assert_eq!(
+            deferred_groups(&mut producer, AT + 780),
+            [("below_quorum".to_string(), 300, AT)]
+        );
     }
 
     #[tokio::test]

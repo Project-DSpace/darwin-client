@@ -154,8 +154,15 @@ const SUPPORT_TAG: u8 = b's';
 const REJECTED_TAG: u8 = b'r';
 /// [`SIDE_DB`]: each [`REJECTED_TAG`] row in the order `rejected.json`
 /// lists it: 1 and its listing's key, or for a row whose listing gives no
-/// key, 0 and its address (no value). Kept with the rows.
+/// key, 0 and its address (no value). Kept with the rows, and made the
+/// rows' own again at every open ([`Dbs::order_rejected`]).
 const REJECTED_ORDER_TAG: u8 = b'R';
+
+/// How many rows of the rejections, or of their order, are held at a time
+/// while each is checked against the other at an open
+/// ([`Dbs::order_rejected`]): the 1,024 the order rows were rebuilt in
+/// before.
+const ORDER_BATCH: usize = 1_024;
 
 /// A file being written is first written under a name like this one, in the
 /// directory of the file it replaces, and then renamed over it.
@@ -1689,59 +1696,88 @@ impl Dbs {
     }
 
     /// Make the order rows of the rejections ([`REJECTED_ORDER_TAG`]) the
-    /// rows' own, as a store from before they were kept needs: once their
-    /// count is the rows' count, they are.
+    /// rows' own, at every open. A version of the producer that keeps no
+    /// order rows (one from before they were kept), run on this store in
+    /// between, sets and clears rejections without them: a rejection it set
+    /// has no order row, and one it cleared, or moved in key order, leaves
+    /// its old order row behind, whatever their counts. So each order row is
+    /// checked against its rejection, and each rejection against its order
+    /// row, [`ORDER_BATCH`] rows at a time: every row is read once, a batch
+    /// is held at a time, and only what differs is written.
+    ///
+    /// # Errors
+    ///
+    /// If the store can't be read or written, or holds a rejection it can't
+    /// read.
     fn order_rejected(&self, txn: &mut RwTxn) -> Result<()> {
-        let count = |tag: u8, txn: &RoTxn| -> Result<usize> {
-            let mut count = 0;
-            for row in self
-                .side
-                .remap_data_type::<heed::types::DecodeIgnore>()
-                .prefix_iter(txn, &[tag])
-                .map_err(store_error)?
-            {
-                row.map_err(store_error)?;
-                count += 1;
-            }
-            Ok(count)
-        };
-        if count(REJECTED_TAG, txn)? == count(REJECTED_ORDER_TAG, txn)? {
-            return Ok(());
-        }
+        // Order rows whose rejection is gone, or has another place now.
+        let mut after: Option<Vec<u8>> = None;
         loop {
-            let keys: Vec<Vec<u8>> = self
-                .side
-                .remap_data_type::<heed::types::DecodeIgnore>()
-                .prefix_iter(txn, &[REJECTED_ORDER_TAG])
-                .map_err(store_error)?
-                .take(1_024)
-                .map(|row| row.map(|(key, ())| key.to_vec()))
-                .collect::<heed::Result<_>>()
-                .map_err(store_error)?;
-            if keys.is_empty() {
+            let keys = self.side_keys(txn, REJECTED_ORDER_TAG, after.as_deref())?;
+            for key in &keys {
+                let address = XorName::try_from(&key[key.len().saturating_sub(32)..]);
+                let place = match address {
+                    Ok(address) => match self
+                        .side
+                        .get(txn, &tagged(REJECTED_TAG, &address))
+                        .map_err(store_error)?
+                    {
+                        Some(bytes) => Some(order_row(&parse(bytes)?, &address)),
+                        None => None,
+                    },
+                    Err(_) => None,
+                };
+                if place.as_deref() != Some(&key[..]) {
+                    self.side.delete(txn, key).map_err(store_error)?;
+                }
+            }
+            if keys.len() < ORDER_BATCH {
                 break;
             }
-            for key in keys {
-                self.side.delete(txn, &key).map_err(store_error)?;
+            after = keys.into_iter().last();
+        }
+        // Rejections without their order row.
+        let mut after: Option<Vec<u8>> = None;
+        loop {
+            let keys = self.side_keys(txn, REJECTED_TAG, after.as_deref())?;
+            for key in &keys {
+                let address: XorName = key[1..].try_into().map_err(|_| {
+                    Error::Storage("listings store: a rejection row without its address".into())
+                })?;
+                let Some(bytes) = self.side.get(txn, key).map_err(store_error)? else {
+                    continue;
+                };
+                let place = order_row(&parse(bytes)?, &address);
+                if self.side.get(txn, &place).map_err(store_error)?.is_none() {
+                    self.side.put(txn, &place, &[]).map_err(store_error)?;
+                }
             }
-        }
-        let mut order = Vec::new();
-        for row in self
-            .side
-            .prefix_iter(txn, &[REJECTED_TAG])
-            .map_err(store_error)?
-        {
-            let (key, value) = row.map_err(store_error)?;
-            let address: XorName = key[1..].try_into().map_err(|_| {
-                Error::Storage("listings store: a rejection row without its address".into())
-            })?;
-            let entry: RejectedEntry = parse(value)?;
-            order.push(order_row(&entry, &address));
-        }
-        for key in order {
-            self.side.put(txn, &key, &[]).map_err(store_error)?;
+            if keys.len() < ORDER_BATCH {
+                break;
+            }
+            after = keys.into_iter().last();
         }
         Ok(())
+    }
+
+    /// Up to [`ORDER_BATCH`] keys of the rows of [`SIDE_DB`] tagged `tag`,
+    /// after `after` (or from the first), in key order.
+    ///
+    /// # Errors
+    ///
+    /// If the store can't be read.
+    fn side_keys(&self, txn: &RoTxn, tag: u8, after: Option<&[u8]>) -> Result<Vec<Vec<u8>>> {
+        let first = [tag];
+        let end = [tag.saturating_add(1)];
+        let low = after.map_or(Bound::Included(&first[..]), Bound::Excluded);
+        let range = (low, Bound::Excluded(&end[..]));
+        self.side
+            .remap_data_type::<heed::types::DecodeIgnore>()
+            .range(txn, &range)
+            .map_err(store_error)?
+            .take(ORDER_BATCH)
+            .map(|row| row.map(|(key, ())| key.to_vec()).map_err(store_error))
+            .collect()
     }
 
     /// Write `rejected.json` to `out`, a row at a time in key order: the
@@ -4775,5 +4811,180 @@ mod tests {
             .filter(|row| row.listing.address != hex::encode(address(7)))
             .collect();
         assert_eq!(after.listings, expected);
+    }
+
+    /// Set and clear rejections in the store as a version of the producer
+    /// that keeps no order rows does: the rows alone.
+    fn set_rows_alone(f: &Fixture, changes: &[RejectedChange]) {
+        let dbs = f.publisher.dbs;
+        let mut txn = f.store.env().write_txn().unwrap();
+        for change in changes {
+            match change {
+                RejectedChange::Set(entry) => {
+                    let address = address_of(&entry.listing.address).unwrap();
+                    dbs.side
+                        .put(
+                            &mut txn,
+                            &tagged(REJECTED_TAG, &address),
+                            &json(entry).unwrap(),
+                        )
+                        .unwrap();
+                }
+                RejectedChange::Clear(address) => {
+                    dbs.side
+                        .delete(&mut txn, &tagged(REJECTED_TAG, address))
+                        .unwrap();
+                }
+            }
+        }
+        txn.commit().unwrap();
+    }
+
+    /// The keys of the order rows, and the order rows the rejections give.
+    fn order_rows(f: &Fixture) -> (Vec<Vec<u8>>, Vec<Vec<u8>>) {
+        let dbs = f.publisher.dbs;
+        let txn = f.store.env().read_txn().unwrap();
+        let kept: Vec<Vec<u8>> = dbs
+            .side
+            .prefix_iter(&txn, &[REJECTED_ORDER_TAG])
+            .unwrap()
+            .map(|row| row.unwrap().0.to_vec())
+            .collect();
+        let mut given: Vec<Vec<u8>> = dbs
+            .side
+            .prefix_iter(&txn, &[REJECTED_TAG])
+            .unwrap()
+            .map(|row| {
+                let (key, value) = row.unwrap();
+                let address: XorName = key[1..].try_into().unwrap();
+                order_row(&parse(value).unwrap(), &address)
+            })
+            .collect();
+        given.sort();
+        (kept, given)
+    }
+
+    #[test]
+    fn rejections_changed_by_a_version_without_their_order_are_ordered_at_the_next_open() {
+        // The producer rolled back to a version that keeps the rejections
+        // without their order rows, and forward again. That version cleared
+        // one rejection and set a new one, so their count is as it was,
+        // moved one in key order, changed one in place, and set one with no
+        // key. The next open makes the order the rows' own again, and
+        // rejected.json lists every row, in key order, once.
+        let mut f = Fixture::new();
+        let rejected = (0..50u64)
+            .map(|seed| RejectedChange::Set(Box::new(deferral(seed, 1_791_000_000 + seed * 60))))
+            .collect();
+        f.publish(&Publication {
+            at: AT,
+            rejected,
+            status: status(AT),
+            ..Publication::default()
+        });
+        let (kept, given) = order_rows(&f);
+        assert_eq!((kept.len(), &kept), (50, &given));
+
+        let moved = deferral(20, 1_791_900_000);
+        let mut in_place = deferral(30, 1_791_000_000 + 30 * 60);
+        in_place.nodes = 3;
+        let mut keyless = deferral(40, 1_791_000_000 + 40 * 60);
+        keyless.listing.address = "not an address".into();
+        set_rows_alone(
+            &f,
+            &[
+                RejectedChange::Clear(address(7)),
+                RejectedChange::Set(Box::new(deferral(500, 1_790_000_000))),
+                RejectedChange::Set(Box::new(moved.clone())),
+                RejectedChange::Set(Box::new(in_place.clone())),
+            ],
+        );
+        // A row whose listing gives no key, at an address of its own.
+        {
+            let dbs = f.publisher.dbs;
+            let mut txn = f.store.env().write_txn().unwrap();
+            dbs.side
+                .put(
+                    &mut txn,
+                    &tagged(REJECTED_TAG, &address(600)),
+                    &json(&keyless).unwrap(),
+                )
+                .unwrap();
+            txn.commit().unwrap();
+        }
+        let (kept, given) = order_rows(&f);
+        assert_eq!((kept.len(), given.len()), (50, 51));
+        assert_ne!(kept, given);
+
+        f.reopen();
+        let (kept, given) = order_rows(&f);
+        assert_eq!(kept, given);
+        // The next write of rejected.json lists every row once, in key order,
+        // as the whole builder does.
+        f.publish(&Publication {
+            at: AT + 60,
+            rejected: vec![RejectedChange::Clear(address(8))],
+            status: status(AT + 60),
+            ..Publication::default()
+        });
+        assert_lists_built_whole(&f);
+        let after: Rejected = f.file(REJECTED_FILE);
+        assert_eq!(after.listings.len(), 50);
+        let addresses: BTreeSet<&str> = after
+            .listings
+            .iter()
+            .map(|row| row.listing.address.as_str())
+            .collect();
+        assert_eq!(addresses.len(), 50);
+        assert!(addresses.contains(hex::encode(address(500)).as_str()));
+        assert!(!addresses.contains(hex::encode(address(7)).as_str()));
+        assert!(after.listings.contains(&moved));
+        assert!(after.listings.contains(&in_place));
+        assert_eq!(after.listings[0], keyless);
+        assert_eq!(after.listings.last(), Some(&moved));
+        // Opened again with nothing changed, the order rows stay as they are.
+        let (kept, given) = order_rows(&f);
+        assert_eq!((kept.len(), &kept), (50, &given));
+        f.reopen();
+        assert_eq!(order_rows(&f), (kept, given));
+    }
+
+    #[test]
+    fn the_order_of_more_rejections_than_a_batch_is_checked_a_batch_at_a_time() {
+        // More rejections than a batch, set with their order rows, then half
+        // of them cleared and as many set anew, later in key order, without
+        // theirs: the next open checks every batch, both ways, and
+        // rejected.json would be written as the whole builder writes it.
+        let mut f = Fixture::new();
+        let count = 2 * ORDER_BATCH as u64 + 10;
+        {
+            let dbs = f.publisher.dbs;
+            let mut txn = f.store.env().write_txn().unwrap();
+            let mut pending = Pending::default();
+            for seed in 0..count {
+                let change = RejectedChange::Set(Box::new(deferral(seed, 1_791_000_000 + seed)));
+                dbs.set_rejected(&mut txn, &change, &mut pending).unwrap();
+            }
+            txn.commit().unwrap();
+        }
+        let (kept, given) = order_rows(&f);
+        assert_eq!((kept.len(), &kept), (count as usize, &given));
+        let changes: Vec<RejectedChange> = (0..count)
+            .filter(|seed| seed.is_multiple_of(2))
+            .flat_map(|seed| {
+                [
+                    RejectedChange::Clear(address(seed)),
+                    RejectedChange::Set(Box::new(deferral(count + seed, 1_792_000_000 + seed))),
+                ]
+            })
+            .collect();
+        set_rows_alone(&f, &changes);
+        f.reopen();
+        let (kept, given) = order_rows(&f);
+        assert_eq!((kept.len(), &kept), (count as usize, &given));
+        let txn = f.store.env().read_txn().unwrap();
+        let mut written = Vec::new();
+        f.publisher.dbs.write_rejected(&txn, &mut written).unwrap();
+        assert_eq!(written, f.publisher.dbs.rejected(&txn).unwrap());
     }
 }
