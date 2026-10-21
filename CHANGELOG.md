@@ -37,12 +37,13 @@ told apart by the commit `darwin --version` prints. Upstream's entries follow.
   A node's requests wait at most two requests' timeouts a cycle, so a slow node can't hold the
   cycle open, and a node whose push comes behind its mirror is asked again in the same cycle. A
   node whose feed can't be read is read with `listings.v2` requests meanwhile, its feed asked for
-  again hourly with one request; and on a stop the producer ends its watches on the nodes. A cycle
-  decides nothing when fewer than 7 nodes, or under three quarters as many as in any of the 10
-  cycles before, answered, as a read's guard counts the nodes it finds. A search for a payment that
-  isn't on the chain goes on, the next time, from the last final block it searched. The full
-  listings behind the nodes' entries are
-  fetched once, one request at a time to a node, those a quorum names first and the others
+  again hourly with one request (and the next cycle, if it has answered its feed since the producer
+  started and leaves that request unanswered); and on a stop the producer ends its watches on the
+  nodes. A cycle decides nothing when fewer than 7 nodes answered, or when the census holds under
+  three quarters as many nodes as in any of the 10 cycles before, as a read's guard counts the
+  nodes it finds. A search for a payment that isn't on the chain goes on, the next time, from the
+  last final block it searched. The full listings behind the nodes' entries are fetched once, one
+  request at a time to a node, those a quorum names first and the others
   within each node's allowance, and kept, in the bytes a `GetResponse` carries them in, up to a page's share of a
   message; a node that doesn't hand one over can't keep an address from being decided, or other
   listings from being fetched. An entry is dropped only when, in one cycle, all 7 of

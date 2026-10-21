@@ -397,10 +397,12 @@ lookups that find the nodes, nor envelope fetches, nor the transport's own
 overhead.
 
 `too_few_answered` is true when fewer than 7 of the census's nodes
-answered the cycle, or under three quarters as many as in any of the 10
-cycles before it, as `darwin listings` measures the nodes a read finds
-against its recent reads: a sudden fall stops deciding, and one that lasts
-stops it until those cycles have all seen it. `census.answering` counts the
+answered the cycle, or the census holds under three quarters as many nodes
+as in any of the 10 cycles before it, as `darwin listings` measures the
+nodes a read finds against its recent reads: nodes that answer lookups but
+not the cycle's requests stay in the census and don't stop deciding, and a
+census that loses a quarter of its nodes at once stops it until those
+cycles have all seen the loss. `census.answering` counts the
 nodes that answered the cycle's request with an answer the producer's checks
 took, and `silent` lists the others.
 
