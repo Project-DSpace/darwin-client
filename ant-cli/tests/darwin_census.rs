@@ -111,9 +111,11 @@ const SELF_UPDATE: Counting = &[
     (None, "self_replace"),
 ];
 
-/// Decoding data maps (and anything else in MessagePack or JSON).
+/// Decoding data maps (and anything else in MessagePack or JSON), with
+/// self-encryption's own decoder too.
 const DECODES: Counting = &[
     (None, "decode_map_record"),
+    (Some("DataMap"), "from_bytes"),
     (Some("rmp_serde"), "from_slice"),
     (Some("rmp_serde"), "from_read"),
     (Some("serde_json"), "from_slice"),
@@ -178,8 +180,11 @@ const UPDATE_OFF: &str = "Unreachable: `darwin update` refuses (SELF_UPDATE is f
 
 const NETWORK_MAP: &str = "A data map read from the network, decoded through \
     decode_map_record, which bounds it.";
-const BOUNDED_MAP: &str = "decode_map_record itself: the one decode of data maps read from the \
-    network.";
+const BOUNDED_MAP: &str = "decode_map_record itself: the decode of data maps read from the \
+    network, but for the producer's bounded root-map read (ROOT_MAP).";
+const ROOT_MAP: &str = "The root map of a listed file whose data map is shrunk once, decrypted \
+    from at most 3 chunks, each checked against its address and decrypted no further than the \
+    size the map declares for it, within MAX_ROOT_MAP_BYTES; only its size is kept.";
 const LOCAL_FILE: &str = "Decodes a local file this client wrote (a datamap file, upload \
     state, a snapshot, earlier listings output), not network bytes.";
 const EMBED_LOCAL: &str = "Decodes a data map from a local manifest file the user gave, to \
@@ -1178,6 +1183,13 @@ const DECODE_SITES: &[Site] = &[
         "serde_json::from_slice",
         1,
         LOCAL_FILE,
+    ),
+    (
+        "ant-core/src/data/client/listings_serve.rs",
+        "read_root_size",
+        "DataMap::from_bytes",
+        1,
+        ROOT_MAP,
     ),
     (
         "ant-core/src/data/client/merkle.rs",
@@ -2251,6 +2263,7 @@ fn every_decode_is_reviewed() {
         DECODES,
         DECODE_SITES,
         "A data map read from the network is decoded only through decode_map_record, which \
-         bounds it; other decodes read local files or other types.",
+         bounds it, or by the producer's root-map read, bounded by the chunks it decrypts; other \
+         decodes read local files or other types.",
     );
 }
