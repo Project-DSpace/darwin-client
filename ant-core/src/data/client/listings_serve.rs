@@ -36,11 +36,11 @@
 //!    comes behind its mirror once its requests are answered is asked again
 //!    to catch up.
 //! 3. **Guard.** If fewer than 7 census nodes answered with answers the
-//!    checks took, or under three quarters as many as in any of the 10
-//!    cycles before ([`Census::guard_ok`], as an index read measures the
-//!    nodes it finds against its recent reads'), the cycle decides and
-//!    drops nothing, and every entry is kept, marked carried, as an index
-//!    read that finds too few nodes keeps them.
+//!    checks took, or the census holds under three quarters as many nodes
+//!    as in any of the 10 cycles before ([`Census::guard_ok`]: an index
+//!    read's guard, the census standing for the nodes a read finds), the
+//!    cycle decides and drops nothing, and every entry is kept, marked
+//!    carried, as an index read that finds too few nodes keeps them.
 //! 4. **Support.** An address's copies are those of the census's 7 nodes
 //!    nearest it ([`Census::nearest`]) whose copies count this cycle: from
 //!    the node's mirror when it is in sync, and for a node without the
@@ -1102,7 +1102,7 @@ impl Producer {
         .await?;
         let answered = self.note_answers(at, &asked).await;
         let guard_ok = self.census.guard_ok(answered);
-        self.census.note_answered(answered);
+        self.census.note_cycle();
         self.guard_ok = guard_ok;
 
         // Nothing below reads the network but fetching listings, deciding
@@ -7574,7 +7574,7 @@ mod tests {
             assert!(took <= Duration::from_secs(21), "cycle {cycle}: {took:?}");
             let answered = producer.note_answers(at, &BTreeSet::new()).await;
             assert!(producer.census.guard_ok(answered), "cycle {cycle}");
-            producer.census.note_answered(answered);
+            producer.census.note_cycle();
             producer.mark_due(at).unwrap();
             let until = Instant::now() + CYCLE;
             let mut drops = DropCheck {

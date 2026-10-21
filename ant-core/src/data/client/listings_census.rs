@@ -59,14 +59,15 @@
 //!   ([`Census::supports_feed`]), and older ones are read with the listings
 //!   v2 requests.
 //! - **Guard.** A cycle in which fewer than [`NEAREST_NODES`] of the
-//!   census answered, or under three quarters as many as in any of the
-//!   cycles before it that are kept (as many as an index read keeps of its
-//!   recent reads), decides and drops nothing ([`Census::guard_ok`]): an
-//!   index read's guard, counting the nodes that answered the poll as a read
-//!   counts the nodes it finds. A sudden fall, as when the producer is cut
-//!   off from much of the network, stops deciding; a fall that lasts, such
-//!   as nodes whose listings service is down while they still answer
-//!   lookups, stops it only until the cycles kept have all seen it.
+//!   census answered, or when the census holds under three quarters as many
+//!   nodes as it did in any of the cycles before it that are kept (as many
+//!   as an index read keeps of its recent reads), decides and drops nothing
+//!   ([`Census::guard_ok`]): an index read's guard, the census's members,
+//!   nodes found answering lookups, standing for the nodes a read finds. So
+//!   nodes that answer lookups but not polls, as while their listings
+//!   service is down, stay members and don't stop deciding, as a read would
+//!   find them; and a census that loses a quarter of its nodes at once stops
+//!   it until the cycles kept have all seen the loss.
 //!
 //! The census is kept in the producer's store
 //! ([`ListingsStore`], databases [`NODES_DB`], [`QUEUE_DB`] and
@@ -81,7 +82,7 @@
 //!    and [`Census::note_peers`] for a list of peers asked for after a
 //!    changed view) or miss ([`Census::record_miss`]);
 //! 3. decides only if [`Census::guard_ok`] for the nodes that answered, and
-//!    notes how many did ([`Census::note_answered`]);
+//!    notes the census's size for the cycles after ([`Census::note_cycle`]);
 //! 4. counts an address's support among [`Census::nearest`];
 //! 5. drops a listing only through [`Census::confirm_drop`];
 //! 6. writes the census ([`Census::save`]) and its status
@@ -147,9 +148,9 @@ pub const META_DB: &str = "census_meta";
 /// The key in [`META_DB`] of when every leaf was last closed (Unix seconds).
 const REFRESHED_AT: &str = "refreshed_at";
 
-/// The key in [`META_DB`] of how many census nodes answered each of the
-/// latest cycles, the latest last ([`Census::note_answered`]), as JSON.
-const RECENT_ANSWERED: &str = "recent_answered";
+/// The key in [`META_DB`] of how many nodes the census held in each of the
+/// latest cycles, the latest last ([`Census::note_cycle`]), as JSON.
+const RECENT_SIZES: &str = "recent_sizes";
 
 /// What a node's user agent starts with: clients' don't.
 const NODE_AGENT: &str = "node/";
@@ -469,10 +470,10 @@ pub struct Census {
     /// The ranges closed in full in the current cycle: a drop in one shares
     /// that closing.
     closed_this_cycle: Vec<AddressRange>,
-    /// How many census nodes answered each of the latest cycles, up to
+    /// How many nodes the census held in each of the latest cycles, up to
     /// [`RECENT_READS`] of them, the latest last ([`Self::guard_ok`]).
-    recent_answered: Vec<u64>,
-    /// Whether `recent_answered` changed since the last save.
+    recent_sizes: Vec<u64>,
+    /// Whether `recent_sizes` changed since the last save.
     recent_dirty: bool,
 }
 
@@ -513,9 +514,9 @@ impl Census {
         let refreshed_at = meta_db.get(&txn, REFRESHED_AT).map_err(store_error)?;
         // Counts that can't be read are as none: the guard then needs only
         // its 7 until cycles have been counted again.
-        let recent_answered = meta_db
+        let recent_sizes = meta_db
             .remap_data_type::<SerdeJson<Vec<u64>>>()
-            .get(&txn, RECENT_ANSWERED)
+            .get(&txn, RECENT_SIZES)
             .ok()
             .flatten()
             .unwrap_or_default();
@@ -539,7 +540,7 @@ impl Census {
             cycles: 0,
             view_closes: BTreeMap::new(),
             closed_this_cycle: Vec::new(),
-            recent_answered,
+            recent_sizes,
             recent_dirty: false,
         })
     }
@@ -1276,7 +1277,7 @@ impl Census {
         if self.recent_dirty {
             self.meta_db
                 .remap_data_type::<SerdeJson<Vec<u64>>>()
-                .put(&mut txn, RECENT_ANSWERED, &self.recent_answered)
+                .put(&mut txn, RECENT_SIZES, &self.recent_sizes)
                 .map_err(store_error)?;
         }
         txn.commit().map_err(store_error)?;
@@ -1425,29 +1426,32 @@ impl Census {
     }
 
     /// Whether a cycle in which `answered` census nodes answered may decide
-    /// and drop listings: at least [`NEAREST_NODES`] of them, and at least
-    /// three quarters of the most that answered in any of the latest cycles
-    /// noted ([`Self::note_answered`]), as an index read's guard measures
-    /// the nodes it finds against its recent reads'. So a sudden fall stops
-    /// deciding, and one that lasts stops it only until every cycle noted
-    /// has seen it; nodes that answer lookups but not polls, as while their
-    /// listings service is down, don't stop it for good.
+    /// and drop listings: at least [`NEAREST_NODES`] of them answered, and
+    /// the census holds at least three quarters as many nodes as it did in
+    /// any of the latest cycles noted ([`Self::note_cycle`]). An index
+    /// read's guard: its members, found answering lookups, stand for the
+    /// nodes a read finds, measured against recent reads'. So nodes that
+    /// answer lookups but not polls stay members and don't stop deciding, as
+    /// a read would find them; a census that loses a quarter of its nodes at
+    /// once stops it until every cycle noted has seen the loss; and a cycle
+    /// that hears from fewer than [`NEAREST_NODES`], as when the producer is
+    /// cut off from the network, decides nothing.
     #[must_use]
     pub fn guard_ok(&self, answered: usize) -> bool {
-        let recent = self.recent_answered.iter().copied().max().unwrap_or(0);
-        let answered_count = u64::try_from(answered).unwrap_or(u64::MAX);
-        answered >= NEAREST_NODES && answered_count.saturating_mul(4) >= recent.saturating_mul(3)
+        let recent = self.recent_sizes.iter().copied().max().unwrap_or(0);
+        let size = u64::try_from(self.nodes.len()).unwrap_or(u64::MAX);
+        answered >= NEAREST_NODES && size.saturating_mul(4) >= recent.saturating_mul(3)
     }
 
-    /// Note that `answered` census nodes answered the latest cycle's poll,
-    /// for the guards of the cycles after it ([`Self::guard_ok`]): the counts
-    /// of the latest [`RECENT_READS`] cycles are kept, across starts too, as
-    /// an index read keeps its recent reads'.
-    pub fn note_answered(&mut self, answered: usize) {
-        self.recent_answered
-            .push(u64::try_from(answered).unwrap_or(u64::MAX));
-        let excess = self.recent_answered.len().saturating_sub(RECENT_READS);
-        self.recent_answered.drain(..excess);
+    /// Note the census's size at the latest cycle, for the guards of the
+    /// cycles after it ([`Self::guard_ok`]): the sizes of the latest
+    /// [`RECENT_READS`] cycles are kept, across starts too, as an index read
+    /// keeps its recent reads'.
+    pub fn note_cycle(&mut self) {
+        self.recent_sizes
+            .push(u64::try_from(self.nodes.len()).unwrap_or(u64::MAX));
+        let excess = self.recent_sizes.len().saturating_sub(RECENT_READS);
+        self.recent_sizes.drain(..excess);
         self.recent_dirty = true;
     }
 
@@ -3078,33 +3082,42 @@ mod tests {
         for byte in 0..20u8 {
             census.admit(peer(byte), Vec::new(), 0);
         }
-        // With no cycle noted yet, only the 7.
+        // Fewer than 7 answering decide nothing, whatever the census holds.
         assert!(!census.guard_ok(6));
         assert!(census.guard_ok(7));
-        census.note_answered(20);
-        assert!(!census.guard_ok(14));
-        assert!(census.guard_ok(15));
-        // A fall that lasts stops deciding only until every cycle kept has
-        // seen it, as an index read's recent reads.
-        for _ in 1..RECENT_READS {
-            assert!(!census.guard_ok(14));
-            census.note_answered(14);
+        census.note_cycle();
+        // Nodes that don't answer, still members, don't stop deciding.
+        assert!(census.guard_ok(10));
+        // A census that loses a quarter of its nodes at once stops it until
+        // every cycle kept has seen the loss, as an index read's recent
+        // reads.
+        for byte in 0..6u8 {
+            census.remove(&peer(byte));
         }
-        assert!(!census.guard_ok(14));
-        census.note_answered(14);
+        for _ in 0..RECENT_READS {
+            assert!(!census.guard_ok(14));
+            census.note_cycle();
+        }
         assert!(census.guard_ok(14));
         // Kept across opens.
+        for byte in 0..6u8 {
+            census.admit(peer(byte), Vec::new(), 0);
+        }
+        census.note_cycle();
         census.save().unwrap();
         drop(census);
-        let census = super::tests::census(dir.path());
-        assert!(census.guard_ok(14));
-        assert!(!census.guard_ok(10));
+        let mut census = super::tests::census(dir.path());
+        assert_eq!(census.len(), 20);
+        for byte in 0..6u8 {
+            census.remove(&peer(byte));
+        }
+        assert!(!census.guard_ok(14));
         let small_dir = tempfile::tempdir().unwrap();
         let mut small = super::tests::census(small_dir.path());
         for byte in 0..6u8 {
             small.admit(peer(byte), Vec::new(), 0);
         }
-        small.note_answered(6);
+        small.note_cycle();
         assert!(!small.guard_ok(6));
     }
 
@@ -3113,9 +3126,8 @@ mod tests {
         // Fault injection: 7 of 24 census nodes answer lookups but never a
         // listings poll (their listings service is down, or out of spec).
         // They stay members, as found answering; the guard measures the
-        // nodes that answer polls against recent cycles', as an index read
-        // measures the nodes it finds, so they hold it shut only for the
-        // cycles kept after they stop at once.
+        // census against recent cycles', as an index read measures the
+        // nodes it finds, so they never hold it shut.
         let dir = tempfile::tempdir().unwrap();
         let (mut census, sim) = closed_census(dir.path(), 24, 21);
         let _ = census.take_changes();
@@ -3141,12 +3153,10 @@ mod tests {
             if !census.guard_ok(answered) {
                 shut.push(cycle);
             }
-            census.note_answered(answered);
+            census.note_cycle();
             now += 60;
         }
-        // Shut for the cycles kept after the fall, then open for good.
-        let expected: Vec<u64> = (5..5 + RECENT_READS as u64).collect();
-        assert_eq!(shut, expected);
+        assert!(shut.is_empty(), "{shut:?}");
         assert!(quiet.iter().all(|peer| census.get(peer).is_some()));
     }
 

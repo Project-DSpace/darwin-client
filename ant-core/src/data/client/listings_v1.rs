@@ -682,11 +682,12 @@ pub struct CycleStatus {
     pub rpc_errors: u64,
     /// Addresses decided.
     pub decided: u64,
-    /// Whether the cycle decided and dropped nothing because too few of the
-    /// nodes it knows answered: fewer than 7 of the census's nodes, or under
-    /// three quarters as many as in any of the 10 cycles before
-    /// ([`Census::guard_ok`]), as an index read's guard measures the nodes it
-    /// finds against its recent reads' ([`ListingsIndex::too_few_nodes`]).
+    /// Whether the cycle decided and dropped nothing because it heard from
+    /// too few nodes: fewer than 7 of the census's nodes answered, or the
+    /// census holds under three quarters as many nodes as in any of the 10
+    /// cycles before ([`Census::guard_ok`]), as an index read's guard
+    /// measures the nodes it finds against its recent reads'
+    /// ([`ListingsIndex::too_few_nodes`]).
     ///
     /// [`ListingsIndex::too_few_nodes`]: super::listings::ListingsIndex::too_few_nodes
     /// [`Census::guard_ok`]: super::listings_census::Census::guard_ok
