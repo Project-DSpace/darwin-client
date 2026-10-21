@@ -43,9 +43,10 @@
 //!    [`MAX_LISTING_BYTES`] is out of spec, and never kept. Fetching is
 //!    bounded: it takes at most [`CYCLE`], however long the poll took; every
 //!    listing a quorum of an address's nearest nodes name is fetched before
-//!    any that fewer name; a node is sent one request at a time, at most its
-//!    allowance in pages a cycle ([`Feeds::page_allowance`]), and nothing
-//!    more that cycle once it leaves one unanswered; and a node that failed
+//!    any that fewer name; a node is sent one request at a time, for
+//!    listings fewer than a quorum name at most its allowance in pages a
+//!    cycle ([`Feeds::page_allowance`]), and nothing more that cycle once it
+//!    leaves one unanswered; and a node that failed
 //!    to hand over the listing behind its entry isn't asked for it again
 //!    until its entry changes, or [`RETRY_INTERVAL`] has passed.
 //! 5. **Work per address**, as an index read decides it, a batch of
@@ -353,8 +354,9 @@ type KeyRange<'a> = (Bound<&'a [u8]>, Bound<&'a [u8]>);
 /// those whose copies count.
 type Work = (XorName, Vec<PeerId>, DigestCopies);
 
-/// A full listing to fetch, and the nodes whose entries name it.
-type Wanted = (ListingId, DigestCopies);
+/// A full listing to fetch, the nodes whose entries name it, and whether
+/// at least [`QUORUM_THRESHOLD`] of the address's nearest nodes name it.
+type Wanted = (ListingId, DigestCopies, bool);
 
 /// Addresses to decide, each with whether a change of its inputs explains
 /// deciding it ([`Producer::next_batch`]).
@@ -1915,7 +1917,9 @@ impl Producer {
             return;
         };
         let (client, feeds, budget) = (&self.client, &self.feeds, &self.fetch_budget);
-        let take = move |peer: &PeerId| budget.take(peer, || feeds.page_allowance(peer));
+        let take = move |peer: &PeerId, quorum: bool| {
+            budget.take(peer, quorum, || feeds.page_allowance(peer))
+        };
         let unanswered = move |peer: &PeerId| budget.exhaust(peer);
         let ask = move |peer: PeerId, address: XorName| async move {
             client
@@ -3009,25 +3013,46 @@ fn kept_listing(bytes: &[u8]) -> Option<Listing> {
 }
 
 /// How many more `GetRequest`s for full listings each node may be sent
-/// this cycle.
+/// this cycle, and the nodes that left one unanswered this cycle.
 #[derive(Debug, Default)]
-struct FetchBudget(Mutex<HashMap<PeerId, usize>>);
+struct FetchBudget(Mutex<Budgets>);
+
+#[derive(Debug, Default)]
+struct Budgets {
+    /// What is left of each node's allowance.
+    left: HashMap<PeerId, usize>,
+    /// The nodes sent nothing more this cycle.
+    unanswered: HashSet<PeerId>,
+}
 
 impl FetchBudget {
     /// A new cycle: every node's allowance starts again.
     fn clear(&mut self) {
-        if let Ok(left) = self.0.get_mut() {
-            left.clear();
+        if let Ok(budgets) = self.0.get_mut() {
+            budgets.left.clear();
+            budgets.unanswered.clear();
         }
     }
 
-    /// Take one request from `peer`'s allowance, `allowance` a cycle:
-    /// whether it had one left.
-    fn take(&self, peer: &PeerId, allowance: impl FnOnce() -> usize) -> bool {
-        let Ok(mut left) = self.0.lock() else {
+    /// Take one request for `peer`: whether it may be sent one. Not once it
+    /// left one unanswered this cycle. For a listing at least a quorum of
+    /// its address's nearest nodes name (`quorum`), the request is taken
+    /// from no allowance: no node can make up such a listing on its own,
+    /// and each is fetched once and kept, so what they cost is bounded by
+    /// what the nodes' mirrors may hold, not by a cycle's allowance, and a
+    /// burst of new listings is fetched as soon as the nodes hand them over.
+    /// Any other is taken from `peer`'s allowance, `allowance` a cycle.
+    fn take(&self, peer: &PeerId, quorum: bool, allowance: impl FnOnce() -> usize) -> bool {
+        let Ok(mut budgets) = self.0.lock() else {
             return false;
         };
-        let left = left.entry(*peer).or_insert_with(allowance);
+        if budgets.unanswered.contains(peer) {
+            return false;
+        }
+        if quorum {
+            return true;
+        }
+        let left = budgets.left.entry(*peer).or_insert_with(allowance);
         if *left == 0 {
             return false;
         }
@@ -3037,8 +3062,8 @@ impl FetchBudget {
 
     /// `peer` left a request unanswered: it is sent nothing more this cycle.
     fn exhaust(&self, peer: &PeerId) {
-        if let Ok(mut left) = self.0.lock() {
-            left.insert(*peer, 0);
+        if let Ok(mut budgets) = self.0.lock() {
+            budgets.unanswered.insert(*peer);
         }
     }
 }
@@ -3079,7 +3104,11 @@ fn fetches_wanted(
             .map(|(digest, (count, holders))| (count, (*address, digest), holders))
             .collect();
         named.sort_by_key(|(count, _, _)| std::cmp::Reverse(*count));
-        wanted.extend(named.into_iter().map(|(_, key, holders)| (key, holders)));
+        wanted.extend(
+            named
+                .into_iter()
+                .map(|(_, key, holders)| (key, holders, quorum)),
+        );
     }
     wanted
 }
@@ -3090,10 +3119,11 @@ fn fetches_wanted(
 /// didn't answer, `Some(None)` if it holds none), [`POLL_CONCURRENCY`] at a
 /// time. A node is sent one request at a time: a fetch whose next holder is
 /// busy asks the first of its holders that isn't, or waits for whichever is
-/// free first. A holder is asked only if `take` gives it a request from its
-/// allowance; one that leaves a request unanswered goes to `unanswered`,
-/// which takes the rest of its allowance, so a node that never answers
-/// costs at most one request's wait a cycle. A listing that takes more than
+/// free first. A holder is asked only if `take` gives it a request, given
+/// whether a quorum names the listing ([`FetchBudget::take`]); one that
+/// leaves a request unanswered goes to `unanswered`, after which it is sent
+/// nothing more, so a node that never answers costs at most one request's
+/// wait a cycle. A listing that takes more than
 /// [`MAX_LISTING_BYTES`] isn't taken: its node failed to hand it over. What
 /// hasn't come by `deadline` is left. Each fetch, when it ends, goes to
 /// `done`: the listing, in the bytes it is kept in ([`kept_bytes`]), if one
@@ -3101,7 +3131,7 @@ fn fetches_wanted(
 /// over.
 async fn fetch_wanted<A, Fut>(
     wanted: impl Iterator<Item = Wanted>,
-    take: impl Fn(&PeerId) -> bool + Copy,
+    take: impl Fn(&PeerId, bool) -> bool + Copy,
     unanswered: impl Fn(&PeerId) + Copy,
     deadline: Instant,
     ask: A,
@@ -3113,7 +3143,7 @@ async fn fetch_wanted<A, Fut>(
     let slots = NodeSlots::default();
     let slots = &slots;
     let mut fetches = stream::iter(wanted)
-        .map(|(key, holders)| async move {
+        .map(|(key, holders, quorum)| async move {
             let mut left = holders;
             let mut failed = Vec::new();
             while !left.is_empty() {
@@ -3121,7 +3151,7 @@ async fn fetch_wanted<A, Fut>(
                     break;
                 };
                 let (peer, entry) = left.remove(index);
-                if !take(&peer) {
+                if !take(&peer, quorum) {
                     continue;
                 }
                 match ask(peer, key.0).await {
@@ -4831,7 +4861,7 @@ mod tests {
         let asked: Mutex<HashMap<PeerId, usize>> = Mutex::new(HashMap::new());
         let in_flight: Mutex<(HashMap<PeerId, usize>, usize)> = Mutex::new((HashMap::new(), 0));
         let (asked_ref, in_flight_ref) = (&asked, &in_flight);
-        let take = |peer: &PeerId| budget.take(peer, || allowance(peer));
+        let take = |peer: &PeerId, quorum: bool| budget.take(peer, quorum, || allowance(peer));
         let unanswered = |peer: &PeerId| budget.exhaust(peer);
         let ask = move |peer: PeerId, address: XorName| async move {
             *asked_ref.lock().unwrap().entry(peer).or_default() += 1;
@@ -5142,10 +5172,50 @@ mod tests {
     fn a_nodes_allowance_of_requests_is_kept_for_the_cycle() {
         let peer = PeerId::from_bytes([1; 32]);
         let mut budget = FetchBudget::default();
-        assert!((0..8).all(|_| budget.take(&peer, || 8)));
-        assert!(!budget.take(&peer, || 8));
+        assert!((0..8).all(|_| budget.take(&peer, false, || 8)));
+        assert!(!budget.take(&peer, false, || 8));
+        // A listing a quorum names takes from no allowance.
+        assert!(budget.take(&peer, true, || 8));
         budget.clear();
-        assert!(budget.take(&peer, || 8));
+        assert!(budget.take(&peer, false, || 8));
+        // Once it leaves one unanswered, nothing more this cycle.
+        budget.exhaust(&peer);
+        assert!(!budget.take(&peer, true, || 8));
+        assert!(!budget.take(&peer, false, || 8));
+        budget.clear();
+        assert!(budget.take(&peer, true, || 8));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_burst_of_new_listings_a_quorum_serves_is_fetched_in_one_cycle() {
+        // 400 new listings, each on its 7 nearest of 20 honest nodes, more
+        // than the nodes' allowances (9 requests each) hold together.
+        let peers: Vec<PeerId> = (1..=20u8).map(|n| PeerId::from_bytes([n; 32])).collect();
+        let work: Vec<Work> = (0..400u32)
+            .map(|n| {
+                let address = spread(n);
+                let entry = DigestEntry::new(&stored(address));
+                let copies = (0..NEAREST_NODES)
+                    .map(|k| (peers[(n as usize + k) % peers.len()], entry))
+                    .collect();
+                (address, Vec::new(), copies)
+            })
+            .collect();
+        let budget = FetchBudget::default();
+        let round = fetch_round(
+            &work,
+            &HashMap::new(),
+            &HashSet::new(),
+            &HashMap::new(),
+            |_| 9,
+            &budget,
+            Instant::now() + CYCLE,
+        )
+        .await;
+        assert_eq!(round.fetched.len(), 400);
+        assert!(round.refused.is_empty());
+        assert_eq!(round.most_in_flight, 1);
+        assert!(round.took < CYCLE, "{:?}", round.took);
     }
 
     #[tokio::test]
