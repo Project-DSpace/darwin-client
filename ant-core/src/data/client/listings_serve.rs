@@ -144,15 +144,16 @@
 //! cycle is due, at least a batch, so what else waits to be decided, or
 //! what doesn't fit, is left to the cycles' bounded passes. Only an address
 //! at least [`QUORUM_THRESHOLD`] of whose nearest nodes pushed their copies
-//! of one listing since the latest poll is decided so: a mirror shows what
-//! its node served at its latest answer or push, and one that has since
-//! gone, or changed without its push coming, would still show it. So
-//! between cycles a listing is put only on a quorum of copies just pushed,
-//! as when its nearest nodes store a new one, however its pushes fell
-//! around the poll: its other copies, read by the poll or pushed while it
-//! ran or before it, only add to its support, which the next cycle measures
-//! again. Every other change waits for the next cycle. One near a node
-//! whose push came behind its mirror, or was dropped, waits too
+//! of one listing since the latest poll, copies deciding takes, is decided
+//! so: a mirror shows what its node served at its latest answer or push,
+//! and one that has since gone, or changed without its push coming, would
+//! still show it. So between cycles a listing is put only on a quorum of
+//! copies just pushed, as when its nearest nodes store a new one, however
+//! its pushes fell around the poll: its other copies, read by the poll or
+//! pushed while it ran or before it, only add to its support, which the
+//! next cycle measures again. Every other change waits for the next cycle,
+//! as does a pushed listing whose full listing couldn't be fetched. One
+//! near a node whose push came behind its mirror, or was dropped, waits too
 //! ([`Feeds::behind`]). A node can have only so many pushes waiting
 //! (`PUSHES_WAITING_PER_NODE`, in `listings`).
 //! Pushes that come during a cycle's poll are decided with the cycle: while
@@ -2684,24 +2685,28 @@ impl Producer {
 
     /// Whether `address` may be decided between cycles: at least
     /// [`QUORUM_THRESHOLD`] of its nearest nodes whose copies count pushed
-    /// their copies of one listing since the latest poll ([`PUSHED_TAG`]).
-    /// A mirror shows what its node served at its latest answer, or push: a
-    /// node that has since gone, or stopped serving the listing without its
-    /// push coming, still shows it until the next poll, so a quorum that
-    /// rests on such a copy is left to that poll, which reads every node. So
-    /// between cycles a listing is put only on a quorum of copies just
-    /// pushed, as when a new one is stored and its nearest nodes push it,
-    /// whenever its other copies came: those the poll read, or that were
-    /// pushed while it ran or before it, only add to its support, which the
-    /// next cycle measures again. Every other change waits for the cycle.
+    /// their copies of one listing since the latest poll ([`PUSHED_TAG`]),
+    /// copies deciding takes ([`taken_copy`]). A mirror shows what its node
+    /// served at its latest answer, or push: a node that has since gone, or
+    /// stopped serving the listing without its push coming, still shows it
+    /// until the next poll, so a quorum that rests on such a copy is left to
+    /// that poll, which reads every node. So between cycles a listing is put
+    /// only on a quorum of copies just pushed, as when a new one is stored
+    /// and its nearest nodes push it, whenever its other copies came: those
+    /// the poll read, or that were pushed while it ran or before it, only add
+    /// to its support, which the next cycle measures again. Every other
+    /// change waits for the cycle. A pushed copy whose full listing isn't
+    /// kept counts only until the listings are `fetched`: deciding counts its
+    /// node as one not heard from.
     ///
     /// # Errors
     ///
     /// If the store can't be read.
-    fn pushed_quorum(&self, address: &XorName) -> Result<bool> {
+    fn pushed_quorum(&self, address: &XorName, fetched: bool) -> Result<bool> {
         let nearest = self.census.nearest(address, NEAREST_NODES);
         let copies = self.feeds.copies(address, &nearest)?;
         let txn = self.store.env().read_txn().map_err(store_error)?;
+        let mut kept: HashMap<[u8; 32], Kept> = HashMap::new();
         let mut pushed: BTreeMap<[u8; 32], usize> = BTreeMap::new();
         for (peer, entry) in &copies {
             let fresh = self
@@ -2709,7 +2714,17 @@ impl Producer {
                 .get(&txn, &pushed_key(address, peer))
                 .map_err(store_error)?
                 .is_some();
-            if fresh {
+            if !fresh {
+                continue;
+            }
+            let taken = match kept
+                .entry(entry.digest)
+                .or_insert_with(|| self.kept_listing(&txn, address, &entry.digest))
+            {
+                Kept::Listing(listing) => taken_copy(entry, listing).is_some(),
+                Kept::None | Kept::Unreadable => !fetched,
+            };
+            if taken {
                 let count = pushed.entry(entry.digest).or_default();
                 *count += 1;
                 if *count >= QUORUM_THRESHOLD {
@@ -2725,7 +2740,8 @@ impl Producer {
     /// full listings fetched first ([`Self::fetch_addresses`]), until
     /// `deadline`, at least a batch, as [`Self::decide_batch`] decides one,
     /// without drops. Only an address a quorum of whose nearest nodes pushed
-    /// their copies of one listing since the latest poll is decided
+    /// their copies of one listing since the latest poll is decided, copies
+    /// deciding takes, as the listings fetched show them
     /// ([`Self::pushed_quorum`]); one of whose nearest nodes' pushes came
     /// behind its mirror is left out too, for the next cycle to decide once
     /// the node is read again ([`Feeds::behind`]); and so is what doesn't fit
@@ -2751,7 +2767,7 @@ impl Producer {
                     .nearest(address, NEAREST_NODES)
                     .iter()
                     .any(|peer| self.feeds.behind(peer));
-            if !near_behind && self.pushed_quorum(address)? {
+            if !near_behind && self.pushed_quorum(address, false)? {
                 ready.push(*address);
             }
         }
@@ -2763,7 +2779,17 @@ impl Producer {
                 break;
             }
             Box::pin(self.fetch_addresses(chunk, deadline)).await?;
-            let batch: Batch = chunk.iter().map(|address| (*address, true)).collect();
+            // Again, with the listings fetched: a pushed copy deciding would
+            // leave out, or whose listing couldn't be had, doesn't count.
+            let mut batch: Batch = Vec::with_capacity(chunk.len());
+            for address in chunk {
+                if self.pushed_quorum(address, true)? {
+                    batch.push((*address, true));
+                }
+            }
+            if batch.is_empty() {
+                continue;
+            }
             let (count, changed) =
                 Box::pin(self.decide_batch(batch, at, None, false, &pass, tally)).await?;
             decided += count;
@@ -3369,16 +3395,16 @@ impl Iterator for WantedIter<'_> {
 }
 
 /// Each of `copies` of an address, digest entries, as the full listing its
-/// node serves: the listing `fetched` gives for the entry's digest (the full
-/// listings fetched, without `first_seen`), with the node's own
-/// `first_seen`, as the node's entry describes it. Those [`Listing::validate`]
-/// refuses, or that the node's entry doesn't describe, are left out, as an
-/// index walk leaves out a copy that fails its checks. Also returns the
-/// nodes whose listing isn't fetched: their copies can't be had this time,
-/// and they count as nodes not heard from ([`Client::decide_backed`]), so
-/// no one node can keep an address from being decided by failing to hand
-/// over its listing. Each digest is read once, however many copies share
-/// it.
+/// node serves ([`taken_copy`]): the listing `fetched` gives for the
+/// entry's digest (the full listings fetched, without `first_seen`), with
+/// the node's own `first_seen`, as the node's entry describes it. Those
+/// [`Listing::validate`] refuses, or that the node's entry doesn't describe,
+/// are left out, as an index walk leaves out a copy that fails its checks.
+/// Also returns the nodes whose listing isn't fetched: their copies can't be
+/// had this time, and they count as nodes not heard from
+/// ([`Client::decide_backed`]), so no one node can keep an address from
+/// being decided by failing to hand over its listing. Each digest is read
+/// once, however many copies share it.
 fn copies_from(
     mut fetched: impl FnMut(&[u8; 32]) -> Option<Listing>,
     copies: &[(PeerId, DigestEntry)],
@@ -3394,15 +3420,24 @@ fn copies_from(
             unheard.push(*peer);
             continue;
         };
-        let copy = Listing {
-            first_seen: entry.first_seen,
-            ..listing.clone()
-        };
-        if entry.describes(&copy) && copy.validate().is_ok() {
+        if let Some(copy) = taken_copy(entry, listing) {
             listed.push((*peer, copy));
         }
     }
     (listed, unheard)
+}
+
+/// The copy `entry`, a node's digest entry, stands for, from `listing`, the
+/// full listing fetched for its digest (without `first_seen`): with the
+/// node's own `first_seen`, if the entry describes it and
+/// [`Listing::validate`] takes it. Deciding takes only such copies
+/// ([`copies_from`]), and leaves out any other.
+fn taken_copy(entry: &DigestEntry, listing: &Listing) -> Option<Listing> {
+    let copy = Listing {
+        first_seen: entry.first_seen,
+        ..listing.clone()
+    };
+    (entry.describes(&copy) && copy.validate().is_ok()).then_some(copy)
 }
 
 /// A full listing as the store keeps it ([`Producer::kept_listing`]).
@@ -7569,8 +7604,9 @@ mod tests {
         assert!(producer.publisher.entry(&fresh.address).unwrap().is_some());
         assert!(!producer.feeds.is_pending(&fresh.address).unwrap());
         // A poll forgets what was pushed: it reads every node again.
+        assert!(producer.pushed_quorum(&fresh.address, true).unwrap());
         producer.forget_pushed().unwrap();
-        assert!(!producer.pushed_quorum(&fresh.address).unwrap());
+        assert!(!producer.pushed_quorum(&fresh.address, false).unwrap());
     }
 
     #[tokio::test]
@@ -7797,6 +7833,156 @@ mod tests {
             }
         }
         assert_eq!(producer.published_between, 4);
+    }
+
+    #[tokio::test]
+    async fn between_cycles_a_pushed_copy_deciding_leaves_out_counts_toward_no_quorum() {
+        // A new listing's copies: 3 read by a cycle's poll, then 3 pushed
+        // after it, and a 4th pushed after it of the same digest but dated
+        // off the hour, a copy deciding leaves out (a faulty node's). Only 3
+        // copies deciding takes were pushed since the poll, so it waits,
+        // pending, for the next cycle, which lists it on the 6 it takes.
+        let dir = tempfile::tempdir().unwrap();
+        let (mut producer, _node) = offline_producer(dir.path()).await;
+        let peers = census_nodes(&mut producer, 8);
+        let (_sink, pushes) = push_channel(PUSH_CAPACITY);
+        producer.pushes = pushes;
+        producer.start_requests();
+        let net = FakeNet::with(
+            peers
+                .iter()
+                .map(|peer| (*peer, FakeNode::serving(Behaviour::Honest, Vec::new())))
+                .collect(),
+        );
+        let now = unix_now();
+        cycle_over(&mut producer, &net, now).await;
+
+        let fresh = hidden_listings(&producer, 0x75, 1).remove(0);
+        keep_listing(&producer, &fresh);
+        let entry = DigestEntry::new(&fresh);
+        let nearest = producer.census.nearest(&fresh.address, NEAREST_NODES);
+        // Three nodes store it before the poll, which reads their copies.
+        for peer in &nearest[..3] {
+            net.node(peer, |node| {
+                node.put(entry);
+                node.take_pushes();
+            });
+        }
+        cycle_over(&mut producer, &net, now + 60).await;
+        assert_eq!(
+            producer
+                .feeds
+                .copies(&fresh.address, &nearest)
+                .unwrap()
+                .len(),
+            3
+        );
+        assert!(producer.publisher.entry(&fresh.address).unwrap().is_none());
+
+        // A node stores `entry`'s copy, and its watch pushes it.
+        let store = |peer: &PeerId, entry: DigestEntry| -> ChangesResponse {
+            net.node(peer, |node| {
+                node.put(entry);
+                let mut pushes = node.take_pushes();
+                assert_eq!(pushes.len(), 1);
+                pushes.remove(0)
+            })
+        };
+        for peer in &nearest[3..6] {
+            producer
+                .take_pushes((*peer, store(peer, entry)), Instant::now() + CYCLE)
+                .await
+                .unwrap();
+        }
+        assert!(producer.publisher.entry(&fresh.address).unwrap().is_none());
+        let first_seen = entry.first_seen.unwrap() + 1;
+        let odd = DigestEntry {
+            first_seen: Some(first_seen),
+            time: first_seen,
+            ..entry
+        };
+        let kept = Listing {
+            first_seen: None,
+            ..fresh.clone()
+        };
+        assert!(taken_copy(&entry, &kept).is_some());
+        assert!(taken_copy(&odd, &kept).is_none());
+        let peer = nearest[6];
+        producer
+            .take_pushes((peer, store(&peer, odd)), Instant::now() + CYCLE)
+            .await
+            .unwrap();
+        assert_eq!(
+            producer
+                .feeds
+                .copies(&fresh.address, &nearest)
+                .unwrap()
+                .len(),
+            NEAREST_NODES
+        );
+        assert!(!producer.pushed_quorum(&fresh.address, true).unwrap());
+        assert!(producer.publisher.entry(&fresh.address).unwrap().is_none());
+        assert!(producer.feeds.is_pending(&fresh.address).unwrap());
+        assert_eq!(producer.published_between, 0);
+
+        // The next cycle lists it, on the copies deciding takes.
+        cycle_over(&mut producer, &net, now + 120).await;
+        assert!(producer.publisher.entry(&fresh.address).unwrap().is_some());
+        let support = producer.publisher.support(&fresh.address).unwrap();
+        assert_eq!(support.map(|support| support.nodes), Some(6));
+    }
+
+    #[tokio::test]
+    async fn between_cycles_a_quorum_of_pushes_whose_listing_cant_be_had_waits_for_the_cycle() {
+        // A quorum of a new listing's nearest nodes pushed it since the poll,
+        // but its full listing isn't kept: the address is taken, to fetch it,
+        // and when the listing can't be had, deciding would count those
+        // nodes as not heard from, so the address waits, pending, for the
+        // next cycle. Once the listing is kept, the same pushes decide it.
+        let dir = tempfile::tempdir().unwrap();
+        let (mut producer, _node) = offline_producer(dir.path()).await;
+        census_nodes(&mut producer, 8);
+        let fresh = hidden_listings(&producer, 0x55, 1).remove(0);
+        serve(
+            &mut producer,
+            std::slice::from_ref(&fresh),
+            QUORUM_THRESHOLD,
+        );
+        let digest = DigestEntry::new(&fresh).digest;
+        {
+            let mut txn = producer.store.env().write_txn().unwrap();
+            producer
+                .listings
+                .delete(&mut txn, &listing_key(&fresh.address, &digest))
+                .unwrap();
+            txn.commit().unwrap();
+        }
+        mark_pushed(&producer, &[fresh.address], QUORUM_THRESHOLD);
+        producer.start_requests();
+        producer.guard_ok = true;
+        producer.last_status = Some(Status::default());
+        producer.feeds.mark_pending(&[fresh.address]).unwrap();
+        assert!(producer.pushed_quorum(&fresh.address, false).unwrap());
+        assert!(!producer.pushed_quorum(&fresh.address, true).unwrap());
+        // No time is left to fetch it: nothing is decided.
+        let pushed = BTreeSet::from([fresh.address]);
+        let (decided, staged) = producer
+            .decide_pushed(&pushed, AT, Instant::now(), &mut Tally::default())
+            .await
+            .unwrap();
+        assert_eq!((decided, staged), (0, false));
+        assert!(producer.publisher.entry(&fresh.address).unwrap().is_none());
+        assert!(producer.feeds.is_pending(&fresh.address).unwrap());
+        // Kept, as fetching it keeps it: listed at once.
+        keep_listing(&producer, &fresh);
+        assert!(producer.pushed_quorum(&fresh.address, true).unwrap());
+        let (decided, staged) = producer
+            .decide_pushed(&pushed, AT, Instant::now() + CYCLE, &mut Tally::default())
+            .await
+            .unwrap();
+        assert_eq!((decided, staged), (1, true));
+        assert!(producer.publisher.entry(&fresh.address).unwrap().is_some());
+        assert!(!producer.feeds.is_pending(&fresh.address).unwrap());
     }
 
     /// Fake nodes, of which `slow` answers each request only after `delay`,
