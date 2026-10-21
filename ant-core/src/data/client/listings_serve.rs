@@ -2720,10 +2720,9 @@ impl Producer {
     /// ([`Self::pushed_quorum`]); one of whose nearest nodes' pushes came
     /// behind its mirror is left out too, for the next cycle to decide once
     /// the node is read again ([`Feeds::behind`]); and so is what doesn't fit
-    /// before `deadline`.
-    /// They all stay pending. What is published is counted into `tally`.
-    /// Returns how many addresses were decided, and whether any batch
-    /// staged a change.
+    /// before `deadline`. They all stay pending. What is published is counted
+    /// into `tally`. Returns how many addresses were decided, and whether any
+    /// batch staged a change.
     ///
     /// # Errors
     ///
@@ -4300,9 +4299,10 @@ fn reason_code(reason: &str) -> u64 {
 /// A deferral read back: since when, from `value`, its [`DEFERRED_TAG`]
 /// row, and its latest reason, from `code`, what its reason row holds
 /// ([`reason_code`]). A row an earlier version of the producer wrote holds
-/// the time with the code in its top byte ([`SINCE_TIME`]), newer than any
-/// reason row then; a deferral with no code, as a version that keeps no
-/// reasons left it, gives `other` until its address is decided again.
+/// the time with the code in its top byte ([`SINCE_TIME`]): that code is
+/// the latest, as that version writes no reason rows. A deferral with no
+/// code, as a version that keeps no reasons left it, gives `other` until
+/// its address is decided again.
 fn deferral_of(value: u64, code: Option<u64>) -> (u64, &'static str) {
     let code = match value >> 56 {
         0 => code.unwrap_or(0),

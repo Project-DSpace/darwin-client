@@ -160,8 +160,8 @@ const REJECTED_ORDER_TAG: u8 = b'R';
 
 /// How many rows of the rejections, or of their order, are held at a time
 /// while each is checked against the other at an open
-/// ([`Dbs::order_rejected`]): the 1,024 the order rows were rebuilt in
-/// before.
+/// ([`Dbs::order_rejected`]): the batch the order rows were cleared in
+/// before this check.
 const ORDER_BATCH: usize = 1_024;
 
 /// A file being written is first written under a name like this one, in the
