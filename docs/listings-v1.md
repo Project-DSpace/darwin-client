@@ -114,7 +114,7 @@ its uploader chose to hide, and those fields are absent from its entry.
 | `address` | The file's address: its envelope's, 64 hex digits |
 | `name` | The name the uploader declared, or `null`. Treat it as untrusted text, not a path |
 | `content_type` | The content type the uploader declared, or `null` |
-| `size` | The file's size in bytes, as its data map gives it. The data map of a file over about 12.5 MB is shrunk into a child map, which gives no size: the producer reads its root map once to find it, and until then it is `null`, so a size can be filled in later for an entry already published, which the feed records as an ordinary put. It stays `null` where the root map can't give one: a data map shrunk more than once (a file over about 650 GB) isn't read. `null` when the data map is withheld. The listings the nodes serve give no size for a shrunk data map, so a reader that compares entries with its own read of the nodes must not count a size an entry has and its read lacks as a difference |
+| `size` | The file's size in bytes, as its data map gives it. The data map of a file over about 12.5 MB is shrunk into a child map, which gives no size: the producer reads its root map once to find it, and until then it is `null`, so a size can be filled in later for an entry already published, which the feed records as an ordinary put. It stays `null` where the root map can't give one. A data map shrunk more than once (a file over about 658 GB) comes from self-encryption labelled as shrunk once, the map in between labelled a root; it gives what self-encryption resolves it to, the length of the root map shrunk away rather than the file's size, and the file can't be downloaded either. `null` when the data map is withheld. The listings the nodes serve give no size for a shrunk data map, so a reader that compares entries with its own read of the nodes must not count a size an entry has and its read lacks as a difference |
 | `readable` | Whether anyone with the address can read the file: the envelope holds its data map rather than withholding it |
 | `hidden` | The payment fields the uploader hid, of `tx-hash`, `block`, `timestamp`, `log-index` and `quote`, in that order |
 | `tx_hash` | The payment's transaction hash. Absent when hidden |
@@ -242,10 +242,12 @@ write starts.
 The nearest nodes are those of the producer's census: the nodes it found
 answering witnessed lookups. A node that misses 3 of its polls in a row
 leaves the census when its part of the address space is closed again, and
-the next nearest takes its place, so for a while after a node stops, these
-counts (and `rejected.json`'s, and `status.json`'s `below_full`) can differ
-from what a one-off read of the network gives while the network still lists
-the node. A reader comparing support with its own read should allow for it.
+the next nearest takes its place. So for a while after a node stops, while
+the network still lists it, what the producer publishes can differ from what
+a one-off read of the network gives: these counts (and `rejected.json`'s,
+and `status.json`'s `below_full`), and also whether an address is listed,
+left for later or dropped. A reader comparing entries or support with its
+own read should allow for it during that time.
 
 ## by-name/
 
@@ -386,7 +388,7 @@ stopped, is stuck, or can't write its files.
 | `census` | The nodes the producer knows: `nodes`; `answering`, those that answered in the latest cycle; `leaves`, the parts the address space is split into; `versions`, how many nodes (`nodes`) give each `version` in their user agent (`null` when unknown); `silent`, each node that didn't answer (`node`, and `last_answered`, or `null` if never) |
 | `deferred` | Addresses left for a later cycle, grouped by `reason`, each group with `addresses`, how many, and `oldest_since`, since when the longest-waiting has waited. An entry kept unconfirmed (`carried`) whose address the cycle left for later counts too, though `rejected.json` doesn't list it |
 | `below_full` | Entries fewer than all of their nearest nodes serve: `listings`, how many, and `oldest_since`, since when the longest-standing has been (`null` if none) |
-| `drops` | `removed`, entries the latest cycle removed; `carried`, entries kept unconfirmed (see the support files) |
+| `drops` | `removed`, entries the latest cycle removed, with those removed between it and the cycle before (what pushes changed, decided at once); `carried`, entries kept unconfirmed (see the support files) |
 | `resources` | What the producer uses, each `null` where it can't tell: `rss_bytes` (its own memory resident, not counting the pages of its store's file the system maps in and can drop at any time), `store_bytes`, `files_bytes` (what it publishes) and `disk_free_bytes` |
 
 `bytes_in` and `bytes_out` count only the listings messages the producer
@@ -525,8 +527,10 @@ Files are fetched one at a time, so a file can be newer than the
   decides). It decides every address again after it starts and once a
   day, a batch at a time for what is left of each cycle's minute, over as
   many cycles as that takes. A node that stores a new listing pushes it, and the producer
-  publishes it within seconds, without waiting for the next cycle; while a
-  node is slow to answer a cycle's requests, a listing pushed meanwhile is
+  publishes it within seconds, without waiting for the next cycle: it
+  decides the addresses pushes changed, and only those, as many as fit
+  before the next cycle is due (what doesn't fit, that cycle decides). While
+  a node is slow to answer a cycle's requests, a listing pushed meanwhile is
   published with the cycle, and while every address is being decided again,
   with the next. An address is decided only once at least 4 of its 7
   nearest nodes serve a listing for it.
@@ -539,8 +543,8 @@ Files are fetched one at a time, so a file can be newer than the
   confirm otherwise is kept, marked `carried` in its support file.
 - An entry whose file's data map is shrunk is published without a `size`
   until the producer has read the file's root map, and is then put again
-  with it, in a later cycle or between cycles. A data map shrunk more than
-  once, or whose root map can't give a size, leaves it without.
+  with it, in a later cycle or between cycles. A data map whose root map
+  can't give a size leaves it without (see `size`).
 - It writes a file only when its bytes change; the files a change touches
   first, then `pages.json`, `feed/index.json` and `head.json`. Time pages
   that `pages.json` no longer lists are deleted a day later.

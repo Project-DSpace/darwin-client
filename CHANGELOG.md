@@ -31,17 +31,21 @@ told apart by the commit `darwin --version` prints. Upstream's entries follow.
   what changed in its part of the address space, and reads the others with one `listings.v2`
   request a minute and a full pass at most hourly. It decides again only the addresses whose
   copies, nearest nodes or chain facts changed (and every address once a day), and publishes a
-  new listing a node pushes within seconds. The full listings behind the nodes' entries are
-  fetched once, within each node's allowance, one request at a time to a node, those a quorum
-  names first, and kept, in the bytes a `GetResponse` carries them in, up to a page's share of a
+  new listing a node pushes within seconds, deciding between cycles only the addresses pushes
+  change, until the next cycle is due. A node whose feed can't be read is read with `listings.v2`
+  requests meanwhile, and on a stop the producer ends its watches on the nodes. The full listings
+  behind the nodes' entries are
+  fetched once, one request at a time to a node, those a quorum names first and the others
+  within each node's allowance, and kept, in the bytes a `GetResponse` carries them in, up to a page's share of a
   message; a node that doesn't hand one over can't keep an address from being decided, or other
   listings from being fetched. An entry is dropped only when, in one cycle, all 7 of
   its nearest nodes answered without a copy, a witnessed lookup confirms them, and each of them
   and the nodes that last served it answers a request for the address with none. An entry that
   itself shows a payment from before the payment vault was deployed is removed (`rejected`), not
-  kept as carried. The size of a readable file whose data map is shrunk once is read from its root
-  map once, within bounds (no chunk decrypted past its declared size), at most 8 a cycle in a task
-  of its own, and filled in to its entry as a put. Deciding every address again, after each start
+  kept as carried. The size of a readable file whose data map is shrunk (into at most 3 chunks,
+  as uploads shrink it) is read from its root map once, within bounds (no chunk decrypted past its
+  declared size), at most 8 a cycle in a task of its own, each in its turn, and filled in to its
+  entry as a put. Deciding every address again, after each start
   and once a day, is spread over cycles, for what is left of each minute. What grows with the index (the mirrors, full listings, what is known of each address) is
   kept in the store, and addresses are decided 256 at a time, each batch recorded before the next
   and the files written once, with `rejected.json` and `pages.json` written a row at a time, so
