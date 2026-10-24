@@ -250,6 +250,15 @@ told apart by the commit `darwin --version` prints. Upstream's entries follow.
   marker, reports as `evicted` and is never started again; a pin checks that no level of disk
   pressure stops a node, deletes a file or writes a marker, and a census
   (`the_node_manager_deletes_no_node_data`) lists every deletion in the node manager's code.
+- `darwin-nodes`, a second binary of `ant-cli`, is the storage-node image's node manager, in place
+  of Autonomi's `ant` 0.3.9, and is built only by darwin-node's image build, from a commit it pins
+  (`cargo build --release --locked -p ant-cli --bin darwin-nodes`). It has `ant node`'s commands the
+  image runs (`add`, `daemon`, `dismiss`, `start`, `status`, `stop`), the same registry in
+  `$XDG_DATA_HOME/ant`, REST API and node start arguments (`--evm-network arbitrum-one` included),
+  and no reset, no log forwarding and no download source: `add` requires `--path`, and its daemon
+  (`ant_core::node::daemon::server::start_image_manager`) serves neither reset nor log-forwarding
+  routes and refuses an add naming any other source. The binary carries neither "WithAutonomi" nor
+  "logs.autonomi.com". `darwin node` stays off.
 - `darwin-linux-x64.tar.gz` from CI carries license notices: `LICENSE-MIT`, `LICENSE-APACHE`,
   `THIRD-PARTY-NOTICES.txt` and `RUST-STD-COPYRIGHT.html` next to `darwin`, like upstream's archives.
 - Upstream's installers are removed: `install.sh`, `install.ps1`, the npm packages (`npm/`), the

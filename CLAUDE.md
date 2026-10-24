@@ -115,6 +115,7 @@ ant-core/src/
 
 ant-cli/src/
 ├── main.rs                   # Entry point, client/wallet/EVM initialization
+├── bin/darwin-nodes/         # darwin-nodes: the storage-node image's node manager (see below)
 ├── cli.rs                    # Top-level clap definition
 └── commands/
     ├── data/
@@ -183,6 +184,20 @@ a key, touches the data directories or reaches a network; so is `darwin update` 
 envelope, is not: it goes on to ask for `SECRET_KEY`. A `darwin node` command a merge adds is
 refused too, and fails `the_node_commands_are_the_ones_checked_off` (cli.rs) until it is added to
 that test's list and to `NODE_COMMANDS` in `darwin_cli.rs`.
+
+## The storage-node image's manager: `darwin-nodes`
+
+`ant-cli`'s second binary (`src/bin/darwin-nodes/`) is the node manager darwin-node's image ships
+in place of Autonomi's `ant` 0.3.9, built by darwin-node's image build only, from a pinned commit.
+It is not `darwin node`, which stays off. It keeps `ant node`'s registry (`$XDG_DATA_HOME/ant`),
+REST API and node start arguments, and has no reset, no log forwarding and no download source
+(`add` requires `--path`); its daemon is `server::start_image_manager`, which reaches none of that
+code, so the binary carries neither "WithAutonomi" nor "logs.autonomi.com". The node manager in
+`ant_core::node` deletes no node's data in any build: the disk-pressure eviction is gone, and the
+disk monitor only reports. Its pins: the command census in `src/bin/darwin-nodes/pins.rs`, the
+binary's tests in `ant-cli/tests/darwin_nodes.rs`, `the_node_manager_deletes_no_node_data` in
+`ant-cli/tests/darwin_census.rs` (every deletion in the node manager's code, reviewed), and
+`the_disk_monitor_deletes_nothing_however_little_space_is_left` in the supervisor.
 
 ## Linear Project
 

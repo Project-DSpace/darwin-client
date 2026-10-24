@@ -45,21 +45,81 @@ pub struct AppState {
     /// Latest fleet health snapshot, refreshed by the disk monitor and served at
     /// `GET /api/v1/health`.
     pub health: Arc<RwLock<FleetHealth>>,
-    /// The running log forwarder, if the user has opted in. `None` while forwarding is disabled.
+    /// The running log forwarder, if the user has opted in. `None` while forwarding is disabled,
+    /// and always in the storage-node image's manager, which forwards no logs.
     pub forwarder: Arc<RwLock<Option<ForwarderHandle>>>,
     /// The daemon's shutdown token, kept so a forwarder started later by `enable` still stops when
     /// the daemon does.
     pub shutdown: CancellationToken,
+    /// The command line that manages this daemon's nodes, as its messages name it: `darwin node`
+    /// for the darwin CLI's daemon, `darwin-nodes` for the storage-node image's manager.
+    pub command: &'static str,
 }
 
-/// Start the daemon HTTP server.
+/// Start the darwin CLI's daemon (`darwin node daemon run`, off in the darwin CLI): the node
+/// manager's core, adding nodes from any binary source (downloads included), reset, and log
+/// forwarding.
 ///
 /// Returns the actual address the server bound to (useful when port is 0).
 pub async fn start(
     config: DaemonConfig,
-    mut registry: NodeRegistry,
+    registry: NodeRegistry,
     shutdown: CancellationToken,
 ) -> Result<SocketAddr> {
+    let daemon = prepare(config, registry, shutdown, "darwin node").await?;
+
+    // Background task: if the user has opted into beta log forwarding, resume it. The opt-in is
+    // persisted rather than held in daemon memory, so restarting the daemon does not silently stop
+    // shipping logs the user asked for.
+    start_forwarder_if_enabled(&daemon.state).await;
+
+    let routes = core_routes()
+        .route("/api/v1/nodes", post(post_nodes))
+        .route("/api/v1/reset", post(post_reset))
+        .route("/api/v1/logs/forward", get(get_log_forward))
+        .route("/api/v1/logs/forward/enable", post(post_log_forward_enable))
+        .route(
+            "/api/v1/logs/forward/disable",
+            post(post_log_forward_disable),
+        )
+        .route("/api/v1/openapi.json", get(get_openapi));
+    daemon.serve(routes)
+}
+
+/// Start the daemon of the storage-node image's manager (`darwin-nodes daemon run`): the node
+/// manager's core alone, adding nodes only from a node binary already on the machine.
+///
+/// It serves no reset, no log forwarding and no download, and this function reaches none of their
+/// code, so a binary built on it carries none of it (`ant-cli/tests/darwin_nodes.rs` checks).
+///
+/// Returns the actual address the server bound to (useful when port is 0).
+pub async fn start_image_manager(
+    config: DaemonConfig,
+    registry: NodeRegistry,
+    shutdown: CancellationToken,
+) -> Result<SocketAddr> {
+    let daemon = prepare(config, registry, shutdown, "darwin-nodes").await?;
+    let routes = core_routes()
+        .route("/api/v1/nodes", post(post_local_nodes))
+        .route("/api/v1/openapi.json", get(get_image_manager_openapi));
+    daemon.serve(routes)
+}
+
+/// A daemon bound and set up, its background tasks running, not yet serving.
+struct Prepared {
+    listener: tokio::net::TcpListener,
+    bound_addr: SocketAddr,
+    state: Arc<AppState>,
+}
+
+/// Bind the daemon's port, bring the registry and supervisor up (adopting nodes a previous daemon
+/// left running) and start the disk and liveness monitors.
+async fn prepare(
+    config: DaemonConfig,
+    mut registry: NodeRegistry,
+    shutdown: CancellationToken,
+    command: &'static str,
+) -> Result<Prepared> {
     let (event_tx, _) = broadcast::channel(256);
 
     let addr = SocketAddr::new(config.listen_addr, config.port.unwrap_or(0));
@@ -103,17 +163,13 @@ pub async fn start(
         supervisor: supervisor.clone(),
         event_tx: event_tx.clone(),
         start_time: Instant::now(),
-        config: config.clone(),
+        config,
         bound_port: bound_addr.port(),
         health: health.clone(),
         forwarder: Arc::new(RwLock::new(None)),
         shutdown: shutdown.clone(),
+        command,
     });
-
-    // Background task: if the user has opted into beta log forwarding, resume it. The opt-in is
-    // persisted rather than held in daemon memory, so restarting the daemon does not silently stop
-    // shipping logs the user asked for.
-    start_forwarder_if_enabled(&state).await;
 
     // Background task: report free disk space at node data directories. Refreshes the fleet health
     // snapshot every tick; it stops no node and deletes nothing. The levels are fixed internal
@@ -135,33 +191,70 @@ pub async fn start(
         supervisor,
         event_tx,
         LIVENESS_POLL_INTERVAL,
-        shutdown.clone(),
+        shutdown,
     );
 
-    let app = build_router(state.clone());
-
-    // Write port and PID files
-    write_file(&config.port_file_path, &bound_addr.port().to_string())?;
-    write_file(&config.pid_file_path, &std::process::id().to_string())?;
-
-    let port_file = config.port_file_path.clone();
-    let pid_file = config.pid_file_path.clone();
-
-    tokio::spawn(async move {
-        axum::serve(listener, app)
-            .with_graceful_shutdown(shutdown.cancelled_owned())
-            .await
-            .ok();
-
-        // Clean up port and PID files on shutdown
-        let _ = std::fs::remove_file(&port_file);
-        let _ = std::fs::remove_file(&pid_file);
-    });
-
-    Ok(bound_addr)
+    Ok(Prepared {
+        listener,
+        bound_addr,
+        state,
+    })
 }
 
-fn build_router(state: Arc<AppState>) -> Router {
+impl Prepared {
+    /// Write the port and PID files and serve `routes` until shutdown, then remove those files.
+    fn serve(self, routes: Router<Arc<AppState>>) -> Result<SocketAddr> {
+        let Prepared {
+            listener,
+            bound_addr,
+            state,
+        } = self;
+        let config = state.config.clone();
+        let shutdown = state.shutdown.clone();
+        let app = with_cors(routes, &state).with_state(state);
+
+        // Write port and PID files
+        write_file(&config.port_file_path, &bound_addr.port().to_string())?;
+        write_file(&config.pid_file_path, &std::process::id().to_string())?;
+
+        let port_file = config.port_file_path;
+        let pid_file = config.pid_file_path;
+
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .with_graceful_shutdown(shutdown.cancelled_owned())
+                .await
+                .ok();
+
+            // Clean up port and PID files on shutdown
+            let _ = std::fs::remove_file(&port_file);
+            let _ = std::fs::remove_file(&pid_file);
+        });
+
+        Ok(bound_addr)
+    }
+}
+
+/// The routes every daemon serves: status, health, events, the console, and each node's detail,
+/// dismissal, start and stop.
+fn core_routes() -> Router<Arc<AppState>> {
+    Router::new()
+        .route("/console", get(get_console))
+        .route("/api/v1/status", get(get_status))
+        .route("/api/v1/health", get(get_health))
+        .route("/api/v1/events", get(get_events))
+        .route("/api/v1/nodes/status", get(get_nodes_status))
+        .route(
+            "/api/v1/nodes/{id}",
+            get(get_node_detail).delete(delete_node),
+        )
+        .route("/api/v1/nodes/{id}/start", post(post_start_node))
+        .route("/api/v1/nodes/start-all", post(post_start_all))
+        .route("/api/v1/nodes/{id}/stop", post(post_stop_node))
+        .route("/api/v1/nodes/stop-all", post(post_stop_all))
+}
+
+fn with_cors(routes: Router<Arc<AppState>>, state: &AppState) -> Router<Arc<AppState>> {
     use axum::http::HeaderValue;
     use tower_http::cors::{Any, CorsLayer};
 
@@ -174,31 +267,7 @@ fn build_router(state: Arc<AppState>) -> Router {
         .allow_methods(Any)
         .allow_headers(Any);
 
-    Router::new()
-        .route("/console", get(get_console))
-        .route("/api/v1/status", get(get_status))
-        .route("/api/v1/health", get(get_health))
-        .route("/api/v1/events", get(get_events))
-        .route("/api/v1/nodes/status", get(get_nodes_status))
-        .route("/api/v1/nodes", post(post_nodes))
-        .route(
-            "/api/v1/nodes/{id}",
-            get(get_node_detail).delete(delete_node),
-        )
-        .route("/api/v1/nodes/{id}/start", post(post_start_node))
-        .route("/api/v1/nodes/start-all", post(post_start_all))
-        .route("/api/v1/nodes/{id}/stop", post(post_stop_node))
-        .route("/api/v1/nodes/stop-all", post(post_stop_all))
-        .route("/api/v1/reset", post(post_reset))
-        .route("/api/v1/logs/forward", get(get_log_forward))
-        .route("/api/v1/logs/forward/enable", post(post_log_forward_enable))
-        .route(
-            "/api/v1/logs/forward/disable",
-            post(post_log_forward_disable),
-        )
-        .route("/api/v1/openapi.json", get(get_openapi))
-        .layer(cors)
-        .with_state(state)
+    routes.layer(cors)
 }
 
 async fn get_status(State(state): State<Arc<AppState>>) -> Json<DaemonStatus> {
@@ -337,19 +406,40 @@ async fn get_node_detail(
     }))
 }
 
-/// POST /api/v1/nodes — Add one or more nodes to the registry.
+/// POST /api/v1/nodes — Add one or more nodes to the registry, from any binary source: a local
+/// path, or a download (the darwin CLI's daemon only).
 async fn post_nodes(
     State(state): State<Arc<AppState>>,
     Json(opts): Json<AddNodeOpts>,
 ) -> std::result::Result<(StatusCode, Json<AddNodeResult>), (StatusCode, Json<serde_json::Value>)> {
     let registry_path = state.config.registry_path.clone();
     let progress = NoopProgress;
+    let added = crate::node::add_nodes(opts, &registry_path, &progress).await;
+    nodes_added(&state, added).await
+}
 
-    match crate::node::add_nodes(opts, &registry_path, &progress).await {
+/// POST /api/v1/nodes — Add one or more nodes that run a node binary already on this machine
+/// (`binary_source` a `local_path`): the storage-node image's manager downloads nothing, so a
+/// request naming any other source is refused before anything is written.
+async fn post_local_nodes(
+    State(state): State<Arc<AppState>>,
+    Json(opts): Json<AddNodeOpts>,
+) -> std::result::Result<(StatusCode, Json<AddNodeResult>), (StatusCode, Json<serde_json::Value>)> {
+    let registry_path = state.config.registry_path.clone();
+    let added = crate::node::add_local_nodes(opts, &registry_path).await;
+    nodes_added(&state, added).await
+}
+
+/// The response to an add, with the in-memory registry brought in step with the file on success.
+async fn nodes_added(
+    state: &AppState,
+    added: Result<AddNodeResult>,
+) -> std::result::Result<(StatusCode, Json<AddNodeResult>), (StatusCode, Json<serde_json::Value>)> {
+    match added {
         Ok(result) => {
             // Update the in-memory registry to stay in sync
             let mut registry = state.registry.write().await;
-            if let Ok(fresh) = NodeRegistry::load(&registry_path) {
+            if let Ok(fresh) = NodeRegistry::load(&state.config.registry_path) {
                 *registry = fresh;
             }
             Ok((StatusCode::CREATED, Json(result)))
@@ -426,8 +516,9 @@ async fn post_start_node(
             Json(serde_json::json!({
                 "error": format!(
                     "Node {id} was evicted by an earlier node manager, which deleted its data, \
-                     and cannot be started. Dismiss it with `darwin node dismiss {id}` and add a \
-                     new node instead."
+                     and cannot be started. Dismiss it with `{} dismiss {id}` and add a new node \
+                     instead.",
+                    state.command
                 ),
                 "current_state": { "node_id": id, "status": "evicted" }
             })),
@@ -561,7 +652,8 @@ async fn post_stop_node(
             Json(serde_json::json!({
                 "error": format!(
                     "Node {id} was evicted by an earlier node manager; there is nothing to stop. \
-                     Dismiss it with `darwin node dismiss {id}`."
+                     Dismiss it with `{} dismiss {id}`.",
+                    state.command
                 ),
                 "current_state": { "node_id": id, "status": "evicted" }
             })),
@@ -830,15 +922,17 @@ fn internal_error(error: crate::error::Error) -> (StatusCode, Json<serde_json::V
     )
 }
 
-async fn get_openapi() -> impl IntoResponse {
+/// The OpenAPI document every daemon starts from: the core routes it serves, with `add_nodes`
+/// describing what `POST /api/v1/nodes` takes.
+fn core_spec(title: &str, description: &str, add_nodes: &str) -> serde_json::Value {
     // TODO: Migrate to utoipa-generated OpenAPI spec. Types already derive
     // utoipa::ToSchema but this spec is still hand-written JSON.
-    let spec = serde_json::json!({
+    serde_json::json!({
         "openapi": "3.1.0",
         "info": {
-            "title": "Darwin Daemon API",
+            "title": title,
             "version": "0.1.0",
-            "description": "REST API for the darwin node management daemon"
+            "description": description
         },
         "paths": {
             "/api/v1/status": {
@@ -871,7 +965,7 @@ async fn get_openapi() -> impl IntoResponse {
             "/api/v1/nodes": {
                 "post": {
                     "summary": "Add nodes",
-                    "description": "Add one or more nodes to the registry",
+                    "description": add_nodes,
                     "requestBody": {
                         "required": true,
                         "content": {
@@ -1013,156 +1107,10 @@ async fn get_openapi() -> impl IntoResponse {
                         }
                     }
                 }
-            },
-            "/api/v1/reset": {
-                "post": {
-                    "summary": "Reset all node state",
-                    "description": "Remove all node data directories, log directories, and clear the registry. Fails if any nodes are running.",
-                    "responses": {
-                        "200": {
-                            "description": "Reset successful",
-                            "content": {
-                                "application/json": {
-                                    "schema": { "$ref": "#/components/schemas/ResetResult" }
-                                }
-                            }
-                        },
-                        "409": {
-                            "description": "Nodes still running"
-                        }
-                    }
-                }
-            },
-            "/api/v1/logs/forward": {
-                "get": {
-                    "summary": "Log forwarding status",
-                    "description": "Whether beta log forwarding is enabled, which nodes are being tailed, which are skipped for having no log directory, and delivery counters. Never returns the write token, only a fingerprint of it.",
-                    "responses": {
-                        "200": {
-                            "description": "Forwarding status",
-                            "content": {
-                                "application/json": {
-                                    "schema": { "$ref": "#/components/schemas/LogForwardStatus" }
-                                }
-                            }
-                        }
-                    }
-                }
-            },
-            "/api/v1/logs/forward/enable": {
-                "post": {
-                    "summary": "Enable log forwarding",
-                    "description": "Opt into forwarding managed nodes' logs to the beta endpoint. This call is the consent act. Omitted fields reuse the stored configuration, so re-enabling after a disable needs no arguments. Idempotent.",
-                    "requestBody": {
-                        "required": false,
-                        "content": {
-                            "application/json": {
-                                "schema": { "$ref": "#/components/schemas/LogForwardEnableRequest" }
-                            }
-                        }
-                    },
-                    "responses": {
-                        "200": {
-                            "description": "Forwarding enabled",
-                            "content": {
-                                "application/json": {
-                                    "schema": { "$ref": "#/components/schemas/LogForwardResult" }
-                                }
-                            }
-                        },
-                        "400": {
-                            "description": "No token has ever been supplied, or the endpoint is not an http(s) URL"
-                        }
-                    }
-                }
-            },
-            "/api/v1/logs/forward/disable": {
-                "post": {
-                    "summary": "Disable log forwarding",
-                    "description": "Stop forwarding. Nothing else about any node changes: no restart, no argument change, no data touched. Idempotent.",
-                    "responses": {
-                        "200": {
-                            "description": "Forwarding disabled",
-                            "content": {
-                                "application/json": {
-                                    "schema": { "$ref": "#/components/schemas/LogForwardResult" }
-                                }
-                            }
-                        }
-                    }
-                }
             }
         },
         "components": {
             "schemas": {
-                "LogLevel": {
-                    "type": "string",
-                    "enum": ["trace", "debug", "info", "warn", "error"]
-                },
-                "ForwardingNode": {
-                    "type": "object",
-                    "properties": {
-                        "node_id": { "type": "integer" },
-                        "service": { "type": "string" },
-                        "log_dir": { "type": "string" }
-                    }
-                },
-                "SkippedNode": {
-                    "type": "object",
-                    "description": "A node that cannot be forwarded, with the reason. Almost always a node added without --log-dir-path, which writes no log files at all.",
-                    "properties": {
-                        "node_id": { "type": "integer" },
-                        "service": { "type": "string" },
-                        "reason": { "type": "string" }
-                    }
-                },
-                "ForwardStats": {
-                    "type": "object",
-                    "description": "Counters since the daemon started; reset on restart.",
-                    "properties": {
-                        "events_forwarded": { "type": "integer" },
-                        "events_dropped_by_level": { "type": "integer" },
-                        "events_dropped_by_overflow": { "type": "integer" },
-                        "batches_sent": { "type": "integer" },
-                        "batches_failed": { "type": "integer" },
-                        "last_success_unix": { "type": "integer", "nullable": true },
-                        "last_error": { "type": "string", "nullable": true }
-                    }
-                },
-                "LogForwardStatus": {
-                    "type": "object",
-                    "properties": {
-                        "enabled": { "type": "boolean" },
-                        "endpoint": { "type": "string" },
-                        "index_prefix": { "type": "string" },
-                        "min_level": { "$ref": "#/components/schemas/LogLevel" },
-                        "token_fingerprint": { "type": "string", "nullable": true, "description": "Short non-reversible identifier for the configured token. The token itself is never returned." },
-                        "active": { "type": "boolean", "description": "Whether the background forwarder is currently running." },
-                        "nodes_forwarding": { "type": "array", "items": { "$ref": "#/components/schemas/ForwardingNode" } },
-                        "nodes_skipped": { "type": "array", "items": { "$ref": "#/components/schemas/SkippedNode" } },
-                        "stats": { "$ref": "#/components/schemas/ForwardStats" }
-                    }
-                },
-                "LogForwardEnableRequest": {
-                    "type": "object",
-                    "properties": {
-                        "token": { "type": "string", "nullable": true, "description": "Write-only Elasticsearch API key. Reuses the stored one when omitted." },
-                        "endpoint": { "type": "string", "nullable": true },
-                        "min_level": { "$ref": "#/components/schemas/LogLevel", "nullable": true }
-                    }
-                },
-                "LogForwardResult": {
-                    "type": "object",
-                    "properties": {
-                        "enabled": { "type": "boolean" },
-                        "already_in_state": { "type": "boolean" },
-                        "endpoint": { "type": "string" },
-                        "min_level": { "$ref": "#/components/schemas/LogLevel" },
-                        "nodes_forwarding": { "type": "array", "items": { "$ref": "#/components/schemas/ForwardingNode" } },
-                        "nodes_skipped": { "type": "array", "items": { "$ref": "#/components/schemas/SkippedNode" } },
-                        "pending_daemon_start": { "type": "boolean", "description": "Set when the config was saved but no forwarder could be started because the daemon is not running." }
-                    }
-                },
                 "DaemonStatus": {
                     "type": "object",
                     "properties": {
@@ -1178,8 +1126,189 @@ async fn get_openapi() -> impl IntoResponse {
                 }
             }
         }
+    })
+}
+
+/// The darwin CLI daemon's OpenAPI document: the core, adding nodes from any binary source, and
+/// reset and log forwarding.
+async fn get_openapi() -> impl IntoResponse {
+    let mut spec = core_spec(
+        "Darwin Daemon API",
+        "REST API for the darwin node management daemon",
+        "Add one or more nodes to the registry",
+    );
+    let paths = serde_json::json!({
+        "/api/v1/reset": {
+            "post": {
+                "summary": "Reset all node state",
+                "description": "Remove all node data directories, log directories, and clear the registry. Fails if any nodes are running.",
+                "responses": {
+                    "200": {
+                        "description": "Reset successful",
+                        "content": {
+                            "application/json": {
+                                "schema": { "$ref": "#/components/schemas/ResetResult" }
+                            }
+                        }
+                    },
+                    "409": {
+                        "description": "Nodes still running"
+                    }
+                }
+            }
+        },
+        "/api/v1/logs/forward": {
+            "get": {
+                "summary": "Log forwarding status",
+                "description": "Whether beta log forwarding is enabled, which nodes are being tailed, which are skipped for having no log directory, and delivery counters. Never returns the write token, only a fingerprint of it.",
+                "responses": {
+                    "200": {
+                        "description": "Forwarding status",
+                        "content": {
+                            "application/json": {
+                                "schema": { "$ref": "#/components/schemas/LogForwardStatus" }
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "/api/v1/logs/forward/enable": {
+            "post": {
+                "summary": "Enable log forwarding",
+                "description": "Opt into forwarding managed nodes' logs to the beta endpoint. This call is the consent act. Omitted fields reuse the stored configuration, so re-enabling after a disable needs no arguments. Idempotent.",
+                "requestBody": {
+                    "required": false,
+                    "content": {
+                        "application/json": {
+                            "schema": { "$ref": "#/components/schemas/LogForwardEnableRequest" }
+                        }
+                    }
+                },
+                "responses": {
+                    "200": {
+                        "description": "Forwarding enabled",
+                        "content": {
+                            "application/json": {
+                                "schema": { "$ref": "#/components/schemas/LogForwardResult" }
+                            }
+                        }
+                    },
+                    "400": {
+                        "description": "No token has ever been supplied, or the endpoint is not an http(s) URL"
+                    }
+                }
+            }
+        },
+        "/api/v1/logs/forward/disable": {
+            "post": {
+                "summary": "Disable log forwarding",
+                "description": "Stop forwarding. Nothing else about any node changes: no restart, no argument change, no data touched. Idempotent.",
+                "responses": {
+                    "200": {
+                        "description": "Forwarding disabled",
+                        "content": {
+                            "application/json": {
+                                "schema": { "$ref": "#/components/schemas/LogForwardResult" }
+                            }
+                        }
+                    }
+                }
+            }
+        }
     });
+    let schemas = serde_json::json!({
+        "LogLevel": {
+            "type": "string",
+            "enum": ["trace", "debug", "info", "warn", "error"]
+        },
+        "ForwardingNode": {
+            "type": "object",
+            "properties": {
+                "node_id": { "type": "integer" },
+                "service": { "type": "string" },
+                "log_dir": { "type": "string" }
+            }
+        },
+        "SkippedNode": {
+            "type": "object",
+            "description": "A node that cannot be forwarded, with the reason. Almost always a node added without --log-dir-path, which writes no log files at all.",
+            "properties": {
+                "node_id": { "type": "integer" },
+                "service": { "type": "string" },
+                "reason": { "type": "string" }
+            }
+        },
+        "ForwardStats": {
+            "type": "object",
+            "description": "Counters since the daemon started; reset on restart.",
+            "properties": {
+                "events_forwarded": { "type": "integer" },
+                "events_dropped_by_level": { "type": "integer" },
+                "events_dropped_by_overflow": { "type": "integer" },
+                "batches_sent": { "type": "integer" },
+                "batches_failed": { "type": "integer" },
+                "last_success_unix": { "type": "integer", "nullable": true },
+                "last_error": { "type": "string", "nullable": true }
+            }
+        },
+        "LogForwardStatus": {
+            "type": "object",
+            "properties": {
+                "enabled": { "type": "boolean" },
+                "endpoint": { "type": "string" },
+                "index_prefix": { "type": "string" },
+                "min_level": { "$ref": "#/components/schemas/LogLevel" },
+                "token_fingerprint": { "type": "string", "nullable": true, "description": "Short non-reversible identifier for the configured token. The token itself is never returned." },
+                "active": { "type": "boolean", "description": "Whether the background forwarder is currently running." },
+                "nodes_forwarding": { "type": "array", "items": { "$ref": "#/components/schemas/ForwardingNode" } },
+                "nodes_skipped": { "type": "array", "items": { "$ref": "#/components/schemas/SkippedNode" } },
+                "stats": { "$ref": "#/components/schemas/ForwardStats" }
+            }
+        },
+        "LogForwardEnableRequest": {
+            "type": "object",
+            "properties": {
+                "token": { "type": "string", "nullable": true, "description": "Write-only Elasticsearch API key. Reuses the stored one when omitted." },
+                "endpoint": { "type": "string", "nullable": true },
+                "min_level": { "$ref": "#/components/schemas/LogLevel", "nullable": true }
+            }
+        },
+        "LogForwardResult": {
+            "type": "object",
+            "properties": {
+                "enabled": { "type": "boolean" },
+                "already_in_state": { "type": "boolean" },
+                "endpoint": { "type": "string" },
+                "min_level": { "$ref": "#/components/schemas/LogLevel" },
+                "nodes_forwarding": { "type": "array", "items": { "$ref": "#/components/schemas/ForwardingNode" } },
+                "nodes_skipped": { "type": "array", "items": { "$ref": "#/components/schemas/SkippedNode" } },
+                "pending_daemon_start": { "type": "boolean", "description": "Set when the config was saved but no forwarder could be started because the daemon is not running." }
+            }
+        }
+    });
+    extend(&mut spec["paths"], paths);
+    extend(&mut spec["components"]["schemas"], schemas);
     Json(spec)
+}
+
+/// The OpenAPI document of the storage-node image's manager: the core routes alone, adding nodes
+/// from a node binary already on the machine.
+async fn get_image_manager_openapi() -> impl IntoResponse {
+    Json(core_spec(
+        "darwin-nodes API",
+        "REST API for darwin-nodes, the storage-node image's node manager. It deletes no node's \
+         data, downloads nothing and forwards no logs.",
+        "Add one or more nodes that run a node binary already on this machine: binary_source \
+         must be a local_path. Nothing is downloaded.",
+    ))
+}
+
+/// Add `more`'s entries to the JSON object `target`.
+fn extend(target: &mut serde_json::Value, more: serde_json::Value) {
+    if let (Some(target), serde_json::Value::Object(more)) = (target.as_object_mut(), more) {
+        target.extend(more);
+    }
 }
 
 async fn get_console() -> Html<&'static str> {

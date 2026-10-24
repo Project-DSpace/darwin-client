@@ -59,6 +59,9 @@ pub enum Error {
     #[error("Binary resolution failed: {0}")]
     BinaryResolution(String),
 
+    #[error("This node manager downloads no node binary, so it adds no nodes from {0}: give the path of a node binary already on this machine (--path)")]
+    NodeDownloadRefused(String),
+
     #[error("Invalid rewards address: {0}")]
     InvalidRewardsAddress(String),
 

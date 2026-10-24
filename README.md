@@ -666,6 +666,31 @@ Autonomi's endpoint, and its daemon serves both through a REST API. Darwin stora
 the storage-node image (see the darwin-node repository's `docker/README.md`). Nodes added by an
 earlier build are managed with Autonomi's `ant`.
 
+### `darwin-nodes` — the storage-node image's node manager
+
+A second binary of `ant-cli`, built for the storage-node image only: darwin-node's image build
+ships it, built with `cargo build --release --locked -p ant-cli --bin darwin-nodes` from a
+darwin-client commit it pins, in place of Autonomi's `ant` 0.3.9, which the image downloaded
+before. It is not `darwin node`, which stays off. It runs and supervises the nodes on one
+machine with the registry, REST API and node start arguments `ant` 0.3.9 had (`--evm-network
+arbitrum-one` included, which the image's payment settings override in the node), and keeps its
+registry in `$XDG_DATA_HOME/ant` as `ant` did, so an install's nodes keep their ids, ports, data
+and identities. It leaves out what would delete or send anything:
+
+- it deletes no node's data: no disk-pressure eviction (removed from `ant_core::node` for every
+  build: upstream's manager deleted the data of the node holding the least at 500 MiB free on a
+  disk shared by two or more nodes) and no reset. Its health check still warns at 1 GiB free or
+  less and reports critical at 500 MiB or less, and only reports;
+- it downloads nothing: `darwin-nodes add` requires `--path`, a node binary already on the
+  machine, and its daemon refuses an add naming any other source;
+- it forwards no logs: no `logs forward`, and its daemon serves no log-forwarding routes.
+
+Its commands are `add`, `daemon` (`start`, `stop`, `status`, `info`, and the hidden `run` the
+image runs), `dismiss`, `start`, `status` and `stop`. A node an earlier manager evicted keeps its
+marker until dismissed, reports as `evicted`, and never starts again under its old identity.
+`ant-cli/src/bin/darwin-nodes/pins.rs`, `ant-cli/tests/darwin_nodes.rs` and the erasure census in
+`ant-cli/tests/darwin_census.rs` hold it to this.
+
 ### `darwin update` — Self-Update
 
 Off in this build: `darwin update` exits with an error. Upstream's release feed (the `ant-cli-v*`
@@ -689,7 +714,9 @@ beta log endpoint through `darwin node logs forward`. Darwin has no beta channel
 
 Off in this build: the REST API is served by the node daemon (`darwin node daemon`), which
 `darwin` never starts while `darwin node` is off. `ant-core` still holds upstream's daemon
-(`ant_core::node::daemon`).
+(`ant_core::node::daemon`). The storage-node image's manager, `darwin-nodes` (above), serves its
+core: status, health, events, the console, and each node's add (from a local binary), detail,
+dismissal, start and stop.
 
 ---
 

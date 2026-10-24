@@ -17,16 +17,16 @@ use crate::error::{Error, Result};
 use crate::node::binary::ProgressReporter;
 use crate::node::registry::NodeRegistry;
 use crate::node::types::{
-    AddNodeOpts, AddNodeResult, NodeConfig, NodeStatus, NodeStatusResult, NodeStatusSummary,
-    RemoveNodeResult, ResetResult,
+    AddNodeOpts, AddNodeResult, BinarySource, NodeConfig, NodeStatus, NodeStatusResult,
+    NodeStatusSummary, RemoveNodeResult, ResetResult,
 };
 
 /// Add one or more nodes to the registry.
 ///
 /// This function:
-/// 1. Resolves the binary (download if needed)
-/// 2. Loads the registry (with file lock)
-/// 3. Validates port ranges match count
+/// 1. Validates the rewards address, node count and ports
+/// 2. Resolves the binary (download if needed)
+/// 3. Loads the registry (with file lock)
 /// 4. Creates data and log directories for each node
 /// 5. Assigns IDs and saves the registry
 ///
@@ -36,6 +36,50 @@ pub async fn add_nodes(
     registry_path: &Path,
     progress: &dyn ProgressReporter,
 ) -> Result<AddNodeResult> {
+    let rewards_address = validate_add(&opts)?;
+
+    // Resolve the binary (downloads to cache if needed)
+    let install_dir = binary::binary_install_dir()?;
+    let resolved = binary::resolve_binary(
+        &opts.binary_source,
+        opts.upgrade_channel,
+        &install_dir,
+        progress,
+    )
+    .await?;
+
+    register_nodes(opts, rewards_address, resolved, registry_path)
+}
+
+/// Add one or more nodes that run a node binary already on this machine.
+///
+/// [`add_nodes`] for a [`BinarySource::LocalPath`], and the only way the storage-node image's
+/// manager (`darwin-nodes`) adds nodes: it downloads nothing, so any other source is refused
+/// before anything is read or written. Nothing here reaches the download code.
+///
+/// Does NOT start the nodes. Does NOT require the daemon.
+pub async fn add_local_nodes(opts: AddNodeOpts, registry_path: &Path) -> Result<AddNodeResult> {
+    let path = match &opts.binary_source {
+        BinarySource::LocalPath(path) => path.clone(),
+        BinarySource::Latest => {
+            return Err(Error::NodeDownloadRefused("the latest release".to_string()))
+        }
+        BinarySource::Version(version) => {
+            return Err(Error::NodeDownloadRefused(format!(
+                "release v{}",
+                version.strip_prefix('v').unwrap_or(version)
+            )))
+        }
+        BinarySource::Url(url) => return Err(Error::NodeDownloadRefused(url.clone())),
+    };
+    let rewards_address = validate_add(&opts)?;
+    let resolved = binary::resolve_local(&path).await?;
+    register_nodes(opts, rewards_address, resolved, registry_path)
+}
+
+/// Check an add's rewards address, node count and ports, before any binary is resolved. Returns
+/// the rewards address as it is stored, trimmed.
+fn validate_add(opts: &AddNodeOpts) -> Result<String> {
     // Validate and normalize rewards address
     validate_rewards_address(&opts.rewards_address)?;
     let rewards_address = opts.rewards_address.trim().to_string();
@@ -60,15 +104,18 @@ pub async fn add_nodes(
         }
     }
 
-    // Resolve the binary (downloads to cache if needed)
-    let install_dir = binary::binary_install_dir()?;
-    let resolved = binary::resolve_binary(
-        &opts.binary_source,
-        opts.upgrade_channel,
-        &install_dir,
-        progress,
-    )
-    .await?;
+    Ok(rewards_address)
+}
+
+/// Register `opts.count` nodes running copies of the `resolved` binary: each gets an id, its data
+/// and log directories, and its own copy of the binary (and of `bootstrap_peers.toml`, if one was
+/// beside it), and the registry is saved.
+fn register_nodes(
+    opts: AddNodeOpts,
+    rewards_address: String,
+    resolved: binary::ResolvedBinary,
+    registry_path: &Path,
+) -> Result<AddNodeResult> {
     let cached_binary = resolved.path;
     let version = resolved.version;
 
@@ -316,6 +363,107 @@ mod tests {
             std::fs::write(&binary_path, "@echo off\r\necho antnode 0.1.0-test\r\n").unwrap();
             binary_path
         }
+    }
+
+    /// The image's manager downloads nothing: an add naming any source but a local path is
+    /// refused, naming the source, before the registry, a data folder or the download cache is
+    /// written.
+    #[tokio::test]
+    async fn add_local_nodes_refuses_every_download_source() {
+        for (source, named) in [
+            (BinarySource::Latest, "the latest release"),
+            (
+                BinarySource::Version("v0.11.2".to_string()),
+                "release v0.11.2",
+            ),
+            (
+                BinarySource::Version("0.11.2".to_string()),
+                "release v0.11.2",
+            ),
+            (
+                BinarySource::Url("https://example.com/ant-node.tar.gz".to_string()),
+                "https://example.com/ant-node.tar.gz",
+            ),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let reg_path = test_registry_path(tmp.path());
+            let opts = AddNodeOpts {
+                count: 1,
+                rewards_address: TEST_ADDR.to_string(),
+                data_dir_path: Some(tmp.path().join("data")),
+                binary_source: source,
+                ..Default::default()
+            };
+
+            let error = add_local_nodes(opts, &reg_path).await.unwrap_err();
+            assert!(
+                matches!(&error, Error::NodeDownloadRefused(source) if source == named),
+                "{error:?}"
+            );
+            assert!(error.to_string().contains("--path"), "{error}");
+            assert_eq!(
+                std::fs::read_dir(tmp.path()).unwrap().count(),
+                0,
+                "nothing was written"
+            );
+        }
+    }
+
+    /// From a local binary, `add_local_nodes` registers what `add_nodes` does.
+    #[tokio::test]
+    async fn add_local_nodes_registers_what_add_nodes_does() {
+        let added = |local: bool| async move {
+            let tmp = tempfile::tempdir().unwrap();
+            let binary = create_fake_binary(tmp.path());
+            let reg_path = test_registry_path(tmp.path());
+            let opts = AddNodeOpts {
+                count: 2,
+                rewards_address: format!("  {TEST_ADDR} "),
+                node_port: Some(PortRange::Range(10000, 10001)),
+                data_dir_path: Some(tmp.path().join("nodes")),
+                log_dir_path: Some(tmp.path().join("logs")),
+                binary_source: BinarySource::LocalPath(binary),
+                bootstrap_peers: vec!["142.93.32.90:10000".to_string()],
+                env_variables: vec![("ANT_EVM_RPC_URL".to_string(), "https://rpc".to_string())],
+                ..Default::default()
+            };
+            let result = if local {
+                add_local_nodes(opts, &reg_path).await.unwrap()
+            } else {
+                add_nodes(opts, &reg_path, &NoopProgress).await.unwrap()
+            };
+            let registry = NodeRegistry::load(&reg_path).unwrap();
+            assert_eq!(registry.len(), 2);
+            // Paths relative to the temporary folder, so the two runs compare.
+            let relative = |path: &std::path::Path| {
+                path.strip_prefix(tmp.path())
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned()
+            };
+            result
+                .nodes_added
+                .iter()
+                .map(|node| {
+                    assert!(node.data_dir.is_dir());
+                    assert!(node.binary_path.is_file());
+                    let mut node = serde_json::to_value(node).unwrap();
+                    for field in ["data_dir", "log_dir", "binary_path"] {
+                        let path = std::path::PathBuf::from(node[field].as_str().unwrap());
+                        node[field] = relative(&path).into();
+                    }
+                    node
+                })
+                .collect::<Vec<_>>()
+        };
+
+        let local = added(true).await;
+        assert_eq!(local, added(false).await);
+        assert_eq!(local[0]["rewards_address"], TEST_ADDR, "stored trimmed");
+        assert_eq!(local[1]["node_port"], 10001);
+        assert_eq!(local[0]["evm_network"], "arbitrum-one");
+        assert!(local[0]["upgrade_channel"].is_null());
+        assert!(local[0]["eviction"].is_null());
     }
 
     #[tokio::test]

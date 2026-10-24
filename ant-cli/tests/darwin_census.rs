@@ -21,9 +21,9 @@
 //! - payments are made per chunk in the network's own token, with paid
 //!   quotes read back from the vault, through the chain-bound wallet;
 //! - self-update and the node manager stay off in this build;
-//! - no path of the node manager deletes a node's data folder: the
-//!   disk-pressure eviction is gone, and the darwin CLI's `darwin node reset`
-//!   is off.
+//! - no path of the node manager deletes a node's data folder: the darwin
+//!   CLI's `darwin node reset` is off, and the storage-node image's manager
+//!   (`darwin-nodes`) has no reset and no disk-pressure eviction.
 //!
 //! The source is read as tokens, so layout, comments and string literals
 //! (except those a list names in double quotes) make no difference.
@@ -205,14 +205,16 @@ const EMBED_LOCAL: &str = "Decodes a data map from a local manifest file the use
     decide whether to embed it.";
 const RESET: &str = "node::reset deletes every node's data and log folders: reached only from \
     `darwin node reset` and the darwin CLI daemon's POST /api/v1/reset, both off (NODE_MANAGER is \
-    false).";
+    false); darwin-nodes reaches neither.";
 const RESET_COMMAND: &str = "Unreachable: `darwin node reset` (imported here, or calling the \
-    reset), and `darwin node` refuses every command before it runs (NODE_MANAGER is false).";
-const RESET_ROUTE: &str = "POST /api/v1/reset, served by the darwin CLI's daemon (`darwin node \
-    daemon run`), which `darwin node` refuses to run (off).";
+    reset), and `darwin node` refuses every command before it runs (NODE_MANAGER is false). \
+    darwin-nodes has no reset.";
+const RESET_ROUTE: &str = "POST /api/v1/reset, served by the darwin CLI's daemon only (`darwin \
+    node daemon run`, off); the daemon of darwin-nodes (server::start_image_manager) has no such \
+    route.";
 const DOWNLOAD_LEFTOVERS: &str = "A download's temporary archive and duplicate extracted copies, \
     in the download cache (<data dir>/bin), never a node's folder; reached only from `darwin node \
-    add` with a download source (off).";
+    add` with a download source (off). darwin-nodes downloads nothing.";
 const DAEMON_FILES: &str = "The daemon's own port and pid files, when it stops or is found gone.";
 const NODE_PID: &str = "A node's pid file (<data dir>/node.pid), once its process has exited; the \
     node's data stays.";
@@ -1130,7 +1132,7 @@ const ERASE_SITES: &[Site] = &[
     ),
     (
         "ant-core/src/node/daemon/server.rs",
-        "start",
+        "Prepared::serve",
         "remove_file",
         2,
         DAEMON_FILES,
@@ -2297,9 +2299,14 @@ fn check(counting: Counting, reviewed: &[Site], rule: &str) {
     check_found(&census(counting), reviewed, rule);
 }
 
-/// The node manager's code: ant-core's `node` module and the darwin CLI's
-/// `node` commands (off).
-const NODE_MANAGER: &[&str] = &["ant-core/src/node/", "ant-cli/src/commands/node/"];
+/// The node manager's code: ant-core's `node` module, the darwin CLI's
+/// `node` commands (off) and `darwin-nodes`, the storage-node image's
+/// manager.
+const NODE_MANAGER: &[&str] = &[
+    "ant-core/src/node/",
+    "ant-cli/src/commands/node/",
+    "ant-cli/src/bin/darwin-nodes/",
+];
 
 /// [`check`], counting in the node manager's code only.
 fn check_node_manager(counting: Counting, reviewed: &[Site], rule: &str) {
@@ -2394,7 +2401,8 @@ fn the_node_manager_deletes_no_node_data() {
         ERASES,
         ERASE_SITES,
         "No path of the node manager deletes a node's data folder: the disk-pressure eviction is \
-         gone, and the darwin CLI's `node reset` is off. What it deletes is its own process and \
-         port files, a node's pid file, and download leftovers.",
+         gone, the storage-node image's manager (darwin-nodes) has no reset, and the darwin CLI's \
+         `node reset` is off. What it deletes is its own process and port files, a node's pid \
+         file, and download leftovers.",
     );
 }

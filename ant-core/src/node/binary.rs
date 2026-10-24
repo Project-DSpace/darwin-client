@@ -66,8 +66,9 @@ pub async fn resolve_binary(
 
 /// Resolve a local binary path: validate it exists and extract its version.
 ///
-/// Also checks for `bootstrap_peers.toml` in the same directory as the binary.
-async fn resolve_local(path: &Path) -> Result<ResolvedBinary> {
+/// Also checks for `bootstrap_peers.toml` in the same directory as the binary. Downloads nothing:
+/// `node::add_local_nodes` resolves binaries here only.
+pub(crate) async fn resolve_local(path: &Path) -> Result<ResolvedBinary> {
     if !path.exists() {
         return Err(Error::BinaryNotFound(path.to_path_buf()));
     }

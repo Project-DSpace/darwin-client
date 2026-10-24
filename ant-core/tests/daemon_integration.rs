@@ -263,3 +263,235 @@ async fn get_node_detail_returns_full_config() {
     shutdown.cancel();
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 }
+
+/// The daemon of the storage-node image's manager (`darwin-nodes daemon run`) serves the node
+/// manager's core, with the shapes the image's entrypoint, stats.sh and the watchdog read, and no
+/// reset and no log forwarding. The darwin CLI's daemon still documents both.
+#[tokio::test]
+async fn the_image_managers_daemon_serves_the_core_and_no_reset_or_log_forwarding() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config(&dir);
+    let registry = NodeRegistry::load(&config.registry_path).unwrap();
+    let shutdown = tokio_util::sync::CancellationToken::new();
+    let addr = server::start_image_manager(config, registry, shutdown.clone())
+        .await
+        .unwrap();
+    let client = reqwest::Client::new();
+
+    for path in [
+        "/api/v1/status",
+        "/api/v1/health",
+        "/api/v1/nodes/status",
+        "/console",
+    ] {
+        let resp = client
+            .get(format!("http://{addr}{path}"))
+            .send()
+            .await
+            .unwrap();
+        assert!(resp.status().is_success(), "GET {path}: {}", resp.status());
+    }
+    let status: DaemonStatus = client
+        .get(format!("http://{addr}/api/v1/status"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(status.running);
+
+    for (method, path) in [
+        (reqwest::Method::POST, "/api/v1/reset"),
+        (reqwest::Method::GET, "/api/v1/logs/forward"),
+        (reqwest::Method::POST, "/api/v1/logs/forward/enable"),
+        (reqwest::Method::POST, "/api/v1/logs/forward/disable"),
+    ] {
+        let resp = client
+            .request(method.clone(), format!("http://{addr}{path}"))
+            .json(&serde_json::json!({}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 404, "{method} {path}");
+    }
+
+    let spec: serde_json::Value = client
+        .get(format!("http://{addr}/api/v1/openapi.json"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(spec["info"]["title"], "darwin-nodes API");
+    let paths: Vec<&String> = spec["paths"].as_object().unwrap().keys().collect();
+    assert!(paths.iter().any(|path| *path == "/api/v1/nodes"));
+    assert!(
+        paths
+            .iter()
+            .all(|path| !path.contains("reset") && !path.contains("logs")),
+        "{paths:?}"
+    );
+    let schemas = spec["components"]["schemas"].as_object().unwrap();
+    assert!(schemas.keys().all(|name| !name.contains("LogForward")));
+    shutdown.cancel();
+
+    // The darwin CLI's daemon (off in the CLI) is unchanged: it documents both.
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config(&dir);
+    let registry = NodeRegistry::load(&config.registry_path).unwrap();
+    let shutdown = tokio_util::sync::CancellationToken::new();
+    let addr = server::start(config, registry, shutdown.clone())
+        .await
+        .unwrap();
+    let spec: serde_json::Value = reqwest::get(format!("http://{addr}/api/v1/openapi.json"))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    for path in [
+        "/api/v1/reset",
+        "/api/v1/logs/forward",
+        "/api/v1/logs/forward/enable",
+        "/api/v1/logs/forward/disable",
+        "/api/v1/nodes",
+        "/api/v1/status",
+    ] {
+        assert!(spec["paths"][path].is_object(), "{path}");
+    }
+    assert!(spec["components"]["schemas"]["LogForwardResult"].is_object());
+    assert!(spec["components"]["schemas"]["DaemonStatus"].is_object());
+
+    shutdown.cancel();
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+}
+
+/// The image manager's daemon adds nodes from a node binary already on the machine, and refuses
+/// every download source before anything is written.
+#[tokio::test]
+async fn the_image_managers_daemon_adds_from_a_local_binary_only() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config(&dir);
+    let reg_path = config.registry_path.clone();
+    let registry = NodeRegistry::load(&reg_path).unwrap();
+    let shutdown = tokio_util::sync::CancellationToken::new();
+    let addr = server::start_image_manager(config, registry, shutdown.clone())
+        .await
+        .unwrap();
+    let client = reqwest::Client::new();
+
+    for source in [
+        BinarySource::Latest,
+        BinarySource::Version("0.11.2".to_string()),
+        BinarySource::Url("https://github.com/x/y.tar.gz".to_string()),
+    ] {
+        let opts = AddNodeOpts {
+            count: 1,
+            rewards_address: "0x1234567890abcdef1234567890abcdef12345678".to_string(),
+            data_dir_path: Some(dir.path().join("data")),
+            binary_source: source,
+            ..Default::default()
+        };
+        let resp = client
+            .post(format!("http://{addr}/api/v1/nodes"))
+            .json(&opts)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 400);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert!(
+            body["error"]
+                .as_str()
+                .unwrap()
+                .contains("downloads no node binary"),
+            "{body}"
+        );
+        assert!(!reg_path.exists(), "the registry was not written");
+        assert!(!dir.path().join("data").exists());
+    }
+
+    let opts = AddNodeOpts {
+        count: 1,
+        rewards_address: "0x1234567890abcdef1234567890abcdef12345678".to_string(),
+        data_dir_path: Some(dir.path().join("data")),
+        binary_source: BinarySource::LocalPath(create_fake_binary(dir.path())),
+        ..Default::default()
+    };
+    let resp = client
+        .post(format!("http://{addr}/api/v1/nodes"))
+        .json(&opts)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201);
+    let detail: NodeInfo = client
+        .get(format!("http://{addr}/api/v1/nodes/1"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(detail.config.service_name, "node1");
+    assert!(detail.config.data_dir.is_dir());
+
+    shutdown.cancel();
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+}
+
+/// A node an earlier manager evicted stays refused, and each daemon names its own command for
+/// dismissing it.
+#[tokio::test]
+async fn each_daemon_names_its_own_command_for_a_node_an_earlier_manager_evicted() {
+    for (image_manager, command) in [
+        (true, "darwin-nodes dismiss 1"),
+        (false, "darwin node dismiss 1"),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(&dir);
+        let reg_path = config.registry_path.clone();
+        let opts = AddNodeOpts {
+            count: 1,
+            rewards_address: "0x1234567890abcdef1234567890abcdef12345678".to_string(),
+            data_dir_path: Some(dir.path().join("data")),
+            binary_source: BinarySource::LocalPath(create_fake_binary(dir.path())),
+            ..Default::default()
+        };
+        ant_core::node::add_nodes(opts, &reg_path, &NoopProgress)
+            .await
+            .unwrap();
+        let mut registry = NodeRegistry::load(&reg_path).unwrap();
+        registry.get_mut(1).unwrap().eviction = Some(ant_core::node::types::EvictionRecord {
+            reason: "Automatically evicted to reclaim disk space".to_string(),
+            evicted_at: 1_760_000_000,
+            reclaimed_bytes: 1_000_000,
+        });
+        registry.save().unwrap();
+
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let addr = if image_manager {
+            server::start_image_manager(config, registry, shutdown.clone()).await
+        } else {
+            server::start(config, registry, shutdown.clone()).await
+        }
+        .unwrap();
+
+        let resp = reqwest::Client::new()
+            .post(format!("http://{addr}/api/v1/nodes/1/start"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 409);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        let error = body["error"].as_str().unwrap();
+        assert!(error.contains(command), "{error}");
+        assert!(error.contains("earlier node manager"), "{error}");
+        assert_eq!(body["current_state"]["status"], "evicted");
+
+        shutdown.cancel();
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+}

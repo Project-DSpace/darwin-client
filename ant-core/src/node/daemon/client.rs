@@ -1,10 +1,14 @@
 use std::path::Path;
 use std::time::Duration;
 
+use tokio_util::sync::CancellationToken;
+
 use crate::error::{Error, Result};
 use crate::node::daemon::forward::{LogForwardEnableRequest, LogForwardResult, LogForwardStatus};
 use crate::node::daemon::health::FleetHealth;
+use crate::node::daemon::server;
 use crate::node::process::detach;
+use crate::node::registry::NodeRegistry;
 use crate::node::types::{
     AddNodeOpts, AddNodeResult, DaemonConfig, DaemonInfo, DaemonStartResult, DaemonStatus,
     DaemonStopResult, NodeStarted, NodeStatusResult, NodeStopped, RemoveNodeResult, ResetResult,
@@ -101,11 +105,22 @@ pub async fn stop(config: &DaemonConfig) -> Result<DaemonStopResult> {
     Ok(DaemonStopResult { pid })
 }
 
-/// Start the daemon as a detached background process.
+/// The words, after the executable, that run the darwin CLI's daemon in the foreground.
+pub const DARWIN_DAEMON_RUN: &[&str] = &["node", "daemon", "run"];
+
+/// Start the darwin CLI's daemon as a detached background process: [`start_as`] with
+/// [`DARWIN_DAEMON_RUN`].
+pub async fn start(config: &DaemonConfig) -> Result<DaemonStartResult> {
+    start_as(config, DARWIN_DAEMON_RUN).await
+}
+
+/// Start the daemon as a detached background process: this executable, run with `run_words`
+/// (the words that run its daemon in the foreground: [`DARWIN_DAEMON_RUN`] for `darwin`,
+/// `daemon run` for `darwin-nodes`) and the config's overrides.
 ///
 /// If the daemon is already running, returns a result with `already_running: true`.
 /// Otherwise, spawns the daemon and polls for the port file to confirm startup.
-pub async fn start(config: &DaemonConfig) -> Result<DaemonStartResult> {
+pub async fn start_as(config: &DaemonConfig, run_words: &[&str]) -> Result<DaemonStartResult> {
     // Check if daemon is already running
     if let Some(pid) = check_running(&config.pid_file_path) {
         let port = read_port_file(&config.port_file_path);
@@ -123,7 +138,7 @@ pub async fn start(config: &DaemonConfig) -> Result<DaemonStartResult> {
         .to_str()
         .ok_or_else(|| Error::ProcessSpawn("Executable path is not valid UTF-8".to_string()))?;
 
-    let args = daemon_run_args(config);
+    let args = daemon_run_args(config, run_words);
     let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
     let pid = detach::spawn_detached(exe_str, &arg_refs)?;
 
@@ -439,15 +454,30 @@ pub fn info(config: &DaemonConfig) -> DaemonInfo {
     }
 }
 
-/// Run the daemon in the foreground (the actual daemon process entry point).
+/// Run the darwin CLI's daemon in the foreground (the actual daemon process entry point): the
+/// server of [`server::start`], with reset, log forwarding and downloads.
 ///
 /// Starts the HTTP server, sets up signal handling, and blocks until shutdown.
 pub async fn run(config: DaemonConfig) -> Result<()> {
-    use crate::node::daemon::server;
-    use crate::node::registry::NodeRegistry;
+    run_with(config, server::start).await
+}
 
+/// Run the storage-node image manager's daemon in the foreground (`darwin-nodes daemon run`): the
+/// server of [`server::start_image_manager`], with no reset, no log forwarding and no download.
+///
+/// Starts the HTTP server, sets up signal handling, and blocks until shutdown.
+pub async fn run_image_manager(config: DaemonConfig) -> Result<()> {
+    run_with(config, server::start_image_manager).await
+}
+
+/// Load the registry, start the server `start` starts, and block until Ctrl+C (SIGINT on Unix).
+async fn run_with<F, Fut>(config: DaemonConfig, start: F) -> Result<()>
+where
+    F: FnOnce(DaemonConfig, NodeRegistry, CancellationToken) -> Fut,
+    Fut: std::future::Future<Output = Result<std::net::SocketAddr>>,
+{
     let registry = NodeRegistry::load(&config.registry_path)?;
-    let shutdown = tokio_util::sync::CancellationToken::new();
+    let shutdown = CancellationToken::new();
 
     let shutdown_clone = shutdown.clone();
     tokio::spawn(async move {
@@ -455,7 +485,7 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
         shutdown_clone.cancel();
     });
 
-    let _addr = server::start(config, registry, shutdown.clone()).await?;
+    let _addr = start(config, registry, shutdown.clone()).await?;
 
     shutdown.cancelled().await;
     // Give the server a moment to clean up
@@ -465,9 +495,10 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
 }
 
 /// Executable names (without `.exe`) a daemon process may run under: the CLI's
-/// own, and `ant`, its name before the rename, so a daemon an older build
-/// started can still be stopped.
-const DAEMON_EXE_NAMES: &[&str] = &["darwin", "ant"];
+/// own, the storage-node image's manager (`darwin-nodes`), which keeps its
+/// daemon's files in the same place, and `ant`, the CLI's name before the
+/// rename, so a daemon an older build started can still be stopped.
+const DAEMON_EXE_NAMES: &[&str] = &["darwin", "darwin-nodes", "ant"];
 
 /// Validate that a PID belongs to a daemon process of this CLI by checking its
 /// command line. This guards against PID reuse after a daemon crash.
@@ -534,14 +565,15 @@ fn validate_daemon_process(pid: u32) -> bool {
     }
 }
 
-/// Build the arg list passed to the detached `darwin node daemon run` child.
+/// Build the arg list passed to the detached daemon child: `run_words` (e.g. `node daemon run`),
+/// then the overrides.
 ///
 /// Overrides are forwarded explicitly so the child binds to the same address
 /// and port the caller asked for. Unset fields fall through to the child's
 /// own defaults (loopback + OS-assigned port).
-fn daemon_run_args(config: &DaemonConfig) -> Vec<String> {
+fn daemon_run_args(config: &DaemonConfig, run_words: &[&str]) -> Vec<String> {
     let defaults = DaemonConfig::default();
-    let mut args = vec!["node".to_string(), "daemon".to_string(), "run".to_string()];
+    let mut args: Vec<String> = run_words.iter().map(|word| (*word).to_string()).collect();
     if let Some(port) = config.port {
         args.push("--port".to_string());
         args.push(port.to_string());
@@ -651,7 +683,7 @@ mod tests {
     #[test]
     fn run_args_default_config_has_no_overrides() {
         let config = DaemonConfig::default();
-        let args = daemon_run_args(&config);
+        let args = daemon_run_args(&config, DARWIN_DAEMON_RUN);
         assert_eq!(args, vec!["node", "daemon", "run"]);
     }
 
@@ -661,7 +693,7 @@ mod tests {
             port: Some(8765),
             ..DaemonConfig::default()
         };
-        let args = daemon_run_args(&config);
+        let args = daemon_run_args(&config, DARWIN_DAEMON_RUN);
         assert_eq!(args, vec!["node", "daemon", "run", "--port", "8765"]);
     }
 
@@ -673,7 +705,7 @@ mod tests {
             log_path: Some(std::path::PathBuf::from("/var/log/ant/daemon.log")),
             ..DaemonConfig::default()
         };
-        let args = daemon_run_args(&config);
+        let args = daemon_run_args(&config, DARWIN_DAEMON_RUN);
         assert_eq!(
             args,
             vec![
@@ -688,7 +720,7 @@ mod tests {
 
     #[test]
     fn run_args_omit_the_log_path_by_default() {
-        let args = daemon_run_args(&DaemonConfig::default());
+        let args = daemon_run_args(&DaemonConfig::default(), DARWIN_DAEMON_RUN);
         assert!(
             !args.contains(&"--log-path".to_string()),
             "daemon logging must stay opt-in"
@@ -701,7 +733,7 @@ mod tests {
             listen_addr: std::net::IpAddr::V4(Ipv4Addr::UNSPECIFIED),
             ..DaemonConfig::default()
         };
-        let args = daemon_run_args(&config);
+        let args = daemon_run_args(&config, DARWIN_DAEMON_RUN);
         assert_eq!(
             args,
             vec!["node", "daemon", "run", "--listen-addr", "0.0.0.0"]
@@ -715,7 +747,7 @@ mod tests {
             listen_addr: std::net::IpAddr::V4(Ipv4Addr::UNSPECIFIED),
             ..DaemonConfig::default()
         };
-        let args = daemon_run_args(&config);
+        let args = daemon_run_args(&config, DARWIN_DAEMON_RUN);
         assert_eq!(
             args,
             vec![
@@ -730,6 +762,38 @@ mod tests {
         );
     }
 
+    /// `darwin-nodes daemon start` spawns `darwin-nodes daemon run`, with the same overrides.
+    #[test]
+    fn run_args_start_with_the_words_given() {
+        let config = DaemonConfig {
+            port: Some(12600),
+            listen_addr: std::net::IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+            log_path: Some(std::path::PathBuf::from("/data/logs/manager")),
+            ..DaemonConfig::default()
+        };
+        let args = daemon_run_args(&config, &["daemon", "run"]);
+        assert_eq!(
+            args,
+            vec![
+                "daemon",
+                "run",
+                "--port",
+                "12600",
+                "--listen-addr",
+                "0.0.0.0",
+                "--log-path",
+                "/data/logs/manager",
+            ]
+        );
+    }
+
+    /// A daemon the image's manager runs is one `daemon stop` may stop, as it may the darwin
+    /// CLI's and `ant`'s; nothing else is.
+    #[test]
+    fn the_daemon_runs_under_the_names_of_its_clis() {
+        assert_eq!(DAEMON_EXE_NAMES, ["darwin", "darwin-nodes", "ant"]);
+    }
+
     #[test]
     fn run_args_forward_explicit_zero_port() {
         // Explicit `--port 0` is preserved so the user's intent (OS-assigned)
@@ -739,7 +803,7 @@ mod tests {
             port: Some(0),
             ..DaemonConfig::default()
         };
-        let args = daemon_run_args(&config);
+        let args = daemon_run_args(&config, DARWIN_DAEMON_RUN);
         assert_eq!(args, vec!["node", "daemon", "run", "--port", "0"]);
     }
 }
