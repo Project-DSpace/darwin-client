@@ -93,6 +93,11 @@ jobs:
     # Pinned to the servers' Ubuntu release: a binary built against a newer
     # glibc will not run on an older one.
     runs-on: ubuntu-24.04
+    # Line tables only, not full debug info, for the test builds (the release
+    # build has none), so they fit on the runner's disk with the vendored
+    # crates' builds; backtraces still give file and line.
+    env:
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
@@ -102,6 +107,17 @@ jobs:
           toolchain: stable
 
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+
+      # The test builds and the release build together can fill the runner's
+      # disk otherwise, as test.yml's builds did. This job uses none of these
+      # preinstalled toolchains.
+      - name: Free disk space
+        run: |
+          df -h /
+          for dir in /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL; do
+            if [ -d "$dir" ]; then sudo rm -rf "$dir"; fi
+          done
+          df -h /
 
       - name: Unit tests
         run: cargo test --locked -p ant-core --lib && cargo test --locked -p ant-cli
