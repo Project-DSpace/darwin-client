@@ -66,6 +66,12 @@ told apart by the commit `darwin --version` prints. Upstream's entries follow.
   earlier version ended and began again isn't given the reason of the one before (rows kept the
   earlier way are read and rewritten), and each start makes the order `rejected.json` lists its
   rows in, and the deferrals' reasons, match the rows an earlier version left.
+  A node that misses 3 polls and isn't found by the lookups that close its leaf is probed before
+  it leaves the census (pinged over the producer's connection to it, or dialed afresh, not taking
+  the word of the 30-minute dial-failure cache), and one that left is probed each cycle for a day
+  and is back in the census on its first answer; an id that answered no lookup is looked for again
+  when a node names it again. `darwin listings refresh-census --state-dir DIR` has the producer's
+  next cycle close every leaf of its census, in place of editing its store by hand.
 - Envelopes are darwin's default: `darwin file upload`, `darwin manifest create` and the
   library's file upload shortcuts store each upload in an envelope, with its payment record, a
   listing when listed, and a `.record`. The other ways of using the network remain, with no

@@ -241,13 +241,16 @@ write starts.
 
 The nearest nodes are those of the producer's census: the nodes it found
 answering witnessed lookups. A node that misses 3 of its polls in a row
-leaves the census when its part of the address space is closed again, and
-the next nearest takes its place. So for a while after a node stops, while
-the network still lists it, what the producer publishes can differ from what
-a one-off read of the network gives: these counts (and `rejected.json`'s,
-and `status.json`'s `below_full`), and also whether an address is listed,
-left for later or dropped. A reader comparing entries or support with its
-own read should allow for it during that time.
+leaves the census when its part of the address space is closed again and
+it doesn't answer a probe either (a ping, or a fresh dial), and the next
+nearest takes its place; the producer probes it again each cycle, for a
+day, and it is back in the census on its first answer. So for a while
+after a node stops, while the network still lists it, what the producer
+publishes can differ from what a one-off read of the network gives: these
+counts (and `rejected.json`'s, and `status.json`'s `below_full`), and also
+whether an address is listed, left for later or dropped. A reader
+comparing entries or support with its own read should allow for it during
+that time.
 
 ## by-name/
 
