@@ -1,69 +1,62 @@
 ---
 name: update-ant-node-ref
-description: Update the ant-node dependency version in ant-core/Cargo.toml, regenerate lockfile, verify the build, and commit the change. Use when asked to update ant-node or /update-ant-node-ref.
+description: Move ant-core's tests, devnet and browser harness to another darwin-node revision, keeping every pin alike and vendor/ant-protocol equal to darwin-node's copy, then verify and commit. Use when asked to update ant-node or darwin-node, or /update-ant-node-ref.
 allowed-tools: Bash, Read, Edit, Glob, Grep, AskUserQuestion
 ---
 
-# Update ant-node Reference
+# Update the darwin-node revision
 
-This skill updates the `ant-node` dependency version in `ant-core/Cargo.toml`, regenerates the
-lockfile, verifies the build, and commits the change.
+ant-core's tests (the `ant-node` dev-dependency), its `devnet` feature (the `ant-node`
+dependency), the workspace's `webrtc` patch and the browser harness all build darwin-node, the
+Darwin network's node, at one git revision. `scripts/darwin-node-pin.py`, which CI runs, fails
+unless every pin names it and `vendor/ant-protocol` equals darwin-node's copy at it.
 
 ## Procedure
 
-### Step 1: Prompt for target version
+### Step 1: Ask for the revision
 
-Ask the user: **What version of `ant-node` should we update to?** (e.g., `0.9.0`)
+Ask the user: **Which darwin-node commit should the tests run?** (the full 40-character hash, for
+example a release tag's commit). Do not proceed without one.
 
-Do not proceed without a version string.
+### Step 2: Change every pin
 
-### Step 2: Update the dependency
+Replace the old hash with the new one in:
 
-Edit `ant-core/Cargo.toml` and change the `ant-node` version to the one the user provided. The line
-to change looks like:
+- `ant-core/Cargo.toml`: the `ant-node` dependency and the `ant-node` dev-dependency (`rev`);
+- `Cargo.toml`: `[patch.crates-io] webrtc` (`rev`);
+- `ant-core/browser-tests/node-revision`: its second line (the first is the repository).
 
-```toml
-ant-node = "X.Y.Z"
-```
-
-### Step 3: Update the lockfile
-
-Run:
+### Step 3: Update the lockfile for darwin-node only
 
 ```bash
-cargo update
+cargo update -p ant-node
 ```
 
-This regenerates `Cargo.lock` to reflect the new version.
+Never a bare `cargo update`: it moves every dependency.
 
-### Step 4: Verify the build
-
-Run:
+### Step 4: Check the pins and the vendored copy
 
 ```bash
-cargo build
+python3 scripts/darwin-node-pin.py --vendored
 ```
 
-Do **not** use `--release` — it is too slow for a validation build.
+If `vendor/ant-protocol` differs from darwin-node's, stop and report the files the script lists:
+the client's copy follows the node's in a change of its own, reviewed against the fork features.
 
-If the build **succeeds**, proceed to Step 5.
+### Step 5: Build and test
 
-If the build **fails**, stop and report the error to the user. Explain what breaking changes were
-detected and what code modifications would be needed to get the build to compile. Do not attempt to
-fix the code automatically — let the user decide how to proceed.
-
-### Step 5: Commit the change
-
-Stage `ant-core/Cargo.toml` and `Cargo.lock`, then create a commit:
-
-```
-chore: update ant-node to <version>
+```bash
+cargo test --locked -p ant-core --features test-utils --no-run
 ```
 
-### Step 6: Ask about PR
+Then run the end-to-end targets that pin payments, with `anvil` on PATH and one test at a time:
+at least `e2e_merkle` and `e2e_record_payment_recovery`
+(`cargo test --locked -p ant-core --features test-utils --test <target> -- --test-threads=1`),
+and the browser harness as `ant-core/browser-tests/README.md` describes. If the build or a test
+fails, stop and report it, with what changed in darwin-node to cause it. Do not change the tests to
+make them pass without the user's say.
 
-Ask the user: **Would you like to create a pull request for this change?**
+### Step 6: Commit
 
-If yes, create a PR with:
-- **Title:** `chore: update ant-node to <version>`
-- **Body:** A brief summary noting the version bump and that the build was verified.
+Stage the three files and `Cargo.lock`, and commit in this repository's style (read `git log`),
+naming the new revision and the release it is. Push or open a pull request only if asked.

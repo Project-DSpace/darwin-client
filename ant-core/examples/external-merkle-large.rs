@@ -13,6 +13,12 @@
 //! (`LocalDevnet`), so this exercises the released node-side merkle
 //! verification, not an in-process test double.
 //!
+//! The `devnet` feature builds darwin-node, which refuses batch payments at
+//! quote time, so against a `LocalDevnet` this stops at step 3: the prepare
+//! falls back to per-chunk payment info. It proves the merkle path only
+//! against a devnet of nodes that accept batch payments (upstream's), joined
+//! with `MANIFEST`.
+//!
 //! # Usage
 //!
 //! ```bash
@@ -226,7 +232,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         )
                     })
                     .collect(),
-                other => panic!("expected merkle payment info, got {other:?}"),
+                other => panic!(
+                    "expected merkle payment info, got {other:?}: the nodes refused batch \
+                     payments (darwin-node does), so run this against nodes that accept them"
+                ),
             };
         println!(
             "      prepared {} total chunks as {} sub-batch(es) in {:?}; RSS so far: {} MiB",
