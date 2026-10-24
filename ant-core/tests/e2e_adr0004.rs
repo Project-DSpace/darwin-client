@@ -11,6 +11,8 @@
 //!    so the storer accepts the bound quotes and the forwarded sidecars too.
 //! 3. A node with NO commitment emits a valid BASELINE quote `(0, None)` priced
 //!    at `calculate_price(0)`, and the full flow still works.
+//! 4. A forced-merkle upload on the commitment-bound network is refused at
+//!    quote time with nothing paid, as darwin-node refuses every batch payment.
 //!
 //! The OFF-CURVE rejection (a node charging above its committed count is dropped
 //! before payment) is proven directly on the gate in the `quote.rs` unit tests
@@ -32,7 +34,10 @@ use bytes::Bytes;
 use serial_test::serial;
 use std::io::Write;
 use std::sync::Arc;
-use support::{test_client_config, MiniTestnet, DEFAULT_NODE_COUNT};
+use support::{
+    assert_batch_refused, test_client_config, wallet_spend, MiniTestnet, DEFAULT_NODE_COUNT,
+    MERKLE_TESTNET_NODES,
+};
 
 /// The committed key count every node attests in these tests. Picked above the
 /// pricing baseline so `calculate_price(N)` is strictly greater than the
@@ -187,15 +192,19 @@ async fn adr0004_baseline_quotes_still_work() {
     testnet.teardown().await;
 }
 
-/// DEV-01 regression: a FORCED-MERKLE upload against a network where every
-/// node carries a live storage commitment (bound candidates). On DEV-01 this
-/// exact combination started failing the moment nodes rotated their first
-/// commitment (2026-07-06 19:38 UTC) while single-node payments kept working.
+/// A FORCED-MERKLE upload against a network where every node carries a live
+/// storage commitment (bound candidates) is refused at quote time, before any
+/// candidate's binding is checked or anything is paid: darwin-node refuses
+/// batch payments. Against upstream's nodes this case was the DEV-01
+/// regression (bound candidates broke merkle uploads the moment nodes rotated
+/// their first commitment, 2026-07-06 19:38 UTC); here it pins that a
+/// commitment-bound network refuses batches as an unbound one does, and that
+/// per-chunk payment, which the first test in this file pins, still works.
 #[tokio::test(flavor = "multi_thread")]
 #[serial]
-async fn adr0004_merkle_upload_against_bound_candidates() {
-    // 35 nodes: merkle pools need 16 valid candidates per pool.
-    let testnet = MiniTestnet::start_with_commitments(35, COMMITTED_KEYS).await;
+async fn adr0004_merkle_upload_against_bound_candidates_is_refused() {
+    // Enough nodes that the client asks them for candidates at all.
+    let testnet = MiniTestnet::start_with_commitments(MERKLE_TESTNET_NODES, COMMITTED_KEYS).await;
     let node = testnet.node(5).expect("node 5 exists");
     let config = ClientConfig {
         quote_timeout_secs: 120,
@@ -211,17 +220,17 @@ async fn adr0004_merkle_upload_against_bound_candidates() {
     input_file.write_all(&data).expect("write temp file");
     input_file.flush().expect("flush temp file");
 
-    let result = client
+    let before = wallet_spend(testnet.wallet()).await;
+    let error = client
         .file_upload_with_mode(input_file.path(), PaymentMode::Merkle)
         .await
-        .expect("merkle upload against bound candidates must succeed");
-
+        .expect_err("darwin-node refuses batch payments, bound candidates or not");
+    assert_batch_refused(&error);
     assert_eq!(
-        result.payment_mode_used,
-        PaymentMode::Merkle,
-        "payment_mode_used must be Merkle"
+        wallet_spend(testnet.wallet()).await,
+        before,
+        "nothing may be paid for a refused batch"
     );
-    assert!(result.chunks_stored >= 3, "chunks must be stored");
 
     drop(client);
     testnet.teardown().await;

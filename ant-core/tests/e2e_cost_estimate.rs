@@ -18,7 +18,7 @@ use serial_test::serial;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use support::MiniTestnet;
+use support::{assert_batch_refused, wallet_spend, MiniTestnet};
 use tempfile::TempDir;
 
 /// Simple xorshift64 PRNG for deterministic, incompressible test data.
@@ -400,22 +400,26 @@ async fn test_estimate_all_stored_full_sample_is_verified() {
     assert_eq!(estimate.payment_mode, PaymentMode::Single);
 }
 
-/// Merkle estimate vs actual on a batch whose leaf count is padded.
+/// Merkle estimate on a batch whose leaf count is padded, and the upload it
+/// estimates.
 ///
 /// The estimator bills `median x 3` per *padded* leaf, so a 9-chunk merkle
-/// batch must quote — and the contract must settle — 16 leaves. Sizing the
-/// file at `6 x MAX_CHUNK_SIZE` makes the count exact: self-encryption emits
-/// 6 data chunks, and `shrink_data_map` adds 3 more for any file above 3
-/// chunks, giving 9. `PaymentMode::Merkle` forces the merkle path at a chunk
-/// count small enough to upload in ~1 minute.
+/// batch is estimated at 16 leaves. Sizing the file at `6 x MAX_CHUNK_SIZE`
+/// makes the count exact: self-encryption emits 6 data chunks, and
+/// `shrink_data_map` adds 3 more for any file above 3 chunks, giving 9.
+/// `PaymentMode::Merkle` forces the merkle path at that small count. Every
+/// node of a fresh testnet quotes the same price, so the merkle estimate is
+/// exactly 16/9 of the per-chunk one.
 ///
-/// The 65- and 257-chunk batch-boundary cases are proved directly against
-/// on-chain payment in `e2e_merkle::test_merkle_payment_across_batch_boundary`,
-/// which needs no multi-hundred-megabyte file to reach those counts.
+/// darwin-node refuses the upload itself at quote time, so nothing settles
+/// to compare the estimate with. That the estimated units are the leaves the
+/// vault bills for the trees the upload engine builds, at the 9-chunk case,
+/// the 65- and 257-chunk batch boundaries and every count between, is pinned
+/// without nodes in `merkle_unit.rs`.
 #[tokio::test(flavor = "multi_thread")]
 #[serial]
-async fn test_merkle_estimate_vs_actual_pads_to_the_billed_tree() {
-    // 20+ nodes so merkle candidate pools (CANDIDATES_PER_POOL = 16) fill.
+async fn test_merkle_estimate_pads_to_the_billed_tree_and_the_upload_is_refused() {
+    // More than 16 nodes, so the client asks them for merkle candidates.
     let testnet = MiniTestnet::start(20).await;
     let node = testnet.node(3).expect("Node 3 should exist");
     let client = Client::from_node(Arc::clone(&node), ClientConfig::default())
@@ -427,45 +431,57 @@ async fn test_merkle_estimate_vs_actual_pads_to_the_billed_tree() {
 
     // Without an envelope, so the merkle batch is the whole upload (an
     // envelope is paid per chunk, on top).
-    let (est_atto, act_atto, est_chunks, act_chunks) = compare_estimate_vs_actual(
-        &client,
-        &path,
-        PaymentMode::Merkle,
-        Some(Visibility::Private),
-    )
-    .await;
+    let estimate =
+        |mode| client.estimate_upload_cost_with_visibility(&path, mode, Visibility::Private, None);
+    let merkle = estimate(PaymentMode::Merkle)
+        .await
+        .expect("merkle estimate");
+    let single = estimate(PaymentMode::Single)
+        .await
+        .expect("per-chunk estimate");
+    let merkle_atto: u128 = merkle.storage_cost_atto.parse().expect("parse atto");
+    let single_atto: u128 = single.storage_cost_atto.parse().expect("parse atto");
 
     eprintln!(
-        "merkle padded batch: est_chunks={est_chunks}, act_chunks={act_chunks}, \
-         billable_leaves={}, est={est_atto} atto, actual={act_atto} atto",
-        merkle_billable_leaves(est_chunks as u64)
+        "merkle padded batch: chunks={}, billable_leaves={}, merkle est={merkle_atto} atto, \
+         per-chunk est={single_atto} atto",
+        merkle.chunk_count,
+        merkle_billable_leaves(merkle.chunk_count as u64)
     );
 
     assert_eq!(
-        est_chunks, 9,
+        merkle.chunk_count, 9,
         "6 data chunks + 3 shrunk DataMap chunks should give 9 chunks"
     );
+    assert_eq!(single.chunk_count, 9);
+    assert_eq!(merkle.payment_mode, PaymentMode::Merkle);
+    assert_eq!(single.payment_mode, PaymentMode::Single);
     assert_eq!(
-        est_chunks, act_chunks,
-        "estimate and upload must agree on the chunk count"
-    );
-    assert_eq!(
-        merkle_billable_leaves(est_chunks as u64),
+        merkle_billable_leaves(merkle.chunk_count as u64),
         16,
         "9 chunks must be billed as a padded 16-leaf tree"
     );
-
-    assert!(
-        act_atto > 0,
-        "a merkle upload must settle a non-zero amount"
+    assert!(single_atto > 0, "a per-chunk estimate prices every chunk");
+    assert_eq!(
+        merkle_atto * 9,
+        single_atto * 16,
+        "the merkle estimate bills 16 leaves where the per-chunk one bills 9 chunks"
     );
-    let ratio = if est_atto > act_atto {
-        est_atto as f64 / act_atto as f64
-    } else {
-        act_atto as f64 / est_atto as f64
-    };
-    assert!(
-        ratio < 1.15,
-        "merkle estimate too far from actual: est={est_atto}, actual={act_atto}, ratio={ratio:.2}"
+
+    let before = wallet_spend(testnet.wallet()).await;
+    let error = client
+        .file_upload_with_visibility_and_progress(
+            &path,
+            PaymentMode::Merkle,
+            Visibility::Private,
+            None,
+        )
+        .await
+        .expect_err("darwin-node refuses batch payments");
+    assert_batch_refused(&error);
+    assert_eq!(
+        wallet_spend(testnet.wallet()).await,
+        before,
+        "nothing may be paid for a refused batch"
     );
 }

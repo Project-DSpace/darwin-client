@@ -1,7 +1,8 @@
 //! Minimal test infrastructure for ant-core E2E tests.
 //!
-//! Spawns a small local testnet with `AntProtocol` handlers and an Anvil
-//! EVM testnet for real on-chain payment verification.
+//! Spawns a small local testnet of darwin-node's `AntProtocol` handlers (the
+//! revision ant-core/Cargo.toml pins) and an Anvil EVM testnet for real
+//! on-chain payment verification.
 
 // This module is compiled into every [[test]] binary separately.
 // Each binary uses a different subset of methods, so Rust flags
@@ -50,6 +51,51 @@ const BOOTSTRAP_COUNT: usize = 2;
 const SPAWN_DELAY_MS: u64 = 200;
 const STABILIZATION_TIMEOUT_SECS: u64 = 180;
 
+/// darwin-node's answer to a merkle (batch) payment. Its nodes give it at
+/// quote time to every merkle candidate request, before anything is signed,
+/// and to every merkle-tagged proof on a PUT: a batch is paid on-chain before
+/// any storer sees it, so a refusal after payment would lose the money.
+pub use ant_node::payment::BATCH_PAYMENTS_REFUSED;
+
+/// Nodes in the testnets the merkle cases run on, as they always have. A
+/// client needs 16 peers to ask for a merkle candidate pool; on a network
+/// where it knows fewer it gives up before asking any node, and the nodes'
+/// refusal of the batch is never seen.
+pub const MERKLE_TESTNET_NODES: usize = 35;
+
+/// What `wallet` has spent, as its chain shows it: the transactions it has
+/// sent (its nonce) and the tokens it holds. Unchanged across a call, nothing
+/// was paid in it.
+pub async fn wallet_spend(wallet: &Wallet) -> (u64, ant_protocol::evm::U256) {
+    use alloy::providers::Provider;
+    let sent = wallet
+        .to_provider()
+        .get_transaction_count(wallet.address())
+        .await
+        .expect("read the wallet's nonce");
+    let tokens = wallet
+        .balance_of_tokens()
+        .await
+        .expect("read the wallet's tokens");
+    (sent, tokens)
+}
+
+/// Check that `error` is darwin-node's refusal of a batch payment: the nodes
+/// refused the merkle candidate requests, so no batch was quoted, let alone
+/// paid. It is not a refusal of this client's settlement version, which would
+/// stop the client paying per chunk too.
+pub fn assert_batch_refused(error: &ant_core::data::Error) {
+    let text = error.to_string();
+    assert!(
+        text.contains(BATCH_PAYMENTS_REFUSED),
+        "expected darwin-node's refusal of batch payments, got: {text}"
+    );
+    assert!(
+        !matches!(error, ant_core::data::Error::ClientUpdateRequired(_)),
+        "a batch refusal is not a settlement-version refusal: {text}"
+    );
+}
+
 /// Default node count for standard E2E tests.
 ///
 /// `CLOSE_GROUP_SIZE` (7) is the quorum the client needs for a quote to
@@ -85,7 +131,7 @@ const TEST_MAX_RECORDS: usize = 1280;
 ///
 /// 60 s is deliberately conservative: in the happy path everything completes
 /// in well under a second, so the larger budget only shows up on flakes.
-/// The merkle suite already uses 120 s for the same reason.
+/// The merkle cases use 120 s for the same reason.
 #[must_use]
 pub fn test_client_config() -> ClientConfig {
     ClientConfig {
@@ -197,7 +243,8 @@ pub struct MiniTestnet {
 impl MiniTestnet {
     /// Start a testnet with the given number of nodes.
     ///
-    /// Use `DEFAULT_NODE_COUNT` for standard tests, 35+ for merkle tests (need 16 peers per pool).
+    /// Use `DEFAULT_NODE_COUNT` for standard tests, `MERKLE_TESTNET_NODES` for
+    /// merkle cases (a client asks 16 peers per pool, so the nodes refuse).
     /// Nodes emit baseline `(0, None)` quotes (no commitment source wired).
     pub async fn start(node_count: usize) -> Self {
         Self::start_inner(node_count, None, false).await
@@ -305,8 +352,9 @@ impl MiniTestnet {
         // Phase 3: Wait for DHT convergence.
         // Every node's routing table must know about all other nodes
         // so that `find_closest_nodes` returns the full close group.
-        // For merkle payments we need at least 16 peers per pool query.
-        // For small networks, require all peers. For large ones, require at least 20.
+        // A merkle candidate pool asks at least 16 peers, which darwin-node
+        // then refuses. For small networks, require all peers. For large
+        // ones, require at least 20.
         let min_routing_table_size = if node_count > 20 { 20 } else { node_count - 1 };
         let deadline =
             tokio::time::Instant::now() + Duration::from_secs(STABILIZATION_TIMEOUT_SECS);

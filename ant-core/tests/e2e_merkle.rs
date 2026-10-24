@@ -1,8 +1,20 @@
-//! E2E tests for merkle batch payment uploads.
+//! Merkle (batch) payments against darwin-node, which refuses them.
 //!
-//! Spins up a 35-node testnet with Anvil EVM, tests merkle payment flow
-//! including upload/download verification, payment mode assertion,
-//! and in-memory data upload path.
+//! A batch is paid on-chain before any storer sees a PUT, so a node that
+//! refused the PUTs afterwards would let the client spend for nothing.
+//! darwin-node refuses batches up front: every merkle candidate request is
+//! answered with `BATCH_PAYMENTS_REFUSED` at quote time, before anything is
+//! signed, and every merkle-tagged proof is refused on a PUT. These tests run
+//! this client's batch paths (wallet, low-level and external signer) against
+//! a 35-node darwin-node testnet on Anvil, and pin what the refusal leaves:
+//! nothing paid (the wallet sent no transaction and holds the same tokens),
+//! nothing stored, and a client that still pays per chunk.
+//!
+//! These tests used to run on upstream's ant-node from crates.io, where batch
+//! payments succeed. The batch arithmetic they also checked (the split either
+//! side of the 256-leaf boundary, the padded leaves billed) needs no nodes and
+//! is pinned in `merkle_unit.rs`; darwin-node's own tests send it well-formed,
+//! tampered and paid merkle proofs (its `tests/e2e/merkle_payment.rs`).
 
 #![allow(
     clippy::unwrap_used,
@@ -12,34 +24,35 @@
 
 mod support;
 
-use ant_core::data::client::merkle::{merkle_billable_leaves, PaymentMode};
+use ant_core::data::client::merkle::PaymentMode;
 use ant_core::data::{compute_address, Client, ClientConfig, ExternalPaymentInfo, Visibility};
+use ant_protocol::evm::{QuoteHash, TxHash};
 use serial_test::serial;
+use std::collections::HashMap;
 use std::io::Write;
 use std::sync::Arc;
-use support::MiniTestnet;
+use support::{
+    assert_batch_refused, wallet_spend, MiniTestnet, BATCH_PAYMENTS_REFUSED, MERKLE_TESTNET_NODES,
+};
 use tempfile::{NamedTempFile, TempDir};
 
 const CLIENT_QUOTE_TIMEOUT_SECS: u64 = 120;
 const CLIENT_STORE_TIMEOUT_SECS: u64 = 120;
 
-/// Chunk size for merkle security tests (small, fast to hash).
+/// Chunk size for the payment-only cases (small, fast to hash).
 const TEST_CHUNK_SIZE: usize = 1024;
 
-/// Create a 35-node testnet suitable for merkle payments.
+/// A testnet large enough for merkle candidate pools, and a client on it, as
+/// the batch payments these tests attempt were made before.
 async fn setup_merkle_testnet() -> (Client, MiniTestnet) {
-    eprintln!("Starting 35-node testnet...");
-    let testnet = MiniTestnet::start(35).await;
+    eprintln!("Starting {MERKLE_TESTNET_NODES}-node testnet...");
+    let testnet = MiniTestnet::start(MERKLE_TESTNET_NODES).await;
     eprintln!(
         "Testnet started, {} nodes running",
         testnet.running_node_count()
     );
 
     let node = testnet.node(5).expect("Node 5 should exist");
-    let routing_size = node.dht().get_routing_table_size().await;
-    let connected = node.connected_peers().await.len();
-    eprintln!("Client node routing table: {routing_size} entries, {connected} connected");
-
     let config = ClientConfig {
         quote_timeout_secs: CLIENT_QUOTE_TIMEOUT_SECS,
         store_timeout_secs: CLIENT_STORE_TIMEOUT_SECS,
@@ -51,255 +64,163 @@ async fn setup_merkle_testnet() -> (Client, MiniTestnet) {
     (client, testnet)
 }
 
-/// Merkle file upload/download round-trip with payment mode assertion.
+/// A file of `size` patterned bytes, `reversed` to keep two files' content
+/// apart.
+fn patterned_file(size: usize, reversed: bool) -> (NamedTempFile, Vec<u8>) {
+    let data: Vec<u8> = if reversed {
+        (0u8..=255).rev().cycle().take(size).collect()
+    } else {
+        (0u8..=255).cycle().take(size).collect()
+    };
+    let mut file = NamedTempFile::new().expect("create temp file");
+    file.write_all(&data).expect("write temp file");
+    file.flush().expect("flush temp file");
+    (file, data)
+}
+
+/// A forced-merkle file upload is refused at quote time, before anything is
+/// paid or stored, and the refusal doesn't stop the client: the same file
+/// then uploads per chunk, and downloads whole.
 #[tokio::test(flavor = "multi_thread")]
 #[serial]
-async fn test_merkle_file_upload_download() {
+async fn a_forced_merkle_file_upload_is_refused_before_anything_is_paid() {
     let (client, testnet) = setup_merkle_testnet().await;
 
     // 500KB file — self-encryption produces 3+ chunks
-    let data: Vec<u8> = (0u8..=255).cycle().take(500_000).collect();
-    let mut input_file = NamedTempFile::new().expect("create temp file");
-    input_file.write_all(&data).expect("write temp file");
-    input_file.flush().expect("flush temp file");
+    let (input_file, data) = patterned_file(500_000, false);
 
-    eprintln!("Uploading 500KB file with forced merkle payment mode...");
-
-    let result = client
+    let before = wallet_spend(testnet.wallet()).await;
+    let error = client
         .file_upload_with_mode(input_file.path(), PaymentMode::Merkle)
         .await
-        .expect("merkle file upload should succeed");
-
-    // Assert merkle payment was actually used (not a silent fallback)
+        .expect_err("darwin-node refuses batch payments");
+    assert_batch_refused(&error);
     assert_eq!(
-        result.payment_mode_used,
-        PaymentMode::Merkle,
-        "payment_mode_used must be Merkle, not a silent fallback to Single"
+        wallet_spend(testnet.wallet()).await,
+        before,
+        "nothing may be paid for a refused batch"
     );
 
-    eprintln!(
-        "Upload complete: {} chunks stored via {:?}",
-        result.chunks_stored, result.payment_mode_used
-    );
-
+    // Not a verdict about this client: it goes on paying per chunk.
+    let result = client
+        .file_upload_with_mode(input_file.path(), PaymentMode::Single)
+        .await
+        .expect("a per-chunk upload after the refusal");
+    assert_eq!(result.payment_mode_used, PaymentMode::Single);
     assert!(
         result.chunks_stored >= 3,
         "self-encryption should produce at least 3 chunks, got {}",
         result.chunks_stored
     );
+    assert!(
+        wallet_spend(testnet.wallet()).await.0 > before.0,
+        "the per-chunk upload paid"
+    );
 
-    // Download and verify content integrity
     let output_dir = TempDir::new().expect("create temp dir");
-    let output_path = output_dir.path().join("merkle_downloaded.bin");
-
-    eprintln!("Downloading file...");
-
+    let output_path = output_dir.path().join("per_chunk_downloaded.bin");
     let bytes_written = client
         .file_download(&result.data_map, &output_path)
         .await
         .expect("file download should succeed");
-
     let downloaded = std::fs::read(&output_path).expect("read downloaded file");
-    assert_eq!(downloaded.len(), data.len(), "downloaded size must match");
     assert_eq!(downloaded, data, "downloaded content must match original");
     assert_eq!(bytes_written, data.len() as u64, "bytes_written must match");
 
-    eprintln!("Merkle file upload/download round-trip verified.");
-
     drop(client);
     testnet.teardown().await;
 }
 
-/// Merkle in-memory data upload/download round-trip.
+/// A forced-merkle upload of in-memory data is refused the same way, and
+/// stores none of its chunks.
 #[tokio::test(flavor = "multi_thread")]
 #[serial]
-async fn test_merkle_data_upload_download() {
+async fn a_forced_merkle_data_upload_is_refused_before_anything_is_paid() {
     let (client, testnet) = setup_merkle_testnet().await;
 
     let data: Vec<u8> = (0u8..=255).cycle().take(100_000).collect();
+    let (data_map, _) = self_encryption::encrypt(bytes::Bytes::from(data.clone()))
+        .expect("encrypt the data as the upload does");
 
-    eprintln!("Uploading 100KB in-memory data with merkle mode...");
-
-    let result = client
-        .data_upload_with_mode(bytes::Bytes::from(data.clone()), PaymentMode::Merkle)
+    let before = wallet_spend(testnet.wallet()).await;
+    let error = client
+        .data_upload_with_mode(bytes::Bytes::from(data), PaymentMode::Merkle)
         .await
-        .expect("merkle data upload should succeed");
+        .expect_err("darwin-node refuses batch payments");
+    assert_batch_refused(&error);
+    assert_eq!(wallet_spend(testnet.wallet()).await, before);
 
-    assert_eq!(
-        result.payment_mode_used,
-        PaymentMode::Merkle,
-        "data upload must use Merkle mode"
-    );
-
-    assert!(result.chunks_stored >= 3, "should produce multiple chunks");
-
-    // Download and verify
-    let downloaded = client
-        .data_download(&result.data_map)
-        .await
-        .expect("data download should succeed");
-
-    assert_eq!(downloaded.len(), data.len());
-    assert_eq!(downloaded.as_ref(), data.as_slice());
-
-    eprintln!("Merkle data upload/download round-trip verified.");
+    for info in data_map.infos() {
+        assert!(
+            client
+                .chunk_get(&info.dst_hash.0)
+                .await
+                .expect("chunk_get answers")
+                .is_none(),
+            "no chunk of a refused upload may be stored"
+        );
+    }
 
     drop(client);
     testnet.teardown().await;
 }
 
-// ─── Merkle Payment Security Tests ─────────────────────────────────────────
-//
-// Verify that nodes reject tampered merkle proofs. Unlike single-node payments
-// where the client controls the amount, merkle payment amounts are determined
-// by the smart contract. The cheating vectors for merkle are:
-// - Using a proof from one chunk to store a different chunk (address mismatch)
-// - Using a proof from a payment that didn't happen on-chain
-
-/// Use a valid merkle proof from chunk A to try storing chunk B.
-///
-/// The merkle proof contains an address-binding commitment: the proof's
-/// `address` field and sibling hashes bind it to a specific leaf in the tree.
-/// Nodes must verify this binding rejects mismatched chunks.
+/// A PUT carrying a merkle proof is refused, whatever the proof, so no chunk
+/// is stored on a batch payment: neither one that is not in the proof's tree
+/// nor one that is. darwin-node refuses on the proof's tag, before any of
+/// upstream's merkle checks; its own tests send it well-formed and tampered
+/// proofs, which a client can no longer get paid for.
 #[tokio::test(flavor = "multi_thread")]
 #[serial]
-async fn test_attack_merkle_proof_for_wrong_chunk() {
+async fn a_put_carrying_a_merkle_proof_is_refused() {
     let (client, testnet) = setup_merkle_testnet().await;
 
-    // Create 4 small chunks for a minimal merkle tree
-    let chunks: Vec<bytes::Bytes> = (0..4u8)
-        .map(|i| bytes::Bytes::from(vec![i; TEST_CHUNK_SIZE]))
-        .collect();
-    let addresses: Vec<[u8; 32]> = chunks.iter().map(|c| compute_address(c)).collect();
+    // The shape of a merkle proof as a client sends it: the tag, then the
+    // proof (here bytes no node reads past the tag).
+    let mut proof = vec![ant_protocol::PROOF_TAG_MERKLE];
+    proof.extend([0x5a; 255]);
 
-    eprintln!("Paying for 4 chunks via merkle batch...");
+    for content in [
+        bytes::Bytes::from(vec![0u8; TEST_CHUNK_SIZE]),
+        bytes::Bytes::from("this content was in no merkle tree"),
+    ] {
+        let address = compute_address(&content);
+        let peers = client
+            .network()
+            .find_closest_peers(&address, 1)
+            .await
+            .expect("should find peers");
+        let (target_peer, target_addrs) = &peers[0];
 
-    // Pay for these chunks via merkle batch payment
-    let batch_result = client
-        .pay_for_merkle_batch(&addresses, 0, TEST_CHUNK_SIZE as u64)
-        .await
-        .expect("merkle batch payment should succeed");
-
-    assert_eq!(
-        batch_result.proofs.len(),
-        4,
-        "should have proofs for all 4 chunks"
-    );
-
-    // Get the proof for chunk 0
-    let proof_for_chunk_0 = batch_result
-        .proofs
-        .get(&addresses[0])
-        .expect("should have proof for chunk 0")
-        .clone();
-
-    // Create a completely different chunk NOT in the merkle tree
-    let evil_content = bytes::Bytes::from("this content was NOT in the merkle tree");
-    let evil_address = compute_address(&evil_content);
-    assert_ne!(
-        evil_address, addresses[0],
-        "evil chunk must have a different address"
-    );
-
-    // Find a peer close to the evil chunk's address to PUT to
-    let peers = client
-        .network()
-        .find_closest_peers(&evil_address, 1)
-        .await
-        .expect("should find peers");
-    let (target_peer, target_addrs) = &peers[0];
-
-    eprintln!("Attempting PUT of wrong chunk with merkle proof for chunk 0...");
-
-    // Try to store the evil chunk using chunk 0's merkle proof
-    let result = client
-        .chunk_put_with_proof(evil_content, proof_for_chunk_0, target_peer, target_addrs)
-        .await;
-
-    assert!(
-        result.is_err(),
-        "PUT with merkle proof for a different chunk should be rejected (address mismatch)"
-    );
+        let error = client
+            .chunk_put_with_proof(content, proof.clone(), target_peer, target_addrs)
+            .await
+            .expect_err("a merkle proof is refused");
+        assert!(
+            error.to_string().contains(BATCH_PAYMENTS_REFUSED),
+            "expected darwin-node's refusal of batch payments, got: {error}"
+        );
+        assert!(
+            client
+                .chunk_get(&address)
+                .await
+                .expect("chunk_get answers")
+                .is_none(),
+            "a chunk PUT with a merkle proof must not be stored"
+        );
+    }
 
     drop(client);
     testnet.teardown().await;
 }
 
-/// Use a proof from chunk A to try storing chunk B where both are in the tree.
-///
-/// Even when both chunks have valid merkle proofs from the same batch, the
-/// proofs are NOT interchangeable — each proof binds to its specific leaf
-/// via the address and sibling hash path.
+/// The low-level batch payment is refused at quote time either side of the
+/// 256-leaf boundary: one tree of 65 addresses, and 257 split across two, the
+/// second of which is never reached. Nothing is paid for either, not even the
+/// first of the two.
 #[tokio::test(flavor = "multi_thread")]
 #[serial]
-async fn test_attack_merkle_proof_swap_within_batch() {
-    let (client, testnet) = setup_merkle_testnet().await;
-
-    let chunks: Vec<bytes::Bytes> = (0..4u8)
-        .map(|i| bytes::Bytes::from(vec![i; TEST_CHUNK_SIZE]))
-        .collect();
-    let addresses: Vec<[u8; 32]> = chunks.iter().map(|c| compute_address(c)).collect();
-
-    eprintln!("Paying for 4 chunks via merkle batch...");
-
-    let batch_result = client
-        .pay_for_merkle_batch(&addresses, 0, TEST_CHUNK_SIZE as u64)
-        .await
-        .expect("merkle batch payment should succeed");
-
-    // Take chunk 0's proof and try to store chunk 1 with it
-    let proof_for_chunk_0 = batch_result
-        .proofs
-        .get(&addresses[0])
-        .expect("should have proof for chunk 0")
-        .clone();
-
-    let peers = client
-        .network()
-        .find_closest_peers(&addresses[1], 1)
-        .await
-        .expect("should find peers");
-    let (target_peer, target_addrs) = &peers[0];
-
-    eprintln!("Attempting to store chunk 1 using chunk 0's merkle proof...");
-
-    let result = client
-        .chunk_put_with_proof(
-            chunks[1].clone(),
-            proof_for_chunk_0,
-            target_peer,
-            target_addrs,
-        )
-        .await;
-
-    assert!(
-        result.is_err(),
-        "Swapping merkle proofs between chunks in the same batch should be rejected"
-    );
-
-    drop(client);
-    testnet.teardown().await;
-}
-
-/// Merkle payment either side of the 256-leaf batch boundary, against a real
-/// on-chain settlement.
-///
-/// 257 is the count the old `addresses.chunks(MAX_LEAVES)` split partitioned
-/// as `[256, 1]`: the 256-address batch was paid for on-chain and the
-/// singleton remainder could not build a tree, so the call returned a *paid*
-/// partial result carrying 256 proofs. It now splits as `[255, 2]` and every
-/// address comes back with a proof.
-///
-/// Paying directly is what makes the boundary reachable: getting 257 chunks
-/// out of self-encryption needs a ~1 GB file, while `pay_for_merkle_batch`
-/// takes the address set straight.
-///
-/// Settlement is checked against the same padded-leaf model the estimator
-/// bills with — 65 addresses settle 128 leaves, 257 settle 256 + 2 — so the
-/// two counts must cost in that ratio.
-#[tokio::test(flavor = "multi_thread")]
-#[serial]
-async fn test_merkle_payment_across_batch_boundary() {
+async fn a_merkle_batch_payment_is_refused_either_side_of_the_batch_boundary() {
     let (client, testnet) = setup_merkle_testnet().await;
 
     // Distinct, deterministic addresses. Payment binds to addresses only; the
@@ -315,129 +236,37 @@ async fn test_merkle_payment_across_batch_boundary() {
             .collect()
     };
 
-    let mut paid: Vec<(usize, u128)> = Vec::new();
-
     for (count, tag) in [(65usize, 0xA1u8), (257usize, 0xB2u8)] {
-        let addrs = addresses(count, tag);
-
-        // A 65/257-address tree collects far more candidate pools than the
-        // small-tree tests above, and an in-process 35-node testnet on a loaded
-        // CI runner can leave one pool a candidate short ("Got 15 merkle
-        // candidates, need 16"). That shortfall is transient, so retry it.
-        // The bug this test guards is not: a `[256, 1]` partition fails to
-        // build its second tree on every attempt, so a short proof set
-        // survives all three and still fails the assertion below.
-        let mut result = None;
-        let mut last_shortfall = String::new();
-        for attempt in 1..=3 {
-            eprintln!("Paying for {count} addresses via merkle batch (attempt {attempt}/3)...");
-            match client
-                .pay_for_merkle_batch(&addrs, 0, TEST_CHUNK_SIZE as u64)
-                .await
-            {
-                Ok(full) if full.proofs.len() == count => {
-                    result = Some(full);
-                    break;
-                }
-                Ok(partial) => {
-                    last_shortfall = format!(
-                        "paid but returned {} of {count} proofs",
-                        partial.proofs.len()
-                    );
-                }
-                Err(e) => last_shortfall = e.to_string(),
-            }
-            eprintln!("  attempt {attempt}/3 fell short: {last_shortfall}");
-        }
-        let result = result.unwrap_or_else(|| {
-            panic!(
-                "merkle payment for {count} addresses never returned a full proof set \
-                 after 3 attempts: {last_shortfall}"
-            )
-        });
-
+        let before = wallet_spend(testnet.wallet()).await;
+        let error = client
+            .pay_for_merkle_batch(&addresses(count, tag), 0, TEST_CHUNK_SIZE as u64)
+            .await
+            .expect_err("darwin-node refuses batch payments");
+        assert_batch_refused(&error);
         assert_eq!(
-            result.proofs.len(),
-            count,
-            "every one of the {count} addresses must come back with a proof, not just the \
-             sub-batches that fit a tree"
+            wallet_spend(testnet.wallet()).await,
+            before,
+            "{count} addresses: nothing may be paid"
         );
-        assert_eq!(result.chunk_count, count);
-        for addr in &addrs {
-            assert!(
-                result.proofs.contains_key(addr),
-                "missing proof for {}",
-                hex::encode(addr)
-            );
-        }
-
-        let settled: u128 = result
-            .storage_cost_atto
-            .parse()
-            .expect("settled amount should parse");
-        assert!(
-            settled > 0,
-            "{count} addresses must settle a non-zero amount"
-        );
-        eprintln!(
-            "  {count} addresses: {} leaves billed, settled {settled} atto",
-            merkle_billable_leaves(count as u64)
-        );
-        paid.push((count, settled));
     }
-
-    // Prices are uniform across a freshly started local testnet and this test
-    // stores nothing, so the only thing separating the two settlements is the
-    // padded leaf count each partition pays for.
-    let [(small, small_atto), (large, large_atto)] = paid[..] else {
-        panic!("expected two payments");
-    };
-    let expected =
-        merkle_billable_leaves(large as u64) as f64 / merkle_billable_leaves(small as u64) as f64;
-    let observed = large_atto as f64 / small_atto as f64;
-    assert!(
-        (observed - expected).abs() / expected < 0.15,
-        "settlement should scale with padded leaves: expected ~{expected:.3}x \
-         ({small} -> {large} addresses), observed {observed:.3}x"
-    );
 
     drop(client);
     testnet.teardown().await;
 }
 
-// Single-node coexistence is tested in e2e_file.rs (DEFAULT_NODE_COUNT testnet).
-// The 35-node testnet's DHT can have sparse XOR regions where single-node
-// quotes can't find 5 peers for a random chunk address, making that test
-// unreliable here. Merkle tests are the focus of this file.
-
-// ─── External-Signer Multi-Batch Tests (ADR-0003) ──────────────────────────
-//
-// The external-signer merkle flow partitions the to-upload set into
-// `MerkleTree`-sized sub-batches, the signer pays one transaction per batch,
-// and finalize takes one winner hash per batch. The per-batch leaf cap is a
-// clamped test seam (`ClientConfig::merkle_external_batch_cap`): pinning it
-// to 3 makes a ~500 KB public upload (3 data chunks + the bundled DataMap
-// chunk) partition as [2, 2] — a genuine multi-batch flow without a
-// multi-GiB fixture.
-
-/// Like [`setup_merkle_testnet`] but with the external per-batch leaf cap
-/// pinned to 3 so small uploads prepare as multiple payable sub-batches.
-async fn setup_external_merkle_testnet() -> (Client, MiniTestnet) {
+/// An external signer asking for merkle sub-batches is never handed one to
+/// pay: the forced-merkle prepare (cap 3, public, so it would have been two
+/// sub-batches) comes back as one per-chunk payment intent, since the nodes
+/// refused the batches' candidates, and the upload completes per chunk: paid
+/// by the testnet wallet as an external signer would, finalized, and read back
+/// from its public address.
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn an_external_signer_is_given_per_chunk_payments_instead_of_merkle_batches() {
     let (mut client, testnet) = setup_merkle_testnet().await;
     client.config_mut().merkle_external_batch_cap = Some(3);
-    (client, testnet)
-}
 
-/// Write ~500 KB of patterned content and prepare it as a public forced-merkle
-/// external upload; returns the prepared upload, the per-batch payment
-/// payloads, and the source bytes.
-async fn prepare_external_multi_batch(
-    client: &Client,
-    input_file: &NamedTempFile,
-) -> (
-    ant_core::data::PreparedUpload,
-    Vec<(u8, Vec<ant_protocol::evm::PoolCommitment>, u64)>,
-) {
+    let (input_file, data) = patterned_file(500_000, false);
     let prepared = client
         .file_prepare_upload_with_mode(
             input_file.path(),
@@ -446,85 +275,39 @@ async fn prepare_external_multi_batch(
             None,
         )
         .await
-        .expect("external merkle prepare should succeed");
-
-    let batch_payloads: Vec<(u8, Vec<ant_protocol::evm::PoolCommitment>, u64)> =
-        match &prepared.payment_info {
-            ExternalPaymentInfo::Merkle {
-                prepared_batches, ..
-            } => prepared_batches
-                .iter()
-                .map(|b| {
-                    (
-                        b.depth,
-                        b.pool_commitments.clone(),
-                        b.merkle_payment_timestamp,
-                    )
-                })
-                .collect(),
-            other => panic!("expected merkle payment info, got {other:?}"),
-        };
-
-    (prepared, batch_payloads)
-}
-
-/// External-signer multi-batch merkle round trip: prepare (forced merkle,
-/// cap 3, public) → pay each sub-batch with the testnet wallet exactly as an
-/// external signer would → finalize with one winner hash per batch →
-/// retrieve via the public DataMap address → byte equality.
-#[tokio::test(flavor = "multi_thread")]
-#[serial]
-async fn test_external_merkle_multi_batch_round_trip() {
-    let (client, testnet) = setup_external_merkle_testnet().await;
-
-    let data: Vec<u8> = (0u8..=255).cycle().take(500_000).collect();
-    let mut input_file = NamedTempFile::new().expect("create temp file");
-    input_file.write_all(&data).expect("write temp file");
-    input_file.flush().expect("flush temp file");
-
-    let (prepared, batch_payloads) = prepare_external_multi_batch(&client, &input_file).await;
+        .expect("the prepare falls back to per-chunk payment");
     let public_address = prepared
         .data_map_address
         .expect("public prepare must record the DataMap address");
-    assert!(
-        batch_payloads.len() >= 2,
-        "the cap-3 partition must force a multi-batch prepare, got {} batch(es)",
-        batch_payloads.len()
-    );
+    let payments = match &prepared.payment_info {
+        ExternalPaymentInfo::WaveBatch { payment_intent, .. } => payment_intent.payments.clone(),
+        ExternalPaymentInfo::Merkle {
+            prepared_batches, ..
+        } => panic!(
+            "darwin-node refuses batch payments, yet {} merkle sub-batch(es) were prepared",
+            prepared_batches.len()
+        ),
+    };
 
-    eprintln!(
-        "Paying {} merkle sub-batches as an external signer...",
-        batch_payloads.len()
-    );
-    let mut winner_hashes = Vec::with_capacity(batch_payloads.len());
-    for (depth, commitments, ts) in batch_payloads {
-        let (winner, _amount, _gas) = testnet
-            .wallet()
-            .pay_for_merkle_tree(depth, commitments, ts)
-            .await
-            .expect("testnet wallet should pay the merkle sub-batch");
-        winner_hashes.push(Some(winner));
-    }
-
-    let result = client
-        .finalize_upload_merkle_multi(prepared, winner_hashes)
+    let (tx_hash_map, _gas) = testnet
+        .wallet()
+        .pay_for_quotes(payments)
         .await
-        .expect("multi-batch finalize should succeed");
-    assert_eq!(result.payment_mode_used, PaymentMode::Merkle);
-    assert_eq!(result.chunks_failed, 0);
-    assert_eq!(
-        result.chunks_stored, result.total_chunks,
-        "every chunk must reach quorum"
-    );
+        .expect("the external signer pays per chunk");
+    let tx_hash_map: HashMap<QuoteHash, TxHash> = tx_hash_map.into_iter().collect();
+    let result = client
+        .finalize_upload(prepared, &tx_hash_map)
+        .await
+        .expect("finalize stores every chunk");
+    assert_eq!(result.payment_mode_used, PaymentMode::Single);
+    assert_eq!(result.chunks_stored, result.total_chunks);
 
-    // Retrieve via the public address only — proves the DataMap chunk was
-    // paid for and stored by one of the sub-batches.
     let fetched_map = client
         .data_map_fetch(&public_address)
         .await
         .expect("public DataMap chunk should be retrievable");
     let output_dir = TempDir::new().expect("create temp dir");
-    let output_path = output_dir.path().join("multi_batch.bin");
+    let output_path = output_dir.path().join("external_per_chunk.bin");
     client
         .file_download(&fetched_map, &output_path)
         .await
@@ -532,80 +315,31 @@ async fn test_external_merkle_multi_batch_round_trip() {
     let downloaded = std::fs::read(&output_path).expect("read downloaded file");
     assert_eq!(downloaded, data, "downloaded content must match original");
 
-    eprintln!("External multi-batch merkle round-trip verified.");
-
     drop(client);
     testnet.teardown().await;
 }
 
-/// A k-of-N external payment makes forward progress: pay only the first
-/// sub-batch, finalize with `None` for the second, and the paid chunks store
-/// while the unpaid ones surface through `PartialUpload` — neither silent
-/// success (#166) nor a fatal abort discarding the paid batch's progress.
+/// Merkle sub-batches prepared directly for an external signer are refused at
+/// quote time, before there is anything to sign: four addresses under cap 3,
+/// two sub-batches, neither prepared.
 #[tokio::test(flavor = "multi_thread")]
 #[serial]
-async fn test_external_merkle_partial_payment_is_partial_upload() {
-    let (client, testnet) = setup_external_merkle_testnet().await;
+async fn merkle_sub_batches_for_an_external_signer_are_refused_at_quote_time() {
+    let (client, testnet) = setup_merkle_testnet().await;
 
-    // Different pattern than the round-trip test so content never collides.
-    let data: Vec<u8> = (0u8..=255).rev().cycle().take(500_000).collect();
-    let mut input_file = NamedTempFile::new().expect("create temp file");
-    input_file.write_all(&data).expect("write temp file");
-    input_file.flush().expect("flush temp file");
-
-    let (prepared, batch_payloads) = prepare_external_multi_batch(&client, &input_file).await;
-    assert_eq!(
-        batch_payloads.len(),
-        2,
-        "4 chunks under cap 3 must partition as [2, 2]"
-    );
-
-    eprintln!("Paying only the first of 2 merkle sub-batches...");
-    let (depth, commitments, ts) = batch_payloads[0].clone();
-    let (winner, _amount, _gas) = testnet
-        .wallet()
-        .pay_for_merkle_tree(depth, commitments, ts)
+    let addresses: Vec<[u8; 32]> = (0..4u8)
+        .map(|i| compute_address(&vec![i; TEST_CHUNK_SIZE]))
+        .collect();
+    let error = client
+        .prepare_merkle_batches_external(
+            &addresses,
+            ant_protocol::DATA_TYPE_CHUNK,
+            TEST_CHUNK_SIZE as u64,
+            3,
+        )
         .await
-        .expect("testnet wallet should pay the first sub-batch");
-
-    let err = client
-        .finalize_upload_merkle_multi(prepared, vec![Some(winner), None])
-        .await
-        .expect_err("finalize with an unpaid batch must not report success");
-    match err {
-        ant_core::data::Error::PartialUpload {
-            stored_count,
-            failed_count,
-            total_chunks,
-            reason,
-            ..
-        } => {
-            assert_eq!(stored_count, 2, "the paid batch's chunks must store");
-            assert_eq!(failed_count, 2, "the unpaid batch's chunks must fail");
-            assert_eq!(total_chunks, 4);
-            // The CLI prints this reason and nothing else. Chunks with no proof
-            // were never attempted, so reporting them as short of quorum after
-            // N attempts describes a failure they never had.
-            assert!(
-                reason.contains("2 chunk(s) have no merkle proof"),
-                "proofless chunks must be reported as such, got: {reason}"
-            );
-            assert!(
-                !reason.contains("short of quorum"),
-                "they had no quorum shortfall, got: {reason}"
-            );
-            // The external signer chose not to pay this batch. No settlement
-            // refusal was involved, so the report must not invent one even if
-            // some other operation on this client had latched a verdict.
-            assert!(
-                !reason.contains("refused") && !reason.contains("ant update"),
-                "an unpaid external batch is not a refusal, got: {reason}"
-            );
-        }
-        other => panic!("expected PartialUpload, got: {other}"),
-    }
-
-    eprintln!("External partial payment correctly surfaced as PartialUpload.");
+        .expect_err("darwin-node refuses batch payments");
+    assert_batch_refused(&error);
 
     drop(client);
     testnet.teardown().await;

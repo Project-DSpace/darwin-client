@@ -22,9 +22,12 @@ use ant_protocol::evm::{Amount, Wallet};
 use bytes::Bytes;
 use serial_test::serial;
 use std::io::Write;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use support::{test_client_config, MiniTestnet, DEFAULT_NODE_COUNT};
+use support::{
+    assert_batch_refused, test_client_config, wallet_spend, MiniTestnet, DEFAULT_NODE_COUNT,
+    MERKLE_TESTNET_NODES,
+};
 use tempfile::{NamedTempFile, TempDir};
 
 async fn setup() -> (Client, MiniTestnet) {
@@ -70,6 +73,8 @@ struct StagedRecords<'a> {
     paid: AtomicBool,
     /// Each per-chunk payment.
     payments: Mutex<Vec<PaidWave>>,
+    /// Merkle batches the engine asked this payer to pay.
+    merkle_payments: AtomicUsize,
 }
 
 impl<'a> StagedRecords<'a> {
@@ -80,6 +85,7 @@ impl<'a> StagedRecords<'a> {
             corrupt,
             paid: AtomicBool::new(false),
             payments: Mutex::new(Vec::new()),
+            merkle_payments: AtomicUsize::new(0),
         }
     }
 
@@ -146,6 +152,7 @@ impl UploadAdapter for StagedRecords<'_> {
         &self,
         batch: &PreparedMerkleBatch,
     ) -> ant_core::data::Result<MerkleUploadPayment> {
+        self.merkle_payments.fetch_add(1, Ordering::SeqCst);
         let (winner_pool, amount, gas) = self
             .wallet
             .pay_for_merkle_tree(
@@ -271,11 +278,11 @@ async fn the_envelope_is_never_sent_when_content_fails_to_store() {
     testnet.teardown().await;
 }
 
-#[tokio::test(flavor = "multi_thread")]
-#[serial]
-async fn from_33_content_records_the_envelope_joins_the_per_chunk_remainder() {
-    // Merkle payments need a larger network, as in the merkle suite.
-    let testnet = MiniTestnet::start(35).await;
+/// A testnet large enough that a client asks its nodes for merkle
+/// candidates, and a client on it, set up as for the batch payments the
+/// tests below attempt.
+async fn setup_merkle_sized() -> (Client, MiniTestnet) {
+    let testnet = MiniTestnet::start(MERKLE_TESTNET_NODES).await;
     let node = testnet.node(5).expect("Node 5 should exist");
     let config = ant_core::data::ClientConfig {
         quote_timeout_secs: 120,
@@ -284,30 +291,75 @@ async fn from_33_content_records_the_envelope_joins_the_per_chunk_remainder() {
         ..Default::default()
     };
     let client = Client::from_node(Arc::clone(&node), config).with_wallet(testnet.wallet().clone());
-    let chain = ListingChain::new(testnet.evm_network()).expect("chain reader");
-    // 33 small content records stand in for a file of 33 chunks: the upload
-    // engine splits them into a batch of 32 and one paid per chunk.
+    (client, testnet)
+}
+
+/// From 33 content records the upload engine would pay a merkle batch of 32,
+/// then the last content record with the envelope per chunk (that split is
+/// pinned in `merkle_unit.rs`). darwin-node refuses the batch at quote time,
+/// so the payer is asked for nothing, neither the batch nor the per-chunk
+/// payment after it, and the envelope is never sent.
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn from_33_content_records_a_merkle_batch_is_refused_and_nothing_is_paid() {
+    let (client, testnet) = setup_merkle_sized().await;
     let (chunks, envelope) = content_and_envelope(33, 1_024);
-    let envelope_bytes = chunks.last().cloned().expect("the envelope");
     let staged = StagedRecords::new(chunks, testnet.wallet(), None);
     let mut records = staged.records();
     let last = records.pop().expect("the envelope");
     let mut state = UploadState::default();
-    let outcome = client
+    let before = wallet_spend(testnet.wallet()).await;
+    let error = client
         .upload_records_then(records, last, &mut state, &staged, PaymentMode::Merkle)
         .await
-        .expect("upload");
-    assert_eq!(outcome.mode, PaymentMode::Merkle);
-    assert_eq!(outcome.addresses.len(), 34);
-    assert_eq!(outcome.addresses.last(), Some(&envelope));
+        .expect_err("darwin-node refuses batch payments");
+    assert_batch_refused(&error);
 
-    // One per-chunk payment: the remainder of one content record, and the
-    // envelope with it.
+    assert_eq!(staged.merkle_payments.load(Ordering::SeqCst), 0);
+    assert!(staged.payments.lock().unwrap().is_empty());
+    assert!(!staged.paid.load(Ordering::SeqCst));
+    assert_eq!(wallet_spend(testnet.wallet()).await, before);
+    assert!(client.chunk_get(&envelope).await.expect("fetch").is_none());
+
+    drop(client);
+    testnet.teardown().await;
+}
+
+/// From 65 content records, at the merkle threshold, `PaymentMode::Auto` asks
+/// the nodes for a batch's candidates; darwin-node refuses them, so every
+/// record is paid per chunk instead, and the envelope joins the last
+/// per-chunk payment after the content: the first payment is 64 content
+/// records, the second the last one and the envelope, in one transaction.
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn from_65_content_records_auto_pays_per_chunk_and_the_envelope_joins_the_last_payment() {
+    let (client, testnet) = setup_merkle_sized().await;
+    let chain = ListingChain::new(testnet.evm_network()).expect("chain reader");
+    let (chunks, envelope) = content_and_envelope(65, 1_024);
+    let envelope_bytes = chunks.last().cloned().expect("the envelope");
+    let staged = StagedRecords::new(chunks, testnet.wallet(), None);
+    let mut records = staged.records();
+    let last = records.pop().expect("the envelope");
+    let content: Vec<[u8; 32]> = records.iter().map(|record| record.address).collect();
+    let mut state = UploadState::default();
+    let outcome = client
+        .upload_records_then(records, last, &mut state, &staged, PaymentMode::Auto)
+        .await
+        .expect("upload");
+    assert_eq!(outcome.mode, PaymentMode::Single);
+    assert_eq!(outcome.addresses.len(), 66);
+    assert_eq!(outcome.addresses.last(), Some(&envelope));
+    assert_eq!(staged.merkle_payments.load(Ordering::SeqCst), 0);
+
     let payments = staged.payments.lock().unwrap().clone();
-    assert_eq!(payments.len(), 1, "{payments:?}");
-    let (addresses, transactions) = &payments[0];
-    assert_eq!(addresses.len(), 2);
-    assert!(addresses.contains(&envelope));
+    assert_eq!(payments.len(), 2, "{payments:?}");
+    let (first, _) = &payments[0];
+    assert_eq!(first.len(), 64);
+    assert!(!first.contains(&envelope));
+    let (second, transactions) = &payments[1];
+    assert_eq!(second.len(), 2);
+    assert!(second.contains(&envelope));
+    assert!(second.contains(&content[64]));
     assert_eq!(transactions.len(), 1);
     assert_eq!(payments_in(&chain, &transactions[0]).await, 2);
 
@@ -555,39 +607,47 @@ async fn hiding_everything_on_a_plain_private_upload_stores_no_envelope() {
     testnet.teardown().await;
 }
 
+/// A forced-merkle upload with a listed envelope would pay the content in a
+/// batch and the envelope per chunk after it. darwin-node refuses the batch
+/// at quote time, so nothing is paid; the same upload paid per chunk then
+/// pays the envelope with the content, and its record checks out.
 #[tokio::test(flavor = "multi_thread")]
 #[serial]
-async fn a_merkle_paid_upload_pays_its_envelope_per_chunk_after_the_batch() {
-    // Merkle payments need a larger network, as in the merkle suite.
-    let testnet = MiniTestnet::start(35).await;
-    let node = testnet.node(5).expect("Node 5 should exist");
-    let config = ant_core::data::ClientConfig {
-        quote_timeout_secs: 120,
-        store_timeout_secs: 120,
-        close_group_size: 20,
-        ..Default::default()
-    };
-    let client = Client::from_node(Arc::clone(&node), config).with_wallet(testnet.wallet().clone());
+async fn a_forced_merkle_upload_with_an_envelope_is_refused_before_anything_is_paid() {
+    let (client, testnet) = setup_merkle_sized().await;
     let chain = ListingChain::new(testnet.evm_network()).expect("chain reader");
     let (file, data) = input(0x44);
-    let result = client
-        .file_upload_with_visibility_and_progress(
+    let upload = |mode| {
+        client.file_upload_with_visibility_and_progress(
             file.path(),
-            PaymentMode::Merkle,
+            mode,
             Visibility::Envelope(EnvelopeOptions::listed()),
             None,
         )
+    };
+    let before = wallet_spend(testnet.wallet()).await;
+    let error = upload(PaymentMode::Merkle)
         .await
-        .expect("upload");
-    assert_eq!(result.payment_mode_used, PaymentMode::Merkle);
+        .expect_err("darwin-node refuses batch payments");
+    assert_batch_refused(&error);
+    assert_eq!(
+        wallet_spend(testnet.wallet()).await,
+        before,
+        "nothing may be paid for a refused batch"
+    );
+
+    let result = upload(PaymentMode::Single).await.expect("upload");
+    assert_eq!(result.payment_mode_used, PaymentMode::Single);
     assert_eq!(result.total_chunks, result.data_map.infos().len() + 1);
     assert_eq!(result.chunks_stored, result.total_chunks);
     let envelope = result.envelope.clone().expect("an envelope");
     assert!(envelope.proof_checked, "{:?}", envelope.proof_problem);
     let record = envelope.proof.clone().expect("a record");
-    // The content went in the batch; the envelope was paid on its own, per
-    // chunk, which is what nodes record a listing from.
-    assert_eq!(payments_in(&chain, &record.tx_hash).await, 1);
+    // The envelope's transaction paid every chunk, the envelope's among them.
+    assert_eq!(
+        payments_in(&chain, &record.tx_hash).await,
+        result.total_chunks
+    );
     chain
         .check_proof(&record)
         .await

@@ -854,7 +854,7 @@ name = "ant-core"
 version = "0.13.0"
 dependencies = [
  "alloy",
- "ant-listings",
+ "ant-listings 0.3.1",
  "ant-node",
  "ant-protocol",
  "anyhow",
@@ -933,6 +933,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "ant-listings"
+version = "0.3.1"
+source = "git+https://github.com/Project-DSpace/darwin-node.git?rev=94bf3425e31f77e150bc98306d02705fc33b1037#94bf3425e31f77e150bc98306d02705fc33b1037"
+dependencies = [
+ "ant-protocol",
+ "postcard",
+ "rmp-serde",
+ "self_encryption",
+ "serde",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "ant-merkle"
 version = "1.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -943,10 +956,10 @@ dependencies = [
 
 [[package]]
 name = "ant-node"
-version = "0.23.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4608e1331581c4f2d15857eaa1f82e74688ef198e6eb62de0fb80b2fca566028"
+version = "0.23.0+ds.15"
+source = "git+https://github.com/Project-DSpace/darwin-node.git?rev=94bf3425e31f77e150bc98306d02705fc33b1037#94bf3425e31f77e150bc98306d02705fc33b1037"
 dependencies = [
+ "ant-listings 0.3.1 (git+https://github.com/Project-DSpace/darwin-node.git?rev=94bf3425e31f77e150bc98306d02705fc33b1037)",
  "ant-protocol",
  "bao",
  "blake3",
@@ -966,6 +979,7 @@ dependencies = [
  "mimalloc",
  "objc2",
  "objc2-foundation",
+ "page_size",
  "parking_lot",
  "postcard",
  "rand 0.8.6",
@@ -7333,8 +7347,7 @@ dependencies = [
 [[package]]
 name = "webrtc"
 version = "0.14.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "08fd686c0920ac08f3a57eacc48e31f0e4ca1ffefba4478784606f78c14e83ad"
+source = "git+https://github.com/Project-DSpace/darwin-node.git?rev=94bf3425e31f77e150bc98306d02705fc33b1037#94bf3425e31f77e150bc98306d02705fc33b1037"
 dependencies = [
  "arc-swap",
  "async-trait",

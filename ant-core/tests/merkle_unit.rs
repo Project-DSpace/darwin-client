@@ -4,15 +4,23 @@
 //! batch partitioning that payment and cost estimation share — so no Client or
 //! network is needed. The rest live in `src/data/client/merkle.rs` (inline test
 //! module).
+//!
+//! darwin-node refuses batch payments, so the end-to-end tests can no longer
+//! settle one; the arithmetic they checked against settlement is here: the
+//! split either side of the 256-leaf boundary, the leaves an estimate bills
+//! for the trees the upload engine builds, and the remainder an envelope is
+//! paid with after the batches.
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use ant_core::data::client::merkle::{
-    merkle_batch_partitions, merkle_batch_sizes, merkle_billable_leaves, should_use_merkle,
-    PaymentMode, DEFAULT_MERKLE_THRESHOLD,
+    merkle_batch_partitions, merkle_batch_sizes, merkle_billable_leaves,
+    merkle_upload_billable_units, merkle_upload_partitions, merkle_upload_split, should_use_merkle,
+    MerkleUploadSplit, PaymentMode, DEFAULT_MERKLE_THRESHOLD, MERKLE_EXACT_MIN_BATCH,
 };
-use ant_protocol::evm::MAX_LEAVES;
+use ant_protocol::evm::{MerkleTree, MAX_LEAVES};
 use std::collections::HashSet;
+use xor_name::XorName;
 
 #[test]
 fn test_threshold_constant() {
@@ -101,6 +109,83 @@ fn partitions_preserve_order_and_use_each_address_once() {
 
         let unique: HashSet<[u8; 32]> = flattened.iter().copied().collect();
         assert_eq!(unique.len(), total, "{total}: no address may repeat");
+    }
+}
+
+/// Leaves the vault bills for one tree of `batch`: the tree is padded to a
+/// power of two, and a batch pays `median16 x 2^depth`.
+fn billed_leaves(batch: &[[u8; 32]]) -> u64 {
+    let leaves = batch.iter().map(|address| XorName(*address)).collect();
+    let tree = MerkleTree::from_xornames(leaves).expect("a batch builds a tree");
+    1u64 << tree.depth()
+}
+
+/// An estimate bills the leaves the vault charges for the trees the upload
+/// engine builds, and one unit per chunk the engine pays per chunk. A
+/// forced-merkle upload of 9 chunks is one tree, padded to 16 leaves; from
+/// 32 chunks the engine builds exact power-of-two trees, so nothing is
+/// padded. Checked for every count up to two full batches and past, the
+/// 65- and 257-chunk boundaries among them.
+#[test]
+fn an_estimate_bills_the_leaves_of_the_trees_the_upload_engine_builds() {
+    let nine = addresses(9);
+    let batches = merkle_upload_partitions(9, &nine);
+    assert_eq!(batches, vec![&nine[..]]);
+    assert_eq!(billed_leaves(batches[0]), 16);
+    assert_eq!(merkle_upload_billable_units(9), 16);
+    assert_eq!(merkle_billable_leaves(9), 16);
+
+    for chunks in 2..=(2 * MAX_LEAVES + 70) {
+        let content = addresses(chunks);
+        let batches = merkle_upload_partitions(chunks, &content);
+        let batched: usize = batches.iter().map(|batch| batch.len()).sum();
+        let billed = batches
+            .iter()
+            .map(|batch| billed_leaves(batch))
+            .sum::<u64>()
+            + (chunks - batched) as u64;
+        assert_eq!(
+            merkle_upload_billable_units(chunks as u64),
+            billed,
+            "{chunks} chunks: the estimate must bill what the batches and the remainder cost"
+        );
+    }
+}
+
+/// From 33 content records the upload engine pays the first 32 in one merkle
+/// batch and leaves the last to be paid per chunk, the payment the envelope,
+/// never in a batch, is paid in (`e2e_envelope` shows it joining the last
+/// per-chunk payment on darwin-node). The batches always take the content in
+/// order and leave fewer than `MERKLE_EXACT_MIN_BATCH` records, so the
+/// remainder and the envelope come to at most 32 records.
+#[test]
+fn after_the_batches_the_remainder_left_for_the_envelope_is_under_32_records() {
+    let content = addresses(33);
+    assert_eq!(merkle_upload_partitions(33, &content), vec![&content[..32]]);
+    assert_eq!(
+        merkle_upload_split(33, 33),
+        MerkleUploadSplit {
+            batches: vec![32],
+            per_chunk: 1,
+        }
+    );
+    // Billed unpadded: 32 leaves and one chunk; an envelope is paid on top.
+    assert_eq!(merkle_upload_billable_units(33), 33);
+
+    for chunks in MERKLE_EXACT_MIN_BATCH..=(4 * MAX_LEAVES + 40) {
+        let content = addresses(chunks);
+        let batches = merkle_upload_partitions(chunks, &content);
+        let batched: usize = batches.iter().map(|batch| batch.len()).sum();
+        assert_eq!(batches.concat(), content[..batched], "{chunks} chunks");
+        assert!(
+            chunks - batched < MERKLE_EXACT_MIN_BATCH,
+            "{chunks} chunks leave {} to pay per chunk",
+            chunks - batched
+        );
+        assert_eq!(
+            merkle_upload_split(chunks, chunks).per_chunk,
+            chunks - batched
+        );
     }
 }
 

@@ -1,9 +1,15 @@
-//! Upload cost comparison: Merkle vs Single payment modes.
+//! Upload costs by file size, paid per chunk, on darwin-node.
 //!
-//! Uploads files of various sizes using both payment modes and reports
-//! the ANT token cost, gas cost, and chunk counts in a summary table.
+//! Uploads files of various sizes and reports the token cost, the gas cost,
+//! the transactions sent and the chunk counts in a summary table. darwin-node
+//! refuses merkle (batch) payments at quote time, so there is no batch column
+//! to compare against: the test first checks that a forced-merkle upload is
+//! refused with nothing paid, then measures per-chunk uploads.
 //!
-//! Run with: cargo test --release --test e2e_upload_costs -- --nocapture
+//! A measurement, not a pin, with uploads of up to 4 GB: CI skips it
+//! (`scripts/test-targets.py`). Run it by hand, with `--release`:
+//!
+//!   cargo test --release -p ant-core --test e2e_upload_costs -- --nocapture
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
@@ -15,7 +21,7 @@ use serial_test::serial;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use support::{test_client_config, MiniTestnet};
+use support::{assert_batch_refused, test_client_config, wallet_spend, MiniTestnet};
 use tempfile::TempDir;
 
 /// Simple xorshift64 PRNG for deterministic, incompressible test data.
@@ -59,68 +65,43 @@ fn create_test_file(dir: &Path, size: u64, name: &str, seed: u64) -> PathBuf {
 /// Result of a single upload cost measurement.
 struct CostResult {
     file_size_mb: u64,
-    mode: &'static str,
     chunks: usize,
-    ant_cost_atto: u128,
+    token_cost_atto: u128,
     gas_cost_wei: u128,
-    num_evm_txs: &'static str,
+    transactions: u64,
 }
 
-/// Measure ANT and gas cost for a single upload.
+/// Measure the token and gas cost, and the transactions sent, of one upload
+/// paid per chunk.
 async fn measure_upload_cost(
     client: &Client,
     wallet: &ant_protocol::evm::Wallet,
     path: &Path,
-    mode: PaymentMode,
     file_size_mb: u64,
 ) -> CostResult {
-    let ant_before = wallet
-        .balance_of_tokens()
-        .await
-        .expect("get ANT balance before");
+    let (sent_before, tokens_before) = wallet_spend(wallet).await;
     let gas_before = wallet
         .balance_of_gas_tokens()
         .await
         .expect("get gas balance before");
 
     let result = client
-        .file_upload_with_mode(path, mode)
+        .file_upload_with_mode(path, PaymentMode::Single)
         .await
         .expect("upload should succeed");
 
-    let ant_after = wallet
-        .balance_of_tokens()
-        .await
-        .expect("get ANT balance after");
+    let (sent_after, tokens_after) = wallet_spend(wallet).await;
     let gas_after = wallet
         .balance_of_gas_tokens()
         .await
         .expect("get gas balance after");
 
-    let ant_spent = ant_before.saturating_sub(ant_after);
-    let gas_spent = gas_before.saturating_sub(gas_after);
-
-    // Estimate tx count based on mode and chunk count
-    let tx_estimate = match mode {
-        PaymentMode::Single => format!("~{}", result.chunks_stored.div_ceil(256)),
-        PaymentMode::Merkle => {
-            let sub_batches = result.chunks_stored.div_ceil(256);
-            format!("{sub_batches}")
-        }
-        PaymentMode::Auto => format!("{:?}", result.payment_mode_used),
-    };
-
     CostResult {
         file_size_mb,
-        mode: match mode {
-            PaymentMode::Single => "Single",
-            PaymentMode::Merkle => "Merkle",
-            PaymentMode::Auto => "Auto",
-        },
         chunks: result.chunks_stored,
-        ant_cost_atto: ant_spent.to::<u128>(),
-        gas_cost_wei: gas_spent.to::<u128>(),
-        num_evm_txs: Box::leak(tx_estimate.into_boxed_str()),
+        token_cost_atto: tokens_before.saturating_sub(tokens_after).to::<u128>(),
+        gas_cost_wei: gas_before.saturating_sub(gas_after).to::<u128>(),
+        transactions: sent_after - sent_before,
     }
 }
 
@@ -128,11 +109,11 @@ fn format_atto(atto: u128) -> String {
     if atto == 0 {
         return "0".to_string();
     }
-    // 1 ANT = 10^18 atto
+    // 1 token = 10^18 atto
     let whole = atto / 1_000_000_000_000_000_000;
     let frac = atto % 1_000_000_000_000_000_000;
     if whole > 0 {
-        format!("{whole}.{frac:018} ANT")
+        format!("{whole}.{frac:018}")
     } else {
         format!("{atto} atto")
     }
@@ -152,9 +133,9 @@ fn format_wei(wei: u128) -> String {
 
 fn print_table(results: &[CostResult]) {
     eprintln!();
-    eprintln!("╔══════════╤══════════╤════════╤══════════════════════════╤══════════════════╤═══════════╗");
-    eprintln!("║ Size     │ Mode     │ Chunks │ ANT Cost                 │ Gas Cost         │ EVM Txs   ║");
-    eprintln!("╠══════════╪══════════╪════════╪══════════════════════════╪══════════════════╪═══════════╣");
+    eprintln!("╔══════════╤════════╤══════════════════════════╤══════════════════╤═════╗");
+    eprintln!("║ Size     │ Chunks │ Token cost               │ Gas cost         │ Txs ║");
+    eprintln!("╠══════════╪════════╪══════════════════════════╪══════════════════╪═════╣");
     for r in results {
         let size = if r.file_size_mb >= 1024 {
             format!("{} GB", r.file_size_mb / 1024)
@@ -162,44 +143,51 @@ fn print_table(results: &[CostResult]) {
             format!("{} MB", r.file_size_mb)
         };
         eprintln!(
-            "║ {:<8} │ {:<8} │ {:>6} │ {:<24} │ {:<16} │ {:<9} ║",
+            "║ {:<8} │ {:>6} │ {:<24} │ {:<16} │ {:>3} ║",
             size,
-            r.mode,
             r.chunks,
-            format_atto(r.ant_cost_atto),
+            format_atto(r.token_cost_atto),
             format_wei(r.gas_cost_wei),
-            r.num_evm_txs,
+            r.transactions,
         );
     }
-    eprintln!("╚══════════╧══════════╧════════╧══════════════════════════╧══════════════════╧═══════════╝");
+    eprintln!("╚══════════╧════════╧══════════════════════════╧══════════════════╧═════╝");
     eprintln!();
 }
 
-/// Upload cost comparison table.
+/// Upload cost table, paid per chunk.
 ///
-/// Uses smaller file sizes (10-500MB) for fast execution while still
-/// covering single-wave, multi-wave, and multi-batch-merkle scenarios.
-///
-/// Run with `--release` for 3-5x speedup:
-///   cargo test --release --test e2e_upload_costs -- --nocapture
+/// Sizes cover a single payment wave through many:
+/// 10 MB   -> ~3 chunks
+/// 50 MB   -> ~13 chunks
+/// 200 MB  -> ~54 chunks  (near the 64-chunk wave)
+/// 500 MB  -> ~128 chunks (two waves)
+/// 2 GB    -> ~512 chunks
+/// 4 GB    -> ~1024 chunks
 #[tokio::test(flavor = "multi_thread")]
 #[serial]
-async fn test_upload_cost_comparison() {
-    // Need 20+ nodes for merkle payment pools (CANDIDATES_PER_POOL = 16)
+async fn test_upload_cost_by_size() {
+    // More than 16 nodes, so the forced-merkle upload asks them for
+    // candidates and they refuse.
     let testnet = MiniTestnet::start(20).await;
     let node = testnet.node(3).expect("Node 3 should exist");
     let client = Client::from_node(Arc::clone(&node), test_client_config())
         .with_wallet(testnet.wallet().clone());
+    let wallet = testnet.wallet();
 
     let work_dir = TempDir::new().expect("create work dir");
 
-    // Sizes covering single-wave through multi-batch merkle scenarios.
-    // 10 MB   -> ~3 chunks   (tiny, below merkle threshold)
-    // 50 MB   -> ~13 chunks  (small, below 64-chunk wave)
-    // 200 MB  -> ~54 chunks  (near wave boundary)
-    // 500 MB  -> ~128 chunks (multi-wave, near merkle 256-leaf limit)
-    // 2 GB    -> ~512 chunks (multi-batch merkle: 2 sub-batches)
-    // 4 GB    -> ~1024 chunks (multi-batch merkle: 4 sub-batches)
+    // No batch column: darwin-node refuses batch payments before anything
+    // is paid.
+    let merkle_path = create_test_file(work_dir.path(), 10 * 1024 * 1024, "merkle.bin", 0xCAFE);
+    let before = wallet_spend(wallet).await;
+    let error = client
+        .file_upload_with_mode(&merkle_path, PaymentMode::Merkle)
+        .await
+        .expect_err("darwin-node refuses batch payments");
+    assert_batch_refused(&error);
+    assert_eq!(wallet_spend(wallet).await, before);
+
     let sizes: Vec<(u64, &str)> = vec![
         (10, "10mb.bin"),
         (50, "50mb.bin"),
@@ -210,78 +198,29 @@ async fn test_upload_cost_comparison() {
     ];
 
     let mut results = Vec::new();
-
     for (size_mb, filename) in &sizes {
-        let file_size = *size_mb * 1024 * 1024;
-        let wallet = testnet.wallet();
-
-        // Create separate files for single and merkle to avoid AlreadyStored
-        let single_name = format!("single_{filename}");
-        let merkle_name = format!("merkle_{filename}");
-
-        // Single payment mode
         eprintln!("--- {size_mb} MB ---");
-        eprintln!("  Creating file for Single mode...");
-        let single_path = create_test_file(
+        let path = create_test_file(
             work_dir.path(),
-            file_size,
-            &single_name,
+            *size_mb * 1024 * 1024,
+            filename,
             0xDEAD_BEEF_0000_0000 + *size_mb,
         );
-        eprintln!("  Uploading (Single)...");
-        let single_result =
-            measure_upload_cost(&client, wallet, &single_path, PaymentMode::Single, *size_mb).await;
+        let result = measure_upload_cost(&client, wallet, &path, *size_mb).await;
         eprintln!(
-            "    {} chunks, ANT: {}, Gas: {}",
-            single_result.chunks,
-            format_atto(single_result.ant_cost_atto),
-            format_wei(single_result.gas_cost_wei)
+            "    {} chunks, tokens: {}, gas: {}, {} transaction(s)",
+            result.chunks,
+            format_atto(result.token_cost_atto),
+            format_wei(result.gas_cost_wei),
+            result.transactions
         );
-        results.push(single_result);
-
-        // Merkle payment mode (skip if < 2 chunks -- merkle requires minimum 2)
-        eprintln!("  Creating file for Merkle mode...");
-        let merkle_path = create_test_file(
-            work_dir.path(),
-            file_size,
-            &merkle_name,
-            0xCAFE_BABE_0000_0000 + *size_mb,
-        );
-        eprintln!("  Uploading (Merkle)...");
-        let merkle_result =
-            measure_upload_cost(&client, wallet, &merkle_path, PaymentMode::Merkle, *size_mb).await;
-        eprintln!(
-            "    {} chunks, ANT: {}, Gas: {}",
-            merkle_result.chunks,
-            format_atto(merkle_result.ant_cost_atto),
-            format_wei(merkle_result.gas_cost_wei)
-        );
-        results.push(merkle_result);
-
-        eprintln!();
+        results.push(result);
+        // The next file needs the room more than this one does.
+        std::fs::remove_file(&path).expect("remove the uploaded file");
     }
 
-    // Print the summary table
-    eprintln!("=== UPLOAD COST COMPARISON TABLE ===");
+    eprintln!("=== UPLOAD COST BY SIZE (per chunk) ===");
     print_table(&results);
-
-    // Verify merkle is cheaper in gas for files with enough chunks
-    for chunk in results.chunks(2) {
-        if let [single, merkle] = chunk {
-            if single.chunks >= 10 {
-                eprintln!(
-                    "Gas savings for {} MB: Single={}, Merkle={} ({}x reduction)",
-                    single.file_size_mb,
-                    format_wei(single.gas_cost_wei),
-                    format_wei(merkle.gas_cost_wei),
-                    single
-                        .gas_cost_wei
-                        .checked_div(merkle.gas_cost_wei)
-                        .unwrap_or(0)
-                );
-            }
-        }
-    }
 
     drop(client);
     testnet.teardown().await;
