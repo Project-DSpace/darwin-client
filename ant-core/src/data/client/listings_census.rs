@@ -35,11 +35,12 @@
 //!   names a node the census lacks that could be among its nearest
 //!   ([`Census::note_peers`]), and before any listing in it is dropped
 //!   ([`Census::witness`]); and every leaf is closed once every
-//!   [`REFRESH_INTERVAL`] ([`Census::refresh`]). The first two queue the
-//!   leaf, kept in the store, and [`Census::maintain`], once a cycle, closes
-//!   what is queued, [`CLOSE_CONCURRENCY`] lookups at a time across every
-//!   range, or every leaf when the refresh is due. What a node names can
-//!   cost only so much: an id farther from it than the census's
+//!   [`REFRESH_INTERVAL`] ([`Census::refresh`]), and at the next upkeep once
+//!   a refresh is asked for ([`Census::force_refresh`]). The first two queue
+//!   the leaf, kept in the store, and [`Census::maintain`], once a cycle,
+//!   closes what is queued, [`CLOSE_CONCURRENCY`] lookups at a time across
+//!   every range, or every leaf when the refresh is due. What a node names
+//!   can cost only so much: an id farther from it than the census's
 //!   [`VIEW_PEERS`] nodes nearest it can't be one of its nearest peers and is
 //!   ignored, and a leaf is closed for what nodes name at most once every
 //!   [`MISSES_BEFORE_CLOSE`] cycles. An id that answered no lookup is looked
@@ -235,7 +236,8 @@ pub struct LeftNode {
     /// When it left (Unix seconds).
     pub left_at: u64,
     /// When it was last probed (Unix seconds); `None` while it is to be
-    /// probed before the others, as after it was named again.
+    /// probed before the others, as after it was named again or a refresh
+    /// was asked for.
     pub probed_at: Option<u64>,
 }
 
@@ -1342,6 +1344,28 @@ impl Census {
         self.refreshed_dirty = true;
     }
 
+    /// Refresh the census at the next upkeep, as a request to refresh it
+    /// asks: every leaf is closed again then, as when the refresh is due
+    /// ([`Self::refresh_due`]), and every node on the re-probe list is to be
+    /// probed before any probed since ([`Self::reprobing`]). Saved at once,
+    /// with whatever else changed, so a stop before that upkeep doesn't lose
+    /// it.
+    ///
+    /// # Errors
+    ///
+    /// If the store can't be written; the refresh is still due in this
+    /// process.
+    pub fn force_refresh(&mut self) -> Result<()> {
+        self.refreshed_at = None;
+        self.refreshed_dirty = true;
+        for (peer, node) in &mut self.left {
+            if node.probed_at.take().is_some() {
+                self.left_dirty.insert(*peer);
+            }
+        }
+        self.save()
+    }
+
     /// Take `peer` into the census, or update it: a node that has just
     /// answered (a responder of a witnessed lookup, or a request), at `at`
     /// (Unix seconds), reachable at `addresses` (kept as they were if
@@ -1518,10 +1542,20 @@ impl Census {
                     .map_err(store_error)?;
             }
         }
-        if let (true, Some(at)) = (self.refreshed_dirty, self.refreshed_at) {
-            self.meta_db
-                .put(&mut txn, REFRESHED_AT, &at)
-                .map_err(store_error)?;
+        if self.refreshed_dirty {
+            match self.refreshed_at {
+                Some(at) => self
+                    .meta_db
+                    .put(&mut txn, REFRESHED_AT, &at)
+                    .map_err(store_error)?,
+                // A refresh asked for: due at the next upkeep, after a
+                // restart too.
+                None => {
+                    self.meta_db
+                        .delete(&mut txn, REFRESHED_AT)
+                        .map_err(store_error)?;
+                }
+            }
         }
         if self.recent_dirty {
             self.meta_db
@@ -4227,6 +4261,38 @@ mod tests {
         let change = run(census.maintain_with(&sim, 400, &mut rng)).unwrap();
         assert_eq!(change.joined, vec![newcomer]);
         assert!(!census.refresh_due(400));
+    }
+
+    #[test]
+    fn a_refresh_asked_for_is_kept_and_closes_every_leaf_at_the_next_upkeep() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ListingsStore::open_with_map_size(dir.path(), 256 * 1024 * 1024).unwrap();
+        let mut census = Census::open(&store).unwrap();
+        let sim = Sim::new(200, 0, 67);
+        let mut rng = rng(68);
+        run(census.maintain_with(&sim, 100, &mut rng)).unwrap();
+        let refresh = sim.lookups.load(Ordering::Relaxed);
+        census.save().unwrap();
+        // Nothing due, nothing queued: no lookups.
+        run(census.maintain_with(&sim, 160, &mut rng)).unwrap();
+        assert_eq!(sim.lookups.load(Ordering::Relaxed), refresh);
+        census.force_refresh().unwrap();
+        assert!(census.refresh_due(161));
+        // Saved at once: a stop before the next upkeep doesn't lose it.
+        drop(census);
+        let mut census = Census::open(&store).unwrap();
+        assert!(census.refresh_due(220));
+        run(census.maintain_with(&sim, 220, &mut rng)).unwrap();
+        // As many lookups as the first refresh, give or take.
+        assert!(
+            sim.lookups.load(Ordering::Relaxed) - refresh >= refresh / 2,
+            "{} lookups, against {refresh}",
+            sim.lookups.load(Ordering::Relaxed) - refresh
+        );
+        assert_eq!(census.refreshed_at(), Some(220));
+        assert_eq!(ids(&census), sim.live());
+        census.save().unwrap();
+        assert_eq!(Census::open(&store).unwrap().refreshed_at(), Some(220));
     }
 
     #[test]

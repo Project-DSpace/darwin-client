@@ -198,10 +198,17 @@ async fn run() -> anyhow::Result<()> {
             result?;
         }
         Commands::Listings(args) => {
-            if let Some(commands::data::listings::ListingsCommand::Serve(serve)) = &args.command {
-                let client = build_data_client(&data_ctx, false, json, None, None).await?;
-                let (network, _) = resolve_evm_network_and_manifest(&data_ctx)?;
-                return serve.execute(client.with_evm_network(network)).await;
+            match &args.command {
+                Some(commands::data::listings::ListingsCommand::Serve(serve)) => {
+                    let client = build_data_client(&data_ctx, false, json, None, None).await?;
+                    let (network, _) = resolve_evm_network_and_manifest(&data_ctx)?;
+                    return serve.execute(client.with_evm_network(network)).await;
+                }
+                // Leaves a file for the producer: no network.
+                Some(commands::data::listings::ListingsCommand::RefreshCensus(refresh)) => {
+                    return refresh.execute(json);
+                }
+                None => {}
             }
             // A --state or --carry file that can't be used fails before the
             // network.

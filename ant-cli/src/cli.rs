@@ -445,7 +445,7 @@ mod bootstrap_tests {
 #[cfg(test)]
 mod listings_tests {
     use super::*;
-    use crate::commands::data::listings::ListingsCommand;
+    use crate::commands::data::listings::{ListingsCommand, RefreshCensusArgs};
 
     fn listings(cli: Cli) -> ListingsArgs {
         match cli.command {
@@ -474,7 +474,7 @@ mod listings_tests {
                 assert_eq!(serve.out_dir, PathBuf::from("/var/www/listings/v1"));
                 assert_eq!(serve.carry, None);
             }
-            None => panic!("no serve"),
+            _ => panic!("no serve"),
         }
         let args = listings(
             Cli::try_parse_from([
@@ -503,5 +503,62 @@ mod listings_tests {
         ] {
             assert!(Cli::try_parse_from(argv).is_err(), "{argv:?}");
         }
+    }
+
+    #[test]
+    fn refresh_census_takes_the_producers_state_directory_and_nothing_else() {
+        let args = listings(
+            Cli::try_parse_from([
+                "darwin",
+                "listings",
+                "refresh-census",
+                "--state-dir",
+                "/var/lib/listings",
+            ])
+            .unwrap(),
+        );
+        match args.command {
+            Some(ListingsCommand::RefreshCensus(refresh)) => {
+                assert_eq!(refresh.state_dir, PathBuf::from("/var/lib/listings"));
+            }
+            _ => panic!("no refresh-census"),
+        }
+        for argv in [
+            &["darwin", "listings", "refresh-census"][..],
+            &[
+                "darwin",
+                "listings",
+                "refresh-census",
+                "--state-dir",
+                "s",
+                "--out-dir",
+                "o",
+            ][..],
+            &[
+                "darwin",
+                "listings",
+                "--all",
+                "refresh-census",
+                "--state-dir",
+                "s",
+            ][..],
+        ] {
+            assert!(Cli::try_parse_from(argv).is_err(), "{argv:?}");
+        }
+    }
+
+    #[test]
+    fn refresh_census_leaves_its_request_only_in_a_producers_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let args = RefreshCensusArgs {
+            state_dir: dir.path().to_path_buf(),
+        };
+        // No store there: refused, and nothing is left.
+        assert!(args.execute(false).is_err());
+        assert!(!dir.path().join("census-refresh").exists());
+        std::fs::create_dir(dir.path().join("listings.mdb")).unwrap();
+        args.execute(true).unwrap();
+        let held = std::fs::read_to_string(dir.path().join("census-refresh")).unwrap();
+        assert!(held.trim().parse::<u64>().is_ok(), "{held:?}");
     }
 }

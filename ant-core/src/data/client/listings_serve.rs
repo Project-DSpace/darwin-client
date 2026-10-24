@@ -16,7 +16,10 @@
 //!    is closed again when a member misses polls or a node names peers the
 //!    census lacks. A member is probed afresh before it leaves, and one that
 //!    left is probed again each cycle, for a day, and is back on its first
-//!    answer.
+//!    answer. A request to refresh the census, left in the state directory
+//!    ([`Producer::request_census_refresh`], `darwin listings
+//!    refresh-census`), has the cycle after it close every leaf, as the
+//!    daily refresh does.
 //! 2. **Poll.** One request to each census node, [`POLL_CONCURRENCY`] at a
 //!    time ([`Feeds::poll`]). A node whose user agent shows the feed
 //!    release ([`Census::supports_feed`]) is sent a `ChangesRequest` for its
@@ -185,7 +188,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::ops::Bound;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -289,6 +292,18 @@ const MAX_ROOT_MAP_BYTES: usize = SHRUNK_CHUNKS * MAX_CHUNK_SIZE;
 
 /// The store's directory inside the state directory.
 pub const STORE_DIR: &str = "listings.mdb";
+
+/// The file in the state directory that asks the producer to refresh its
+/// census ([`Producer::request_census_refresh`]): its next cycle closes
+/// every leaf again, as the daily refresh does, and probes every node that
+/// left first ([`Census::force_refresh`]), and then removes the file. It
+/// holds when it was asked for, in Unix seconds.
+pub const CENSUS_REFRESH_FILE: &str = "census-refresh";
+
+/// The most of a request to refresh the census that is read: its time, and
+/// room to spare. A request is told apart from the last one taken by what
+/// it holds.
+const CENSUS_REFRESH_BYTES: u64 = 64;
 
 /// Since when each address has been deferred, or listed below full
 /// support: a tag ([`DEFERRED_TAG`] or [`BELOW_FULL_TAG`]) and the
@@ -808,6 +823,12 @@ pub struct Producer {
     /// The listings traffic counted into `totals` so far, received and
     /// sent: traffic between cycles is added with the next cycle's.
     traffic_counted: (u64, u64),
+    /// Where a request to refresh the census is left
+    /// ([`CENSUS_REFRESH_FILE`] in the state directory).
+    refresh_request: PathBuf,
+    /// What the latest request taken held, while its file couldn't be
+    /// removed: it isn't taken again until it changes.
+    refresh_taken: Option<Vec<u8>>,
 }
 
 impl Producer {
@@ -879,7 +900,90 @@ impl Producer {
             started_at: now,
             totals: Totals::default(),
             traffic_counted,
+            refresh_request: state_dir.join(CENSUS_REFRESH_FILE),
+            refresh_taken: None,
         })
+    }
+
+    /// Ask the producer keeping its state in `state_dir` to refresh its
+    /// census: its next cycle closes every leaf again with witnessed
+    /// lookups, as the daily refresh does, and probes every node that left
+    /// before any other ([`Census::force_refresh`]). A producer that isn't
+    /// running does so in the first cycle after it starts. The request is a
+    /// file there ([`CENSUS_REFRESH_FILE`]), which the producer removes once
+    /// it has taken it; asking again before then asks once. Returns the
+    /// file's path.
+    ///
+    /// # Errors
+    ///
+    /// If `state_dir` holds no producer's store ([`STORE_DIR`]), or the file
+    /// can't be written.
+    pub fn request_census_refresh(state_dir: &Path) -> Result<PathBuf> {
+        if !state_dir.join(STORE_DIR).is_dir() {
+            return Err(Error::NotFound(format!(
+                "no listings producer keeps its state in {} (it has no {STORE_DIR})",
+                state_dir.display()
+            )));
+        }
+        let path = state_dir.join(CENSUS_REFRESH_FILE);
+        std::fs::write(&path, format!("{}\n", unix_now())).map_err(|e| {
+            Error::Storage(format!(
+                "could not write the census refresh request {}: {e}",
+                path.display()
+            ))
+        })?;
+        Ok(path)
+    }
+
+    /// Take a request to refresh the census, if one is waiting
+    /// ([`Self::request_census_refresh`]): the census is refreshed at its
+    /// next upkeep ([`Census::force_refresh`]), and the request's file is
+    /// removed. One whose file can't be removed isn't taken again until it
+    /// holds something else. Returns whether one was taken.
+    ///
+    /// # Errors
+    ///
+    /// If the census can't be saved.
+    fn take_refresh_request(&mut self) -> Result<bool> {
+        use std::io::Read as _;
+        let path = &self.refresh_request;
+        let mut held = Vec::new();
+        let read = std::fs::File::open(path)
+            .and_then(|file| file.take(CENSUS_REFRESH_BYTES).read_to_end(&mut held));
+        match read {
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                self.refresh_taken = None;
+                return Ok(false);
+            }
+            Err(e) => {
+                warn!(
+                    "Could not read the census refresh request {}: {e}",
+                    path.display()
+                );
+                return Ok(false);
+            }
+        }
+        if self.refresh_taken.as_ref() == Some(&held) {
+            return Ok(false);
+        }
+        self.census.force_refresh()?;
+        info!(
+            "Census: a refresh was asked for ({}): every leaf is closed again this cycle",
+            path.display()
+        );
+        match std::fs::remove_file(path) {
+            Ok(()) => self.refresh_taken = None,
+            Err(e) => {
+                warn!(
+                    "Could not remove the census refresh request {}: {e}; it is taken again only \
+                     once it changes",
+                    path.display()
+                );
+                self.refresh_taken = Some(held);
+            }
+        }
+        Ok(true)
     }
 
     /// On a first start, while the store holds no index yet, take the
@@ -1085,6 +1189,7 @@ impl Producer {
         // Each node's allowance of full-listing requests starts again.
         self.fetch_budget.clear();
 
+        self.take_refresh_request()?;
         if let Err(e) = Box::pin(self.census.maintain(&self.client)).await {
             warn!("The census's upkeep failed in part: {e}");
         }
@@ -5957,6 +6062,34 @@ mod tests {
     /// An address from `n`.
     fn numbered(n: u32) -> XorName {
         ant_protocol::compute_address(&n.to_be_bytes())
+    }
+
+    #[tokio::test]
+    async fn a_census_refresh_request_is_taken_once_and_removed() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut producer, _node) = offline_producer(dir.path()).await;
+        let state = dir.path().join("state");
+        assert!(!producer.take_refresh_request().unwrap(), "none asked for");
+        let now = unix_now();
+        producer.census.set_refreshed_at(now);
+        assert!(!producer.census.refresh_due(now));
+        let file = Producer::request_census_refresh(&state).unwrap();
+        assert_eq!(file, state.join(CENSUS_REFRESH_FILE));
+        assert!(producer.take_refresh_request().unwrap());
+        assert!(
+            producer.census.refresh_due(now),
+            "the next upkeep refreshes"
+        );
+        assert!(!file.exists(), "removed once taken");
+        assert!(!producer.take_refresh_request().unwrap());
+        // Kept: a producer started again before its upkeep refreshes too.
+        drop(producer);
+        let (producer, _node) = offline_producer(dir.path()).await;
+        assert!(producer.census.refresh_due(now));
+        // Asked for only where a producer keeps its state.
+        let elsewhere = tempfile::tempdir().unwrap();
+        assert!(Producer::request_census_refresh(elsewhere.path()).is_err());
+        assert!(!elsewhere.path().join(CENSUS_REFRESH_FILE).exists());
     }
 
     #[tokio::test]

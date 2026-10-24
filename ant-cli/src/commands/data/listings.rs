@@ -50,6 +50,9 @@ pub enum ListingsCommand {
     /// Follow what the nodes serve and keep the index published as the
     /// static files of listings/v1/ (docs/listings-v1.md), until stopped
     Serve(ServeArgs),
+    /// Ask the producer (`darwin listings serve`) to refresh its census of
+    /// nodes at its next cycle, or its next start if it isn't running
+    RefreshCensus(RefreshCensusArgs),
 }
 
 /// Arguments of `darwin listings serve`.
@@ -92,6 +95,39 @@ impl ServeArgs {
             stop.cancel();
         });
         Box::pin(producer.run(cancel)).await?;
+        Ok(())
+    }
+}
+
+/// Arguments of `darwin listings refresh-census`.
+#[derive(Args)]
+pub struct RefreshCensusArgs {
+    /// The producer's state directory, as given to `darwin listings serve
+    /// --state-dir`. The request is left there, as the file census-refresh,
+    /// which the producer removes once it takes it.
+    #[arg(long, value_name = "DIR")]
+    pub state_dir: PathBuf,
+}
+
+impl RefreshCensusArgs {
+    /// Leave the request: the producer's next cycle closes every leaf of its
+    /// census again with witnessed lookups, as its daily refresh does, and
+    /// probes every node that left it first. Needs no network.
+    pub fn execute(&self, json: bool) -> anyhow::Result<()> {
+        let path = Producer::request_census_refresh(&self.state_dir)?;
+        if json {
+            println!(
+                "{}",
+                serde_json::json!({ "requested": true, "file": path.display().to_string() })
+            );
+        } else {
+            println!(
+                "Asked the producer using {} to refresh its census: its next cycle closes every \
+                 leaf again ({} until it does)",
+                self.state_dir.display(),
+                path.display()
+            );
+        }
         Ok(())
     }
 }

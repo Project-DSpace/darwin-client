@@ -188,6 +188,9 @@ const COMMANDS: &[Reviewed] = &[
         NoPayment,
         &["state_dir", "out_dir", "carry"],
     ),
+    // Leaves a file in the producer's state directory, on this machine: no
+    // network, no store, no payment.
+    ("listings refresh-census", NoPayment, &["state_dir"]),
     ("listing", NoPayment, &["address"]),
     ("manifest", NoPayment, &[]),
     (
