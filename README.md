@@ -1044,6 +1044,13 @@ cargo run --bin darwin -- --help
 cargo run --bin darwin -- file upload photo.jpg --public --devnet-manifest ~/.local/share/ant/devnet-manifest.json --allow-loopback --evm-network local
 ```
 
+ant-core's end-to-end tests (`ant-core/tests/e2e_*.rs`) start in-process
+darwin-node nodes, at the revision `ant-core/Cargo.toml` pins, and a local Anvil
+chain, so `anvil` (Foundry) must be on PATH. CI runs every test target:
+`scripts/test-targets.py` lists where each one runs, or why it is skipped, and
+`scripts/darwin-node-pin.py` checks that the darwin-node revision is pinned
+alike everywhere and that `vendor/ant-protocol` is darwin-node's copy.
+
 ## License
 
 Licensed under either of

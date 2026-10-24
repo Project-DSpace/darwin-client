@@ -49,23 +49,31 @@ First build the bindings from `ant-core`:
 wasm-pack build --target web --out-dir wasm-tests/pkg --release . --no-default-features --features browser-wasm
 ```
 
-The test starts seven real ant-nodes and an isolated Anvil chain, then uses
-Chromium's real WebRTC implementation. `ANT_NODE_DIR` overrides the default
-sibling `ant-node-web-support` checkout. CI checks out the exact browser-enabled
-node revision in [`node-revision`](node-revision); use that revision locally to
-reproduce CI. Without `ANT_NODE_DIR`, the devnet refuses to start unless the
-sibling checkout is that revision without tracked edits, and builds it with
-`--locked`. The pin runs the same code as a node release already on the
-network, so the suite checks this client against older nodes. It is currently
-`26129a26`, the ant-node `main` commit that adds only the Rust 1.99 fixes to
-the 0.21.0 release: its one runtime change renames `fetch_update` to
-`try_update`, the same method. CI builds the pin without `-D warnings`, because
-each new toolchain can add warnings to an old release. This integration pin is
-separate from the native `ant-node` dependency in `ant-core/Cargo.toml`. Update
-the pin only with a passing paid browser integration run against the
-replacement. In CI, the run fails unless every test ran and passed:
-`run-guard.js` fails a run with a skipped or unfinished test, and `.only` is
-rejected. Anvil must be installed and available on PATH.
+The test starts seven real darwin-node nodes and an isolated Anvil chain, then
+uses Chromium's real WebRTC implementation. [`node-revision`](node-revision)
+pins the node: darwin-node's repository, then the revision. It is the revision
+`ant-core/Cargo.toml` pins for the tests and the devnet, so the browser and the
+native suites run the same nodes; `scripts/darwin-node-pin.py`, which CI runs,
+checks that the pins agree. It is currently `94bf3425`: darwin-node's ds.15
+release, which the network runs, with SECURITY.md added.
+
+The devnet runs from a sibling `darwin-node` checkout (beside this repository's
+checkout), or from the one `ANT_NODE_DIR` names. Without `ANT_NODE_DIR`, it
+refuses to start unless the sibling checkout is the pinned revision without
+tracked edits, and builds it with `--locked`, as CI does:
+
+```sh
+git clone https://github.com/Project-DSpace/darwin-node.git ../../../darwin-node
+git -C ../../../darwin-node checkout "$(tail -n 1 node-revision)"
+```
+
+CI runs this suite in test.yml's `browser` job, on that checkout. It builds
+the pin without `-D warnings`, because each new toolchain can add warnings to
+an older release. Update the pin, with `ant-core/Cargo.toml`'s, only with a
+passing paid browser integration run against the replacement. In CI, the run
+fails unless every test ran and passed: `run-guard.js` fails a run with a
+skipped or unfinished test, and `.only` is rejected. Anvil must be installed
+and available on PATH.
 
 The harness authenticates through `BrowserNetworkClient.connect()` and retains
 that pool for the upload, makes one batched storage payment,

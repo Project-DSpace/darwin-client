@@ -1,7 +1,8 @@
 # Runs the end-to-end tests (in-process darwin-node nodes and a local Anvil
-# chain) and the browser core's tests. Kept apart from build.yml, which checks
-# formatting and lints, runs the unit tests and the test targets that need no
-# nodes, and builds the binary.
+# chain), the browser core's tests, and the browser harness (real Chromium
+# against darwin-node). Kept apart from build.yml, which checks formatting and
+# lints, runs the unit tests and the test targets that need no nodes, and
+# builds the binary.
 #
 # Runs on every push, to any branch, and on pull requests, so a merge branch
 # is tested before it lands; weekly; and by hand. Actions are pinned by commit.
@@ -158,3 +159,86 @@ jobs:
         run: >-
           node --import ./wasm-tests/setup-wasm.mjs
           --test ./wasm-tests/*.test.mjs
+
+  # The browser harness (ant-core/browser-tests): real Chromium against seven
+  # darwin-node nodes and a local Anvil chain. The nodes are the revision
+  # browser-tests/node-revision pins, checked out beside this repository and
+  # built from that revision's own lockfile, as the harness requires: a paid
+  # upload resumed after a failure, a download by address, and pointers.
+  browser:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    # Line tables only, not full debug info, so both builds fit on the
+    # runner's disk.
+    env:
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          path: darwin-client
+
+      - name: Check out the pinned darwin-node beside it
+        run: |
+          { read -r repository; read -r revision; } < darwin-client/ant-core/browser-tests/node-revision
+          git init -q darwin-node
+          git -C darwin-node fetch -q --depth 1 "$repository" "$revision"
+          git -C darwin-node checkout -q FETCH_HEAD
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable branch
+        with:
+          toolchain: stable
+          targets: wasm32-unknown-unknown
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: |
+            darwin-client -> target
+            darwin-node -> target
+
+      # Pinned, as for the end-to-end tests.
+      - name: Install Foundry (anvil)
+        uses: foundry-rs/foundry-toolchain@908c540300062bd5a7e473851cdb4282204cee09 # v1.9.1
+        with:
+          version: v1.8.5
+
+      - name: Free disk space
+        run: |
+          df -h /
+          for dir in /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL; do
+            if [ -d "$dir" ]; then sudo rm -rf "$dir"; fi
+          done
+          df -h /
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 22
+
+      - name: Install wasm-pack
+        run: cargo install wasm-pack --version 0.15.0 --locked
+
+      - name: Generate the browser bindings
+        working-directory: darwin-client/ant-core
+        run: >-
+          wasm-pack build
+          --target web
+          --out-dir wasm-tests/pkg
+          --release
+          .
+          --no-default-features
+          --features browser-wasm
+
+      # Built before the harness starts it, so the harness's wait for the
+      # devnet covers its start, not its build.
+      - name: Build the pinned node's devnet
+        run: cargo build --locked --manifest-path darwin-node/Cargo.toml --bin ant-devnet
+
+      - name: Install the harness and Chromium
+        working-directory: darwin-client/ant-core/browser-tests
+        run: |
+          npm ci
+          npx playwright install --with-deps chromium
+
+      - name: Run the browser harness
+        working-directory: darwin-client/ant-core/browser-tests
+        run: npm test

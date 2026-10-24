@@ -2,7 +2,9 @@
 # no nodes and the vendored crates' own tests, then builds the Linux `darwin`
 # client binary (from the ant-cli crate) and uploads it,
 # with its licence files and third-party notices, as the `darwin-linux-x64`
-# workflow artifact. Also checks that upstream's installers stay deleted.
+# workflow artifact. Also checks that upstream's installers stay deleted, and
+# that the darwin-node revision the tests run is pinned alike everywhere, with
+# vendor/ant-protocol equal to its copy.
 #
 # Runs on every push, to any branch, and on pull requests, so a merge branch
 # is checked before it lands; test.yml runs the end-to-end and browser tests.
@@ -53,6 +55,16 @@ jobs:
               exit 1
             fi
           done
+
+      # ant-core's tests and devnet build darwin-node at one revision, which
+      # browser-tests/node-revision, ant-core/Cargo.toml, the webrtc patch and
+      # Cargo.lock must all name. The workspace's [patch] builds that
+      # darwin-node against this repository's vendor/ant-protocol, so a copy
+      # that drifted from darwin-node's would never show in a build: the
+      # script fetches the revision and compares the two as git trees, every
+      # file byte for byte as committed.
+      - name: One darwin-node revision, and vendor/ant-protocol is its copy
+        run: python3 scripts/darwin-node-pin.py --vendored
 
   fmt:
     runs-on: ubuntu-24.04
