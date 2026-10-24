@@ -82,20 +82,23 @@ pub enum NodeStatus {
     Running,
     Stopping,
     Errored,
-    /// The daemon automatically stopped this node and deleted its data directory to reclaim disk
-    /// space for the remaining nodes. This is a terminal state derived from a persisted
-    /// [`EvictionRecord`] on the node's config — it survives daemon restarts and is cleared only
-    /// when the user dismisses the node (which removes it from the registry entirely).
+    /// An earlier node manager (Autonomi's `ant`, or this crate before its disk-pressure eviction
+    /// was removed) stopped this node and deleted its data directory to reclaim disk space. This
+    /// is a terminal state derived from a persisted [`EvictionRecord`] on the node's config — it
+    /// survives daemon restarts and is cleared only when the user dismisses the node (which
+    /// removes it from the registry entirely). This manager evicts no node, so no new node enters
+    /// it.
     Evicted,
 }
 
-/// Record of an automatic eviction, persisted on a node's [`NodeConfig`] so that the `evicted`
-/// state survives daemon restarts.
+/// Record of an automatic eviction by an earlier node manager, persisted on a node's
+/// [`NodeConfig`] so that the `evicted` state survives daemon restarts.
 ///
 /// [`NodeStatus`] is otherwise runtime-only (rebuilt from process scans on startup), so the
 /// presence of this record — not live process state — is what makes a node report as
-/// [`NodeStatus::Evicted`]. Eviction deletes the node's data directory but keeps the registry
-/// entry until the user dismisses it.
+/// [`NodeStatus::Evicted`]. That eviction deleted the node's data directory but kept the registry
+/// entry until the user dismisses it. This manager writes no such record: it evicts nothing. It
+/// reads the ones registries from earlier managers carry, and never starts their nodes.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct EvictionRecord {
     /// Human-readable explanation of why the node was evicted (shown to the user).
@@ -128,10 +131,11 @@ pub struct NodeConfig {
     /// EVM network the node uses for storage payments.
     #[serde(default)]
     pub evm_network: EvmNetwork,
-    /// Set when the daemon has automatically evicted this node to reclaim disk space. Its presence
-    /// makes the node report as [`NodeStatus::Evicted`] regardless of runtime state, and persists
-    /// across daemon restarts. `None` for normal nodes. Backwards compatible: defaults to `None`
-    /// when absent from an older registry file.
+    /// Set when an earlier node manager evicted this node to reclaim disk space, deleting its
+    /// data directory; this one never sets it. Its presence makes the node report as
+    /// [`NodeStatus::Evicted`] regardless of runtime state, and persists across daemon restarts.
+    /// `None` for normal nodes. Backwards compatible: defaults to `None` when absent from an older
+    /// registry file.
     #[serde(default)]
     pub eviction: Option<EvictionRecord>,
 }

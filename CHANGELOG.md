@@ -237,7 +237,19 @@ told apart by the commit `darwin --version` prints. Upstream's entries follow.
   `daemon run` and its REST API included, fails before it downloads, writes or starts anything.
   Darwin storage nodes run from the storage-node image (the darwin-node repository's
   `docker/README.md`); nodes an earlier build added are managed with Autonomi's `ant`. The
-  library's `ant_core::node` is unchanged.
+  library's `ant_core::node` keeps upstream's manager, but for its disk-pressure eviction (below).
+- The node manager deletes no node's data. `ant_core::node` loses upstream's disk-pressure
+  eviction, for every build: at 500 MiB free on a partition shared by two or more nodes, it stopped
+  the node holding the least data and deleted its data directory, with no check that the network
+  held its records elsewhere. The daemon's disk monitor now only reports: the fleet health warns at
+  1 GiB free or less and is critical at 500 MiB or less, names no node, and says the manager deletes
+  nothing (`GET /api/v1/health` keeps `overall` and each check's `level`, `partition` and `summary`;
+  `eviction_threshold_bytes` is now `critical_threshold_bytes`, and the eviction candidate and the
+  `node_evicted` event are gone). It measures each partition's free space only, no longer walking
+  every data directory, and from the daemon's start. A node an earlier manager evicted keeps its
+  marker, reports as `evicted` and is never started again; a pin checks that no level of disk
+  pressure stops a node, deletes a file or writes a marker, and a census
+  (`the_node_manager_deletes_no_node_data`) lists every deletion in the node manager's code.
 - `darwin-linux-x64.tar.gz` from CI carries license notices: `LICENSE-MIT`, `LICENSE-APACHE`,
   `THIRD-PARTY-NOTICES.txt` and `RUST-STD-COPYRIGHT.html` next to `darwin`, like upstream's archives.
 - Upstream's installers are removed: `install.sh`, `install.ps1`, the npm packages (`npm/`), the

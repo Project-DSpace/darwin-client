@@ -22,7 +22,7 @@ use crate::node::daemon::forward::{
 };
 use crate::node::daemon::health::{DiskThresholds, FleetHealth};
 use crate::node::daemon::supervisor::{
-    spawn_eviction_monitor, spawn_liveness_monitor, Supervisor, EVICTION_POLL_INTERVAL,
+    spawn_disk_monitor, spawn_liveness_monitor, Supervisor, DISK_POLL_INTERVAL,
     LIVENESS_POLL_INTERVAL,
 };
 use crate::node::events::NodeEvent;
@@ -42,7 +42,7 @@ pub struct AppState {
     pub config: DaemonConfig,
     /// The actual address the server bound to (resolves port 0 to real port).
     pub bound_port: u16,
-    /// Latest fleet health snapshot, refreshed by the eviction monitor and served at
+    /// Latest fleet health snapshot, refreshed by the disk monitor and served at
     /// `GET /api/v1/health`.
     pub health: Arc<RwLock<FleetHealth>>,
     /// The running log forwarder, if the user has opted in. `None` while forwarding is disabled.
@@ -115,17 +115,15 @@ pub async fn start(
     // shipping logs the user asked for.
     start_forwarder_if_enabled(&state).await;
 
-    // Background task: monitor free disk space at node data directories. Refreshes the fleet health
-    // snapshot every tick and auto-evicts a node (smallest data dir) on any partition that has
-    // fallen to the eviction threshold while ≥2 nodes remain. The threshold is a fixed internal
-    // constant (mirroring ant-node's own refuse-to-store reserve), not user-configurable.
-    spawn_eviction_monitor(
+    // Background task: report free disk space at node data directories. Refreshes the fleet health
+    // snapshot every tick; it stops no node and deletes nothing. The levels are fixed internal
+    // constants, not user-configurable.
+    spawn_disk_monitor(
         registry.clone(),
-        supervisor.clone(),
         event_tx.clone(),
         health,
         DiskThresholds::default(),
-        EVICTION_POLL_INTERVAL,
+        DISK_POLL_INTERVAL,
         shutdown.clone(),
     );
 
@@ -222,7 +220,8 @@ async fn get_status(State(state): State<Arc<AppState>>) -> Json<DaemonStatus> {
 
 /// GET /api/v1/health — Current fleet health (overall level + per-check findings).
 ///
-/// Refreshed by the eviction monitor; reflects disk pressure and the next eviction candidate.
+/// Refreshed by the disk monitor; reports free disk space where node data lives. A report only:
+/// nothing is deleted at any level.
 async fn get_health(State(state): State<Arc<AppState>>) -> Json<FleetHealth> {
     Json(state.health.read().await.clone())
 }
@@ -419,15 +418,16 @@ async fn post_start_node(
     };
     drop(registry);
 
-    // An evicted node's data directory is gone; refuse to start it (recovery is to dismiss and
-    // re-add, not restart).
+    // An earlier manager evicted this node and deleted its data directory; refuse to start it
+    // (recovery is to dismiss and re-add, not restart).
     if config.eviction.is_some() {
         return Err((
             StatusCode::CONFLICT,
             Json(serde_json::json!({
                 "error": format!(
-                    "Node {id} has been evicted and cannot be started. Dismiss it with \
-                     `darwin node dismiss {id}` and add a new node instead."
+                    "Node {id} was evicted by an earlier node manager, which deleted its data, \
+                     and cannot be started. Dismiss it with `darwin node dismiss {id}` and add a \
+                     new node instead."
                 ),
                 "current_state": { "node_id": id, "status": "evicted" }
             })),
@@ -553,14 +553,15 @@ async fn post_stop_node(
     };
     drop(registry);
 
-    // An evicted node is already stopped and its data directory deleted; there is nothing to stop.
+    // An earlier manager evicted this node: it is stopped and its data directory deleted, so there
+    // is nothing to stop.
     if config.eviction.is_some() {
         return Err((
             StatusCode::CONFLICT,
             Json(serde_json::json!({
                 "error": format!(
-                    "Node {id} has been evicted; there is nothing to stop. Dismiss it with \
-                     `darwin node dismiss {id}`."
+                    "Node {id} was evicted by an earlier node manager; there is nothing to stop. \
+                     Dismiss it with `darwin node dismiss {id}`."
                 ),
                 "current_state": { "node_id": id, "status": "evicted" }
             })),

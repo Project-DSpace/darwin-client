@@ -1,13 +1,14 @@
 //! Census of the places in ant-core and ant-cli that store or pay, choose
 //! how an upload is shown or paid, build a wallet, replace the binary, or
-//! decode a data map.
+//! decode a data map, and of the node manager's erasures.
 //!
 //! Each test reads the production source of both crates (`../ant-core/src`
-//! and `src`) and fails when a mention of a name it counts appears anywhere
-//! its reviewed list doesn't name, or when a listed site holds more or fewer
-//! mentions than listed. A change that adds such a path, a merge from
-//! upstream among them, then fails CI until someone has looked at it and
-//! listed it with its reason.
+//! and `src`; the erasure census only the node manager's part of it) and
+//! fails when a mention of a name it counts appears anywhere its reviewed
+//! list doesn't name, or when a listed site holds more or fewer mentions than
+//! listed. A change that adds such a path, a merge from upstream among them,
+//! then fails CI until someone has looked at it and listed it with its
+//! reason.
 //!
 //! The rules the reasons answer to:
 //!
@@ -19,7 +20,10 @@
 //!   envelope: "raw, by the caller's choice: no envelope";
 //! - payments are made per chunk in the network's own token, with paid
 //!   quotes read back from the vault, through the chain-bound wallet;
-//! - self-update and the node manager stay off in this build.
+//! - self-update and the node manager stay off in this build;
+//! - no path of the node manager deletes a node's data folder: the
+//!   disk-pressure eviction is gone, and the darwin CLI's `darwin node reset`
+//!   is off.
 //!
 //! The source is read as tokens, so layout, comments and string literals
 //! (except those a list names in double quotes) make no difference.
@@ -121,6 +125,16 @@ const DECODES: Counting = &[
     (Some("serde_json"), "from_slice"),
 ];
 
+/// Erasures in the node manager's code (see [`NODE_MANAGER`]): every deletion
+/// of a file or folder, and every reset of all node state.
+const ERASES: Counting = &[
+    (None, "remove_dir_all"),
+    (None, "remove_dir"),
+    (None, "remove_file"),
+    (Some("node"), "reset"),
+    (Some("client"), "reset"),
+];
+
 // Reasons, shared by the sites below.
 
 const ENVELOPE_CLI: &str = "darwin's own upload command: every file gets an envelope from \
@@ -189,6 +203,20 @@ const LOCAL_FILE: &str = "Decodes a local file this client wrote (a datamap file
     state, a snapshot, earlier listings output), not network bytes.";
 const EMBED_LOCAL: &str = "Decodes a data map from a local manifest file the user gave, to \
     decide whether to embed it.";
+const RESET: &str = "node::reset deletes every node's data and log folders: reached only from \
+    `darwin node reset` and the darwin CLI daemon's POST /api/v1/reset, both off (NODE_MANAGER is \
+    false).";
+const RESET_COMMAND: &str = "Unreachable: `darwin node reset` (imported here, or calling the \
+    reset), and `darwin node` refuses every command before it runs (NODE_MANAGER is false).";
+const RESET_ROUTE: &str = "POST /api/v1/reset, served by the darwin CLI's daemon (`darwin node \
+    daemon run`), which `darwin node` refuses to run (off).";
+const DOWNLOAD_LEFTOVERS: &str = "A download's temporary archive and duplicate extracted copies, \
+    in the download cache (<data dir>/bin), never a node's folder; reached only from `darwin node \
+    add` with a download source (off).";
+const DAEMON_FILES: &str = "The daemon's own port and pid files, when it stops or is found gone.";
+const NODE_PID: &str = "A node's pid file (<data dir>/node.pid), once its process has exited; the \
+    node's data stays.";
+
 const NOT_A_MAP: &str = "Decodes a quote, proof, peer record or receipt, not a data map.";
 
 const STORE_SITES: &[Site] = &[
@@ -1061,6 +1089,72 @@ const SELF_UPDATE_SITES: &[Site] = &[
         "self_replace",
         2,
         UPDATE_OFF,
+    ),
+];
+
+const ERASE_SITES: &[Site] = &[
+    (
+        "ant-cli/src/commands/node/mod.rs",
+        "<module>",
+        "node::reset",
+        1,
+        RESET_COMMAND,
+    ),
+    (
+        "ant-cli/src/commands/node/reset.rs",
+        "ResetArgs::execute",
+        "client::reset",
+        1,
+        RESET_COMMAND,
+    ),
+    (
+        "ant-cli/src/commands/node/reset.rs",
+        "ResetArgs::reset_directly",
+        "node::reset",
+        1,
+        RESET_COMMAND,
+    ),
+    (
+        "ant-core/src/node/binary.rs",
+        "download_and_extract",
+        "remove_file",
+        3,
+        DOWNLOAD_LEFTOVERS,
+    ),
+    (
+        "ant-core/src/node/daemon/client.rs",
+        "stop",
+        "remove_file",
+        6,
+        DAEMON_FILES,
+    ),
+    (
+        "ant-core/src/node/daemon/server.rs",
+        "start",
+        "remove_file",
+        2,
+        DAEMON_FILES,
+    ),
+    (
+        "ant-core/src/node/daemon/server.rs",
+        "post_reset",
+        "node::reset",
+        1,
+        RESET_ROUTE,
+    ),
+    (
+        "ant-core/src/node/daemon/supervisor.rs",
+        "remove_node_pid",
+        "remove_file",
+        1,
+        NODE_PID,
+    ),
+    (
+        "ant-core/src/node/mod.rs",
+        "reset",
+        "remove_dir_all",
+        2,
+        RESET,
     ),
 ];
 
@@ -2152,11 +2246,13 @@ fn census(counting: Counting) -> BTreeMap<(String, String, String), Vec<usize>> 
     found
 }
 
-/// `reviewed` against what `counting` finds: an empty string when they
+/// `reviewed` against what a census `found`: an empty string when they
 /// agree, else each difference, unlisted mentions written as entries ready
 /// to review.
-fn differences(counting: Counting, reviewed: &[Site]) -> String {
-    let found = census(counting);
+fn differences(
+    found: &BTreeMap<(String, String, String), Vec<usize>>,
+    reviewed: &[Site],
+) -> String {
     let mut listed: BTreeMap<(String, String, String), usize> = BTreeMap::new();
     let mut report = String::new();
     for (file, site, name, count, reason) in reviewed {
@@ -2172,7 +2268,7 @@ fn differences(counting: Counting, reviewed: &[Site]) -> String {
             let _ = writeln!(report, "  listed without a reason: {file} {site} {name}");
         }
     }
-    for (key, lines) in &found {
+    for (key, lines) in found {
         let allowed = listed.get(key).copied().unwrap_or(0);
         let (file, site, name) = key;
         if lines.len() != allowed {
@@ -2195,9 +2291,33 @@ fn differences(counting: Counting, reviewed: &[Site]) -> String {
     report
 }
 
-/// Fail with `rule` and the differences, if there are any.
+/// Fail with `rule` and the differences between both crates' census of
+/// `counting` and `reviewed`, if there are any.
 fn check(counting: Counting, reviewed: &[Site], rule: &str) {
-    let report = differences(counting, reviewed);
+    check_found(&census(counting), reviewed, rule);
+}
+
+/// The node manager's code: ant-core's `node` module and the darwin CLI's
+/// `node` commands (off).
+const NODE_MANAGER: &[&str] = &["ant-core/src/node/", "ant-cli/src/commands/node/"];
+
+/// [`check`], counting in the node manager's code only.
+fn check_node_manager(counting: Counting, reviewed: &[Site], rule: &str) {
+    let found = census(counting)
+        .into_iter()
+        .filter(|((file, _, _), _)| NODE_MANAGER.iter().any(|dir| file.starts_with(dir)))
+        .collect();
+    check_found(&found, reviewed, rule);
+}
+
+/// Fail with `rule` and the differences between `found` and `reviewed`, if
+/// there are any.
+fn check_found(
+    found: &BTreeMap<(String, String, String), Vec<usize>>,
+    reviewed: &[Site],
+    rule: &str,
+) {
+    let report = differences(found, reviewed);
     assert!(
         report.is_empty(),
         "
@@ -2265,5 +2385,16 @@ fn every_decode_is_reviewed() {
         "A data map read from the network is decoded only through decode_map_record, which \
          bounds it, or by the producer's root-map read, bounded by the chunks it decrypts; other \
          decodes read local files or other types.",
+    );
+}
+
+#[test]
+fn the_node_manager_deletes_no_node_data() {
+    check_node_manager(
+        ERASES,
+        ERASE_SITES,
+        "No path of the node manager deletes a node's data folder: the disk-pressure eviction is \
+         gone, and the darwin CLI's `node reset` is off. What it deletes is its own process and \
+         port files, a node's pid file, and download leftovers.",
     );
 }

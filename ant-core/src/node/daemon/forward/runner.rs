@@ -1,6 +1,6 @@
 //! The background task that does the forwarding.
 //!
-//! It follows the shape of the daemon's other background workers (`spawn_eviction_monitor`,
+//! It follows the shape of the daemon's other background workers (`spawn_disk_monitor`,
 //! `spawn_liveness_monitor`): spawned once, driven by a poll interval, stopped by a
 //! [`CancellationToken`]. It additionally carries its own token so `disable` can stop forwarding
 //! without touching the daemon.

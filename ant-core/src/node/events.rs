@@ -51,15 +51,6 @@ pub enum NodeEvent {
         old_version: String,
         new_version: String,
     },
-    /// Emitted when the daemon automatically evicts a node to reclaim disk space: its process was
-    /// stopped and its data directory deleted. The node now reports as `Evicted` until dismissed.
-    NodeEvicted {
-        node_id: u32,
-        /// Human-readable explanation of the eviction.
-        reason: String,
-        /// Approximate bytes reclaimed by deleting the node's data directory.
-        reclaimed_bytes: u64,
-    },
     /// Emitted when the fleet's overall health level changes (e.g. green → warning as disk fills),
     /// so a connected GUI can refresh its always-visible health indicator without polling.
     FleetHealthChanged {
@@ -83,7 +74,6 @@ impl NodeEvent {
             NodeEvent::DownloadProgress { .. } => "download_progress",
             NodeEvent::DownloadComplete { .. } => "download_complete",
             NodeEvent::NodeUpgraded { .. } => "node_upgraded",
-            NodeEvent::NodeEvicted { .. } => "node_evicted",
             NodeEvent::FleetHealthChanged { .. } => "fleet_health_changed",
         }
     }

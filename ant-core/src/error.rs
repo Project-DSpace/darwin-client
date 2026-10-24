@@ -20,7 +20,7 @@ pub enum Error {
     #[error("Node not running: {0}")]
     NodeNotRunning(u32),
 
-    #[error("Node {0} has been evicted; its data directory was deleted to reclaim disk space. Dismiss it and add a new node instead of restarting.")]
+    #[error("Node {0} was evicted by an earlier node manager, which deleted its data directory to reclaim disk space. Dismiss it and add a new node instead of restarting.")]
     NodeEvicted(u32),
 
     #[error("Daemon already running (pid: {0})")]
