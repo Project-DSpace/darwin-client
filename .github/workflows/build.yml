@@ -1,4 +1,5 @@
-# Checks formatting and lints, runs the unit tests, then builds the Linux `darwin`
+# Checks formatting and lints, runs the unit tests and the test targets that
+# need no nodes, then builds the Linux `darwin`
 # client binary (from the ant-cli crate) and uploads it,
 # with its licence files and third-party notices, as the `darwin-linux-x64`
 # workflow artifact. Also checks that upstream's installers stay deleted.
@@ -92,6 +93,15 @@ jobs:
 
       - name: Unit tests
         run: cargo test --locked -p ant-core --lib && cargo test --locked -p ant-cli
+
+      # ant-core's test targets that start neither nodes nor a chain, as
+      # scripts/test-targets.py lists them (test.yml runs the rest, against
+      # darwin-node): the node manager's integration tests among them. The
+      # script fails first if a test target would be neither run nor skipped.
+      - name: Test targets that need no nodes
+        run: |
+          targets=$(python3 scripts/test-targets.py no-nodes)
+          cargo test --locked -p ant-core --no-fail-fast $targets
 
       # vendor/ant-listings' own tests, under this repository's Cargo.lock: a
       # dependency this lock resolves differently from darwin-listings' fails

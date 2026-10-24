@@ -1,6 +1,7 @@
-# Runs the end-to-end tests (a local devnet of nodes and a local Anvil chain)
-# and the browser core's tests. Kept apart from build.yml, which checks
-# formatting and lints, runs the unit tests and builds the binary.
+# Runs the end-to-end tests (in-process darwin-node nodes and a local Anvil
+# chain) and the browser core's tests. Kept apart from build.yml, which checks
+# formatting and lints, runs the unit tests and the test targets that need no
+# nodes, and builds the binary.
 #
 # Runs on every push, to any branch, and on pull requests, so a merge branch
 # is tested before it lands; weekly; and by hand. Actions are pinned by commit.
@@ -28,32 +29,49 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # The end-to-end targets: every file in ant-core/tests that
+  # scripts/test-targets.py doesn't name as run by build.yml (no nodes) or as
+  # skipped, with why. A new test file runs here without being added to a
+  # list, and the script fails when a test target would be neither run nor
+  # skipped.
+  targets:
+    runs-on: ubuntu-24.04
+    outputs:
+      e2e: ${{ steps.list.outputs.e2e }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      # For `cargo metadata --no-deps`, which fetches nothing.
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable branch
+        with:
+          toolchain: stable
+
+      - name: List the end-to-end targets
+        id: list
+        run: |
+          python3 scripts/test-targets.py check
+          e2e=$(python3 scripts/test-targets.py e2e)
+          echo "e2e=$e2e" >> "$GITHUB_OUTPUT"
+
   # One job per target, in parallel, so no single job runs every target in a
   # row: together they outgrew one job's time limit. Every target reports,
-  # whether or not another fails. e2e_merkle runs against the devnet's nodes,
-  # which are upstream's ant-node: it pins that merkle payments still work
-  # there, while darwin's own nodes refuse them.
+  # whether or not another fails. The nodes are darwin-node's, at the revision
+  # ant-core/Cargo.toml pins, so the tests check this client against the nodes
+  # it pays and stores on: e2e_merkle pins that they refuse batch payments at
+  # quote time, before anything is paid. (The tests used to run on upstream's
+  # ant-node from crates.io, where e2e_merkle pinned that batch payments
+  # worked; that run was dropped on purpose, as the Darwin network refuses
+  # them.)
   e2e:
     name: e2e (${{ matrix.target }})
+    needs: targets
     runs-on: ubuntu-24.04
     timeout-minutes: 120
     strategy:
       fail-fast: false
       matrix:
-        target:
-          - e2e_envelope
-          - e2e_occupied_quotes
-          - e2e_native_payment
-          - e2e_pointer
-          - e2e_manifest
-          - e2e_file
-          - e2e_data
-          - e2e_payment
-          - e2e_security
-          - e2e_chunk
-          - e2e_cost_estimate
-          - e2e_adr0004
-          - e2e_merkle
+        target: ${{ fromJSON(needs.targets.outputs.e2e) }}
     # Line tables only, not full debug info, so the test build fits on the
     # runner's disk; backtraces still give file and line.
     env:
