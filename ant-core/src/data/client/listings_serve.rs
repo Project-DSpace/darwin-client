@@ -14,7 +14,9 @@
 //! 1. **Census.** Its upkeep ([`Census::maintain`]): every leaf is closed
 //!    with witnessed lookups at the first start and once a day, and a leaf
 //!    is closed again when a member misses polls or a node names peers the
-//!    census lacks.
+//!    census lacks. A member is probed afresh before it leaves, and one that
+//!    left is probed again each cycle, for a day, and is back on its first
+//!    answer.
 //! 2. **Poll.** One request to each census node, [`POLL_CONCURRENCY`] at a
 //!    time ([`Feeds::poll`]). A node whose user agent shows the feed
 //!    release ([`Census::supports_feed`]) is sent a `ChangesRequest` for its
@@ -1091,6 +1093,16 @@ impl Producer {
             debug!(
                 "Census: {} ids named by other nodes answered no lookup",
                 change.unanswered.len()
+            );
+        }
+        if !change.is_empty() {
+            info!(
+                "Census: {} nodes joined and {} left, for {} in all; {} that left are probed \
+                 each cycle",
+                change.joined.len(),
+                change.left.len(),
+                self.census.len(),
+                self.census.reprobing().count()
             );
         }
 

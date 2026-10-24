@@ -12,7 +12,9 @@
 //!   responders' views name are merged, and those that answered no lookup
 //!   are reported ([`CensusChange::unanswered`]) but never join, so an id a
 //!   peer slips into its view or its list of peers never becomes one of an
-//!   address's nearest nodes.
+//!   address's nearest nodes. A node that left comes back on answering a
+//!   probe (see below): it answered a lookup before, and the probe's dial
+//!   authenticates it as the id it answered under.
 //! - **Leaves.** The address space is split as [`ant_listings::leaves`]
 //!   splits it over the census's ids: a range is halved only while both
 //!   halves hold at least [`NEAREST_NODES`] nodes, so the [`NEAREST_NODES`]
@@ -39,10 +41,25 @@
 //!   range, or every leaf when the refresh is due. What a node names can
 //!   cost only so much: an id farther from it than the census's
 //!   [`VIEW_PEERS`] nodes nearest it can't be one of its nearest peers and is
-//!   ignored, an id that answered no lookup isn't looked for again until the
-//!   next refresh, and a leaf is closed for what nodes name at most once
-//!   every [`MISSES_BEFORE_CLOSE`] cycles. A leaf closed in a cycle is closed
-//!   only once in it: the drops in it share that closing.
+//!   ignored, and a leaf is closed for what nodes name at most once every
+//!   [`MISSES_BEFORE_CLOSE`] cycles. An id that answered no lookup is looked
+//!   for again when a node names it so again, as one back after a while
+//!   would be. A leaf closed in a cycle is closed only once in it: the drops
+//!   in it share that closing.
+//! - **Leaving, and coming back.** A member that closing would take out
+//!   (not found answering, and silent at its latest poll) is probed first
+//!   ([`probe_peer`]): pinged over the client's connection to it, or with
+//!   none, dialed afresh at the addresses the census keeps for it. The
+//!   client's own dials (the poll's requests, the lookups) skip an address
+//!   for 30 minutes after a dial of it failed, as saorsa-core's dial-failure
+//!   cache has it, so a node back from a restart would otherwise be passed
+//!   over; a probe doesn't take the cache's word. One that answers stays.
+//!   One that doesn't leaves, onto the re-probe list ([`Census::reprobing`],
+//!   kept in the store), for [`REFRESH_INTERVAL`] from when it left: each
+//!   upkeep probes those on it again, at most [`PROBE_CONCURRENCY`], the
+//!   longest unprobed first, and one that answers is back in the census at
+//!   once ([`Census::maintain`]). One named again meanwhile
+//!   ([`Census::note_peers`]) is probed first.
 //! - **Drops.** A published listing is dropped only on evidence for its
 //!   address within one cycle ([`Census::confirm_drop`]): all
 //!   [`NEAREST_NODES`] of the census's nodes nearest it answered and serve no
@@ -70,12 +87,13 @@
 //!   it until the cycles kept have all seen the loss.
 //!
 //! The census is kept in the producer's store
-//! ([`ListingsStore`], databases [`NODES_DB`], [`QUEUE_DB`] and
-//! [`META_DB`]); changes are written once a cycle ([`Census::save`]).
+//! ([`ListingsStore`], databases [`NODES_DB`], [`QUEUE_DB`], [`META_DB`]
+//! and [`LEFT_DB`]); changes are written once a cycle ([`Census::save`]).
 //!
 //! **Each cycle**, the producer:
 //!
-//! 1. calls [`Census::maintain`] (at its first start this closes every leaf);
+//! 1. calls [`Census::maintain`] (at its first start this closes every leaf;
+//!    each time, it probes the nodes on the re-probe list);
 //! 2. polls each of [`Census::nodes`], asking a node that
 //!    [`Census::supports_feed`] about its leaf ([`Census::leaf_of`]), and
 //!    notes each answer ([`Census::record_answer`], [`Census::record_view`],
@@ -120,6 +138,20 @@ pub const MISSES_BEFORE_CLOSE: u32 = 3;
 /// Every leaf is closed again this often: once a day.
 pub const REFRESH_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
 
+/// How many nodes are probed at once ([`probe_peer`]): as many as the
+/// producer polls at once.
+pub const PROBE_CONCURRENCY: usize = super::listings_serve::POLL_CONCURRENCY;
+
+/// The longest a probe of a node takes ([`probe_peer`]): saorsa-core's
+/// budget for its own probe of whether a peer is alive
+/// (`STALE_REVALIDATION_BUDGET`), a fresh identity exchange
+/// ([`IDENTITY_TIMEOUT`]) and a ping's round trip of a second.
+pub const PROBE_TIMEOUT: Duration = Duration::from_secs(6);
+
+/// How long a node a probe dials has to give its identity: as long as
+/// saorsa-core waits for a dialed peer's (`IDENTITY_EXCHANGE_TIMEOUT`).
+pub const IDENTITY_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// The first node release that keeps a change feed and answers
 /// `ChangesRequest` and `RangeListRequest`: `ds.15`, as a node's user agent
 /// gives it (`node/0.23.0+ds.15`).
@@ -144,6 +176,9 @@ pub const QUEUE_DB: &str = "census_queue";
 
 /// The census's other state: when it was last refreshed.
 pub const META_DB: &str = "census_meta";
+
+/// The re-probe list: the nodes that left, by id ([`Census::reprobing`]).
+pub const LEFT_DB: &str = "census_left";
 
 /// The key in [`META_DB`] of when every leaf was last closed (Unix seconds).
 const REFRESHED_AT: &str = "refreshed_at";
@@ -182,6 +217,26 @@ impl CensusNode {
     fn answered_latest_poll(&self) -> bool {
         self.last_answered.is_some() && self.missed == 0
     }
+}
+
+/// A node on the re-probe list: it left the census when its part of the
+/// address space was closed, not found answering and not answering a probe
+/// either. Each upkeep probes it again ([`Census::maintain`]), until it
+/// answers, and then it is back in the census, or until
+/// [`REFRESH_INTERVAL`] after it left.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LeftNode {
+    /// The node's id.
+    pub peer: PeerId,
+    /// Where it was reached while in the census: where it is probed.
+    pub addresses: Vec<MultiAddr>,
+    /// The user agent it gave while in the census, if known.
+    pub user_agent: Option<String>,
+    /// When it left (Unix seconds).
+    pub left_at: u64,
+    /// When it was last probed (Unix seconds); `None` while it is to be
+    /// probed before the others, as after it was named again.
+    pub probed_at: Option<u64>,
 }
 
 /// What closing leaves changed in the census.
@@ -440,11 +495,19 @@ pub struct Census {
     nodes_db: Database<Bytes, SerdeJson<CensusNode>>,
     queue_db: Database<Bytes, Unit>,
     meta_db: Database<Str, U64<BigEndian>>,
+    left_db: Database<Bytes, SerdeJson<LeftNode>>,
     nodes: BTreeMap<PeerId, CensusNode>,
     /// Nodes changed since the last save.
     dirty: BTreeSet<PeerId>,
     /// Nodes removed since the last save.
     removed: BTreeSet<PeerId>,
+    /// The re-probe list: nodes that left, by id. None of them is in
+    /// `nodes`.
+    left: BTreeMap<PeerId, LeftNode>,
+    /// Nodes on the re-probe list changed since the last save.
+    left_dirty: BTreeSet<PeerId>,
+    /// Nodes taken off the re-probe list since the last save.
+    left_removed: BTreeSet<PeerId>,
     /// Ranges queued to be closed again.
     queue: BTreeSet<AddressRange>,
     /// Whether the queue changed since the last save.
@@ -455,9 +518,6 @@ pub struct Census {
     /// called.
     changes: CensusChange,
     index: OnceLock<Index>,
-    /// Ids named in nodes' views that answered no lookup since the last
-    /// refresh: not looked for again until the next.
-    unanswered: BTreeSet<PeerId>,
     /// Ids nodes named in their lists of peers that the census lacks, until
     /// their part of the address space is closed: then, if they still
     /// aren't in it, they answered no lookup.
@@ -481,6 +541,7 @@ impl std::fmt::Debug for Census {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Census")
             .field("nodes", &self.nodes.len())
+            .field("reprobing", &self.left.len())
             .field("refreshed_at", &self.refreshed_at)
             .finish_non_exhaustive()
     }
@@ -496,11 +557,25 @@ impl Census {
         let nodes_db: Database<Bytes, SerdeJson<CensusNode>> = store.database(NODES_DB)?;
         let queue_db: Database<Bytes, Unit> = store.database(QUEUE_DB)?;
         let meta_db: Database<Str, U64<BigEndian>> = store.database(META_DB)?;
+        let left_db: Database<Bytes, SerdeJson<LeftNode>> = store.database(LEFT_DB)?;
         let txn = store.env().read_txn().map_err(store_error)?;
         let mut nodes = BTreeMap::new();
         for row in nodes_db.iter(&txn).map_err(store_error)? {
             let (_, node) = row.map_err(store_error)?;
             nodes.insert(node.peer, node);
+        }
+        // A node on the re-probe list that is in the census too (an earlier
+        // version of the producer, which keeps no list, took it back in)
+        // comes off the list at the next save.
+        let mut left = BTreeMap::new();
+        let mut left_removed = BTreeSet::new();
+        for row in left_db.iter(&txn).map_err(store_error)? {
+            let (_, node) = row.map_err(store_error)?;
+            if nodes.contains_key(&node.peer) {
+                left_removed.insert(node.peer);
+            } else {
+                left.insert(node.peer, node);
+            }
         }
         let mut queue = BTreeSet::new();
         for row in queue_db.iter(&txn).map_err(store_error)? {
@@ -526,16 +601,19 @@ impl Census {
             nodes_db,
             queue_db,
             meta_db,
+            left_db,
             nodes,
             dirty: BTreeSet::new(),
             removed: BTreeSet::new(),
+            left,
+            left_dirty: BTreeSet::new(),
+            left_removed,
             queue,
             queue_dirty: false,
             refreshed_at,
             refreshed_dirty: false,
             changes: CensusChange::default(),
             index: OnceLock::new(),
-            unanswered: BTreeSet::new(),
             named_lacking: BTreeSet::new(),
             cycles: 0,
             view_closes: BTreeMap::new(),
@@ -551,13 +629,20 @@ impl Census {
     /// closed, as the leaves now split it: the leaf holding it, or itself
     /// where it holds several, every range at once, [`CLOSE_CONCURRENCY`]
     /// lookups at a time. A range closed leaves the queue; one whose lookups
-    /// failed stays for the next cycle. It begins a cycle: what was closed in
-    /// the last no longer counts as closed in this one.
+    /// failed stays for the next cycle. Then the nodes on the re-probe list
+    /// are probed ([`Self::reprobing`]): at most [`PROBE_CONCURRENCY`] of
+    /// them, all at once, those not probed for longest first, but none
+    /// probed at `now` already, as one that left in this upkeep was. Each
+    /// that answers is back in the census, and one that left
+    /// [`REFRESH_INTERVAL`] or more ago comes off the list. It begins a
+    /// cycle: what was closed in the last no longer counts as closed in this
+    /// one.
     ///
     /// # Errors
     ///
     /// If a lookup fails: what the others found is taken in all the same
-    /// ([`Self::take_changes`]), and the parts not closed stay queued.
+    /// ([`Self::take_changes`]), the parts not closed stay queued, and the
+    /// nodes on the re-probe list are probed all the same.
     pub async fn maintain(&mut self, client: &Client) -> Result<CensusChange> {
         let mut rng = StdRng::from_entropy();
         let now = unix_now();
@@ -573,9 +658,26 @@ impl Census {
         rng: &mut StdRng,
     ) -> Result<CensusChange> {
         self.begin_cycle();
-        if self.refresh_due(now) {
-            return self.refresh_with(lookups, now, rng).await;
-        }
+        let closed = if self.refresh_due(now) {
+            self.refresh_with(lookups, now, rng).await
+        } else {
+            self.close_queued(lookups, now, rng).await
+        };
+        let back = self.reprobe_with(lookups, now).await;
+        closed.map(|mut change| {
+            change.absorb(back);
+            change
+        })
+    }
+
+    /// Close each range queued, as [`Self::maintain`] does when the refresh
+    /// isn't due.
+    async fn close_queued<L: Lookups>(
+        &mut self,
+        lookups: &L,
+        now: u64,
+        rng: &mut StdRng,
+    ) -> Result<CensusChange> {
         let ranges = self.ranges_to_close();
         if ranges.is_empty() {
             return Ok(CensusChange::default());
@@ -595,6 +697,88 @@ impl Census {
             None => Ok(change),
             Some(e) => Err(e),
         }
+    }
+
+    /// Probe the nodes on the re-probe list, as [`Self::maintain`] does after
+    /// closing, at `now` (Unix seconds): what that changed in the census.
+    async fn reprobe_with<L: Lookups>(&mut self, lookups: &L, now: u64) -> CensusChange {
+        let expired: Vec<PeerId> = self
+            .left
+            .values()
+            .filter(|node| now.saturating_sub(node.left_at) >= REFRESH_INTERVAL.as_secs())
+            .map(|node| node.peer)
+            .collect();
+        for peer in &expired {
+            debug!(
+                "Census: {peer} left a day ago and answered no probe since: it is probed no more"
+            );
+            self.unlist(peer);
+        }
+        let mut due: Vec<&LeftNode> = self
+            .left
+            .values()
+            .filter(|node| node.probed_at.is_none_or(|at| at < now))
+            .collect();
+        // Never probed first (`None` sorts first), then those probed longest
+        // ago.
+        due.sort_by_key(|node| (node.probed_at, node.peer));
+        let targets: Vec<(PeerId, Vec<MultiAddr>)> = due
+            .into_iter()
+            .take(PROBE_CONCURRENCY)
+            .map(|node| (node.peer, node.addresses.clone()))
+            .collect();
+        if targets.is_empty() {
+            return CensusChange::default();
+        }
+        let answered = probe_all(lookups, &targets).await;
+        let mut change = CensusChange::default();
+        for (peer, _) in targets {
+            if !answered.contains(&peer) {
+                if let Some(node) = self.left.get_mut(&peer) {
+                    node.probed_at = Some(now);
+                    self.left_dirty.insert(peer);
+                }
+                continue;
+            }
+            let agent = lookups.user_agent(&peer).await;
+            let Some(node) = self.unlist(&peer) else {
+                continue;
+            };
+            if agent
+                .as_deref()
+                .is_some_and(|agent| node_version(agent).is_none())
+            {
+                // It says it isn't a node now: it doesn't come back.
+                debug!("Census: {peer} answered a probe, but not as a node");
+                continue;
+            }
+            if self.admit(peer, node.addresses, now) {
+                change.joined.push(peer);
+                debug!(
+                    "Census: {peer} answered a probe {} s after it left: it is back",
+                    now.saturating_sub(node.left_at)
+                );
+            }
+            if let Some(agent) = agent.or(node.user_agent) {
+                self.set_user_agent(&peer, agent);
+            }
+        }
+        change
+    }
+
+    /// Take `peer` off the re-probe list. Returns it, if it was on it.
+    fn unlist(&mut self, peer: &PeerId) -> Option<LeftNode> {
+        let node = self.left.remove(peer)?;
+        self.left_dirty.remove(peer);
+        self.left_removed.insert(*peer);
+        Some(node)
+    }
+
+    /// The nodes on the re-probe list, in id order: those that left the
+    /// census in the last [`REFRESH_INTERVAL`] and haven't answered a probe
+    /// since (see the module docs).
+    pub fn reprobing(&self) -> impl Iterator<Item = &LeftNode> {
+        self.left.values()
     }
 
     /// Begin a cycle: what was closed in the last no longer counts as
@@ -654,11 +838,22 @@ impl Census {
     /// changed ([`Self::record_view`]): the leaves of the ids in it that the
     /// census lacks and that could be among its nearest ([`Self::lacking`])
     /// are queued to be closed again, each leaf at most once every
-    /// [`MISSES_BEFORE_CLOSE`] cycles for what nodes name. Returns how many
-    /// leaves that queued.
+    /// [`MISSES_BEFORE_CLOSE`] cycles for what nodes name. An id named so
+    /// again is looked for again, though it answered no lookup when last
+    /// looked for, and one on the re-probe list is probed first at the next
+    /// upkeep ([`Self::reprobing`]): it may be back. Returns how many leaves
+    /// that queued.
     pub fn note_peers(&mut self, reporter: &PeerId, peers: &[[u8; 32]]) -> usize {
         let ids = self.lacking_ids(reporter, peers);
         let lacking: BTreeSet<AddressRange> = ids.iter().map(|id| self.leaf_of(id)).collect();
+        for id in &ids {
+            let peer = PeerId::from_bytes(*id);
+            if let Some(node) = self.left.get_mut(&peer) {
+                if node.probed_at.take().is_some() {
+                    self.left_dirty.insert(peer);
+                }
+            }
+        }
         self.named_lacking
             .extend(ids.iter().map(|id| PeerId::from_bytes(*id)));
         let mut queued = 0;
@@ -742,7 +937,9 @@ impl Census {
         for peer in found.answered.keys() {
             agents.insert(*peer, lookups.user_agent(peer).await);
         }
-        let change = self.take_in(&found, &agents, now);
+        let leaving = self.leaving(&found);
+        let reached = probe_all(lookups, &leaving).await;
+        let change = self.take_in(&found, &agents, &reached, now);
         if !shared {
             self.requeue(&leaf, &found.failed);
             if found.failed.is_empty() && found.first.as_ref().is_some_and(|first| first.is_ok()) {
@@ -915,10 +1112,10 @@ impl Census {
     /// witnessed lookups (see the module docs), at first from an empty
     /// census, and then once every [`REFRESH_INTERVAL`]
     /// ([`Self::refresh_due`]). Nodes found answering join; members not found
-    /// answering, and silent at their latest poll, leave. The census is then
-    /// marked refreshed now; parts whose lookups failed are queued
-    /// ([`Self::queued`]), so the next [`Self::maintain`] closes only them,
-    /// not the whole space again.
+    /// answering, and silent at their latest poll, leave, unless they answer
+    /// a probe. The census is then marked refreshed now; parts whose lookups
+    /// failed are queued ([`Self::queued`]), so the next [`Self::maintain`]
+    /// closes only them, not the whole space again.
     ///
     /// # Errors
     ///
@@ -934,8 +1131,8 @@ impl Census {
     /// Close `range` (usually one of [`Self::leaves`]) again with witnessed
     /// lookups (see the module docs), as [`Self::maintain`] does for what is
     /// queued. Nodes found answering join; members not found answering, and
-    /// silent at their latest poll, leave. The leaves may change. Ranges
-    /// queued within `range` leave the queue.
+    /// silent at their latest poll, leave, unless they answer a probe. The
+    /// leaves may change. Ranges queued within `range` leave the queue.
     ///
     /// # Errors
     ///
@@ -961,8 +1158,6 @@ impl Census {
         now: u64,
         rng: &mut StdRng,
     ) -> Result<CensusChange> {
-        // Ids that answered no lookup are looked for again.
-        self.unanswered.clear();
         self.named_lacking.clear();
         self.view_closes.clear();
         let closed = self.close_with(lookups, AddressRange::ALL, now, rng).await;
@@ -995,17 +1190,20 @@ impl Census {
         for peer in found.answered.keys() {
             agents.insert(*peer, lookups.user_agent(peer).await);
         }
-        let change = self.take_in(found, &agents, now);
+        let leaving = self.leaving(found);
+        let reached = probe_all(lookups, &leaving).await;
+        let change = self.take_in(found, &agents, &reached, now);
         if found.failed.is_empty() {
             self.closed_this_cycle.push(range);
         }
         debug!(
-            "Census: closing {} took {} lookups: {} joined, {} left, {} named that didn't \
-             answer, {} parts closed, {} not",
+            "Census: closing {} took {} lookups: {} joined, {} left, {} kept by a probe, {} \
+             named that didn't answer, {} parts closed, {} not",
             range_text(&range),
             found.lookups,
             change.joined.len(),
             change.left.len(),
+            reached.len(),
             change.unanswered.len(),
             found.closed.len(),
             found.failed.len()
@@ -1022,14 +1220,32 @@ impl Census {
         }
     }
 
+    /// The members that taking in what closing found (`found`) would take
+    /// out of the census, with the addresses it keeps for each, to probe
+    /// first: those in the closed parts that weren't found, and were silent
+    /// at their latest poll.
+    fn leaving(&self, found: &Exploration) -> Vec<(PeerId, Vec<MultiAddr>)> {
+        let closed = Closed::new(&found.closed);
+        self.nodes
+            .values()
+            .filter(|node| {
+                !found.answered.contains_key(&node.peer)
+                    && !node.answered_latest_poll()
+                    && closed.contains(node.peer.as_bytes())
+            })
+            .map(|node| (node.peer, node.addresses.clone()))
+            .collect()
+    }
+
     /// Take in what closing found: nodes that answered join (or are brought
-    /// up to date), unless their user agent says they aren't nodes; members
-    /// in the closed parts that weren't found and were silent at their
-    /// latest poll leave.
+    /// up to date), unless their user agent says they aren't nodes; the
+    /// members [`Self::leaving`] gives leave, onto the re-probe list, but
+    /// those in `reached`, which answered a probe.
     fn take_in(
         &mut self,
         found: &Exploration,
         agents: &BTreeMap<PeerId, Option<String>>,
+        reached: &BTreeSet<PeerId>,
         now: u64,
     ) -> CensusChange {
         let mut change = CensusChange::default();
@@ -1048,21 +1264,17 @@ impl Census {
                 self.set_user_agent(peer, agent);
             }
         }
-        let closed = Closed::new(&found.closed);
         let leaving: Vec<PeerId> = self
-            .nodes
-            .values()
-            .filter(|node| {
-                !found.answered.contains_key(&node.peer)
-                    && !node.answered_latest_poll()
-                    && closed.contains(node.peer.as_bytes())
-            })
-            .map(|node| node.peer)
+            .leaving(found)
+            .into_iter()
+            .map(|(peer, _)| peer)
+            .filter(|peer| !reached.contains(peer))
             .collect();
         for peer in leaving {
-            self.remove(&peer);
+            self.leave(&peer, now);
             change.left.push(peer);
         }
+        let closed = Closed::new(&found.closed);
         change.unanswered = found
             .named
             .iter()
@@ -1083,11 +1295,30 @@ impl Census {
                 change.unanswered.push(peer);
             }
         }
-        self.unanswered.extend(change.unanswered.iter().copied());
-        for peer in found.answered.keys() {
-            self.unanswered.remove(peer);
-        }
         change
+    }
+
+    /// Take `peer` out of the census, as a node that left when its part of
+    /// the address space was closed: onto the re-probe list, as probed at
+    /// `now` (Unix seconds), when it left. Returns whether it was in the
+    /// census.
+    fn leave(&mut self, peer: &PeerId, now: u64) -> bool {
+        let Some(node) = self.nodes.get(peer) else {
+            return false;
+        };
+        let left = LeftNode {
+            peer: *peer,
+            addresses: node.addresses.clone(),
+            user_agent: node.user_agent.clone(),
+            left_at: now,
+            probed_at: Some(now),
+        };
+        self.remove(peer);
+        debug!("Census: {peer} left, and answered no probe: it is probed again each upkeep");
+        self.left_removed.remove(peer);
+        self.left_dirty.insert(*peer);
+        self.left.insert(*peer, left);
+        true
     }
 
     /// Whether every leaf is due to be closed again: never refreshed, or
@@ -1114,8 +1345,10 @@ impl Census {
     /// Take `peer` into the census, or update it: a node that has just
     /// answered (a responder of a witnessed lookup, or a request), at `at`
     /// (Unix seconds), reachable at `addresses` (kept as they were if
-    /// empty). Returns whether it is new.
+    /// empty). A node on the re-probe list comes off it. Returns whether it
+    /// is new.
     pub fn admit(&mut self, peer: PeerId, addresses: Vec<MultiAddr>, at: u64) -> bool {
+        self.unlist(&peer);
         self.dirty.insert(peer);
         self.removed.remove(&peer);
         match self.nodes.get_mut(&peer) {
@@ -1148,7 +1381,9 @@ impl Census {
         }
     }
 
-    /// Take `peer` out of the census. Returns whether it was in it.
+    /// Take `peer` out of the census. Returns whether it was in it. Only a
+    /// node that leaves when its part of the address space is closed goes
+    /// on the re-probe list; one taken out so doesn't.
     pub fn remove(&mut self, peer: &PeerId) -> bool {
         if self.nodes.remove(peer).is_none() {
             return false;
@@ -1242,6 +1477,8 @@ impl Census {
     pub fn save(&mut self) -> Result<()> {
         if self.dirty.is_empty()
             && self.removed.is_empty()
+            && self.left_dirty.is_empty()
+            && self.left_removed.is_empty()
             && !self.refreshed_dirty
             && !self.queue_dirty
             && !self.recent_dirty
@@ -1258,6 +1495,18 @@ impl Census {
         }
         for peer in &self.removed {
             self.nodes_db
+                .delete(&mut txn, peer.as_bytes())
+                .map_err(store_error)?;
+        }
+        for peer in &self.left_dirty {
+            if let Some(node) = self.left.get(peer) {
+                self.left_db
+                    .put(&mut txn, peer.as_bytes(), node)
+                    .map_err(store_error)?;
+            }
+        }
+        for peer in &self.left_removed {
+            self.left_db
                 .delete(&mut txn, peer.as_bytes())
                 .map_err(store_error)?;
         }
@@ -1283,6 +1532,8 @@ impl Census {
         txn.commit().map_err(store_error)?;
         self.dirty.clear();
         self.removed.clear();
+        self.left_dirty.clear();
+        self.left_removed.clear();
         self.refreshed_dirty = false;
         self.queue_dirty = false;
         self.recent_dirty = false;
@@ -1377,9 +1628,9 @@ impl Census {
     /// than the census's [`VIEW_PEERS`]th node nearest it (other than
     /// itself), while the census holds that many. A farther id can't be one
     /// of its nearest peers, and neither can a made-up one far from it, so
-    /// what a node names can only have leaves near it closed. Ids that
-    /// answered no lookup since the last refresh are left out. Empty when
-    /// the census holds every one of them.
+    /// what a node names can only have leaves near it closed. An id that
+    /// answered no lookup when last looked for counts again: it may be back.
+    /// Empty when the census holds every one of them.
     #[must_use]
     pub fn lacking(&self, reporter: &PeerId, peers: &[[u8; 32]]) -> Vec<AddressRange> {
         self.lacking_ids(reporter, peers)
@@ -1405,9 +1656,7 @@ impl Census {
         peers
             .iter()
             .filter(|id| {
-                let peer = PeerId::from_bytes(**id);
-                !self.nodes.contains_key(&peer)
-                    && !self.unanswered.contains(&peer)
+                !self.nodes.contains_key(&PeerId::from_bytes(**id))
                     && farthest.is_none_or(|farthest| distance(own, id) < farthest)
             })
             .copied()
@@ -1551,6 +1800,59 @@ pub async fn user_agent_of(network: &Network, peer: &PeerId) -> Option<String> {
     network.peer_user_agent(peer).await
 }
 
+/// Whether `peer` answers a probe now, within [`PROBE_TIMEOUT`]: a DHT ping
+/// over the client's connection to it, or with none, a dial of each of
+/// `addresses` (the QUIC ones, in turn) until one of them authenticates as
+/// `peer`. These dials are made here, not through the DHT's dialer, so an
+/// address isn't skipped for a dial of it that failed in the last 30
+/// minutes, as saorsa-core's dial-failure cache has the poll's requests and
+/// the lookups skip it: a node back from a restart answers. A node that
+/// dials into gives another identity isn't `peer`; the connection is left
+/// to the transport, as saorsa-core leaves one after such a dial.
+pub async fn probe_peer(network: &Network, peer: &PeerId, addresses: &[MultiAddr]) -> bool {
+    let probe = Box::pin(probe_within(network, peer, addresses));
+    tokio::time::timeout(PROBE_TIMEOUT, probe)
+        .await
+        .unwrap_or(false)
+}
+
+/// [`probe_peer`], with no time limit of its own.
+async fn probe_within(network: &Network, peer: &PeerId, addresses: &[MultiAddr]) -> bool {
+    let node = network.node();
+    if network.is_peer_connected(peer).await {
+        return match node.dht_manager().ping(peer).await {
+            Ok(_) => true,
+            Err(e) => {
+                debug!("Census: {peer} answered no ping over its connection: {e}");
+                false
+            }
+        };
+    }
+    for address in addresses {
+        if address.dialable_socket_addr().is_none() {
+            continue;
+        }
+        let channel = match node.connect_peer(address).await {
+            Ok(channel) => channel,
+            Err(e) => {
+                debug!("Census: a probe of {peer} found nothing at {address}: {e}");
+                continue;
+            }
+        };
+        match node
+            .wait_for_peer_identity(&channel, IDENTITY_TIMEOUT)
+            .await
+        {
+            Ok(answered) if answered == *peer => return true,
+            Ok(answered) => {
+                debug!("Census: a probe of {peer} found {answered} at {address}");
+            }
+            Err(e) => debug!("Census: {address} gave a probe of {peer} no identity: {e}"),
+        }
+    }
+    false
+}
+
 /// What one witnessed lookup gave.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct Sighting {
@@ -1598,6 +1900,40 @@ pub(crate) trait Lookups {
 
     /// The user agent `peer` gave ([`user_agent_of`]).
     async fn user_agent(&self, peer: &PeerId) -> Option<String>;
+
+    /// Whether `peer` answers a probe now, reached at `addresses`
+    /// ([`probe_peer`]): not the dial-failure cache's word.
+    async fn probe(&self, peer: &PeerId, addresses: &[MultiAddr]) -> bool;
+}
+
+/// Probe each of `nodes` ([`Lookups::probe`]), at the addresses given with
+/// it, [`PROBE_CONCURRENCY`] at a time: those that answered.
+async fn probe_all<L: Lookups>(
+    lookups: &L,
+    nodes: &[(PeerId, Vec<MultiAddr>)],
+) -> BTreeSet<PeerId> {
+    let mut waiting = nodes.iter();
+    let mut running = FuturesUnordered::new();
+    let mut answered = BTreeSet::new();
+    loop {
+        while running.len() < PROBE_CONCURRENCY {
+            let Some((peer, addresses)) = waiting.next() else {
+                break;
+            };
+            let (peer, addresses) = (*peer, addresses.clone());
+            running.push(async move {
+                let reached = lookups.probe(&peer, &addresses).await;
+                (peer, reached)
+            });
+        }
+        let Some((peer, reached)) = running.next().await else {
+            break;
+        };
+        if reached {
+            answered.insert(peer);
+        }
+    }
+    answered
 }
 
 /// The `GetRequest`s a drop needs: the network's, or in tests a synthetic
@@ -1656,6 +1992,10 @@ impl Lookups for NetworkLookups<'_> {
 
     async fn user_agent(&self, peer: &PeerId) -> Option<String> {
         user_agent_of(self.0, peer).await
+    }
+
+    async fn probe(&self, peer: &PeerId, addresses: &[MultiAddr]) -> bool {
+        probe_peer(self.0, peer, addresses).await
     }
 }
 
@@ -1945,6 +2285,7 @@ mod tests {
     use super::*;
     use std::collections::{HashMap, HashSet};
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
 
     const TEST_MAP: usize = 16 * 1024 * 1024;
 
@@ -1999,10 +2340,18 @@ mod tests {
     /// makes through it, as the DHT's: ask the three nearest the target not
     /// yet asked, take in what they name, and stop when no node named is
     /// nearer than the farthest of the `count` nearest that answered.
+    ///
+    /// The client's dial-failure cache is `cached`: the nodes a dial of
+    /// which failed lately, which its lookups skip, as though they didn't
+    /// answer, whether they would now or not, until a probe reaches one
+    /// (it is connected then). A probe of a node answers whenever it is
+    /// alive.
     struct Sim {
         nodes: BTreeMap<[u8; 32], SimNode>,
         client: Vec<[u8; 32]>,
         lookups: AtomicUsize,
+        cached: Mutex<BTreeSet<[u8; 32]>>,
+        probes: Mutex<Vec<PeerId>>,
     }
 
     /// 32 bytes spread from `seed` (splitmix64).
@@ -2103,7 +2452,24 @@ mod tests {
                 nodes,
                 client,
                 lookups: AtomicUsize::new(0),
+                cached: Mutex::new(BTreeSet::new()),
+                probes: Mutex::new(Vec::new()),
             }
+        }
+
+        /// A dial of `peer` fails: the client's lookups skip it from now
+        /// on, until a probe reaches it.
+        fn cache(&self, peer: &PeerId) {
+            self.cached.lock().unwrap().insert(*peer.as_bytes());
+        }
+
+        /// The nodes probed so far, in order, and forget them.
+        fn take_probes(&self) -> Vec<PeerId> {
+            std::mem::take(&mut *self.probes.lock().unwrap())
+        }
+
+        fn set_alive(&mut self, peer: &PeerId, alive: bool) {
+            self.nodes.get_mut(peer.as_bytes()).unwrap().alive = alive;
         }
 
         fn live(&self) -> BTreeSet<PeerId> {
@@ -2229,7 +2595,9 @@ mod tests {
                 for (far, node) in batch {
                     candidates.remove(&far);
                     asked.insert(node);
-                    if !self.nodes.get(&node).is_some_and(|sim| sim.alive) {
+                    if !self.nodes.get(&node).is_some_and(|sim| sim.alive)
+                        || self.cached.lock().unwrap().contains(&node)
+                    {
                         continue;
                     }
                     answered.insert(far, node);
@@ -2265,6 +2633,19 @@ mod tests {
             self.nodes
                 .get(peer.as_bytes())
                 .and_then(|node| node.agent.clone())
+        }
+
+        async fn probe(&self, peer: &PeerId, _addresses: &[MultiAddr]) -> bool {
+            self.probes.lock().unwrap().push(*peer);
+            let alive = self
+                .nodes
+                .get(peer.as_bytes())
+                .is_some_and(|node| node.alive);
+            if alive {
+                // Connected now: lookups reach it.
+                self.cached.lock().unwrap().remove(peer.as_bytes());
+            }
+            alive
         }
     }
 
@@ -2522,6 +2903,10 @@ mod tests {
         async fn user_agent(&self, peer: &PeerId) -> Option<String> {
             self.0.user_agent(peer).await
         }
+
+        async fn probe(&self, peer: &PeerId, addresses: &[MultiAddr]) -> bool {
+            self.0.probe(peer, addresses).await
+        }
     }
 
     #[test]
@@ -2595,6 +2980,10 @@ mod tests {
                 Some(agent) => agent.clone(),
                 None => self.0.user_agent(peer).await,
             }
+        }
+
+        async fn probe(&self, peer: &PeerId, addresses: &[MultiAddr]) -> bool {
+            self.0.probe(peer, addresses).await
         }
     }
 
@@ -2854,7 +3243,8 @@ mod tests {
         assert!(near
             .iter()
             .all(|id| unanswered.contains(&PeerId::from_bytes(*id))));
-        // Named again, they answered no lookup: not looked for again.
+        // Named again at once: its leaf was just closed for what nodes
+        // named, so it isn't queued again yet.
         assert_eq!(census.note_peers(&reporter, &near), 0);
         // New made-up ids next to it within MISSES_BEFORE_CLOSE cycles of
         // the last: its leaf isn't queued again until then.
@@ -3239,6 +3629,10 @@ mod tests {
 
         async fn user_agent(&self, peer: &PeerId) -> Option<String> {
             self.0.user_agent(peer).await
+        }
+
+        async fn probe(&self, peer: &PeerId, addresses: &[MultiAddr]) -> bool {
+            self.0.probe(peer, addresses).await
         }
     }
 
@@ -3625,5 +4019,262 @@ mod tests {
         }
         assert_eq!(range_from_key(&[0; 32]), None);
         assert_eq!(range_from_key(&[0; 34]), None);
+    }
+
+    /// One cycle as the producer runs it, through `sim` at `now`: the
+    /// census's upkeep, then a poll of every member. A member answers its
+    /// poll while it is alive and the client's dial-failure cache doesn't
+    /// skip it; one that doesn't answer is cached, as when a poll's dial of
+    /// it fails. Returns what the upkeep changed.
+    fn producer_cycle(census: &mut Census, sim: &Sim, now: u64, rng: &mut StdRng) -> CensusChange {
+        let change = run(census.maintain_with(sim, now, rng)).unwrap();
+        for peer in ids(census) {
+            let alive = sim.nodes[peer.as_bytes()].alive;
+            if alive && !sim.cached.lock().unwrap().contains(peer.as_bytes()) {
+                census.record_answer(&peer, now, None);
+            } else {
+                sim.cache(&peer);
+                census.record_miss(&peer);
+            }
+        }
+        census.note_cycle();
+        change
+    }
+
+    #[test]
+    fn a_member_silent_for_three_polls_that_then_answers_is_a_member_again_within_a_few_cycles() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut census, mut sim) = closed_census(dir.path(), 100, 61);
+        let _ = census.take_changes();
+        let mut rng = rng(62);
+        let members: Vec<PeerId> = ids(&census).into_iter().collect();
+        let mut now = 100;
+        producer_cycle(&mut census, &sim, now, &mut rng);
+
+        // A node is down for its next 3 polls and for the upkeep after them,
+        // which closes its leaf: not found, silent, and not answering a
+        // probe either, it leaves, onto the re-probe list.
+        let down = members[40];
+        sim.set_alive(&down, false);
+        for _ in 0..MISSES_BEFORE_CLOSE {
+            now += 60;
+            producer_cycle(&mut census, &sim, now, &mut rng);
+        }
+        assert_eq!(census.get(&down).unwrap().missed, MISSES_BEFORE_CLOSE);
+        assert_eq!(census.queued(), vec![census.leaf_of(down.as_bytes())]);
+        assert!(sim.take_probes().is_empty());
+        now += 60;
+        let change = producer_cycle(&mut census, &sim, now, &mut rng);
+        assert_eq!(change.left, vec![down]);
+        assert!(census.get(&down).is_none());
+        assert_eq!(sim.take_probes(), vec![down], "probed before it left");
+        let listed: Vec<(PeerId, u64)> = census
+            .reprobing()
+            .map(|node| (node.peer, node.left_at))
+            .collect();
+        assert_eq!(listed, vec![(down, now)]);
+        // While it is down, each upkeep probes it again.
+        for _ in 0..2 {
+            now += 60;
+            let change = producer_cycle(&mut census, &sim, now, &mut rng);
+            assert!(change.is_empty(), "{change:?}");
+            assert_eq!(sim.take_probes(), vec![down]);
+        }
+        // It comes back, its address still in the client's dial-failure
+        // cache, which the lookups and the poll's requests go by: the next
+        // upkeep's probe reaches it, and it is a member again, answering
+        // its poll.
+        sim.set_alive(&down, true);
+        assert!(sim.cached.lock().unwrap().contains(down.as_bytes()));
+        now += 60;
+        let change = producer_cycle(&mut census, &sim, now, &mut rng);
+        assert_eq!(change.joined, vec![down]);
+        assert_eq!(sim.take_probes(), vec![down]);
+        let node = census.get(&down).unwrap();
+        assert_eq!(node.last_answered, Some(now), "it answered its poll");
+        assert_eq!(node.missed, 0);
+        assert!(census.reprobing().next().is_none());
+        assert_eq!(ids(&census), sim.live());
+        assert_eq!(census.take_changes().joined, vec![down]);
+
+        // Another is down for 3 polls, and back by the upkeep that closes
+        // its leaf, but its address is cached, so the lookups pass over it.
+        // The probe before it would leave reaches it: it stays, never
+        // having left, and answers its next poll.
+        let restarted = members[70];
+        sim.set_alive(&restarted, false);
+        for _ in 0..MISSES_BEFORE_CLOSE {
+            now += 60;
+            producer_cycle(&mut census, &sim, now, &mut rng);
+        }
+        sim.set_alive(&restarted, true);
+        assert!(sim.take_probes().is_empty());
+        now += 60;
+        let change = producer_cycle(&mut census, &sim, now, &mut rng);
+        assert!(change.is_empty(), "{change:?}");
+        assert_eq!(sim.take_probes(), vec![restarted]);
+        let node = census.get(&restarted).unwrap();
+        assert_eq!(node.last_answered, Some(now));
+        assert_eq!(node.missed, 0);
+        assert!(census.take_changes().is_empty(), "it never left");
+        assert!(census.reprobing().next().is_none());
+        assert!(census.queued().is_empty());
+    }
+
+    /// The ids in `census.reprobing()` whose `probed_at` is `at`.
+    fn probed_at(census: &Census, at: Option<u64>) -> BTreeSet<PeerId> {
+        census
+            .reprobing()
+            .filter(|node| node.probed_at == at)
+            .map(|node| node.peer)
+            .collect()
+    }
+
+    #[test]
+    fn the_reprobe_list_is_kept_probed_a_wave_at_a_time_and_let_go_a_day_on() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ListingsStore::open_with_map_size(dir.path(), 256 * 1024 * 1024).unwrap();
+        let mut census = Census::open(&store).unwrap();
+        let mut sim = Sim::new(400, 0, 63);
+        let mut rng = rng(64);
+        run(census.maintain_with(&sim, 10, &mut rng)).unwrap();
+        // More nodes go than a wave of probes holds, silent at their latest
+        // poll; closing the whole space takes them out, each probed first.
+        let gone: Vec<PeerId> = ids(&census)
+            .into_iter()
+            .step_by(5)
+            .take(PROBE_CONCURRENCY + 6)
+            .collect();
+        for peer in &gone {
+            sim.set_alive(peer, false);
+            census.record_miss(peer);
+        }
+        census.queue_close(AddressRange::ALL);
+        let change = run(census.maintain_with(&sim, 100, &mut rng)).unwrap();
+        let left: BTreeSet<PeerId> = change.left.iter().copied().collect();
+        let gone_set: BTreeSet<PeerId> = gone.iter().copied().collect();
+        assert_eq!(left, gone_set);
+        assert_eq!(sim.take_probes().len(), gone.len(), "each probed once");
+        assert_eq!(probed_at(&census, Some(100)), gone_set);
+        assert_eq!(ids(&census), sim.live());
+
+        // Kept in the store.
+        census.save().unwrap();
+        let reopened: Vec<LeftNode> = Census::open(&store).unwrap().reprobing().cloned().collect();
+        let listed: Vec<LeftNode> = census.reprobing().cloned().collect();
+        assert_eq!(reopened, listed);
+
+        // A wave at a time: the first holds PROBE_CONCURRENCY; the next
+        // starts with those it left out.
+        run(census.maintain_with(&sim, 160, &mut rng)).unwrap();
+        let first: BTreeSet<PeerId> = sim.take_probes().into_iter().collect();
+        assert_eq!(first.len(), PROBE_CONCURRENCY);
+        let left_out: BTreeSet<PeerId> = gone_set.difference(&first).copied().collect();
+        assert_eq!(left_out.len(), 6);
+        assert_eq!(probed_at(&census, Some(100)), left_out);
+        // One named again by a node it neighbours is probed first too.
+        let named = *first.iter().next().unwrap();
+        let reporter = ids(&census)
+            .into_iter()
+            .find(|peer| !census.lacking(peer, &[*named.as_bytes()]).is_empty())
+            .expect("a node it neighbours");
+        census.note_peers(&reporter, &[*named.as_bytes()]);
+        assert_eq!(probed_at(&census, None), BTreeSet::from([named]));
+        run(census.maintain_with(&sim, 220, &mut rng)).unwrap();
+        let second: BTreeSet<PeerId> = sim.take_probes().into_iter().collect();
+        assert_eq!(second.len(), PROBE_CONCURRENCY);
+        assert!(second.is_superset(&left_out));
+        assert!(second.contains(&named));
+
+        // Kept a day from when they left, and let go then.
+        let day = 100 + REFRESH_INTERVAL.as_secs();
+        run(census.maintain_with(&sim, day - 1, &mut rng)).unwrap();
+        assert_eq!(census.reprobing().count(), gone.len());
+        sim.take_probes();
+        run(census.maintain_with(&sim, day, &mut rng)).unwrap();
+        assert_eq!(census.reprobing().count(), 0);
+        assert!(sim.take_probes().is_empty());
+        census.save().unwrap();
+        assert_eq!(Census::open(&store).unwrap().reprobing().count(), 0);
+    }
+
+    #[test]
+    fn an_id_that_answered_no_lookup_named_again_is_looked_for_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut census, mut sim) = closed_census(dir.path(), 200, 65);
+        let mut rng = rng(66);
+        let reporter = *ids(&census).iter().next().unwrap();
+        let own = *reporter.as_bytes();
+        // A node joins next to the reporter, but the client's dial of it
+        // failed: the lookup that closes its leaf passes over it.
+        let joining = next_to(&own, 7);
+        sim.join(joining, &mut rng);
+        let newcomer = PeerId::from_bytes(joining);
+        sim.cache(&newcomer);
+        assert_eq!(census.note_peers(&reporter, &[joining]), 1);
+        let change = run(census.maintain_with(&sim, 100, &mut rng)).unwrap();
+        assert!(change.joined.is_empty());
+        assert!(change.unanswered.contains(&newcomer));
+        // The cache lets go of it, as after its 30 minutes. Named again, it
+        // is looked for again once its leaf may be closed again for what
+        // nodes name, not only at the next refresh, and joins.
+        sim.cached.lock().unwrap().clear();
+        for cycle in 1..MISSES_BEFORE_CLOSE {
+            assert_eq!(census.note_peers(&reporter, &[joining]), 0, "cycle {cycle}");
+            run(census.maintain_with(&sim, 100 + 60 * u64::from(cycle), &mut rng)).unwrap();
+        }
+        assert_eq!(census.note_peers(&reporter, &[joining]), 1);
+        let change = run(census.maintain_with(&sim, 400, &mut rng)).unwrap();
+        assert_eq!(change.joined, vec![newcomer]);
+        assert!(!census.refresh_due(400));
+    }
+
+    #[test]
+    fn a_node_taken_back_in_elsewhere_comes_off_the_reprobe_list() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ListingsStore::open_with_map_size(dir.path(), TEST_MAP).unwrap();
+        let mut census = Census::open(&store).unwrap();
+        census.admit(peer(1), Vec::new(), 0);
+        census.admit(peer(2), Vec::new(), 0);
+        assert!(census.leave(&peer(1), 50));
+        assert!(!census.leave(&peer(9), 50));
+        census.save().unwrap();
+        let node = census.reprobing().next().unwrap().clone();
+        assert_eq!(node.peer, peer(1));
+        assert_eq!((node.left_at, node.probed_at), (50, Some(50)));
+        // Found again by a lookup: off the list.
+        census.admit(peer(1), Vec::new(), 60);
+        assert!(census.reprobing().next().is_none());
+        census.save().unwrap();
+        assert!(Census::open(&store).unwrap().reprobing().next().is_none());
+        // An earlier version of the producer, which keeps no list, took one
+        // back in: it comes off the list when the census opens.
+        census.leave(&peer(2), 70);
+        census.save().unwrap();
+        let mut earlier = Census::open(&store).unwrap();
+        earlier.nodes.insert(
+            peer(2),
+            CensusNode {
+                peer: peer(2),
+                addresses: Vec::new(),
+                first_seen: 80,
+                last_answered: None,
+                user_agent: None,
+                missed: 0,
+                view: None,
+            },
+        );
+        earlier.dirty.insert(peer(2));
+        // Saved as an earlier version saves it: the node, and its own row
+        // of the list left as it was.
+        earlier.left_dirty.clear();
+        earlier.save().unwrap();
+        drop(earlier);
+        let mut reopened = Census::open(&store).unwrap();
+        assert!(reopened.get(&peer(2)).is_some());
+        assert!(reopened.reprobing().next().is_none());
+        reopened.save().unwrap();
+        let txn = store.env().read_txn().unwrap();
+        assert!(reopened.left_db.is_empty(&txn).unwrap());
     }
 }
