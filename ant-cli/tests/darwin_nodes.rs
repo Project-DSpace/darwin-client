@@ -477,8 +477,8 @@ fn start_daemon(homes: &Homes) -> Daemon {
     }
 }
 
-/// The daemon the image runs serves the node manager's core, with the shapes the image, stats.sh
-/// and the watchdog read, and no reset, no log forwarding and no download; adding from a
+/// The daemon the image runs serves the node manager's core, with the shapes the image and the
+/// servers' monitoring read, and no reset, no log forwarding and no download; adding from a
 /// download source is refused; and across a daemon run on an ordinary disk, it leaves a node's
 /// data as it was. The pin for a low or critical disk is the supervisor's
 /// `the_disk_monitor_deletes_nothing_however_little_space_is_left`

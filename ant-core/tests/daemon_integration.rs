@@ -265,7 +265,7 @@ async fn get_node_detail_returns_full_config() {
 }
 
 /// The daemon of the storage-node image's manager (`darwin-nodes daemon run`) serves the node
-/// manager's core, with the shapes the image's entrypoint, stats.sh and the watchdog read, and no
+/// manager's core, with the shapes the image's entrypoint and the servers' monitoring read, and no
 /// reset and no log forwarding. The darwin CLI's daemon still documents both.
 #[tokio::test]
 async fn the_image_managers_daemon_serves_the_core_and_no_reset_or_log_forwarding() {

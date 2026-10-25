@@ -275,7 +275,7 @@ mod tests {
         assert!(health.checks.is_empty());
     }
 
-    /// What the storage-deploy watchdog reads from `GET /api/v1/health`: `overall`, and each
+    /// What the server watchdog reads from `GET /api/v1/health`: `overall`, and each
     /// check's `level`, `partition` and `summary`, in these names.
     #[test]
     fn the_fields_the_watchdog_reads_keep_their_names() {
