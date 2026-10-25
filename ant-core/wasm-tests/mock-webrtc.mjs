@@ -26,6 +26,10 @@ export async function closesSettled() {
 // How soon a refusing node's transport fails a dial, as a STUN error response
 // to the browser's first answered connectivity check would.
 const REFUSAL_MS = 20;
+// How late a node that never connects fails a dial's ICE checks: past the
+// client's 3 s REFUSAL_DETECTION_WINDOW, with a second of margin, and well
+// inside its 10 s channel-open deadline.
+const SLOW_ICE_FAIL_MS = 4_000;
 
 export function mockWebRtc(nodes = [{}], { gatheringMs = 0 } = {}) {
   const connections = [];
@@ -173,6 +177,16 @@ export function mockWebRtc(nodes = [{}], { gatheringMs = 0 } = {}) {
           this.connectionState = "failed";
           this.onconnectionstatechange?.(new Event("connectionstatechange"));
         }, REFUSAL_MS);
+        return;
+      }
+      // ICE checks fail late without ever connecting, as when no node answers
+      // and the browser gives up on its own: an ordinary failure, not a refusal.
+      if (this.dial <= (nodes[this.remoteSeed - 1].slowIceFailDials ?? 0)) {
+        setTimeout(() => {
+          this.iceConnectionState = "failed";
+          this.connectionState = "failed";
+          this.onconnectionstatechange?.(new Event("connectionstatechange"));
+        }, SLOW_ICE_FAIL_MS);
         return;
       }
       // A different node at the endpoint answers ICE, but fails the DTLS

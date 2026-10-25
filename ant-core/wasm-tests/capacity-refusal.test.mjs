@@ -42,3 +42,22 @@ test("a node that declines a dial fails it at once and is dialled again after th
     client.close();
   }
 });
+
+test("an ICE failure later than the refusal window keeps the full failure cooldown", async () => {
+  // The node never connects, and its ICE checks fail after
+  // REFUSAL_DETECTION_WINDOW (3 s): that is no refusal, so the node is not
+  // dialled again once the 15 s refusal cooldown has passed.
+  const rtc = mockWebRtc([{ slowIceFailDials: 1 }]);
+  const client = new BrowserNetworkClient(rtc.endpoints);
+  try {
+    await assert.rejects(client.connect());
+    assert.equal(rtc.connections.length, 1);
+
+    await sleep(AFTER_REFUSAL_COOLDOWN_MS);
+    await assert.rejects(client.connect());
+    await sleep(DIALS_SETTLED_MS);
+    assert.equal(rtc.connections.length, 1, "a late ICE failure keeps the 30-minute cooldown");
+  } finally {
+    client.close();
+  }
+});
