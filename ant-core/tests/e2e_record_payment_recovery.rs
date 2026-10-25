@@ -61,6 +61,9 @@ struct Proxy {
     down: AtomicBool,
     /// `eth_sendRawTransaction` calls forwarded.
     sends: AtomicUsize,
+    /// Answer every `eth_estimateGas` with -32603, forwarding none, so a
+    /// payment fails before anything is signed or sent.
+    refuse_gas_estimates: AtomicBool,
 }
 
 impl Proxy {
@@ -87,6 +90,11 @@ impl Proxy {
         self.down.store(true, Ordering::SeqCst);
     }
 
+    /// Every payment fails before anything is signed or sent, while `on`.
+    fn refuse_gas_estimates(&self, on: bool) {
+        self.refuse_gas_estimates.store(on, Ordering::SeqCst);
+    }
+
     fn sends(&self) -> usize {
         self.sends.load(Ordering::SeqCst)
     }
@@ -107,6 +115,11 @@ async fn relay(State(proxy): State<Arc<Proxy>>, body: axum::body::Bytes) -> Resp
     let call: Value = serde_json::from_slice(&body).unwrap_or_default();
     let id = call.get("id").cloned().unwrap_or(Value::Null);
     if proxy.down.load(Ordering::SeqCst) {
+        return internal_error(id);
+    }
+    if proxy.refuse_gas_estimates.load(Ordering::SeqCst)
+        && call.get("method").and_then(Value::as_str) == Some("eth_estimateGas")
+    {
         return internal_error(id);
     }
     let send = call.get("method").and_then(Value::as_str) == Some("eth_sendRawTransaction");
@@ -607,6 +620,65 @@ async fn refusals_on_every_run_pay_again_at_most_once() {
     assert_eq!(sent(&direct).await, before + 2);
     assert_eq!(
         (record_checkpoints(), upload_checkpoints()),
+        checkpoints,
+        "nothing kept once stored"
+    );
+
+    testnet.teardown().await;
+}
+
+/// A chunk paid again because every storer refused its kept proof, whose
+/// new payment then fails before anything is sent, keeps the mark: its
+/// checkpoint stays, and the runs after it, refused again, pay once more
+/// in all, never a third time.
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn a_failed_payment_after_a_refusal_never_pays_a_third_time() {
+    let (testnet, proxy, direct, proxied) = setup().await;
+    let checkpoints = record_checkpoints();
+
+    let content = random_chunk();
+    let before = sent(&direct).await;
+    {
+        let _refusing = Refusing::start();
+        client(&testnet, &proxied)
+            .chunk_put(content.clone())
+            .await
+            .expect_err("every storer refuses");
+        assert_eq!(sent(&direct).await, before + 1, "the first payment");
+
+        // Refused again, the kept proof is paid again; that payment fails
+        // before anything is sent.
+        proxy.refuse_gas_estimates(true);
+        let failed = client(&testnet, &proxied).chunk_put(content.clone()).await;
+        proxy.refuse_gas_estimates(false);
+        failed.expect_err("the new payment fails before it is sent");
+        assert_eq!(sent(&direct).await, before + 1, "nothing sent");
+        assert_eq!(
+            record_checkpoints(),
+            checkpoints + 1,
+            "the checkpoint holding the mark stays"
+        );
+
+        for run in 1..=2 {
+            client(&testnet, &proxied)
+                .chunk_put(content.clone())
+                .await
+                .expect_err("every storer refuses");
+            assert_eq!(
+                sent(&direct).await,
+                before + 2,
+                "run {run}: paid again once in all"
+            );
+        }
+    }
+    client(&testnet, &proxied)
+        .chunk_put(content)
+        .await
+        .expect("stored with the kept proof");
+    assert_eq!(sent(&direct).await, before + 2, "two transactions in all");
+    assert_eq!(
+        record_checkpoints(),
         checkpoints,
         "nothing kept once stored"
     );

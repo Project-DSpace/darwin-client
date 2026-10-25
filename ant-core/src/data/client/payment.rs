@@ -298,8 +298,14 @@ impl Client {
                 Err(error) => {
                     // With neither a journal to reconcile nor a proof, as
                     // when the payment failed before anything was sent or
-                    // failed for good, nothing is left to keep.
-                    if state.pending_payment.is_none() && state.proof(content).is_none() {
+                    // failed for good, nothing is left to keep, unless the
+                    // record is marked paid again ([`PaidRecord::refused`]):
+                    // the mark goes only once the record is stored or found
+                    // stored, so no later attempt pays for it a third time.
+                    if state.pending_payment.is_none()
+                        && state.proof(content).is_none()
+                        && !state.was_paid_again(content)
+                    {
                         checkpoint.finish();
                     }
                     return Err(error);
@@ -796,6 +802,58 @@ mod tests {
         assert!(paid.reused);
         paid.refused().unwrap();
         assert!(pay(&client, directory.path(), &record).await.is_err());
+    }
+
+    /// A record marked paid again keeps its checkpoint, the mark in it,
+    /// when the new payment fails before anything is sent (here, no quotes):
+    /// the mark goes only with the record stored, so a later attempt never
+    /// pays for it a third time. Untouched for 30 days, the mark-only
+    /// checkpoint is removed like any other with no pending payment.
+    #[tokio::test]
+    async fn a_failed_payment_after_a_refusal_keeps_the_mark() {
+        let directory = tempfile::tempdir().unwrap();
+        let (client, _node) = offline_client().await;
+        let record = pointer();
+        let now = crate::runtime::system_time();
+        kept_proof(&client, directory.path(), &record, now).await;
+        let paid = pay(&client, directory.path(), &record).await.unwrap();
+        assert!(paid.reused && !paid.paid_again);
+        paid.refused().unwrap();
+
+        for attempt in 1..=2 {
+            assert!(
+                pay(&client, directory.path(), &record).await.is_err(),
+                "attempt {attempt}: no quotes, nothing sent"
+            );
+            assert_eq!(
+                checkpoints(directory.path()).len(),
+                1,
+                "attempt {attempt}: the mark-only checkpoint stays"
+            );
+        }
+        let wallet = client.require_wallet().unwrap();
+        let (checkpoint, state) = RecordCheckpoint::open(
+            directory.path(),
+            wallet.network(),
+            wallet.address().as_slice(),
+            &record.state_id(),
+        )
+        .await
+        .unwrap();
+        assert!(state.was_paid_again(&record.state_id()));
+        assert!(state.proof(&record.state_id()).is_none());
+        assert!(state.pending_payment.is_none());
+        drop(checkpoint);
+
+        let later = SystemTime::now() + Duration::from_secs(31 * 24 * 60 * 60);
+        assert_eq!(
+            crate::data::client::upload_checkpoint::remove_unresumed_before(
+                directory.path(),
+                later
+            ),
+            1
+        );
+        assert!(checkpoints(directory.path()).is_empty());
     }
 
     /// An attempt that fails holding neither a journal nor a proof, such as
