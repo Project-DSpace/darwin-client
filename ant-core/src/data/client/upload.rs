@@ -415,11 +415,13 @@ impl Client {
         let total = records.len() + usize::from(last.is_some());
         let mut unique = records.to_vec();
         // The records this run paid for, at once, again, or by settling a
-        // payment an earlier run journaled: a proof among them that storers
-        // refuse is a failure, never paid for again.
-        let mut paid_now = HashSet::new();
+        // payment an earlier run journaled, are kept in `state` for every
+        // pass a command makes over it ([`UploadState::paid_this_run`]): a
+        // proof among them that storers refuse is a failure, never paid for
+        // again.
         let preparation = async {
-            paid_now.extend(self.reconcile_upload_payment(state, adapter).await?);
+            let settled = self.reconcile_upload_payment(state, adapter).await?;
+            state.add_paid_this_run(settled);
             self.prepare_upload_merkle(&mut unique, state, adapter, mode, outcome)
                 .await
         }
@@ -479,7 +481,7 @@ impl Client {
             let mut payable = Vec::new();
             for (record, plan) in &plans {
                 if let Some(plan) = plan {
-                    drop_proof_paid_outside(state, plan, &paid_now);
+                    drop_proof_paid_outside(state, plan);
                     if !state.is_paid(&plan.address, crate::runtime::system_time()) {
                         state.prepare(plan.clone());
                         payable.push(plan.clone());
@@ -494,7 +496,7 @@ impl Client {
                 order_by_quote_hash(&mut payable);
             }
             adapter.checkpoint(state, None).await?;
-            paid_now.extend(payable.iter().map(|plan| plan.address));
+            state.add_paid_this_run(payable.iter().map(|plan| plan.address));
             let (payment, found_stored, unpaid) = self
                 .pay_wave(payable, &mut plans, state, adapter, last.is_some(), total)
                 .await?;
@@ -526,8 +528,7 @@ impl Client {
             );
             prefetched = next;
             let mut fatal = false;
-            let refused =
-                absorb_stores(results, state, &paid_now, outcome, &mut failed, &mut fatal);
+            let refused = absorb_stores(results, state, outcome, &mut failed, &mut fatal);
             if fatal {
                 break;
             }
@@ -542,7 +543,7 @@ impl Client {
                 .filter(|record| refused.contains(&record.address))
                 .copied()
                 .collect::<Vec<_>>();
-            paid_now.extend(refused);
+            state.add_paid_this_run(refused);
             let plans = self
                 .pay_again(
                     &records,
@@ -558,7 +559,7 @@ impl Client {
             let results = self
                 .store_planned(plans, state, adapter, total, stored)
                 .await;
-            absorb_stores(results, state, &paid_now, outcome, &mut failed, &mut fatal);
+            absorb_stores(results, state, outcome, &mut failed, &mut fatal);
             if fatal {
                 break;
             }
@@ -571,11 +572,10 @@ impl Client {
             let results = self
                 .store_planned(vec![(record, plan)], state, adapter, total, stored)
                 .await;
-            let refused =
-                absorb_stores(results, state, &paid_now, outcome, &mut failed, &mut fatal);
+            let refused = absorb_stores(results, state, outcome, &mut failed, &mut fatal);
             let refused = self.payable_again(refused, state, &mut failed).await;
             if !refused.is_empty() {
-                paid_now.extend(refused);
+                state.add_paid_this_run(refused);
                 let plans = self
                     .pay_again(&[record], state, adapter, true, total, outcome, &mut failed)
                     .await?;
@@ -583,7 +583,7 @@ impl Client {
                 let results = self
                     .store_planned(plans, state, adapter, total, stored)
                     .await;
-                absorb_stores(results, state, &paid_now, outcome, &mut failed, &mut fatal);
+                absorb_stores(results, state, outcome, &mut failed, &mut fatal);
             }
         }
         if !failed.is_empty() {
@@ -1392,14 +1392,11 @@ impl PerChunkWaves {
 /// it and `plan`, a fresh lookup's, puts the paid node outside the record's
 /// [`PUT_TARGET_WIDTH`](crate::quote_policy::PUT_TARGET_WIDTH) nearest
 /// storers, the width within which storers take a proof: the record is then
-/// paid again with `plan`. A proof this run paid (`paid_now`) or a Merkle
-/// one is kept. Returns whether it dropped one.
-pub(crate) fn drop_proof_paid_outside(
-    state: &mut UploadState,
-    plan: &ChunkPaymentPlan,
-    paid_now: &HashSet<[u8; 32]>,
-) -> bool {
-    if paid_now.contains(&plan.address)
+/// paid again with `plan`. A proof this run paid
+/// ([`UploadState::paid_this_run`]) or a Merkle one is kept. Returns whether
+/// it dropped one.
+pub(crate) fn drop_proof_paid_outside(state: &mut UploadState, plan: &ChunkPaymentPlan) -> bool {
+    if state.paid_this_run().contains(&plan.address)
         || !state
             .proof(&plan.address)
             .is_some_and(|proof| paid_outside_width(proof, &plan.quoted_peers))
@@ -1443,14 +1440,14 @@ pub(crate) fn paid_outside_width(
 /// records into `outcome`, failed ones into `failed`, and `fatal` set if a
 /// record couldn't be sent at all. Returns the records to pay for again,
 /// with their store's error: those whose single-node proof an earlier run
-/// paid (not in `paid_now`) and every storer that failed the store refused
+/// paid (not in [`UploadState::paid_this_run`]) and every storer that failed
+/// the store refused
 /// ([`proof_refused`](super::chunk::proof_refused)), left out of `failed`,
 /// unless they were paid again once already
 /// ([`UploadState::was_paid_again`]): those are failures.
 pub(crate) fn absorb_stores(
     results: Vec<([u8; 32], Result<WaveResult>)>,
     state: &mut UploadState,
-    paid_now: &HashSet<[u8; 32]>,
     outcome: &mut UploadOutcome,
     failed: &mut Vec<([u8; 32], String)>,
     fatal: &mut bool,
@@ -1476,7 +1473,7 @@ pub(crate) fn absorb_stores(
             .refused
             .into_iter()
             .filter(|address| {
-                !paid_now.contains(address)
+                !state.paid_this_run().contains(address)
                     && !state.was_paid_again(address)
                     && state
                         .proof(address)
@@ -2030,29 +2027,20 @@ mod tests {
         let mut inside = others(19);
         inside.push(median);
         let mut state = state_paid();
-        assert!(!drop_proof_paid_outside(
-            &mut state,
-            &with_targets(inside),
-            &HashSet::new()
-        ));
+        assert!(!drop_proof_paid_outside(&mut state, &with_targets(inside)));
         assert!(state.proof(&paid.address).is_some());
         // The 21st: dropped.
         let mut outside = others(20);
         outside.push(median);
         assert!(drop_proof_paid_outside(
             &mut state,
-            &with_targets(outside.clone()),
-            &HashSet::new()
+            &with_targets(outside.clone())
         ));
         assert!(state.proof(&paid.address).is_none());
         // Paid by this run: kept.
         let mut state = state_paid();
-        let paid_now = HashSet::from([paid.address]);
-        assert!(!drop_proof_paid_outside(
-            &mut state,
-            &with_targets(outside),
-            &paid_now
-        ));
+        state.add_paid_this_run([paid.address]);
+        assert!(!drop_proof_paid_outside(&mut state, &with_targets(outside)));
         assert!(state.proof(&paid.address).is_some());
         // A lookup that fell back to the close group: 7 targets, the paid
         // node not among them. Storers in places 8 to 20 still take the
@@ -2060,11 +2048,7 @@ mod tests {
         // (`settle_record` decides by the same check).
         let mut state = state_paid();
         let close_group = with_targets(others(7));
-        assert!(!drop_proof_paid_outside(
-            &mut state,
-            &close_group,
-            &HashSet::new()
-        ));
+        assert!(!drop_proof_paid_outside(&mut state, &close_group));
         assert!(state.proof(&paid.address).is_some());
         let proof = state.proof(&paid.address).unwrap();
         assert!(!paid_outside_width(proof, &close_group.quoted_peers));
@@ -2118,14 +2102,8 @@ mod tests {
         let mut outcome = UploadOutcome::default();
         let mut failed = Vec::new();
         let mut fatal = false;
-        let again = absorb_stores(
-            results,
-            &mut state,
-            &HashSet::from([this_run]),
-            &mut outcome,
-            &mut failed,
-            &mut fatal,
-        );
+        state.add_paid_this_run([this_run]);
+        let again = absorb_stores(results, &mut state, &mut outcome, &mut failed, &mut fatal);
         assert_eq!(
             again,
             HashMap::from([(earlier, "short of a quorum".to_string())])
@@ -2149,12 +2127,86 @@ mod tests {
         absorb_stores(
             vec![(paid_again, Ok(stored))],
             &mut state,
-            &HashSet::new(),
             &mut outcome,
             &mut Vec::new(),
             &mut fatal,
         );
         assert!(!state.was_paid_again(&paid_again));
+    }
+
+    /// A proof the command paid in its first pass over the state, refused
+    /// by every storer, is still this run's in the pass the command makes
+    /// after a payment whose outcome was unknown: a failure, never paid
+    /// again, nor dropped for its paid node's place. Read back from its
+    /// checkpoint, as a new process reads it, the proof is an earlier
+    /// run's.
+    #[test]
+    fn a_proof_paid_in_the_first_pass_is_this_runs_in_the_second() {
+        use crate::data::client::upload_state::test_state::{plan, transactions};
+        let now = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000);
+        let record = plan(b"paid in the first pass", now);
+        let address = record.address;
+        let mut state = UploadState::default();
+        // The first pass pays for the record.
+        state.add_paid_this_run([address]);
+        state.prepare(record.clone());
+        state
+            .confirm(&[address], &transactions(&record), now)
+            .unwrap();
+        let refused = || {
+            vec![(
+                address,
+                Ok(WaveResult {
+                    stored: Vec::new(),
+                    failed: vec![(address, "refused".into())],
+                    refused: vec![address],
+                    chunk_attempts_total: 1,
+                    store_durations_ms: Vec::new(),
+                    retries_per_chunk: Vec::new(),
+                }),
+            )]
+        };
+        // Both passes over the same state: a failure each time.
+        for pass in 1..=2 {
+            let mut failed = Vec::new();
+            let again = absorb_stores(
+                refused(),
+                &mut state,
+                &mut UploadOutcome::default(),
+                &mut failed,
+                &mut false,
+            );
+            assert!(again.is_empty(), "pass {pass}: not paid again");
+            assert_eq!(failed.len(), 1, "pass {pass}: a failure");
+        }
+        // A fresh lookup that puts the paid node outside the width.
+        let mut outside = record.clone();
+        outside.quoted_peers = (0..crate::quote_policy::PUT_TARGET_WIDTH)
+            .map(|i| {
+                let byte = u8::try_from(i + 100).unwrap();
+                (
+                    ant_protocol::transport::PeerId::from_bytes([byte; 32]),
+                    Vec::new(),
+                )
+            })
+            .collect();
+        assert!(!drop_proof_paid_outside(&mut state, &outside));
+        assert!(state.proof(&address).is_some());
+
+        // A new process: the proof is an earlier run's.
+        let mut state = UploadState::parse(&state.checkpoint().unwrap())
+            .unwrap()
+            .state;
+        assert!(state.paid_this_run().is_empty());
+        let again = absorb_stores(
+            refused(),
+            &mut state,
+            &mut UploadOutcome::default(),
+            &mut Vec::new(),
+            &mut false,
+        );
+        assert!(again.contains_key(&address), "paid again, once");
+        assert!(drop_proof_paid_outside(&mut state, &outside));
     }
 
     /// A kept proof every storer refused is paid again only when the vault's

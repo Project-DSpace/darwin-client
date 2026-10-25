@@ -151,6 +151,11 @@ pub struct UploadState {
     /// the number of runs.
     #[serde(default, skip_serializing_if = "HashSet::is_empty")]
     paid_again: HashSet<XorName>,
+    /// The records this run paid for, at once, again, or by settling a
+    /// payment an earlier run journaled ([`Self::paid_this_run`]); never
+    /// saved, so a new process starts with none.
+    #[serde(skip)]
+    paid_this_run: HashSet<XorName>,
 }
 
 /// A checkpoint's body, as written after the magic and format.
@@ -444,6 +449,20 @@ impl UploadState {
         self.paid_again.contains(address)
     }
 
+    /// Record that this run paid for `addresses`, at once, again, or by
+    /// settling a payment an earlier run journaled: a proof among them that
+    /// storers refuse is a failure, never paid for again. Kept for the life
+    /// of this state, across every pass an upload makes over it, and never
+    /// saved.
+    pub(crate) fn add_paid_this_run(&mut self, addresses: impl IntoIterator<Item = XorName>) {
+        self.paid_this_run.extend(addresses);
+    }
+
+    /// The records this run paid for ([`Self::add_paid_this_run`]).
+    pub(crate) fn paid_this_run(&self) -> &HashSet<XorName> {
+        &self.paid_this_run
+    }
+
     /// The records paid again once already ([`Self::mark_paid_again`]).
     #[cfg(feature = "native")]
     pub(crate) fn paid_again(&self) -> &HashSet<XorName> {
@@ -550,6 +569,7 @@ impl UploadState {
             pending_payment: None,
             failed_payments: Vec::new(),
             paid_again: HashSet::new(),
+            paid_this_run: HashSet::new(),
         };
         state.renumber();
         state
@@ -841,6 +861,7 @@ impl UploadState {
             pending_payment: body.pending_payment,
             failed_payments: body.failed_payments,
             paid_again: body.paid_again,
+            paid_this_run: HashSet::new(),
         };
         state.renumber();
         Ok(Parsed {
