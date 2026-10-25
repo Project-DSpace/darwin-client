@@ -252,6 +252,17 @@ whether an address is listed, left for later or dropped. A reader
 comparing entries or support with its own read should allow for it during
 that time.
 
+The census also keeps, in each node's entry in the producer's store
+(database `census_nodes`), the node's WebRTC Direct addresses, where
+browsers reach it: `webrtc_direct`, the WebRTC Direct addresses among the
+records of the node's signed address record, as the census's lookups bring
+it in, the record with the newest sequence kept (`webrtc_direct_sequence`).
+A node registers these apart from its native addresses, which a lookup's
+answer gives as `addresses`. The list is empty where that record has none,
+and the field is left out while the census has no signed record of the
+node. Nothing published carries it; an operator's monitoring can read it
+from the store.
+
 ## by-name/
 
 `by-name/<prefix>.json` holds the entries of every name whose prefix is

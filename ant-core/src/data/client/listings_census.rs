@@ -79,6 +79,14 @@
 //!   ([`user_agent_of`]). One from [`FEED_RELEASE`] on answers change feeds
 //!   ([`Census::supports_feed`]), and older ones are read with the listings
 //!   v2 requests.
+//! - **Browser addresses.** A node's WebRTC Direct addresses, where browsers
+//!   reach it, aren't among the addresses a lookup gives: the node registers
+//!   them apart, in its signed address record. The census keeps those its
+//!   lookups bring in ([`CensusNode::webrtc_direct`], [`BrowserAddresses`]):
+//!   the WebRTC Direct addresses among the records of the node's signed
+//!   record, an empty list where that record has none, and none at all
+//!   while the census has no signed record of the node. Across sightings the
+//!   record with the newer sequence is kept.
 //! - **Guard.** A cycle in which fewer than [`NEAREST_NODES`] of the
 //!   census answered, or when the census holds under three quarters as many
 //!   nodes as it did in any of the cycles before it that are kept (as many
@@ -231,6 +239,16 @@ pub struct CensusNode {
     /// hash of its nearest peers ([`ant_listings::view_hash`]), if known.
     #[serde(default)]
     pub view: Option<[u8; 32]>,
+    /// Its WebRTC Direct addresses, where browsers reach it: those among
+    /// the records of its signed address record, the newest the census's
+    /// lookups brought in. Empty where that record has none; `None` (and
+    /// left out of the store's entry) while the census has no signed record
+    /// of the node, so it can't say.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub webrtc_direct: Option<Vec<MultiAddr>>,
+    /// The sequence of the signed record [`Self::webrtc_direct`] comes from.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub webrtc_direct_sequence: Option<u64>,
 }
 
 impl CensusNode {
@@ -960,6 +978,9 @@ impl Census {
                 for (peer, addresses) in &sighting.answered {
                     found.answered.insert(*peer, addresses.clone());
                 }
+                for (peer, browser) in &sighting.browser {
+                    BrowserAddresses::merge(&mut found.browser, *peer, browser.clone());
+                }
                 found.named = sighting
                     .named
                     .iter()
@@ -1302,6 +1323,9 @@ impl Census {
             if let Some(agent) = agent {
                 self.set_user_agent(peer, agent);
             }
+            if let Some(browser) = found.browser.get(peer) {
+                self.note_browser(peer, browser);
+            }
         }
         let leaving: Vec<PeerId> = self
             .leaving(found)
@@ -1490,6 +1514,8 @@ impl Census {
                         user_agent: None,
                         missed: 0,
                         view: None,
+                        webrtc_direct: None,
+                        webrtc_direct_sequence: None,
                     },
                 );
                 self.index = OnceLock::new();
@@ -1579,6 +1605,27 @@ impl Census {
     }
 
     /// Note the user agent `peer` gave, if it is in the census.
+    /// Keep `browser`, from `peer`'s signed address record, as its browser
+    /// addresses, unless the census holds them from a record with a newer
+    /// sequence.
+    fn note_browser(&mut self, peer: &PeerId, browser: &BrowserAddresses) {
+        if let Some(node) = self.nodes.get_mut(peer) {
+            if node
+                .webrtc_direct_sequence
+                .is_some_and(|kept| kept > browser.sequence)
+            {
+                return;
+            }
+            if node.webrtc_direct.as_ref() != Some(&browser.addresses)
+                || node.webrtc_direct_sequence != Some(browser.sequence)
+            {
+                node.webrtc_direct = Some(browser.addresses.clone());
+                node.webrtc_direct_sequence = Some(browser.sequence);
+                self.dirty.insert(*peer);
+            }
+        }
+    }
+
     fn set_user_agent(&mut self, peer: &PeerId, user_agent: String) {
         if let Some(node) = self.nodes.get_mut(peer) {
             if node.user_agent.as_deref() != Some(user_agent.as_str()) {
@@ -2019,6 +2066,48 @@ async fn probe_within(
     false
 }
 
+/// A node's browser addresses, as its signed address record gives them.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct BrowserAddresses {
+    /// The sequence the node gave the record.
+    pub(crate) sequence: u64,
+    /// The WebRTC Direct addresses among its records: empty if it has none.
+    pub(crate) addresses: Vec<MultiAddr>,
+}
+
+impl BrowserAddresses {
+    /// What `record` gives, if it is `peer`'s and its signature checks.
+    pub(crate) fn of(
+        peer: &PeerId,
+        record: &ant_protocol::transport::signed_address::SignedAddressRecord,
+    ) -> Option<Self> {
+        let record = record.verify().ok()?;
+        if record.owner() != *peer {
+            return None;
+        }
+        Some(Self {
+            sequence: record.sequence(),
+            addresses: record
+                .records()
+                .iter()
+                .filter_map(|record| record.decode_known().ok().flatten())
+                .filter(MultiAddr::is_webrtc_direct)
+                .collect(),
+        })
+    }
+
+    /// Keep in `kept` for `peer` the newer of what it holds and `browser`,
+    /// by sequence.
+    fn merge(kept: &mut BTreeMap<PeerId, Self>, peer: PeerId, browser: Self) {
+        match kept.get(&peer) {
+            Some(held) if held.sequence >= browser.sequence => {}
+            _ => {
+                kept.insert(peer, browser);
+            }
+        }
+    }
+}
+
 /// What one witnessed lookup gave.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct Sighting {
@@ -2027,6 +2116,9 @@ pub(crate) struct Sighting {
     pub(crate) answered: Vec<(PeerId, Vec<MultiAddr>)>,
     /// Every other id the views of those nodes named.
     pub(crate) named: Vec<PeerId>,
+    /// The browser addresses of those that answered, for each whose signed
+    /// address record the client holds.
+    pub(crate) browser: BTreeMap<PeerId, BrowserAddresses>,
 }
 
 impl Sighting {
@@ -2048,6 +2140,7 @@ impl Sighting {
         Self {
             answered,
             named: named.into_iter().collect(),
+            browser: BTreeMap::new(),
         }
     }
 }
@@ -2153,7 +2246,18 @@ impl Lookups for NetworkLookups<'_> {
             self.0
                 .find_witnessed_close_group_with_view_count(target, count, view_count),
         );
-        Ok(Sighting::of(&lookup.await?))
+        let mut sighting = Sighting::of(&lookup.await?);
+        // The signed address records the lookup brought in, which hold the
+        // browser addresses its answers leave out.
+        let dht = self.0.node().dht_manager();
+        for (peer, _) in &sighting.answered {
+            if let Some(record) = dht.signed_address_record_for_peer(peer).await {
+                if let Some(browser) = BrowserAddresses::of(peer, &record) {
+                    sighting.browser.insert(*peer, browser);
+                }
+            }
+        }
+        Ok(sighting)
     }
 
     async fn user_agent(&self, peer: &PeerId) -> Option<String> {
@@ -2173,6 +2277,9 @@ struct Exploration {
     answered: BTreeMap<PeerId, Vec<MultiAddr>>,
     /// The other ids the views of nodes that answered named.
     named: BTreeSet<PeerId>,
+    /// The browser addresses of nodes that answered, from their signed
+    /// address records, the newest sequence of each.
+    browser: BTreeMap<PeerId, BrowserAddresses>,
     /// The parts of the range closed: every node in them that answers was
     /// found. They don't overlap.
     closed: Vec<AddressRange>,
@@ -2268,6 +2375,9 @@ async fn explore_many<L: Lookups>(
             if known.is_empty() {
                 *known = addresses;
             }
+        }
+        for (peer, browser) in sighting.browser {
+            BrowserAddresses::merge(&mut found.browser, peer, browser);
         }
         found.named.extend(sighting.named);
     }
@@ -2792,6 +2902,7 @@ mod tests {
                     .map(|id| (PeerId::from_bytes(id), Vec::new()))
                     .collect(),
                 named: named.into_iter().map(PeerId::from_bytes).collect(),
+                browser: BTreeMap::new(),
             })
         }
 
@@ -3219,6 +3330,7 @@ mod tests {
                 .map(|id| (PeerId::from_bytes(*id), Vec::new()))
                 .collect(),
             named: Vec::new(),
+            browser: BTreeMap::new(),
         };
         // The farthest is outside the part: all of it is closed.
         let mut outside = target;
@@ -4515,6 +4627,8 @@ mod tests {
                 user_agent: None,
                 missed: 0,
                 view: None,
+                webrtc_direct: None,
+                webrtc_direct_sequence: None,
             },
         );
         earlier.dirty.insert(peer(2));
@@ -4529,5 +4643,125 @@ mod tests {
         reopened.save().unwrap();
         let txn = store.env().read_txn().unwrap();
         assert!(reopened.left_db.is_empty(&txn).unwrap());
+    }
+
+    /// A WebRTC Direct address of the node `owner`, at `port`.
+    fn browser_address(owner: &PeerId, port: u16) -> MultiAddr {
+        format!(
+            "/ip4/192.0.2.7/udp/{port}/webrtc-direct/certhash/\
+             uEiAkAsFZc-iV5UToJHyETA8GLBIVdzB10Qv6VuNlwqTwkQ/p2p/{}",
+            hex::encode(owner.as_bytes())
+        )
+        .parse()
+        .unwrap()
+    }
+
+    /// A node's browser addresses are the WebRTC Direct addresses among the
+    /// records of its signed address record: an empty list when it has
+    /// none, and nothing from a record that isn't the node's or whose
+    /// signature fails.
+    #[test]
+    fn browser_addresses_come_from_the_nodes_signed_record() {
+        use ant_protocol::transport::signed_address::SignedAddressRecord;
+        use ant_protocol::transport::{KnownReachability, NodeIdentity, TransportAddressRecord};
+        let identity = NodeIdentity::generate().unwrap();
+        let owner = *identity.peer_id();
+        let record = |address: &MultiAddr| {
+            TransportAddressRecord::from_multiaddr(address, KnownReachability::Direct)
+                .unwrap()
+                .unwrap()
+        };
+        let quic = record(&"/ip4/192.0.2.7/udp/10000/quic".parse().unwrap());
+        let browser = browser_address(&owner, 10002);
+        let both =
+            SignedAddressRecord::sign(&identity, 3, vec![quic.clone(), record(&browser)]).unwrap();
+        assert_eq!(
+            BrowserAddresses::of(&owner, &both),
+            Some(BrowserAddresses {
+                sequence: 3,
+                addresses: vec![browser],
+            })
+        );
+        let native_only = SignedAddressRecord::sign(&identity, 4, vec![quic]).unwrap();
+        assert_eq!(
+            BrowserAddresses::of(&owner, &native_only),
+            Some(BrowserAddresses {
+                sequence: 4,
+                addresses: Vec::new(),
+            })
+        );
+        assert_eq!(BrowserAddresses::of(&peer(9), &both), None);
+        let mut tampered = both.encode().unwrap();
+        let last = tampered.len() - 1;
+        tampered[last] ^= 1;
+        let tampered = SignedAddressRecord::decode(&tampered).unwrap();
+        assert_eq!(BrowserAddresses::of(&owner, &tampered), None);
+    }
+
+    /// The census keeps a node's browser addresses from the newest signed
+    /// record its lookups bring in, across sightings, and writes them in the
+    /// node's entry as `webrtc_direct`: an empty list where the record has
+    /// none, and no field for a node it has no signed record of.
+    #[test]
+    fn the_census_keeps_the_newest_browser_addresses_and_none_where_unknown() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ListingsStore::open_with_map_size(dir.path(), TEST_MAP).unwrap();
+        let mut census = Census::open(&store).unwrap();
+        let (with, without) = (peer(1), peer(2));
+        let found = |sequence: u64, addresses: Vec<MultiAddr>| Exploration {
+            answered: [(with, Vec::new()), (without, Vec::new())]
+                .into_iter()
+                .collect(),
+            browser: [(
+                with,
+                BrowserAddresses {
+                    sequence,
+                    addresses,
+                },
+            )]
+            .into_iter()
+            .collect(),
+            ..Exploration::default()
+        };
+        let (none, reached) = (BTreeMap::new(), BTreeSet::new());
+        let first = browser_address(&with, 10002);
+        census.take_in(&found(5, vec![first.clone()]), &none, &reached, 100);
+        // An older record, sighted later, doesn't replace it.
+        census.take_in(
+            &found(4, vec![browser_address(&with, 10004)]),
+            &none,
+            &reached,
+            110,
+        );
+        assert_eq!(census.get(&with).unwrap().webrtc_direct, Some(vec![first]));
+        assert_eq!(census.get(&without).unwrap().webrtc_direct, None);
+        // A newer one does, if it lists none.
+        census.take_in(&found(6, Vec::new()), &none, &reached, 120);
+        assert_eq!(census.get(&with).unwrap().webrtc_direct, Some(Vec::new()));
+        census.save().unwrap();
+        // A node's entry in the store, as the network monitor reads it.
+        let entry = |peer: &PeerId| -> serde_json::Value {
+            let rows: Database<Bytes, Str> = store.database(NODES_DB).unwrap();
+            let txn = store.env().read_txn().unwrap();
+            serde_json::from_str(rows.get(&txn, peer.as_bytes()).unwrap().unwrap()).unwrap()
+        };
+        assert_eq!(entry(&with)["webrtc_direct"], serde_json::json!([]));
+        assert_eq!(entry(&with)["webrtc_direct_sequence"], 6);
+        assert!(entry(&without).get("webrtc_direct").is_none());
+        // Read back as written.
+        let reopened = Census::open(&store).unwrap();
+        assert_eq!(reopened.get(&with).unwrap().webrtc_direct, Some(Vec::new()));
+        assert_eq!(reopened.get(&without).unwrap().webrtc_direct, None);
+        // The entry a newer sighting with addresses writes lists them as
+        // the network monitor reads them.
+        let mut census = reopened;
+        let again = browser_address(&with, 10006);
+        census.take_in(&found(7, vec![again.clone()]), &none, &reached, 130);
+        census.save().unwrap();
+        assert_eq!(
+            entry(&with)["webrtc_direct"],
+            serde_json::json!([again.to_string()])
+        );
+        assert!(again.to_string().contains("/webrtc-direct/"));
     }
 }
