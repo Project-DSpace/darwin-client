@@ -17,3 +17,10 @@ ant-protocol = { path = "vendor/ant-protocol" }
 # as darwin-node builds them. Only builds that link darwin-node (the tests and
 # the `devnet` feature) use webrtc; the `darwin` binary doesn't.
 webrtc = { git = "https://github.com/Project-DSpace/darwin-node.git", rev = "94bf3425e31f77e150bc98306d02705fc33b1037" }
+
+# Tests start whole networks of nodes in one process, and debug-built
+# signature checks are about 200 times slower than optimised ones. Compile
+# every dependency (darwin-node, the crypto crates) optimised in dev and test
+# builds; the workspace's own crates stay debuggable.
+[profile.dev.package."*"]
+opt-level = 2
