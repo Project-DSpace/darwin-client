@@ -444,11 +444,10 @@ impl Client {
             (Err(error), Ok(())) | (Ok(()), Err(error)) => return Err(error),
             (Ok(()), Ok(())) => {}
         }
-        // Never in a Merkle batch: always paid per chunk, in the last wave.
-        unique.extend(last);
-        let waves = unique
-            .chunks(super::batch::PAYMENT_WAVE_SIZE)
-            .collect::<Vec<_>>();
+        // `last` is never in a Merkle batch: always paid per chunk, in the
+        // final wave, and stored after every other record.
+        let per_chunk = PerChunkWaves::new(&unique, last);
+        let waves = &per_chunk.waves;
         let mut prefetched = None;
         let mut failed = Vec::new();
         let mut held = None;
@@ -493,15 +492,9 @@ impl Client {
             let max_size = wave.iter().map(|r| r.size as usize).max().unwrap_or(1);
             let recovery = &*state;
             let live_stored = std::sync::atomic::AtomicUsize::new(outcome.addresses.len());
-            let mut to_store = Vec::with_capacity(plans.len());
-            for (record, plan) in plans {
-                match plan {
-                    Some(plan) if Some(record.address) == last.map(|l| l.address) => {
-                        held = Some((record, plan));
-                    }
-                    Some(plan) => to_store.push((record, plan)),
-                    None => {}
-                }
+            let (to_store, held_here) = per_chunk.hold_back(plans);
+            if held_here.is_some() {
+                held = held_here;
             }
             let stores = crate::client_engine::rolling_unordered(
                 to_store,
@@ -1161,6 +1154,64 @@ impl Client {
     }
 }
 
+/// What an upload pays per chunk once its Merkle batches are stored, and the
+/// order it stores it in: the records no batch paid, in their order, then
+/// `last` (an envelope), in payment waves of
+/// [`PAYMENT_WAVE_SIZE`](super::batch::PAYMENT_WAVE_SIZE).
+///
+/// `last` is never in a batch, since the batches are planned from the other
+/// records alone. It rides in the final wave: with the remainder the batches
+/// left (fewer than `MERKLE_EXACT_MIN_BATCH` records, as
+/// `merkle_upload_split` leaves them), or alone when they left none, so its
+/// payment is always per chunk. Each wave's stores leave it out
+/// ([`PerChunkWaves::hold_back`]), and it is sent only once every other
+/// record is stored ([`release_last`]). With no batch paid (per-chunk
+/// payment, or `Auto` falling back to it), the waves are every record's.
+#[derive(Debug)]
+pub(crate) struct PerChunkWaves {
+    /// The payment waves, in the order paid.
+    pub(crate) waves: Vec<Vec<UploadRecord>>,
+    /// The address of the record stored last, if there is one.
+    pub(crate) last: Option<[u8; 32]>,
+}
+
+/// A record with the paid plan it is stored by.
+pub(crate) type Planned<P> = (UploadRecord, P);
+
+impl PerChunkWaves {
+    /// The waves for `remaining`, the records left after the Merkle batches
+    /// (all of them when there were none), and `last`.
+    pub(crate) fn new(remaining: &[UploadRecord], last: Option<UploadRecord>) -> Self {
+        let records = remaining.iter().copied().chain(last).collect::<Vec<_>>();
+        Self {
+            waves: records
+                .chunks(super::batch::PAYMENT_WAVE_SIZE)
+                .map(<[UploadRecord]>::to_vec)
+                .collect(),
+            last: last.map(|record| record.address),
+        }
+    }
+
+    /// One paid wave's plans split into the records to store now, and the
+    /// record held back to be stored last (`last`, when this wave pays it).
+    /// A record with no plan is already stored, and is in neither.
+    pub(crate) fn hold_back<P>(
+        &self,
+        plans: Vec<(UploadRecord, Option<P>)>,
+    ) -> (Vec<Planned<P>>, Option<Planned<P>>) {
+        let mut to_store = Vec::with_capacity(plans.len());
+        let mut held = None;
+        for (record, plan) in plans {
+            match plan {
+                Some(plan) if Some(record.address) == self.last => held = Some((record, plan)),
+                Some(plan) => to_store.push((record, plan)),
+                None => {}
+            }
+        }
+        (to_store, held)
+    }
+}
+
 /// Why the record stored last (an envelope) was not sent.
 pub(crate) const HELD_BACK: &str = "not stored, since other records failed to store";
 
@@ -1440,5 +1491,172 @@ mod tests {
                 ([7; 32], HELD_BACK.to_string())
             ]
         );
+    }
+
+    /// `count` content records, by index, and an envelope after them.
+    fn content_and_envelope(count: usize) -> (Vec<UploadRecord>, UploadRecord) {
+        let record = |index: usize, tag: u8| {
+            let mut address = [tag; 32];
+            address[..8].copy_from_slice(&(index as u64).to_be_bytes());
+            UploadRecord {
+                address,
+                size: 1_000,
+                index,
+            }
+        };
+        let content = (0..count).map(|index| record(index, 0x00)).collect();
+        (content, record(count, 0xee))
+    }
+
+    fn addresses_of(records: &[UploadRecord]) -> Vec<[u8; 32]> {
+        records.iter().map(|record| record.address).collect()
+    }
+
+    /// The order the engine stores an upload in once every payment is made
+    /// and every store succeeds: each batch, then each per-chunk wave's
+    /// records (`hold_back`), then the record held back (`release_last`).
+    fn stored_in_order(batches: &[&[[u8; 32]]], per_chunk: &PerChunkWaves) -> Vec<[u8; 32]> {
+        let mut stored = batches.concat();
+        let mut held = None;
+        for wave in &per_chunk.waves {
+            let plans = wave.iter().map(|record| (*record, Some(()))).collect();
+            let (to_store, held_here) = per_chunk.hold_back(plans);
+            stored.extend(to_store.iter().map(|(record, ())| record.address));
+            if held_here.is_some() {
+                held = held_here;
+            }
+        }
+        let mut failed = Vec::new();
+        if let Some((record, ())) = release_last(held, |(record, ())| record.address, &mut failed) {
+            stored.push(record.address);
+        }
+        assert!(failed.is_empty(), "{failed:?}");
+        stored
+    }
+
+    /// An envelope joined after paid Merkle batches, as the engine lays it
+    /// out on a network that takes batches (darwin-node refuses them, so no
+    /// end-to-end test reaches this): for 33, 65 and 4 × `MAX_LEAVES` + 40
+    /// content records, and 32 and 64, which the batches use up. The batches
+    /// (`merkle_upload_partitions`, as the engine plans them) hold content
+    /// only; the envelope rides in the final per-chunk wave with the
+    /// remainder they left, or alone when there is none; and it is stored
+    /// after everything else.
+    #[test]
+    fn after_merkle_batches_the_envelope_is_paid_per_chunk_with_the_remainder_and_stored_last() {
+        use super::super::merkle::{merkle_upload_partitions, merkle_upload_split};
+        use ant_protocol::evm::MAX_LEAVES;
+
+        for (count, remainder) in [(33, 1), (65, 1), (4 * MAX_LEAVES + 40, 8), (32, 0), (64, 0)] {
+            let (content, envelope) = content_and_envelope(count);
+            let content_addresses = addresses_of(&content);
+
+            // The batches: content only, in order, as the split says.
+            let batches = merkle_upload_partitions(count, &content_addresses);
+            let batched: usize = batches.iter().map(|batch| batch.len()).sum();
+            assert!(!batches.is_empty(), "{count} records: batches are paid");
+            assert_eq!(batches.concat(), content_addresses[..batched], "{count}");
+            assert!(
+                batches
+                    .iter()
+                    .all(|batch| !batch.contains(&envelope.address)),
+                "{count} records: the envelope is never in a batch"
+            );
+            assert_eq!(merkle_upload_split(count, count).per_chunk, remainder);
+
+            // Left after the batches, as storing them leaves the records.
+            let paid_in_batches: HashSet<[u8; 32]> = batches.concat().into_iter().collect();
+            let remaining: Vec<UploadRecord> = content
+                .iter()
+                .copied()
+                .filter(|record| !paid_in_batches.contains(&record.address))
+                .collect();
+            assert_eq!(remaining.len(), remainder, "{count}");
+
+            // The per-chunk waves: the remainder, then the envelope, in one
+            // final wave of at most 32 records.
+            let per_chunk = PerChunkWaves::new(&remaining, Some(envelope));
+            assert_eq!(per_chunk.last, Some(envelope.address));
+            assert_eq!(per_chunk.waves.len(), 1, "{count}");
+            let wave = addresses_of(&per_chunk.waves[0]);
+            let mut expected = addresses_of(&remaining);
+            expected.push(envelope.address);
+            assert_eq!(wave, expected, "{count} records");
+            if remainder == 0 {
+                assert_eq!(wave, vec![envelope.address], "{count}: the envelope alone");
+            }
+
+            // Stored last, after every content record.
+            let stored = stored_in_order(&batches, &per_chunk);
+            assert_eq!(stored.len(), count + 1, "{count}");
+            assert_eq!(stored.last(), Some(&envelope.address), "{count}");
+            let stored_content: HashSet<[u8; 32]> = stored[..count].iter().copied().collect();
+            let all_content: HashSet<[u8; 32]> = content_addresses.into_iter().collect();
+            assert_eq!(stored_content, all_content, "{count}");
+        }
+    }
+
+    /// With no batch paid (`Single`, or `Auto` falling back to per-chunk
+    /// payment when the nodes refuse batches), the waves are every record's,
+    /// 64 a wave, and the envelope joins the last one: 65 content records
+    /// pay 64, then the last one with the envelope.
+    #[test]
+    fn with_no_batch_the_envelope_joins_the_last_wave_of_64() {
+        let (content, envelope) = content_and_envelope(65);
+        let per_chunk = PerChunkWaves::new(&content, Some(envelope));
+        assert_eq!(
+            per_chunk.waves.iter().map(Vec::len).collect::<Vec<_>>(),
+            vec![super::super::batch::PAYMENT_WAVE_SIZE, 2]
+        );
+        assert_eq!(
+            addresses_of(&per_chunk.waves[1]),
+            vec![content[64].address, envelope.address]
+        );
+        let stored = stored_in_order(&[], &per_chunk);
+        assert_eq!(stored.last(), Some(&envelope.address));
+        assert_eq!(stored.len(), 66);
+    }
+
+    /// A wave's stores leave out the record held back, and a record with no
+    /// plan (already stored); with no `last`, nothing is held back. If any
+    /// other record failed to store, the held record is not sent.
+    #[test]
+    fn a_wave_holds_back_only_the_record_stored_last() {
+        let (content, envelope) = content_and_envelope(3);
+        let per_chunk = PerChunkWaves::new(&content, Some(envelope));
+        let plans = vec![
+            (content[0], Some("a")),
+            (content[1], None),
+            (envelope, Some("envelope")),
+            (content[2], Some("c")),
+        ];
+        let (to_store, held) = per_chunk.hold_back(plans);
+        assert_eq!(
+            to_store
+                .iter()
+                .map(|(record, plan)| (record.address, *plan))
+                .collect::<Vec<_>>(),
+            vec![(content[0].address, "a"), (content[2].address, "c")]
+        );
+        assert_eq!(
+            held.map(|(record, plan)| (record.address, plan)),
+            Some((envelope.address, "envelope"))
+        );
+
+        // A content record failed: the envelope is reported held back.
+        let mut failed = vec![(content[0].address, "timed out".to_string())];
+        assert!(release_last(held, |(record, _)| record.address, &mut failed).is_none());
+        assert_eq!(
+            failed.last(),
+            Some(&(envelope.address, HELD_BACK.to_string()))
+        );
+
+        // No record stored last: nothing held back.
+        let raw = PerChunkWaves::new(&content, None);
+        assert_eq!(raw.last, None);
+        let plans = content.iter().map(|record| (*record, Some(()))).collect();
+        let (to_store, held) = raw.hold_back(plans);
+        assert_eq!(to_store.len(), 3);
+        assert!(held.is_none());
     }
 }

@@ -9,7 +9,10 @@
 //! settle one; the arithmetic they checked against settlement is here: the
 //! split either side of the 256-leaf boundary, the leaves an estimate bills
 //! for the trees the upload engine builds, and the remainder an envelope is
-//! paid with after the batches.
+//! paid with after the batches. Where the engine puts the envelope after
+//! paid batches (in the final per-chunk wave, with that remainder, stored
+//! last) is unit-tested beside it, in `src/data/client/upload.rs`
+//! (`PerChunkWaves`): no end-to-end test reaches it on darwin-node.
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
@@ -166,10 +169,12 @@ fn an_estimate_bills_the_leaves_of_the_trees_the_upload_engine_builds() {
 
 /// From 33 content records the upload engine pays the first 32 in one merkle
 /// batch and leaves the last to be paid per chunk, the payment the envelope,
-/// never in a batch, is paid in (`e2e_envelope` shows it joining the last
-/// per-chunk payment on darwin-node). The batches always take the content in
+/// never in a batch, is paid in. The batches always take the content in
 /// order and leave fewer than `MERKLE_EXACT_MIN_BATCH` records, so the
-/// remainder and the envelope come to at most 32 records.
+/// remainder and the envelope come to at most 32 records. That the envelope
+/// joins that remainder's wave and is stored last is pinned in
+/// `src/data/client/upload.rs`'s unit tests (`PerChunkWaves`); darwin-node
+/// refuses the batch, so no end-to-end test gets past it.
 #[test]
 fn after_the_batches_the_remainder_left_for_the_envelope_is_under_32_records() {
     let content = addresses(33);

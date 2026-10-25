@@ -295,10 +295,13 @@ async fn setup_merkle_sized() -> (Client, MiniTestnet) {
 }
 
 /// From 33 content records the upload engine would pay a merkle batch of 32,
-/// then the last content record with the envelope per chunk (that split is
-/// pinned in `merkle_unit.rs`). darwin-node refuses the batch at quote time,
-/// so the payer is asked for nothing, neither the batch nor the per-chunk
-/// payment after it, and the envelope is never sent.
+/// then the last content record with the envelope per chunk. darwin-node
+/// refuses the batch at quote time, so the payer is asked for nothing,
+/// neither the batch nor the per-chunk payment after it, and the envelope is
+/// never sent. This test doesn't reach the envelope's per-chunk payment after
+/// a paid batch: the split is pinned in `merkle_unit.rs`, and the envelope's
+/// place after the batches (the final per-chunk wave, stored last) in
+/// `src/data/client/upload.rs`'s unit tests (`PerChunkWaves`).
 #[tokio::test(flavor = "multi_thread")]
 #[serial]
 async fn from_33_content_records_a_merkle_batch_is_refused_and_nothing_is_paid() {
