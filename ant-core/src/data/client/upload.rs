@@ -162,6 +162,14 @@ pub trait UploadAdapter: AdapterBounds {
     ) -> Result<()> {
         Ok(())
     }
+    /// Persist the marks that records are being paid again
+    /// ([`UploadState::mark_paid_again`]), their refused proofs still in
+    /// `state`, before those proofs are dropped and anything is paid. An
+    /// adapter whose other checkpoints are best effort must fail here when
+    /// the marks can't be saved, so the payment stops.
+    async fn checkpoint_paid_again(&self, state: &UploadState) -> Result<()> {
+        self.checkpoint(state, None).await
+    }
     /// Adapter resource ceiling; the adaptive controller still controls scheduling.
     fn quote_limit(&self) -> usize {
         usize::MAX
@@ -683,6 +691,12 @@ impl Client {
                 hex::encode(record.address)
             );
             state.mark_paid_again(record.address);
+        }
+        // The marks are saved first, the refused proofs still kept, so a
+        // crash before the proofs are dropped leaves them marked, never
+        // dropped unmarked; a mark that can't be saved stops the payment.
+        adapter.checkpoint_paid_again(state).await?;
+        for record in records {
             state.drop_proof(&record.address);
         }
         // Saved before anything is paid, so no later run pays again.
@@ -784,29 +798,29 @@ impl Client {
     ) -> HashSet<[u8; 32]> {
         let mut payable = HashSet::new();
         for (address, error) in refused {
-            let kept = match state.proof(&address) {
-                Some(proof) => self.kept_payment(proof).await,
-                None => KeptPayment::NotChecked,
-            };
-            if kept == KeptPayment::Unreadable {
-                tracing::warn!(
-                    "every storer refused the proof kept for {}, and its payment can't be \
-                     read from the chain; keeping the proof rather than paying again",
-                    hex::encode(address)
-                );
-                failed.push((
-                    address,
-                    format!(
-                        "{error}; the payment record couldn't be read, so the proof is kept \
-                         and the record not paid for again"
-                    ),
-                ));
-            } else {
-                tracing::info!(
-                    "the vault's record of the refused proof of {}: {kept:?}",
-                    hex::encode(address)
-                );
+            let Some(proof) = state.proof(&address) else {
+                // No kept proof to protect.
                 payable.insert(address);
+                continue;
+            };
+            let kept = self.kept_payment(proof).await;
+            match kept_proof_failure(kept, &error) {
+                Some(failure) => {
+                    tracing::warn!(
+                        "every storer refused the proof kept for {}, and its payment wasn't \
+                         read from the chain ({kept:?}); keeping the proof rather than paying \
+                         again",
+                        hex::encode(address)
+                    );
+                    failed.push((address, failure));
+                }
+                None => {
+                    tracing::info!(
+                        "the vault's record of the refused proof of {}: {kept:?}",
+                        hex::encode(address)
+                    );
+                    payable.insert(address);
+                }
             }
         }
         payable
@@ -1534,6 +1548,26 @@ pub(super) fn validate_payment_total(
     Ok(())
 }
 
+/// Why a record whose kept proof every storer refused (with `error`) is not
+/// paid again, given what the vault's record of its payment showed
+/// ([`Client::kept_payment`]): its record unread, whether no RPC answered or
+/// this client reads no records (a browser build, or no payment network).
+/// `None` when the record was read, and it is paid again.
+fn kept_proof_failure(kept: KeptPayment, error: &str) -> Option<String> {
+    match kept {
+        KeptPayment::Recorded | KeptPayment::NotRecorded => None,
+        KeptPayment::Unreadable => Some(format!(
+            "{error}; the payment record couldn't be read, so the proof is kept and the record \
+             not paid for again"
+        )),
+        KeptPayment::NotChecked => Some(format!(
+            "{error}; the payment record couldn't be checked, since this client reads no payment \
+             records (a browser build, or no payment network configured), so the proof is kept \
+             and the record not paid for again"
+        )),
+    }
+}
+
 /// Native wallet and in-memory byte source for the shared upload coordinator.
 pub(crate) struct MemoryUploadAdapter<'a> {
     pub client: &'a Client,
@@ -1653,6 +1687,29 @@ impl UploadAdapter for MemoryUploadAdapter<'_> {
         }
         #[cfg(not(feature = "native"))]
         let _ = (state, payment, self.resume_key);
+        Ok(())
+    }
+    /// The marks, in the cached receipt, or the error that stops the
+    /// payment: unlike the other checkpoints, never best effort.
+    async fn checkpoint_paid_again(&self, state: &UploadState) -> Result<()> {
+        #[cfg(feature = "native")]
+        if let Some(key) = self.resume_key {
+            super::cached_single::append_wave_marked(
+                key,
+                state.proofs().clone(),
+                state.paid_again(),
+                "0",
+                0,
+            )
+            .map_err(|e| {
+                Error::Payment(format!(
+                    "the mark that records are paid again couldn't be saved in the cached \
+                     receipt ({e}); nothing is paid again"
+                ))
+            })?;
+        }
+        #[cfg(not(feature = "native"))]
+        let _ = (state, self.resume_key);
         Ok(())
     }
     fn stored(&self, stored: usize, total: usize) {
@@ -2098,6 +2155,117 @@ mod tests {
             &mut fatal,
         );
         assert!(!state.was_paid_again(&paid_again));
+    }
+
+    /// A kept proof every storer refused is paid again only when the vault's
+    /// record of its payment was read; unread, whether no RPC answered or
+    /// this client reads none (a browser build, or no payment network), it
+    /// is kept and the record fails, each with its own reason.
+    #[test]
+    fn a_kept_proof_is_paid_again_only_when_its_record_was_read() {
+        assert!(kept_proof_failure(KeptPayment::Recorded, "refused").is_none());
+        assert!(kept_proof_failure(KeptPayment::NotRecorded, "refused").is_none());
+        let unreadable = kept_proof_failure(KeptPayment::Unreadable, "refused").unwrap();
+        let unchecked = kept_proof_failure(KeptPayment::NotChecked, "refused").unwrap();
+        assert!(unreadable.starts_with("refused; ") && unchecked.starts_with("refused; "));
+        assert!(unreadable.contains("couldn't be read"), "{unreadable}");
+        assert!(unchecked.contains("couldn't be checked"), "{unchecked}");
+        assert_ne!(unreadable, unchecked);
+    }
+
+    /// The marks that records are paid again are saved, their refused
+    /// proofs still kept, before the proofs are dropped or anything is
+    /// paid; a mark that can't be saved stops the payment, as does the
+    /// save after the proofs are dropped.
+    #[cfg(feature = "native")]
+    #[tokio::test]
+    async fn the_paid_again_mark_is_saved_before_the_proof_goes_or_anything_is_paid() {
+        use crate::data::client::upload_state::test_state::{plan, transactions};
+        use std::sync::Mutex;
+
+        /// Records what each save held (which save, marked, proof kept),
+        /// and fails the mark's if told to, and every other.
+        struct Saves {
+            fail_mark: bool,
+            saved: Mutex<Vec<(&'static str, bool, bool)>>,
+            address: [u8; 32],
+        }
+        impl Saves {
+            fn save(&self, kind: &'static str, state: &UploadState) {
+                self.saved.lock().unwrap().push((
+                    kind,
+                    state.was_paid_again(&self.address),
+                    state.proof(&self.address).is_some(),
+                ));
+            }
+        }
+        #[async_trait::async_trait]
+        impl UploadAdapter for Saves {
+            async fn load(&self, _: UploadRecord) -> Result<Bytes> {
+                Err(Error::InvalidData("no bytes".into()))
+            }
+            async fn pay(&self, _: &[ChunkPaymentPlan]) -> Result<UploadPayment> {
+                panic!("nothing may be paid")
+            }
+            async fn checkpoint(
+                &self,
+                state: &UploadState,
+                _: Option<&UploadPayment>,
+            ) -> Result<()> {
+                self.save("checkpoint", state);
+                Err(Error::InvalidData("disk full".into()))
+            }
+            async fn checkpoint_paid_again(&self, state: &UploadState) -> Result<()> {
+                self.save("mark", state);
+                if self.fail_mark {
+                    return Err(Error::InvalidData("disk full".into()));
+                }
+                Ok(())
+            }
+        }
+
+        let now = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000);
+        let refused = plan(b"refused", now);
+        let node = crate::data::Network::unstarted(&[], true, false)
+            .await
+            .unwrap();
+        let client = Client::from_node(std::sync::Arc::clone(node.node()), Default::default());
+        for (fail_mark, expected) in [
+            (true, vec![("mark", true, true)]),
+            (
+                false,
+                vec![("mark", true, true), ("checkpoint", true, false)],
+            ),
+        ] {
+            let mut state = UploadState::default();
+            state.prepare(refused.clone());
+            state
+                .confirm(&[refused.address], &transactions(&refused), now)
+                .unwrap();
+            let adapter = Saves {
+                fail_mark,
+                saved: Mutex::new(Vec::new()),
+                address: refused.address,
+            };
+            let record = UploadRecord {
+                address: refused.address,
+                size: refused.data_size,
+                index: 0,
+            };
+            let result = client
+                .pay_again(
+                    &[record],
+                    &mut state,
+                    &adapter,
+                    false,
+                    1,
+                    &mut UploadOutcome::default(),
+                    &mut Vec::new(),
+                )
+                .await;
+            assert!(result.is_err());
+            assert_eq!(*adapter.saved.lock().unwrap(), expected);
+        }
     }
 
     /// The mark that a record was paid again is saved with the checkpoint

@@ -566,7 +566,6 @@ pub(crate) fn write_wave_file(journal: &WaveSigned) -> Result<()> {
         .parent()
         .ok_or_else(|| Error::Config("missing waves directory".into()))?;
     std::fs::create_dir_all(directory)?;
-    super::upload_checkpoint::remove_old_wave_files(directory);
     let bytes = serde_json::to_vec(journal).map_err(|e| Error::Serialization(e.to_string()))?;
     let mut file = tempfile::NamedTempFile::new_in(directory)?;
     file.write_all(&bytes)?;
@@ -720,6 +719,33 @@ mod tests {
         remove_wave_file(&journal.wave);
         assert!(read_wave_file(&journal.wave).unwrap().is_none());
         assert!(read_wave_file("../escape").is_err());
+    }
+
+    /// A wave's file is never removed by age: one untouched for a year is
+    /// still there after another wave writes its own. A member's checkpoint
+    /// that names the wave is kept while its payment is pending, and the
+    /// file may be its only record of what the wave signed.
+    #[test]
+    fn a_waves_file_is_never_removed_by_age() {
+        let journal = |byte: u8| WaveSigned {
+            wave: hex::encode(rand::random::<[u8; 32]>()),
+            transaction: signed(&[byte]),
+            quotes: vec![quote(byte, 30)],
+        };
+        let old = journal(1);
+        write_wave_file(&old).unwrap();
+        let long_ago = std::time::SystemTime::now() - Duration::from_secs(365 * 24 * 60 * 60);
+        std::fs::File::options()
+            .write(true)
+            .open(wave_path(&old.wave).unwrap())
+            .unwrap()
+            .set_modified(long_ago)
+            .unwrap();
+        let new = journal(2);
+        write_wave_file(&new).unwrap();
+        assert!(read_wave_file(&old.wave).unwrap().is_some());
+        remove_wave_file(&old.wave);
+        remove_wave_file(&new.wave);
     }
 
     /// Two uploads in progress share one wave: its leader closes it once

@@ -69,7 +69,10 @@ proof (its 32-byte address, a 4-byte little-endian length, the proof, and the
 first 8 bytes of a BLAKE3 hash of the three; a length of 0 forgets the
 address's proof), appended once each rather than rewritten at every step. A
 torn last record is left out on reading and cut off before the next append.
-`upload_checkpoint_files` lists a checkpoint's files (`.msgpack`, `.proofs`,
+The `.msgpack` records the proof file's length at each save; a checkpoint
+whose proof file is missing, or shorter in whole records than that, is
+refused with an error that names it and says to keep it, rather than opened
+to pay for those records again. `upload_checkpoint_files` lists a checkpoint's files (`.msgpack`, `.proofs`,
 `.salt`, `.lock`), for servers that remove what ended uploads leave. The
 browser's checkpoint is the same format, with its file/payment-network scope
 inside, handed to `on_checkpoint` as text: its bytes as standard base64, a
@@ -104,11 +107,14 @@ is full, or holds every upload the client has in progress, or 500 ms have
 passed since it opened. Each member's journal names the wave before anything
 is signed for it, and saves the signed transaction before it is sent; the
 transaction is also written whole to `payments/waves/<id>.json` until every
-member has saved it; a wave's file left there, by a member stopped before
-that and never resumed, is removed once untouched for 30 days, as unresumed
-checkpoints are. No member is quoted again before the wave ends: a resume
-reconciles the wave's transaction from that file, else from the member's own
-copy, and a member left out of the wave starts afresh. Each member's payment
+member has saved it, and never removed by age, since a member's checkpoint
+that names the wave is kept while its payment is pending. No member is quoted
+again before the wave ends: a resume reconciles the wave's transaction from
+that file, else from the member's own copy, and a member left out of the wave
+starts afresh. A member whose journal names a wave whose file is gone first
+reads its quotes back from the vault: if any is recorded as paid, or the
+vault can't be read, its journal is kept and the upload fails rather than pay
+again. Each member's payment
 record, proofs and reported cost show only its own quotes and its share of
 the gas. Waves are per client process: for higher rates, run one wallet per
 worker, as the gateway's agents each pay from their own.

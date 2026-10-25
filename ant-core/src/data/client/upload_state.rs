@@ -168,6 +168,11 @@ struct BodyOut<'a> {
     failed_payments: &'a [FailedPaymentAttempt],
     #[serde(skip_serializing_if = "no_address")]
     paid_again: &'a HashSet<XorName>,
+    /// A native file's proof file's length, up to its last whole record,
+    /// when this was written: a proof file found missing or shorter when
+    /// the checkpoint is opened lost proofs, and the checkpoint is refused.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    proofs_len: Option<u64>,
 }
 
 fn no_address(addresses: &&HashSet<XorName>) -> bool {
@@ -191,6 +196,8 @@ struct BodyIn {
     failed_payments: Vec<FailedPaymentAttempt>,
     #[serde(default)]
     paid_again: HashSet<XorName>,
+    #[serde(default)]
+    proofs_len: Option<u64>,
 }
 
 /// A checkpoint as read, before it is checked ([`UploadState::validated`]).
@@ -205,6 +212,11 @@ pub(crate) struct Parsed {
     pub(crate) scope: Option<String>,
     /// Whether it was in the format before [`CHECKPOINT_MAGIC`].
     pub(crate) legacy: bool,
+    /// How long a native file's proof file was, up to its last whole
+    /// record, when the checkpoint was written; `None` if unrecorded (a
+    /// browser snapshot, or a file written before the length was).
+    #[cfg_attr(not(feature = "native"), allow(dead_code))]
+    pub(crate) proofs_len: Option<u64>,
 }
 
 /// The bytes of a browser snapshot given as text: base64 (what
@@ -665,7 +677,7 @@ impl UploadState {
     /// Serialize a local recovery checkpoint, proofs included. Treat it like
     /// a native payment receipt.
     pub fn checkpoint(&self) -> Result<Vec<u8>> {
-        self.encode(None, true)
+        self.encode(None, true, None)
     }
 
     /// A browser's snapshot: the whole checkpoint, with `scope` (its file
@@ -673,7 +685,7 @@ impl UploadState {
     /// [`MAX_BROWSER_SNAPSHOT_BYTES`].
     #[cfg(any(test, all(target_arch = "wasm32", feature = "browser-wasm")))]
     pub(crate) fn snapshot(&self, scope: &str) -> Result<Vec<u8>> {
-        let bytes = self.encode(Some(scope), true)?;
+        let bytes = self.encode(Some(scope), true, None)?;
         if bytes.len() > MAX_BROWSER_SNAPSHOT_BYTES {
             return Err(Error::InvalidData("upload checkpoint too large".into()));
         }
@@ -749,13 +761,19 @@ impl UploadState {
     }
 
     /// The checkpoint without its proofs, which a native file keeps apart,
-    /// one appended at a time (`upload_checkpoint`).
+    /// one appended at a time (`upload_checkpoint`), with the proof file's
+    /// length up to its last whole record (`proofs_len`).
     #[cfg(feature = "native")]
-    pub(crate) fn checkpoint_without_proofs(&self) -> Result<Vec<u8>> {
-        self.encode(None, false)
+    pub(crate) fn checkpoint_without_proofs(&self, proofs_len: u64) -> Result<Vec<u8>> {
+        self.encode(None, false, Some(proofs_len))
     }
 
-    fn encode(&self, scope: Option<&str>, with_proofs: bool) -> Result<Vec<u8>> {
+    fn encode(
+        &self,
+        scope: Option<&str>,
+        with_proofs: bool,
+        proofs_len: Option<u64>,
+    ) -> Result<Vec<u8>> {
         let body = BodyOut {
             scope,
             plans: &self.plans,
@@ -771,6 +789,7 @@ impl UploadState {
             pending_payment: &self.pending_payment,
             failed_payments: &self.failed_payments,
             paid_again: &self.paid_again,
+            proofs_len,
         };
         let mut bytes = Vec::with_capacity(5);
         bytes.extend_from_slice(&CHECKPOINT_MAGIC);
@@ -796,6 +815,7 @@ impl UploadState {
                 state,
                 scope: None,
                 legacy: true,
+                proofs_len: None,
             });
         };
         let (&format, body) = rest
@@ -827,6 +847,7 @@ impl UploadState {
             state,
             scope: body.scope,
             legacy: false,
+            proofs_len: body.proofs_len,
         })
     }
 

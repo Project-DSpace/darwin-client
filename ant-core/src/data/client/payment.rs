@@ -72,7 +72,9 @@ impl PaidRecord {
     /// an earlier attempt paid ([`Self::reused`]): forget the proof, so the
     /// next payment for the record pays again rather than reuse it, and
     /// mark the record paid again ([`Self::paid_again`]). The mark is saved
-    /// before anything is paid, so no later attempt pays a third time.
+    /// before anything is paid, so no later attempt pays a third time: first
+    /// with the refused proof still kept, so a crash before the proof is
+    /// forgotten leaves it marked, never forgotten unmarked.
     ///
     /// # Errors
     ///
@@ -80,6 +82,12 @@ impl PaidRecord {
     pub(crate) fn refused(self) -> Result<()> {
         let mut state = UploadState::default();
         state.mark_paid_again(self.address);
+        state.add_parsed_proofs(std::collections::HashMap::from([(
+            self.address,
+            self.proof.clone(),
+        )]));
+        self.checkpoint.save(&state)?;
+        state.drop_proof(&self.address);
         self.checkpoint.save(&state)
     }
 

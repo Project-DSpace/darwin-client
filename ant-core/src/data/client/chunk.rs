@@ -640,11 +640,14 @@ impl Client {
                     // Every storer refused the proof an earlier attempt
                     // paid: pay once more, at once, rather than stall; but
                     // never a second time, and never while the payment
-                    // can't be read from the chain (the proof is kept).
+                    // can't be read, or isn't, from the chain (the proof
+                    // is kept).
                     Err(error) if paid.reused && !paid.paid_again && proof_refused(&error) => {
-                        if self.kept_payment(&paid.proof).await
-                            == crate::data::client::occupied::KeptPayment::Unreadable
-                        {
+                        use crate::data::client::occupied::KeptPayment;
+                        if matches!(
+                            self.kept_payment(&paid.proof).await,
+                            KeptPayment::Unreadable | KeptPayment::NotChecked
+                        ) {
                             warn!(
                                 "every storer refused the proof kept for chunk {}, and its \
                                  payment can't be read from the chain; keeping the proof \

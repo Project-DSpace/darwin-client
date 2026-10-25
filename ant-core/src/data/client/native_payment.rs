@@ -421,6 +421,13 @@ async fn finish_wave<A: UploadAdapter>(
 /// nothing was signed for the attempt ([`super::shared_wave::wave_payment`]),
 /// it starts afresh (`None`), its journal back to preparing. Returns the
 /// receipt and how many quotes the wave paid.
+///
+/// The wave's file is the only record of a later round the attempt didn't
+/// save. So when it is gone, and the attempt would start afresh, or its own
+/// copy ended reverted or replaced, the vault's records of its quotes are
+/// read first ([`wave_quotes_unpaid`]): if any is recorded as paid, or they
+/// can't be read, the journal is kept and the payment fails, never paid
+/// again.
 async fn reconcile_wave<A: UploadAdapter, F: Fn(&UploadState) -> bool + Send + Sync>(
     client: &Client,
     adapter: &A,
@@ -433,7 +440,11 @@ async fn reconcile_wave<A: UploadAdapter, F: Fn(&UploadState) -> bool + Send + S
     let wallet = client.require_wallet()?;
     let _wallet_lock = wallet.lock().await;
     let file = super::shared_wave::read_wave_file(wave)?;
+    let file_gone = file.is_none();
     let Some(signed) = super::shared_wave::wave_payment(file, own, quotes)? else {
+        if file_gone {
+            wave_quotes_unpaid(client, wave, quotes).await?;
+        }
         if let Some(attempt) = &mut state.pending_payment {
             initialize(attempt);
         }
@@ -445,8 +456,39 @@ async fn reconcile_wave<A: UploadAdapter, F: Fn(&UploadState) -> bool + Send + S
         fresh(state)
     })
     .await;
+    if file_gone && matches!(settled, Settled::Reverted | Settled::Replaced(_)) {
+        // The attempt's own copy may be of an earlier round than the one
+        // the wave sent.
+        wave_quotes_unpaid(client, wave, quotes).await?;
+    }
     let receipt = finish(adapter, state, settled).await?;
     Ok(Some((receipt, signed.quotes.len())))
+}
+
+/// Check, before a shared wave's member whose wave's file is gone is paid
+/// afresh, that the vault records none of its `quotes` as paid
+/// ([`Client::quotes_recorded`]).
+///
+/// # Errors
+///
+/// If any is recorded as paid, or they can't be read: the journal is kept,
+/// and the error says not to delete the checkpoint.
+async fn wave_quotes_unpaid(client: &Client, wave: &str, quotes: &[QuoteTuple]) -> Result<()> {
+    use super::occupied::KeptPayment;
+    match client.quotes_recorded(quotes).await {
+        KeptPayment::NotRecorded => Ok(()),
+        KeptPayment::Recorded => Err(Error::Payment(format!(
+            "the shared wave {wave}'s file is gone and the vault records this payment's quotes \
+             as paid, so its transaction can't be reconciled from this checkpoint; its journal \
+             is kept, and nothing is paid again. Don't delete the upload's checkpoint: it holds \
+             a payment that was made"
+        ))),
+        KeptPayment::Unreadable | KeptPayment::NotChecked => Err(Error::Payment(format!(
+            "the shared wave {wave}'s file is gone and the vault's records of this payment's \
+             quotes couldn't be read; its journal is kept, and a retry reads them again rather \
+             than pay twice. Don't delete the upload's checkpoint"
+        ))),
+    }
 }
 
 pub(super) async fn pay_merkle<A: UploadAdapter>(
@@ -882,6 +924,114 @@ mod tests {
 
         let (_, state) = open().await.unwrap();
         assert!(state.pending_payment.is_none() && state.proof(&address).is_none());
+    }
+
+    /// An adapter that keeps nothing, counts its checkpoints, and pays
+    /// nothing.
+    #[derive(Default)]
+    struct Counting(std::sync::atomic::AtomicUsize);
+
+    #[async_trait::async_trait]
+    impl UploadAdapter for Counting {
+        async fn load(&self, _: UploadRecord) -> Result<bytes::Bytes> {
+            Err(Error::InvalidData("no bytes".into()))
+        }
+        async fn pay(&self, _: &[ChunkPaymentPlan]) -> Result<UploadPayment> {
+            panic!("nothing may be paid")
+        }
+        async fn checkpoint(&self, _: &UploadState, _: Option<&UploadPayment>) -> Result<()> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(())
+        }
+    }
+
+    /// A member whose journal names only its shared wave, the wave's file
+    /// gone (as an aged one once was removed), is never paid afresh while
+    /// the vault records its quotes as paid, or can't be read: its journal
+    /// is kept and nothing is signed or sent. Only when none is recorded
+    /// does it start afresh.
+    #[tokio::test]
+    async fn a_member_whose_waves_file_is_gone_never_pays_again() {
+        use crate::data::client::listings::test_chain::{serve, MockChain, VAULT};
+        use ant_protocol::evm::CustomNetwork;
+        use std::sync::{Arc, Mutex};
+
+        let address = [6u8; 32];
+        // Quoted long ago: a member that starts afresh finds its quotes
+        // expired before it joins a wave, so nothing is signed for it.
+        let plan = signed_plan(
+            address,
+            1024,
+            std::time::UNIX_EPOCH + Duration::from_secs(1_000_000),
+        );
+        let quote = plan
+            .payment
+            .quotes
+            .iter()
+            .find(|quote| !quote.amount.is_zero())
+            .unwrap()
+            .clone();
+        let mut prefix = [0u8; 16];
+        prefix.copy_from_slice(&quote.rewards_address.as_slice()[..16]);
+        let paid = (quote.quote_hash.0, (prefix, quote.amount.to::<u128>()));
+        let wave = hex::encode(rand::random::<[u8; 32]>());
+        // (the vault's records, whether it refuses reads, whether the
+        // journal is kept)
+        for (records, refused, kept) in [
+            (vec![paid], false, true),
+            (Vec::new(), true, true),
+            (Vec::new(), false, false),
+        ] {
+            let chain = MockChain {
+                vault_records: records.into_iter().collect(),
+                refused: if refused {
+                    vec!["eth_call"]
+                } else {
+                    Vec::new()
+                },
+                ..MockChain::default()
+            };
+            let chain = Arc::new(Mutex::new(chain));
+            let url = serve(Arc::clone(&chain)).await;
+            let node = crate::data::Network::unstarted(&[], true, false)
+                .await
+                .unwrap();
+            let client = Client::from_node(Arc::clone(node.node()), Default::default())
+                .with_wallet(Wallet::new_with_random_wallet(Network::Custom(
+                    CustomNetwork {
+                        rpc_url_http: url.parse().unwrap(),
+                        payment_token_address: [0x11; 20].into(),
+                        payment_vault_address: VAULT.into(),
+                    },
+                )));
+            let mut state = UploadState::default();
+            state.prepare(plan.clone());
+            state.start_payment(false, vec![address]).unwrap();
+            set_journal(&mut state, &Journal::Wave(wave.clone())).unwrap();
+            let adapter = Counting::default();
+            let error = pay_shared(&client, &adapter, std::slice::from_ref(&plan), &mut state)
+                .await
+                .unwrap_err()
+                .to_string();
+            let calls = chain.lock().unwrap().calls.clone();
+            assert!(
+                !calls.iter().any(|method| method.starts_with("eth_send")
+                    || method == "eth_getTransactionCount"
+                    || method == "eth_estimateGas"),
+                "{calls:?}"
+            );
+            if kept {
+                assert!(error.contains("Don't delete"), "{error}");
+                assert!(
+                    matches!(journal_of(&state).unwrap(), Journal::Wave(ref id) if *id == wave),
+                    "the journal is kept"
+                );
+                assert_eq!(adapter.0.load(std::sync::atomic::Ordering::Relaxed), 0);
+            } else {
+                assert!(error.contains("expired"), "{error}");
+                assert!(state.pending_payment.is_none());
+            }
+        }
     }
 
     /// A second attempt at the same record waits for the first to let go of

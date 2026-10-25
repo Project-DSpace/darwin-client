@@ -20,7 +20,13 @@
 //!   off before the next record is appended. A record that fails its check
 //!   with more after it, or whose length is past the longest proof, is
 //!   damage: the file is refused, and kept. A proof file found shorter than
-//!   its records as last written is written anew;
+//!   its records as last written is written anew. The main file records the
+//!   proof file's length, up to its last whole record, at each save (after
+//!   the proofs are appended, so a crash between the two leaves the proof
+//!   file longer, which is read). A checkpoint whose proof file is missing,
+//!   or holds fewer whole records' bytes than that, lost proofs: it is
+//!   refused, not opened to quote and pay those records again. A main file
+//!   that records no length (written before it was) is read unchecked;
 //! - `<stem>.salt`, a private upload's envelope salt;
 //! - `<stem>.lock`, held while the checkpoint is in use.
 //!
@@ -148,6 +154,24 @@ impl UploadCheckpointFiles {
         }
         let mut state = parsed.state;
         let (proofs, length) = read_proofs(&self.proofs_path())?;
+        if let Some(expected) = parsed.proofs_len {
+            match length {
+                None => {
+                    return Err(Error::InvalidData(format!(
+                        "its proof file {} is missing",
+                        self.proofs_path().display()
+                    )))
+                }
+                Some(length) if length < expected => {
+                    return Err(Error::InvalidData(format!(
+                        "its proof file {} holds {length} bytes of whole records, fewer than \
+                         the {expected} it held when the checkpoint was saved",
+                        self.proofs_path().display()
+                    )))
+                }
+                Some(_) => {}
+            }
+        }
         state.add_parsed_proofs(proofs);
         let state = state.validated()?;
         let mut written = self.lock_written();
@@ -178,7 +202,7 @@ impl UploadCheckpointFiles {
     }
 
     /// Save `state`: the proofs it has that the proof file doesn't, then
-    /// the rest, whole or not at all.
+    /// the rest, whole or not at all, with the proof file's length.
     ///
     /// # Errors
     ///
@@ -189,7 +213,7 @@ impl UploadCheckpointFiles {
             .parent()
             .ok_or_else(|| Error::Config("missing checkpoint directory".into()))?;
         std::fs::create_dir_all(directory)?;
-        {
+        let proofs_len = {
             let mut written = self.lock_written();
             if let Some(length) = written.length {
                 // A proof file shorter than its records as last written
@@ -260,8 +284,9 @@ impl UploadCheckpointFiles {
                     }
                 }
             }
-        }
-        write_whole(&self.path, &state.checkpoint_without_proofs()?)
+            written.length.unwrap_or_default()
+        };
+        write_whole(&self.path, &state.checkpoint_without_proofs(proofs_len)?)
     }
 
     /// Remove the checkpoint and its proofs, once its records are stored:
@@ -415,53 +440,6 @@ fn sweep_due(directory: &Path) -> bool {
     }
     swept.insert(directory.to_path_buf(), now);
     true
-}
-
-/// Remove the shared waves' files (`payments/waves/<id>.json`) in
-/// `directory` untouched for [`UNRESUMED_PROOFS_BACKSTOP`]. A wave's file
-/// goes once every member has saved its transaction; one whose leader or
-/// member stopped before that, and whose upload is never resumed, would
-/// otherwise stay for good. Any checkpoint that names such a wave is itself
-/// at or past the same backstop by then. A process does this for a
-/// directory at most once every [`UNRESUMED_SWEEP_INTERVAL`]. Returns how
-/// many files were removed.
-pub(crate) fn remove_old_wave_files(directory: &Path) -> usize {
-    if !sweep_due(directory) {
-        return 0;
-    }
-    remove_wave_files_before(directory, SystemTime::now() - UNRESUMED_PROOFS_BACKSTOP)
-}
-
-/// [`remove_old_wave_files`], for files last written before `before`.
-pub(crate) fn remove_wave_files_before(directory: &Path, before: SystemTime) -> usize {
-    let Ok(entries) = std::fs::read_dir(directory) else {
-        return 0;
-    };
-    let mut removed = 0;
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let is_wave = path.extension().is_some_and(|e| e == "json")
-            && path.file_stem().is_some_and(|stem| {
-                let stem = stem.to_string_lossy();
-                stem.len() == 64 && stem.bytes().all(|b| b.is_ascii_hexdigit())
-            });
-        let old = std::fs::metadata(&path)
-            .and_then(|metadata| metadata.modified())
-            .is_ok_and(|at| at < before);
-        if !is_wave || !old {
-            continue;
-        }
-        info!(
-            "Removing the shared wave's file {}, untouched for {} days",
-            path.display(),
-            UNRESUMED_PROOFS_BACKSTOP.as_secs() / 86_400
-        );
-        match std::fs::remove_file(&path) {
-            Ok(()) => removed += 1,
-            Err(error) => warn!("Could not remove {}: {error}", path.display()),
-        }
-    }
-    removed
 }
 
 /// [`remove_unresumed`], for checkpoints last written before `before`.
@@ -731,6 +709,74 @@ mod tests {
         assert_eq!(restored.unwrap().proof_addresses(), state.proof_addresses());
     }
 
+    /// A checkpoint whose proof file is missing, or cut at a record's end
+    /// short of its length as last saved, lost proofs: it is refused, and
+    /// kept, never opened to quote and pay those records again. One whose
+    /// proof file is longer (a torn tail, or records appended before a
+    /// crash kept the main file from being written) opens, as does one
+    /// that records no length (written before it was).
+    #[test]
+    fn a_proof_file_missing_or_cut_short_refuses_the_checkpoint() {
+        let dir = tempfile::tempdir().unwrap();
+        let (files, _) = UploadCheckpointFiles::open(checkpoint_in(dir.path())).unwrap();
+        let mut state = state_with(&[b"one"], None);
+        files.save(&state).unwrap();
+        let first = std::fs::read(files.proofs_path()).unwrap();
+        let p = plan(b"two", now());
+        state.prepare(p.clone());
+        state
+            .confirm(&[p.address], &transactions(&p), now())
+            .unwrap();
+        files.save(&state).unwrap();
+        let whole = std::fs::read(files.proofs_path()).unwrap();
+        let main = std::fs::read(files.path()).unwrap();
+        drop(files);
+
+        // Cut at the end of its first record.
+        std::fs::write(
+            checkpoint_in(dir.path()).with_extension(PROOFS_EXTENSION),
+            &first,
+        )
+        .unwrap();
+        let error = UploadCheckpointFiles::open(checkpoint_in(dir.path()))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("fewer than"), "{error}");
+        assert!(error.contains("Don't delete it"), "{error}");
+        assert_eq!(std::fs::read(checkpoint_in(dir.path())).unwrap(), main);
+
+        // Missing.
+        std::fs::remove_file(checkpoint_in(dir.path()).with_extension(PROOFS_EXTENSION)).unwrap();
+        let error = UploadCheckpointFiles::open(checkpoint_in(dir.path()))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("is missing"), "{error}");
+        assert!(error.contains("Don't delete it"), "{error}");
+        assert_eq!(std::fs::read(checkpoint_in(dir.path())).unwrap(), main);
+
+        // Longer, by a torn record.
+        let mut longer = whole;
+        longer.extend_from_slice(&a_record()[..50]);
+        std::fs::write(
+            checkpoint_in(dir.path()).with_extension(PROOFS_EXTENSION),
+            &longer,
+        )
+        .unwrap();
+        let (_, restored) = UploadCheckpointFiles::open(checkpoint_in(dir.path())).unwrap();
+        assert_eq!(restored.unwrap().proof_addresses(), state.proof_addresses());
+
+        // A main file that records no length opens with its proof file
+        // missing.
+        let unrecorded = dir.path().join(format!("{}.msgpack", "cd".repeat(32)));
+        std::fs::write(
+            &unrecorded,
+            state_with(&[], Some(b"x")).checkpoint().unwrap(),
+        )
+        .unwrap();
+        let (_, restored) = UploadCheckpointFiles::open(unrecorded).unwrap();
+        assert!(restored.unwrap().pending_payment.is_some());
+    }
+
     /// A checkpoint in the format before the magic, native, is read and
     /// migrated: its proofs go to a proof file, and the new checkpoint
     /// replaces the old one. A crash before that rename leaves the old file,
@@ -834,24 +880,6 @@ mod tests {
         assert!(!old_paid.exists() && !old_paid.with_extension(PROOFS_EXTENSION).exists());
         assert!(old_pending.exists() && old_pending.with_extension(PROOFS_EXTENSION).exists());
         assert!(in_use.exists() && unreadable.exists());
-    }
-
-    /// The backstop removes shared waves' files untouched for 30 days, and
-    /// nothing else in their directory.
-    #[test]
-    fn the_backstop_removes_old_wave_files() {
-        let dir = tempfile::tempdir().unwrap();
-        let wave = dir.path().join(format!("{}.json", "a".repeat(64)));
-        let other = dir.path().join("notes.json");
-        std::fs::write(&wave, b"{}").unwrap();
-        std::fs::write(&other, b"{}").unwrap();
-        // Nothing is old enough yet.
-        assert_eq!(remove_old_wave_files(dir.path()), 0);
-        assert!(wave.exists());
-        let later = SystemTime::now() + Duration::from_secs(60);
-        assert_eq!(remove_wave_files_before(dir.path(), later), 1);
-        assert!(!wave.exists());
-        assert!(other.exists());
     }
 
     /// The files of a checkpoint, as a server removing ended uploads lists

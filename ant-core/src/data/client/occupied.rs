@@ -331,10 +331,6 @@ impl Client {
     /// up to 3 times 2 seconds apart while no RPC answers.
     #[cfg(feature = "native")]
     pub(crate) async fn kept_payment(&self, proof: &[u8]) -> KeptPayment {
-        /// Reads while no RPC answers, and the pause between them.
-        const READS: usize = 3;
-        const PAUSE: std::time::Duration = std::time::Duration::from_secs(2);
-
         let Some(network) = self.evm_network.as_ref() else {
             return KeptPayment::NotChecked;
         };
@@ -348,26 +344,47 @@ impl Client {
                 return KeptPayment::Unreadable;
             }
         };
-        for read in 0..READS {
-            if read > 0 {
-                crate::runtime::sleep(PAUSE).await;
-            }
-            match chain.completed_payment(&hash).await {
-                Ok(record) => {
-                    return if !record.amount.is_zero()
-                        && record.rewards_prefix[..] == rewards.as_slice()[..16]
-                    {
-                        KeptPayment::Recorded
-                    } else {
-                        KeptPayment::NotRecorded
-                    };
-                }
-                Err(error) => {
-                    tracing::debug!("reading the vault record of {hash:#x} failed: {error}");
-                }
-            }
+        match read_record(&chain, &hash).await {
+            Some(record) if records_payment_to(&record, &rewards) => KeptPayment::Recorded,
+            Some(_) => KeptPayment::NotRecorded,
+            None => KeptPayment::Unreadable,
         }
-        KeptPayment::Unreadable
+    }
+
+    /// Read back the vault's record of each of `quotes`, a shared wave
+    /// member's, whose wave's file is gone, before the member is taken to
+    /// have had nothing signed for it and pays afresh: `Recorded` if any is
+    /// recorded as a payment to its rewards address, `NotRecorded` if every
+    /// one was read and none is, else `Unreadable` (or `NotChecked`, with no
+    /// EVM network). Each read as [`Self::kept_payment`] reads.
+    #[cfg(feature = "native")]
+    pub(crate) async fn quotes_recorded(
+        &self,
+        quotes: &[(QuoteHash, RewardsAddress, Amount)],
+    ) -> KeptPayment {
+        let Some(network) = self.evm_network.as_ref() else {
+            return KeptPayment::NotChecked;
+        };
+        let chain = match read_back_chain(network) {
+            Ok(chain) => chain,
+            Err(error) => {
+                tracing::warn!("cannot read the shared wave's payment records ({error})");
+                return KeptPayment::Unreadable;
+            }
+        };
+        let records = futures::future::join_all(
+            quotes
+                .iter()
+                .map(|(hash, rewards, _)| records_payment_of(&chain, hash, rewards)),
+        )
+        .await;
+        if records.contains(&Some(true)) {
+            KeptPayment::Recorded
+        } else if records.contains(&None) {
+            KeptPayment::Unreadable
+        } else {
+            KeptPayment::NotRecorded
+        }
     }
 
     /// Browser builds read no records back: the wallet callback owns the RPC.
@@ -375,6 +392,48 @@ impl Client {
     pub(crate) async fn kept_payment(&self, _proof: &[u8]) -> KeptPayment {
         KeptPayment::NotChecked
     }
+}
+
+/// The vault's record of `hash`, read up to 3 times 2 seconds apart while
+/// no RPC answers; `None` if none did.
+#[cfg(feature = "native")]
+async fn read_record(chain: &ListingChain, hash: &QuoteHash) -> Option<VaultRecord> {
+    /// Reads while no RPC answers, and the pause between them.
+    const READS: usize = 3;
+    const PAUSE: std::time::Duration = std::time::Duration::from_secs(2);
+
+    for read in 0..READS {
+        if read > 0 {
+            crate::runtime::sleep(PAUSE).await;
+        }
+        match chain.completed_payment(hash).await {
+            Ok(record) => return Some(record),
+            Err(error) => {
+                tracing::debug!("reading the vault record of {hash:#x} failed: {error}");
+            }
+        }
+    }
+    None
+}
+
+/// Whether the vault's record of `hash` is a payment to `rewards`
+/// ([`read_record`], [`records_payment_to`]); `None` if it couldn't be read.
+#[cfg(feature = "native")]
+async fn records_payment_of(
+    chain: &ListingChain,
+    hash: &QuoteHash,
+    rewards: &RewardsAddress,
+) -> Option<bool> {
+    read_record(chain, hash)
+        .await
+        .map(|record| records_payment_to(&record, rewards))
+}
+
+/// Whether `record` is a payment to `rewards`: not empty, and to the first
+/// 16 bytes of that address, as the vault records it.
+#[cfg(feature = "native")]
+fn records_payment_to(record: &VaultRecord, rewards: &RewardsAddress) -> bool {
+    !record.amount.is_zero() && record.rewards_prefix[..] == rewards.as_slice()[..16]
 }
 
 /// What the vault holds for the payment a kept proof carries
@@ -388,7 +447,9 @@ pub(crate) enum KeptPayment {
     NotRecorded,
     /// No RPC answered: the record is not paid again, and its proof is kept.
     Unreadable,
-    /// Not read: a browser build, or a client with no EVM network.
+    /// Not read: a browser build, a client with no EVM network, or a proof
+    /// that names no single paid quote. A kept proof is treated as when the
+    /// record is unreadable: kept, and the record not paid again.
     NotChecked,
 }
 
