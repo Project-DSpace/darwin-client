@@ -97,7 +97,7 @@ sysinfo = { version = "0.32", default-features = false, features = ["system"], o
 # as the `ant-protocol` pin above — a version skew pulls a second copy of
 # `saorsa-core` into the graph and makes `ant_node`'s and `ant_protocol`'s
 # `MultiAddr` mutually incompatible in `node/devnet.rs`.
-ant-node = { git = "https://github.com/Project-DSpace/darwin-node.git", rev = "94bf3425e31f77e150bc98306d02705fc33b1037", optional = true }
+ant-node = { git = "https://github.com/Project-DSpace/darwin-node.git", rev = "aa45ab9b3db1aacd70ff89fceafa0eceda4ba000", optional = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = true }
 
 # Browser bindings are optional so ordinary native consumers do not pull the
@@ -194,7 +194,7 @@ test-utils = ["dep:fips204"]
 # (separate from the optional runtime dep above) so tests always compile even
 # without the `devnet` feature. Pinned to the same revision as the runtime dep
 # so there is a single ant-node / saorsa-core version across the whole graph.
-ant-node = { git = "https://github.com/Project-DSpace/darwin-node.git", rev = "94bf3425e31f77e150bc98306d02705fc33b1037", features = ["test-utils"] }
+ant-node = { git = "https://github.com/Project-DSpace/darwin-node.git", rev = "aa45ab9b3db1aacd70ff89fceafa0eceda4ba000", features = ["test-utils"] }
 serial_test = "3"
 anyhow = "1"
 alloy = { version = "1.6", features = ["node-bindings"] }

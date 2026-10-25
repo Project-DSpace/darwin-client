@@ -935,7 +935,7 @@ dependencies = [
 [[package]]
 name = "ant-listings"
 version = "0.3.1"
-source = "git+https://github.com/Project-DSpace/darwin-node.git?rev=94bf3425e31f77e150bc98306d02705fc33b1037#94bf3425e31f77e150bc98306d02705fc33b1037"
+source = "git+https://github.com/Project-DSpace/darwin-node.git?rev=aa45ab9b3db1aacd70ff89fceafa0eceda4ba000#aa45ab9b3db1aacd70ff89fceafa0eceda4ba000"
 dependencies = [
  "ant-protocol",
  "postcard",
@@ -957,9 +957,9 @@ dependencies = [
 [[package]]
 name = "ant-node"
 version = "0.23.0+ds.15"
-source = "git+https://github.com/Project-DSpace/darwin-node.git?rev=94bf3425e31f77e150bc98306d02705fc33b1037#94bf3425e31f77e150bc98306d02705fc33b1037"
+source = "git+https://github.com/Project-DSpace/darwin-node.git?rev=aa45ab9b3db1aacd70ff89fceafa0eceda4ba000#aa45ab9b3db1aacd70ff89fceafa0eceda4ba000"
 dependencies = [
- "ant-listings 0.3.1 (git+https://github.com/Project-DSpace/darwin-node.git?rev=94bf3425e31f77e150bc98306d02705fc33b1037)",
+ "ant-listings 0.3.1 (git+https://github.com/Project-DSpace/darwin-node.git?rev=aa45ab9b3db1aacd70ff89fceafa0eceda4ba000)",
  "ant-protocol",
  "bao",
  "blake3",
@@ -7347,7 +7347,7 @@ dependencies = [
 [[package]]
 name = "webrtc"
 version = "0.14.0"
-source = "git+https://github.com/Project-DSpace/darwin-node.git?rev=94bf3425e31f77e150bc98306d02705fc33b1037#94bf3425e31f77e150bc98306d02705fc33b1037"
+source = "git+https://github.com/Project-DSpace/darwin-node.git?rev=aa45ab9b3db1aacd70ff89fceafa0eceda4ba000#aa45ab9b3db1aacd70ff89fceafa0eceda4ba000"
 dependencies = [
  "arc-swap",
  "async-trait",
