@@ -951,6 +951,17 @@ cache.put(address, content);
 if let Some(data) = cache.get(&address) { /* ... */ }
 ```
 
+The default cache holds at most 1,024 chunks and an eighth of the memory free for use when the
+client is built, at least one full chunk (4 MiB) and at most 256 MiB, where it used to hold up
+to 1,024 full chunks (4 GiB) whatever the memory. A larger one is a client's own choice:
+`Client::with_chunk_cache(ChunkCache::with_byte_budget(chunks, bytes))`, or `ChunkCache::new`
+for a cache bounded by chunks alone.
+
+The client also keeps which node served each chunk it read in the last 15 minutes (1,024 chunks
+at most). A read of a chunk the cache has let go asks that node first, and looks the chunk up
+only once the node answers without it, or hasn't answered within a second; a node that no
+longer serves it is forgotten. Reading a chunk again soon after costs no lookup.
+
 ### Node Management (Programmatic)
 
 `ant-core` keeps upstream's node manager, which `darwin node` used before it was turned off. It

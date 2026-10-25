@@ -16,7 +16,7 @@ pub(crate) const CLOSE_GROUP_RETRY_DELAY: Duration = Duration::from_secs(1);
 /// hold-off the waits add at most 45 s and three lookups to a read on a
 /// network that is full.
 const MAX_REFUSAL_WAITS: usize = 3;
-const EARLY_READ_HEDGE_DELAY: Duration = Duration::from_secs(1);
+pub(crate) const EARLY_READ_HEDGE_DELAY: Duration = Duration::from_secs(1);
 /// Speculative GETs per round are bounded by this multiple of the early
 /// allowance, including hints that may hold the record after stale hints used it.
 const MAX_EARLY_READS_PER_ALLOWANCE: usize = 2;
@@ -393,6 +393,58 @@ where
                 CLOSE_GROUP_RETRY_DELAY
             }
         });
+    }
+}
+
+/// What [`read_from_holder`] found, and whether the holder served it.
+pub(crate) struct HolderRead<T, E> {
+    pub found: Result<Option<T>, E>,
+    /// The holder answered with the record. When it didn't, it is no longer
+    /// one to ask first.
+    pub served: bool,
+}
+
+/// Read a record from the node that last served it, `from_holder`, and look
+/// it up with `looked_up`, the ordinary read, only once that node has answered
+/// without it, or hasn't answered when `hedge` ends. A re-read whose holder
+/// still serves the record then costs no lookup. The holder is a hint: what it
+/// answers never establishes that the record is absent, and the ordinary read
+/// decides that as it always does. A fatal error from either ends the read, as
+/// it would in [`retrieve_progressive`].
+pub(crate) async fn read_from_holder<T, E>(
+    from_holder: impl Future<Output = Result<Option<T>, E>>,
+    looked_up: impl Future<Output = Result<Option<T>, E>>,
+    retryable: impl Fn(&E) -> bool,
+    hedge: impl Future<Output = ()>,
+) -> HolderRead<T, E> {
+    let (asked, answered) = futures::channel::oneshot::channel::<()>();
+    let from_holder = async {
+        let result = from_holder.await;
+        let _ = asked.send(());
+        result
+    };
+    let looked_up = async {
+        let _ = select(answered, Box::pin(hedge)).await;
+        looked_up.await
+    };
+    let served = |found| HolderRead {
+        found,
+        served: true,
+    };
+    let looked_up_instead = |found| HolderRead {
+        found,
+        served: false,
+    };
+    match select(Box::pin(from_holder), Box::pin(looked_up)).await {
+        Either::Left((Ok(Some(value)), _)) => served(Ok(Some(value))),
+        Either::Left((Err(error), _)) if !retryable(&error) => looked_up_instead(Err(error)),
+        Either::Left((_, looked_up)) => looked_up_instead(looked_up.await),
+        Either::Right((Ok(Some(value)), _)) => looked_up_instead(Ok(Some(value))),
+        Either::Right((found, from_holder)) => match from_holder.await {
+            Ok(Some(value)) => served(Ok(Some(value))),
+            Err(error) if !retryable(&error) => looked_up_instead(Err(error)),
+            _ => looked_up_instead(found),
+        },
     }
 }
 
@@ -1461,6 +1513,113 @@ mod tests {
         assert_eq!(result, Ok(None));
         assert_eq!(rounds, 1);
         assert_eq!(start.elapsed(), Duration::ZERO);
+    }
+
+    /// A read of the record at `holder_after`'s holder, which answers
+    /// `holder` after `holder_after` (or never), and a lookup that answers
+    /// `found` `lookup_takes` after it starts. Returns the read, when the
+    /// lookup started if it did, and when the read ended.
+    async fn read_through_holder(
+        holder: Result<Option<u32>, ReadError>,
+        holder_after: Option<Duration>,
+        found: Result<Option<u32>, ReadError>,
+        lookup_takes: Duration,
+    ) -> (HolderRead<u32, ReadError>, Option<Duration>, Duration) {
+        let start = tokio::time::Instant::now();
+        let lookup_started = Cell::new(None);
+        let read = read_from_holder(
+            async move {
+                match holder_after {
+                    Some(after) => tokio::time::sleep(after).await,
+                    None => futures::future::pending().await,
+                }
+                holder
+            },
+            async {
+                lookup_started.set(Some(start.elapsed()));
+                tokio::time::sleep(lookup_takes).await;
+                found
+            },
+            |error| *error == ReadError::Transport,
+            tokio::time::sleep(EARLY_READ_HEDGE_DELAY),
+        )
+        .await;
+        (read, lookup_started.get(), start.elapsed())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_holder_that_serves_the_record_spares_the_lookup() {
+        let (read, lookup, took) = read_through_holder(
+            Ok(Some(42)),
+            Some(Duration::from_millis(50)),
+            Ok(Some(7)),
+            Duration::ZERO,
+        )
+        .await;
+        assert_eq!(read.found, Ok(Some(42)));
+        assert!(read.served);
+        assert_eq!(lookup, None, "no lookup");
+        assert_eq!(took, Duration::from_millis(50));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_holder_without_the_record_starts_the_lookup_at_once() {
+        for answer in [Ok(None), Err(ReadError::Transport)] {
+            let (read, lookup, took) = read_through_holder(
+                answer,
+                Some(Duration::from_millis(50)),
+                Ok(Some(42)),
+                Duration::from_millis(100),
+            )
+            .await;
+            assert_eq!(read.found, Ok(Some(42)));
+            assert!(!read.served);
+            assert_eq!(lookup, Some(Duration::from_millis(50)));
+            assert_eq!(took, Duration::from_millis(150));
+        }
+        // The holder's miss proves nothing: the lookup decides absence.
+        let (read, _, _) =
+            read_through_holder(Ok(None), Some(Duration::ZERO), Ok(None), Duration::ZERO).await;
+        assert_eq!(read.found, Ok(None));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_silent_holder_starts_the_lookup_after_the_hedge_delay() {
+        let (read, lookup, took) =
+            read_through_holder(Ok(Some(7)), None, Ok(Some(42)), Duration::from_millis(100)).await;
+        assert_eq!(read.found, Ok(Some(42)));
+        assert!(!read.served);
+        assert_eq!(lookup, Some(EARLY_READ_HEDGE_DELAY));
+        assert_eq!(took, EARLY_READ_HEDGE_DELAY + Duration::from_millis(100));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_lookup_that_finds_nothing_first_waits_for_a_slow_holder() {
+        let (read, lookup, took) = read_through_holder(
+            Ok(Some(42)),
+            Some(Duration::from_millis(1500)),
+            Ok(None),
+            Duration::from_millis(200),
+        )
+        .await;
+        assert_eq!(read.found, Ok(Some(42)));
+        assert!(read.served);
+        assert_eq!(lookup, Some(EARLY_READ_HEDGE_DELAY));
+        assert_eq!(took, Duration::from_millis(1500));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_fatal_error_from_the_holder_ends_the_read() {
+        let (read, lookup, _) = read_through_holder(
+            Err(ReadError::Integrity),
+            Some(Duration::ZERO),
+            Ok(Some(42)),
+            Duration::ZERO,
+        )
+        .await;
+        assert_eq!(read.found, Err(ReadError::Integrity));
+        assert!(!read.served);
+        assert_eq!(lookup, None);
     }
 
     #[test]

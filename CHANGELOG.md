@@ -389,6 +389,16 @@ commit `darwin --version` prints. Upstream's entries follow.
   first of them to come back, up to 3 times, and then fails with "the nodes that may hold chunk
   ... are busy; try again shortly", not as a missing chunk. With every seed held off, `connect()`
   says how many are busy.
+- The library's default chunk cache (`ChunkCache::default`, every client's) holds at most 1,024
+  chunks and an eighth of the memory free for use when the client is built, at least 4 MiB and
+  at most 256 MiB (`default_cache_bytes`); before, up to 1,024 full chunks, 4 GiB, whatever
+  the memory. `ChunkCache::with_byte_budget` builds one with other bounds, and `ChunkCache::new`
+  one bounded by chunks alone, as before.
+- A client keeps which node served each chunk it read in the last 15 minutes (1,024 chunks at
+  most). A read of a chunk no longer in the chunk cache asks that node first, and looks the
+  chunk up only once the node answers without it or hasn't answered within the 1-second hedge
+  delay of early reads (`read_from_holder`); a node that no longer serves it is forgotten, and
+  what it answers never makes a chunk missing.
 - `darwin-nodes` caps its own log: `daemon run --log-path PATH` writes `<PATH>.<UTC time>.log`,
   a new file every 10 MiB or hour and on every start, and after each new file deletes the oldest
   closed files of the family (the daily files earlier builds wrote included) until it holds at

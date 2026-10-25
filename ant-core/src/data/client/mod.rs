@@ -18,6 +18,7 @@ pub mod data;
 pub mod diagnostics;
 pub mod envelope;
 pub mod file;
+pub(crate) mod holders;
 #[cfg(feature = "native")]
 pub mod listings;
 #[cfg(feature = "native")]
@@ -688,6 +689,9 @@ pub struct Client {
     wallet: Option<Arc<Wallet>>,
     evm_network: Option<ant_protocol::evm::Network>,
     chunk_cache: ChunkCache,
+    /// The nodes that served chunks read recently, which a read of one again
+    /// asks first.
+    holders: holders::HolderCache,
     /// Chunk GETs in flight, by address and peer count, so concurrent reads
     /// of one chunk share a single network GET.
     chunk_gets: SingleFlight<(XorName, usize), Result<Option<ant_protocol::DataChunk>>>,
@@ -773,6 +777,7 @@ impl Client {
             wallet: None,
             evm_network: None,
             chunk_cache: ChunkCache::default(),
+            holders: holders::HolderCache::default(),
             chunk_gets: SingleFlight::default(),
             next_request_id: AtomicU64::new(1),
             controller,
@@ -820,6 +825,7 @@ impl Client {
             wallet: None,
             evm_network: None,
             chunk_cache: ChunkCache::default(),
+            holders: holders::HolderCache::default(),
             chunk_gets: SingleFlight::default(),
             next_request_id: AtomicU64::new(1),
             unversioned_quote_peers: Arc::new(Mutex::new(HashSet::new())),
@@ -878,6 +884,7 @@ impl Client {
             wallet: None,
             evm_network: None,
             chunk_cache: ChunkCache::default(),
+            holders: holders::HolderCache::default(),
             chunk_gets: SingleFlight::default(),
             next_request_id: AtomicU64::new(1),
             unversioned_quote_peers: Arc::new(Mutex::new(HashSet::new())),
@@ -996,6 +1003,11 @@ impl Client {
     #[must_use]
     pub fn chunk_cache(&self) -> &ChunkCache {
         &self.chunk_cache
+    }
+
+    /// The nodes that served chunks read recently.
+    pub(crate) fn holders(&self) -> &holders::HolderCache {
+        &self.holders
     }
 
     /// Adaptive concurrency controller. Hot loops read

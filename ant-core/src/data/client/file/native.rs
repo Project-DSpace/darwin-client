@@ -1103,7 +1103,9 @@ fn check_disk_space_for_spill(file_size: u64) -> Result<()> {
     Ok(())
 }
 
-fn usable_memory_bytes() -> Option<u64> {
+/// The memory free for use now: the most of the system's available, free and unused figures,
+/// within a container's limit when it has one, or `None` when none can be read.
+pub(crate) fn usable_memory_bytes() -> Option<u64> {
     let mut system = sysinfo::System::new();
     system.refresh_memory();
 

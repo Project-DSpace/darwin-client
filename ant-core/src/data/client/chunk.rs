@@ -508,6 +508,12 @@ fn retry_on_next_peer(error: &Error) -> bool {
     )
 }
 
+/// A chunk read's ordinary path, boxed: `Send` where the client's futures are.
+#[cfg(feature = "native")]
+type ChunkRead<'a> = futures::future::BoxFuture<'a, Result<Option<DataChunk>>>;
+#[cfg(not(feature = "native"))]
+type ChunkRead<'a> = futures::future::LocalBoxFuture<'a, Result<Option<DataChunk>>>;
+
 /// The last answer to a chunk read whose bytes didn't match the address. The
 /// read asks the next peer after one, and fails with it only if no peer
 /// serves the chunk intact.
@@ -935,7 +941,68 @@ impl Client {
         #[cfg(feature = "native")]
         let observation = diag.map(|_| std::sync::Mutex::new(ReadObservation::default()));
         let bad_bytes = BadBytes::default();
-        let result = crate::client_engine::read::retrieve_progressive(
+        // The node that served this chunk last, if recently: asked first, and
+        // the chunk looked up only if it can't serve it soon (diagnostics
+        // observe the ordinary read).
+        #[cfg(feature = "native")]
+        let holder = diag
+            .is_none()
+            .then(|| self.holders().get(address))
+            .flatten();
+        #[cfg(not(feature = "native"))]
+        let holder = self.holders().get(address);
+        let served_by = std::sync::Mutex::new(None);
+        let get_one = |(peer, addrs): (PeerId, Vec<MultiAddr>), early: bool| {
+            #[cfg(feature = "native")]
+            let observation = &observation;
+            async move {
+                if early {
+                    #[cfg(feature = "native")]
+                    if let Some(diag) = diag {
+                        let early_observation = std::sync::Mutex::new(ReadObservation {
+                            lookup_id: format!(
+                                "{}-{}-early-{}",
+                                diag.file_attempt,
+                                diag.chunk_index,
+                                NEXT_DIAGNOSTIC_LOOKUP_ID.fetch_add(1, AtomicOrdering::Relaxed)
+                            ),
+                            ..ReadObservation::default()
+                        });
+                        return self
+                            .chunk_get_diagnostic_attempt(
+                                address,
+                                &peer,
+                                &addrs,
+                                diag,
+                                &early_observation,
+                            )
+                            .await;
+                    }
+                }
+                #[cfg(feature = "native")]
+                if let (Some(diag), Some(observation)) = (diag, observation) {
+                    return self
+                        .chunk_get_diagnostic_attempt(address, &peer, &addrs, diag, observation)
+                        .await;
+                }
+                self.chunk_get_from_peer(address, &peer, &addrs).await
+            }
+        };
+        // A GET that gets the chunk notes its node, for the next read of it.
+        let get = |(peer, addrs): (PeerId, Vec<MultiAddr>), early: bool| {
+            let read = get_one((peer, addrs.clone()), early);
+            let served_by = &served_by;
+            async move {
+                let result = read.await;
+                if matches!(result, Ok(Some(_))) {
+                    *served_by.lock().unwrap_or_else(|e| e.into_inner()) = Some((peer, addrs));
+                }
+                result
+            }
+        };
+        // Boxed, so the read's future stays the size of a pointer inside every
+        // future that awaits a chunk, however deep the race below nests it.
+        let ordinary: ChunkRead<'_> = Box::pin(crate::client_engine::read::retrieve_progressive(
             *address,
             // Use the same bounded fallback allowance while discovery is in
             // flight. Stopping after just the close-group count can exhaust
@@ -1029,42 +1096,7 @@ impl Client {
                 }
             },
             |(peer, _)| *peer.as_bytes(),
-            |(peer, addrs), early| {
-                #[cfg(feature = "native")]
-                let observation = &observation;
-                async move {
-                    if early {
-                        #[cfg(feature = "native")]
-                        if let Some(diag) = diag {
-                            let early_observation = std::sync::Mutex::new(ReadObservation {
-                                lookup_id: format!(
-                                    "{}-{}-early-{}",
-                                    diag.file_attempt,
-                                    diag.chunk_index,
-                                    NEXT_DIAGNOSTIC_LOOKUP_ID.fetch_add(1, AtomicOrdering::Relaxed)
-                                ),
-                                ..ReadObservation::default()
-                            });
-                            return self
-                                .chunk_get_diagnostic_attempt(
-                                    address,
-                                    &peer,
-                                    &addrs,
-                                    diag,
-                                    &early_observation,
-                                )
-                                .await;
-                        }
-                    }
-                    #[cfg(feature = "native")]
-                    if let (Some(diag), Some(observation)) = (diag, observation) {
-                        return self
-                            .chunk_get_diagnostic_attempt(address, &peer, &addrs, diag, observation)
-                            .await;
-                    }
-                    self.chunk_get_from_peer(address, &peer, &addrs).await
-                }
-            },
+            &get,
             |error| bad_bytes.retry_on_next_peer(error),
             || {
                 self.network()
@@ -1080,8 +1112,26 @@ impl Client {
                 ))
             },
             crate::runtime::sleep,
-        )
-        .await?;
+        ));
+        let result = match holder {
+            None => ordinary.await,
+            Some(holder) => {
+                // The lookup starts once the holder has answered without the
+                // chunk, or hasn't answered within the delay a stalled early
+                // read is raced after.
+                let read = crate::client_engine::read::read_from_holder(
+                    get(holder, true),
+                    ordinary,
+                    |error| bad_bytes.retry_on_next_peer(error),
+                    crate::runtime::sleep(crate::client_engine::read::EARLY_READ_HEDGE_DELAY),
+                )
+                .await;
+                if !read.served {
+                    self.holders().forget(address);
+                }
+                read.found
+            }
+        }?;
         #[cfg(feature = "native")]
         if result.is_none() {
             if let (Some(diag), Some(observation)) = (diag, &observation) {
@@ -1097,6 +1147,9 @@ impl Client {
         let result = bad_bytes.result(result)?;
         if let Some(chunk) = &result {
             self.chunk_cache().put(chunk.address, chunk.content.clone());
+            if let Some((peer, addrs)) = served_by.into_inner().unwrap_or_else(|e| e.into_inner()) {
+                self.holders().note(*address, peer, addrs);
+            }
         }
         Ok(result)
     }
