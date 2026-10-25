@@ -155,10 +155,20 @@ cargo build --release --locked -p ant-cli --bin darwin
 # The binary is target/release/darwin (darwin.exe on Windows).
 ```
 
-Every push to `main` also builds a Linux x86-64 binary in CI, uploaded as the
-`darwin-linux-x64` workflow artifact (`darwin-linux-x64.tar.gz` and its `SHA256SUMS.txt`).
-Next to `darwin`, the archive holds its license files (`LICENSE-MIT`, `LICENSE-APACHE`) and the
-notices for the third-party code in it (`THIRD-PARTY-NOTICES.txt`, `RUST-STD-COPYRIGHT.html`).
+Or take a release: the Linux x86-64 `darwin`, as `darwin-linux-x64.tar.gz` with its
+`SHA256SUMS.txt`, from this repository's GitHub releases (tags `vX.Y.Z+ds.N`). A release is
+published by the Release workflow (`.github/workflows/release.yml`) only once the tagged commit's
+Test run (the end-to-end and browser tests, with the payment-recovery, batch-refusal and
+occupied-quote pins) and Build run (the unit tests, the targets that need no nodes, the censuses,
+and the build) both succeeded, and once approved in the repository's `release` environment; the
+archive is that Build run's, checked against its sums, and its `darwin --version` names the tag and
+the commit. Next to `darwin`, the archive holds its license files (`LICENSE-MIT`, `LICENSE-APACHE`)
+and the notices for the third-party code in it (`THIRD-PARTY-NOTICES.txt`,
+`RUST-STD-COPYRIGHT.html`). Check it with `sha256sum -c SHA256SUMS.txt`.
+
+Every push also uploads its build as the `darwin-linux-x64` workflow artifact. That is CI output,
+made whether or not the end-to-end tests pass: for trying a commit, not for deployment. Deploy a
+release.
 
 `darwin --version` prints the package version and, on a second line, the git commit the binary
 was built from (`unknown` outside a git checkout of this repository; uncommitted changes don't
@@ -178,8 +188,8 @@ installers leave in the same directories name Autonomi's network, and `darwin` n
 A seed file written for an earlier `darwin` build is read again once renamed
 `darwin_bootstrap_peers.toml`. See [Bootstrap multiaddresses and browser defaults](#bootstrap-multiaddresses-and-browser-defaults).
 
-This repository has no installer or npm package for darwin: build from source or take the
-`darwin-linux-x64` CI artifact.
+This repository has no installer or npm package for darwin: build from source or take a
+release.
 
 ## Quick Start
 
@@ -702,9 +712,8 @@ marker until dismissed, reports as `evicted`, and never starts again under its o
 ### `darwin update` — Self-Update
 
 Off in this build: `darwin update` exits with an error. Upstream's release feed (the `ant-cli-v*`
-releases of `WithAutonomi/ant-client`) would replace `darwin` with Autonomi's `ant`, and Darwin
-publishes no releases yet. Update by building a new `darwin` or taking the latest
-`darwin-linux-x64` CI artifact.
+releases of `WithAutonomi/ant-client`) would replace `darwin` with Autonomi's `ant`. Darwin's own
+releases are installed by hand: update by building a new `darwin` or taking the latest release.
 
 ---
 

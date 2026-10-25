@@ -1,0 +1,207 @@
+# Publishes the Linux x86_64 `darwin` client as a GitHub release, the build
+# deployments take. Runs when a person pushes a version tag:
+#
+#   git tag -a v0.3.11+ds.1 -m v0.3.11+ds.1 && git push origin v0.3.11+ds.1
+#
+# Versions are <upstream base>+ds.<build>, as darwin-node's are. Bump
+# ant-cli/Cargo.toml's version (and Cargo.lock's ant-cli entry) to the tag's
+# first, so `darwin --version` names the release; the package job checks it.
+#
+# The tag has to come from a person: GitHub won't let GITHUB_TOKEN create a
+# tag on a commit that changes .github/workflows, so this only publishes an
+# existing tag.
+#
+# Nothing is published until the checks job has seen the tagged commit pass
+# both other workflows: its newest Test run (from the push to main, or one
+# run by hand) and the Build run from its push to main, waited for if they
+# are still going. Test runs the end-to-end targets, among them the
+# payment-recovery, batch-refusal and occupied-quote pins, and the browser
+# tests; Build runs the unit tests, the targets that need no nodes and the
+# censuses, and builds the binary. What is released is that Build run's
+# darwin-linux-x64, not a rebuild: the package job checks it against its
+# SHA256SUMS.txt, and checks that it reports this tag's version and the
+# tagged commit. The release environment's approval is asked for only after
+# that, and the checks job first makes sure that environment exists and
+# asks for one.
+#
+# scripts/check-workflows.sh, which the Build and Test workflows run, fails
+# if this file loses that order.
+
+name: Release
+
+on:
+  push:
+    tags: ['v*\+ds.*']
+
+permissions: {}
+
+defaults:
+  run:
+    shell: bash
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  # The tagged commit must have passed the Test and Build workflows. Test
+  # cancels a run in progress when the same ref is pushed again, so a
+  # cancelled run fails this job: re-run it, or run Test by hand on the tag,
+  # then this job. The Build run found here is the one the package job takes
+  # the binary from.
+  checks:
+    runs-on: ubuntu-24.04
+    permissions:
+      actions: read
+    outputs:
+      build_run: ${{ steps.build_run.outputs.run }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - name: Check the tag
+        run: |
+          if [[ ! "$GITHUB_REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+\+ds\.[1-9][0-9]*$ ]]; then
+            echo "::error::$GITHUB_REF_NAME is not vX.Y.Z+ds.N"
+            exit 1
+          fi
+
+      # The publish job waits for a person's approval in the release
+      # environment. GitHub creates an environment a job names that the
+      # repository lacks, with no reviewers, so a missing one would publish
+      # unasked.
+      - name: Check the release environment asks for approval
+        run: |
+          rules=$(gh api "repos/$GH_REPO/environments/release" --jq '[.protection_rules[]?.type] | join(",")' 2> /dev/null) || rules=""
+          if [[ ",$rules," != *",required_reviewers,"* ]]; then
+            echo "::error::the release environment must exist and ask for approval (required reviewers; it has: '${rules:-no such environment, or no rules}'): set it up in the repository's settings, then re-run this job"
+            exit 1
+          fi
+
+      # The newest run of the suite on this commit: from its push to main,
+      # or one run by hand. A pull request's run tests a merge, not this
+      # commit, and a run from a push to another branch is not taken.
+      - name: Wait for the Test workflow's run of this commit
+        run: |
+          run=$(gh api -X GET "repos/$GH_REPO/actions/workflows/test.yml/runs" \
+            -f head_sha="$GITHUB_SHA" -f per_page=100 \
+            --jq '[.workflow_runs[] | select((.event == "push" and .head_branch == "main") or .event == "workflow_dispatch")] | max_by(.run_number) | .id // empty')
+          if [[ -z "$run" ]]; then
+            echo "::error::no Test run of $GITHUB_SHA from a push to main, or by hand: run Test on it, then this job"
+            exit 1
+          fi
+          echo "Test run $run"
+          gh run watch "$run" --exit-status --interval 60 > /dev/null || true
+          conclusion=$(gh api "repos/$GH_REPO/actions/runs/$run" --jq '.conclusion // empty')
+          if [[ "$conclusion" != "success" ]]; then
+            echo "::error::Test run $run of $GITHUB_SHA ended '${conclusion:-unfinished}', not success: re-run it, then this job"
+            exit 1
+          fi
+
+      # Only a push run built the binary from this commit itself.
+      - name: Wait for the Build workflow's run of this commit
+        id: build_run
+        run: |
+          run=$(gh api -X GET "repos/$GH_REPO/actions/workflows/build.yml/runs" \
+            -f head_sha="$GITHUB_SHA" -f event=push -f branch=main -f per_page=1 \
+            --jq '.workflow_runs[0].id // empty')
+          if [[ -z "$run" ]]; then
+            echo "::error::no Build run from a push of $GITHUB_SHA to main: tag a commit that Build ran for on main"
+            exit 1
+          fi
+          echo "Build run $run"
+          gh run watch "$run" --exit-status --interval 60 > /dev/null || true
+          conclusion=$(gh api "repos/$GH_REPO/actions/runs/$run" --jq '.conclusion // empty')
+          if [[ "$conclusion" != "success" ]]; then
+            echo "::error::Build run $run of $GITHUB_SHA ended '${conclusion:-unfinished}', not success: re-run it, then this job"
+            exit 1
+          fi
+          echo "run=$run" >> "$GITHUB_OUTPUT"
+
+  # The binary the checked Build run made, checked before anyone is asked to
+  # approve it: the archive is the one its SHA256SUMS.txt names, holds the
+  # files Build packs, and its `darwin` reports this tag's version and the
+  # tagged commit.
+  package:
+    needs: checks
+    runs-on: ubuntu-24.04
+    permissions:
+      actions: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      RUN: ${{ needs.checks.outputs.build_run }}
+      TAG: ${{ github.ref_name }}
+    steps:
+      - name: Download the Build run's darwin-linux-x64
+        run: |
+          if ! gh run download "$RUN" --name darwin-linux-x64 --dir dist; then
+            echo "::error::Build run $RUN has no darwin-linux-x64 artifact (kept 30 days): re-run its linux-x64 job, then this workflow's failed jobs"
+            exit 1
+          fi
+
+      - name: Check the archive, its version and its commit
+        working-directory: dist
+        run: |
+          sha256sum -c SHA256SUMS.txt
+          mkdir unpacked
+          tar -xzf darwin-linux-x64.tar.gz -C unpacked
+          for file in darwin LICENSE-MIT LICENSE-APACHE THIRD-PARTY-NOTICES.txt RUST-STD-COPYRIGHT.html; do
+            if [[ ! -f "unpacked/$file" ]]; then
+              echo "::error::darwin-linux-x64.tar.gz has no $file"
+              exit 1
+            fi
+          done
+          reported=$(unpacked/darwin --version)
+          version=$(sed -n 1p <<< "$reported")
+          commit=$(sed -n 2p <<< "$reported")
+          if [[ "$version" != "darwin ${TAG#v}" ]]; then
+            echo "::error::the binary reports '$version', not 'darwin ${TAG#v}': set ant-cli's version to ${TAG#v} in the tagged commit"
+            exit 1
+          fi
+          commit=${commit#commit }
+          if [[ ${#commit} -lt 7 || "$GITHUB_SHA" != "$commit"* ]]; then
+            echo "::error::the binary reports commit '$commit', not $GITHUB_SHA"
+            exit 1
+          fi
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: release-files
+          path: |
+            dist/darwin-linux-x64.tar.gz
+            dist/SHA256SUMS.txt
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    needs: [checks, package]
+    runs-on: ubuntu-24.04
+    environment: release
+    permissions:
+      contents: write
+    env:
+      TAG: ${{ github.ref_name }}
+      RUN: ${{ needs.checks.outputs.build_run }}
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: release-files
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          sha256sum -c SHA256SUMS.txt
+          printf '%s\n' \
+            "The darwin client $TAG for Linux x86_64 (Ubuntu 24.04 or newer)." \
+            "" \
+            "Built from $GITHUB_SHA by the Build workflow (run $RUN), and published once that run and the commit's Test run had passed." \
+            "Check the archive with: sha256sum -c SHA256SUMS.txt" \
+            "" \
+            "The archive holds darwin, LICENSE-MIT and LICENSE-APACHE, plus THIRD-PARTY-NOTICES.txt and RUST-STD-COPYRIGHT.html with the licences and copyright notices of the third-party code in the binary and of the tools used to build it." \
+            > notes.md
+          gh release create "$TAG" --verify-tag --latest \
+            --title "darwin $TAG" --notes-file notes.md \
+            darwin-linux-x64.tar.gz SHA256SUMS.txt

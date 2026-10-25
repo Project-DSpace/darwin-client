@@ -7,9 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Darwin fork
 
-Our changes on top of upstream 0.3.11 (ant-core 0.13.0). There are no tagged releases; builds are
-told apart by the commit `darwin --version` prints. Upstream's entries follow.
+Our changes on top of upstream 0.3.11 (ant-core 0.13.0). Releases are tagged `vX.Y.Z+ds.N`, with
+ant-cli's version set to match, and none is published yet; other builds are told apart by the
+commit `darwin --version` prints. Upstream's entries follow.
 
+- Releases: `.github/workflows/release.yml` publishes `darwin-linux-x64.tar.gz` and its
+  `SHA256SUMS.txt` for a `vX.Y.Z+ds.N` tag a person pushes, only after the tagged commit's Test run
+  (the end-to-end and browser tests) and its Build run from the push to main both succeeded, and
+  after approval in the `release` environment, which the workflow first checks exists and asks for
+  approval. The archive is that Build run's artifact, checked against its sums, with a `darwin`
+  that reports the tag's version and the tagged commit. `scripts/check-workflows.sh`, run by Build
+  and Test and tested by `scripts/test_check_workflows.sh`, fails if the workflows lose that order
+  or a run could succeed without running every pin. The `darwin-linux-x64` artifact every push
+  uploads is CI output, not for deployment.
 - The default network is ours: Robinhood Chain (chain ID 4663), with the seeds, token, vault and
   RPCs bundled in `ant-core/resources/`.
 - Payments in DARWIN (`0x511f76A3…`, vault `0xE0f62798…`), priced like Autonomi with a price
@@ -281,7 +291,7 @@ told apart by the commit `darwin --version` prints. Upstream's entries follow.
   (`resources/release-signing-key.pub`). They installed or verified Autonomi's `ant`, not
   `darwin`, and the installers wrote Autonomi's `bootstrap_peers.toml` into the config directory
   `darwin` shares. CI fails if any of them is tracked again. `darwin` is built from source or
-  taken from the `darwin-linux-x64` CI artifact.
+  taken from a release.
 - In the library, the upload calls that take no visibility (`file_upload`, `file_upload_with_mode`,
   `file_upload_with_progress`, `estimate_upload_cost`, `file_prepare_upload`,
   `data_prepare_upload`) store the private envelope `darwin file upload` stores, with every

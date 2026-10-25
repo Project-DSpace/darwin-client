@@ -6,6 +6,11 @@
 #
 # Runs on every push, to any branch, and on pull requests, so a merge branch
 # is tested before it lands; weekly; and by hand. Actions are pinned by commit.
+#
+# A client release (release.yml) waits for this workflow's run of the tagged
+# commit, from its push to main or run by hand, and publishes nothing unless
+# it succeeded. Every job here runs on every run, with no condition, so a run
+# that succeeded ran them all (scripts/check-workflows.sh holds that).
 
 name: Test
 
@@ -54,6 +59,13 @@ jobs:
           python3 scripts/test-targets.py check
           e2e=$(python3 scripts/test-targets.py e2e)
           echo "e2e=$e2e" >> "$GITHUB_OUTPUT"
+
+      # The release gate (see build.yml), and the check's own tests.
+      - name: Run the release gate's check
+        run: bash scripts/check-workflows.sh
+
+      - name: Test the release gate's check
+        run: bash scripts/test_check_workflows.sh
 
   # One job per target, in parallel, so no single job runs every target in a
   # row: together they outgrew one job's time limit. Every target reports,

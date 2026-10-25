@@ -2,9 +2,15 @@
 # no nodes and the vendored crates' own tests, then builds the Linux `darwin`
 # client binary (from the ant-cli crate) and uploads it,
 # with its licence files and third-party notices, as the `darwin-linux-x64`
-# workflow artifact. Also checks that upstream's installers stay deleted, and
-# that the darwin-node revision the tests run is pinned alike everywhere, with
-# vendor/ant-protocol equal to its copy.
+# workflow artifact. Also checks that upstream's installers stay deleted, that
+# the darwin-node revision the tests run is pinned alike everywhere, with
+# vendor/ant-protocol equal to its copy, and that the release gate holds
+# (scripts/check-workflows.sh).
+#
+# The artifact is CI output, made whether or not test.yml's end-to-end and
+# browser tests pass: for trying a commit, not for deployment. Deployments
+# take a release, which release.yml publishes from this artifact only once
+# the tagged commit's Build and Test runs both succeeded.
 #
 # Runs on every push, to any branch, and on pull requests, so a merge branch
 # is checked before it lands; test.yml runs the end-to-end and browser tests.
@@ -65,6 +71,12 @@ jobs:
       # file byte for byte as committed.
       - name: One darwin-node revision, and vendor/ant-protocol is its copy
         run: python3 scripts/darwin-node-pin.py --vendored
+
+      # The release gate: release.yml publishes a client only after the
+      # tagged commit's Test and Build runs succeeded, and those runs carry
+      # every pin. The script says what it checks; test.yml runs its tests.
+      - name: Run the release gate's check
+        run: bash scripts/check-workflows.sh
 
   fmt:
     runs-on: ubuntu-24.04
@@ -190,7 +202,10 @@ jobs:
           tar -C dist -czf darwin-linux-x64.tar.gz .
           sha256sum darwin-linux-x64.tar.gz > SHA256SUMS.txt
 
-      - name: Upload build
+      # CI output, not for deployment (see the top of this file). release.yml
+      # takes it from a push to main's run, as the release, once that commit's
+      # Build and Test runs both succeeded.
+      - name: Upload the CI build (not for deployment)
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: darwin-linux-x64

@@ -48,8 +48,8 @@ impl UpdateArgs {
         if !SELF_UPDATE {
             anyhow::bail!(
                 "self-update is off in this build: it would install Autonomi's `ant`, \
-                 not `darwin`. New builds of `darwin` come from the Project-DSpace/darwin-client \
-                 CI (the darwin-linux-x64 artifact)."
+                 not `darwin`. Take a release of `darwin` from Project-DSpace/darwin-client \
+                 (darwin-linux-x64.tar.gz), or build it from source."
             );
         }
         let current_version = env!("CARGO_PKG_VERSION");
