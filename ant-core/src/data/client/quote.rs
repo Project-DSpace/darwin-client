@@ -2677,7 +2677,7 @@ mod tests {
     // and for bound quotes: parse + peer-binding + signature + hash==pin +
     // count==key_count) using the shared ant-protocol commitment type, so an
     // unresolvable/forged commitment is never paid. A live resolve against a
-    // REAL signed commitment is proven in the e2e suite (e2e_adr0004.rs).
+    // REAL signed commitment is proven in the e2e suite (tests/e2e/adr0004.rs).
     // ============================================================
 
     /// A throwaway peer id for tests that fail BEFORE commitment resolution

@@ -7,7 +7,8 @@ exactly one place, or is skipped by name with its reason:
 - test.yml runs the end-to-end targets, one job each, against in-process
   darwin-node nodes and a local Anvil chain. Its matrix is every target this
   file doesn't name below, so a new test file runs there without being added
-  to any list.
+  to any list. Today that is `e2e`, whose cases (tests/e2e/*.rs) share one
+  network; see tests/e2e.rs.
 - build.yml runs the targets in NO_NODES, which start neither nodes nor a
   chain, beside the unit tests.
 - SKIPPED names the targets CI doesn't run, each with why. They still build in
@@ -39,6 +40,8 @@ TESTS = ROOT / "ant-core" / "tests"
 # unit tests. daemon_integration and node_add_integration test the node
 # manager the node image ships. census_probe starts two of the network
 # library's peers on loopback, no storage node, to probe one that restarted.
+# offline runs client checks that fail before any network call, on a node
+# that is never started.
 NO_NODES = [
     "census_probe",
     "daemon_integration",
@@ -46,6 +49,7 @@ NO_NODES = [
     "log_forward_integration",
     "merkle_unit",
     "node_add_integration",
+    "offline",
     "unit_self_encrypt",
 ]
 

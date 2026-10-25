@@ -220,7 +220,7 @@ edit "${TEST}" $'    timeout-minutes: 120\n' $'    timeout-minutes: 120\n    con
 expect "end-to-end failures let through" "test.yml must not continue on error"
 
 fresh
-edit "${TEST}" 'target: ${{ fromJSON(needs.targets.outputs.e2e) }}' 'target: [e2e_merkle, e2e_envelope]'
+edit "${TEST}" 'target: ${{ fromJSON(needs.targets.outputs.e2e) }}' 'target: [e2e]'
 expect "the end-to-end targets listed by hand" "e2e job no longer runs each listed end-to-end target"
 
 fresh

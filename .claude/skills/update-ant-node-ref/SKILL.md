@@ -49,9 +49,9 @@ the client's copy follows the node's in a change of its own, reviewed against th
 cargo test --locked -p ant-core --features test-utils --no-run
 ```
 
-Then run the end-to-end targets that pin payments, with `anvil` on PATH and one test at a time:
-at least `e2e_merkle` and `e2e_record_payment_recovery`
-(`cargo test --locked -p ant-core --features test-utils --test <target> -- --test-threads=1`),
+Then run the end-to-end cases, with `anvil` on PATH: the whole `e2e` target, or at least its
+`refusals` group and the payment-recovery cases
+(`cargo test --locked -p ant-core --features test-utils --test e2e -- refusals payment_recovery native_payment`),
 and the browser harness as `ant-core/browser-tests/README.md` describes. If the build or a test
 fails, stop and report it, with what changed in darwin-node to cause it. Do not change the tests to
 make them pass without the user's say.

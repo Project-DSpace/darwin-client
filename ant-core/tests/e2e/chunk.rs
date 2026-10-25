@@ -1,65 +1,88 @@
-//! E2E tests for chunk operations using a local testnet with real EVM payments.
+//! Chunk operations with real EVM payments: the raw chunk path, by the
+//! caller's choice, with no envelope.
 
-#![allow(clippy::unwrap_used, clippy::expect_used)]
-
-mod support;
-
+use crate::support::runner::Case;
+use crate::support::{test_client_config, MiniTestnet, CLIENT_NODE};
 use ant_core::data::{compute_address, Client};
+use ant_protocol::pointer::pointer_address;
+use ant_protocol::pqc::api::ml_dsa_65;
 use bytes::Bytes;
 use futures::future::join_all;
-use serial_test::serial;
 use std::sync::Arc;
-use support::{test_client_config, MiniTestnet, DEFAULT_NODE_COUNT};
 
-async fn setup() -> (Client, MiniTestnet) {
-    let testnet = MiniTestnet::start(DEFAULT_NODE_COUNT).await;
-    let node = testnet.node(3).expect("Node 3 should exist");
-
-    let client = Client::from_node(Arc::clone(&node), test_client_config())
-        .with_wallet(testnet.wallet().clone());
-
-    (client, testnet)
+pub fn cases() -> Vec<Case> {
+    vec![
+        Case::on_network("chunk::round_trip", round_trip),
+        Case::on_network(
+            "chunk::concurrent_gets_share_one_fetch",
+            concurrent_gets_share_one_fetch,
+        ),
+        Case::on_network(
+            "chunk::extended_fallback_reaches_quorum",
+            extended_fallback_reaches_quorum,
+        ),
+        Case::on_network("chunk::duplicate_skips_payment", duplicate_skips_payment),
+        Case::on_network("chunk::absent_reads", absent_reads),
+        Case::on_network("chunk::no_wallet_fails", no_wallet_fails),
+    ]
 }
 
-#[tokio::test(flavor = "multi_thread")]
-#[serial]
-async fn test_chunk_put_get_round_trip() {
-    let (client, testnet) = setup().await;
+/// A paid PUT stores the chunk at BLAKE3(content); it reads back, `exists()`
+/// sees it, and reading costs nothing, with or without a wallet.
+async fn round_trip(testnet: Arc<MiniTestnet>) {
+    let client = testnet.client();
 
     let content = Bytes::from("ant-core chunk e2e test payload");
     let address = client
         .chunk_put(content.clone())
         .await
         .expect("chunk_put should succeed with payment");
-
-    let expected_address = compute_address(&content);
     assert_eq!(
-        address, expected_address,
+        address,
+        compute_address(&content),
         "address should be BLAKE3(content)"
     );
 
-    let retrieved = client
+    let wallet = client.wallet().expect("wallet should be set");
+    let balance_before = wallet.balance_of_tokens().await.expect("balance");
+    let chunk = client
         .chunk_get(&address)
         .await
-        .expect("chunk_get should succeed");
-
-    let chunk = retrieved.expect("Chunk should be found after storing it");
+        .expect("chunk_get should succeed")
+        .expect("Chunk should be found after storing it");
     assert_eq!(chunk.content.as_ref(), content.as_ref());
     assert_eq!(chunk.address, address);
+    assert!(
+        client
+            .chunk_exists(&address)
+            .await
+            .expect("exists should succeed"),
+        "exists() should return true for stored chunk"
+    );
+    assert_eq!(
+        wallet.balance_of_tokens().await.expect("balance"),
+        balance_before,
+        "reads are free"
+    );
 
-    drop(client);
-    testnet.teardown().await;
+    // A client WITHOUT a wallet on the same node reads it too.
+    let node = testnet.node(CLIENT_NODE).expect("client node");
+    let no_wallet_client = Client::from_node(node, test_client_config());
+    let chunk = no_wallet_client
+        .chunk_get(&address)
+        .await
+        .expect("GET without wallet should succeed (reads are free)")
+        .expect("Chunk should be found");
+    assert_eq!(chunk.content.as_ref(), content.as_ref());
 }
 
 /// Concurrent reads of one chunk share a single fetch: with the cache empty,
 /// every concurrent `chunk_get` returns the chunk and no node is asked for it
 /// more than once. Without sharing, each reader sends its own GETs and the
 /// first holder is asked once per reader.
-#[tokio::test(flavor = "multi_thread")]
-#[serial]
-async fn test_concurrent_chunk_gets_share_one_fetch() {
+async fn concurrent_gets_share_one_fetch(testnet: Arc<MiniTestnet>) {
     const READERS: usize = 8;
-    let (client, testnet) = setup().await;
+    let client = testnet.client();
 
     let content = Bytes::from("ant-core concurrent chunk_get payload");
     let address = client
@@ -92,9 +115,6 @@ async fn test_concurrent_chunk_gets_share_one_fetch() {
         sent.iter().all(|&gets| gets <= 1),
         "{READERS} concurrent readers should ask each node at most once: {sent:?}"
     );
-
-    drop(client);
-    testnet.teardown().await;
 }
 
 /// ADR-0002: when initial PUT targets fail, the client falls back to the
@@ -114,15 +134,12 @@ async fn test_concurrent_chunk_gets_share_one_fetch() {
 /// `classify_put_failure_*` unit test. A live close-group node returning
 /// `StorageFailed` (a genuinely full member) needs a node-side capacity hook the
 /// in-process MiniTestnet does not expose — tracked as a follow-up.
-#[cfg(feature = "test-utils")]
-#[tokio::test(flavor = "multi_thread")]
-#[serial]
-async fn test_chunk_put_extended_fallback_reaches_quorum() {
+async fn extended_fallback_reaches_quorum(testnet: Arc<MiniTestnet>) {
     /// Unreachable initial peers to inject; equals `CLOSE_GROUP_MAJORITY` so a
     /// full quorum must be served by the extended fallback.
     const DEAD_INITIAL_PEERS: usize = 4;
 
-    let (client, testnet) = setup().await;
+    let client = testnet.client();
 
     let content = Bytes::from("adr-0002 extended fallback payload");
     let address = compute_address(&content);
@@ -134,271 +151,84 @@ async fn test_chunk_put_extended_fallback_reaches_quorum() {
     assert_eq!(stored, address, "stored address should be BLAKE3(content)");
 
     // Retrievable -> quorum was genuinely met via the fallback peers.
-    let retrieved = client
+    let chunk = client
         .chunk_get(&address)
         .await
-        .expect("chunk_get should succeed");
-    let chunk = retrieved.expect("chunk should be found after fallback store");
+        .expect("chunk_get should succeed")
+        .expect("chunk should be found after fallback store");
     assert_eq!(chunk.content.as_ref(), content.as_ref());
-
-    drop(client);
-    testnet.teardown().await;
 }
 
-#[tokio::test(flavor = "multi_thread")]
-#[serial]
-async fn test_chunk_put_duplicate_is_idempotent() {
-    let (client, testnet) = setup().await;
-
-    let content = Bytes::from("duplicate chunk test");
-    let addr1 = client
-        .chunk_put(content.clone())
-        .await
-        .expect("first put should succeed");
-
-    // Second put — node sees AlreadyExists, returns success
-    let addr2 = client
-        .chunk_put(content.clone())
-        .await
-        .expect("duplicate put should succeed");
-
-    assert_eq!(addr1, addr2, "duplicate put should return same address");
-
-    drop(client);
-    testnet.teardown().await;
-}
-
-#[tokio::test(flavor = "multi_thread")]
-#[serial]
-async fn test_chunk_get_nonexistent_returns_none() {
-    let (client, testnet) = setup().await;
-
-    let missing_address = [0xDE; 32];
-    let result = client
-        .chunk_get(&missing_address)
-        .await
-        .expect("get for missing address should not error");
-
-    assert!(
-        result.is_none(),
-        "Should return None for non-existent chunk"
-    );
-
-    drop(client);
-    testnet.teardown().await;
-}
-
-#[tokio::test(flavor = "multi_thread")]
-#[serial]
-async fn test_chunk_exists() {
-    let (client, testnet) = setup().await;
-
-    let content = Bytes::from("exists check test");
-    let address = client.chunk_put(content).await.expect("put should succeed");
-
-    let exists = client
-        .chunk_exists(&address)
-        .await
-        .expect("exists should succeed");
-    assert!(exists, "exists() should return true for stored chunk");
-
-    let missing = [0xAA; 32];
-    let not_exists = client
-        .chunk_exists(&missing)
-        .await
-        .expect("exists for missing should succeed");
-    assert!(
-        !not_exists,
-        "exists() should return false for missing chunk"
-    );
-
-    drop(client);
-    testnet.teardown().await;
-}
-
-#[tokio::test(flavor = "multi_thread")]
-#[serial]
-async fn test_chunk_put_with_insufficient_proof_rejected() {
-    let (client, testnet) = setup().await;
-
-    let content = Bytes::from("this should be rejected — insufficient proof");
-    let address = compute_address(&content);
-
-    // Send a too-short proof (not even valid msgpack)
-    let insufficient_proof = vec![0x00; 16];
-    let (target_peer, target_addrs) = client
-        .network()
-        .find_closest_peers(&address, 1)
-        .await
-        .expect("should find peers")
-        .into_iter()
-        .next()
-        .expect("should have at least one peer");
-    let result = client
-        .chunk_put_with_proof(content, insufficient_proof, &target_peer, &target_addrs)
-        .await;
-
-    assert!(
-        result.is_err(),
-        "PUT with insufficient proof should be rejected"
-    );
-    let err_msg = format!("{}", result.expect_err("should have error"));
-    let err_lower = err_msg.to_lowercase();
-    assert!(
-        err_lower.contains("payment") || err_lower.contains("error"),
-        "Error should be payment-related, got: {err_msg}"
-    );
-
-    // Verify the chunk was NOT stored on the network
-    let get_result = client
-        .chunk_get(&address)
-        .await
-        .expect("chunk_get should succeed");
-    assert!(
-        get_result.is_none(),
-        "Rejected chunk should not be stored on the network"
-    );
-
-    drop(client);
-    testnet.teardown().await;
-}
-
-#[tokio::test(flavor = "multi_thread")]
-#[serial]
-async fn test_chunk_get_is_always_free() {
-    let (client, testnet) = setup().await;
-
-    // First, store a chunk with payment
-    let content = Bytes::from("chunk for free-get test");
-    let address = client
-        .chunk_put(content.clone())
-        .await
-        .expect("paid put should succeed");
-
-    // Create a client WITHOUT a wallet using the SAME P2P node.
-    // Reads are free so the wallet absence should not matter.
-    // Using the same node ensures the DHT routes to the same storing peer.
-    let node = testnet.node(3).expect("Node 3 should exist");
-    let no_wallet_client = Client::from_node(Arc::clone(&node), test_client_config());
-
-    let retrieved = no_wallet_client
-        .chunk_get(&address)
-        .await
-        .expect("GET without wallet should succeed (reads are free)");
-
-    let chunk = retrieved.expect("Chunk should be found");
-    assert_eq!(chunk.content.as_ref(), content.as_ref());
-
-    drop(client);
-    drop(no_wallet_client);
-    testnet.teardown().await;
-}
-
-#[tokio::test(flavor = "multi_thread")]
-#[serial]
-async fn test_chunk_put_with_invalid_proof_rejected() {
-    let (client, testnet) = setup().await;
-
-    // Build a garbage proof
-    let content = Bytes::from("chunk with invalid proof");
-    let address = compute_address(&content);
-    let invalid_proof = vec![0xDE, 0xAD, 0xBE, 0xEF];
-
-    let (target_peer, target_addrs) = client
-        .network()
-        .find_closest_peers(&address, 1)
-        .await
-        .expect("should find peers")
-        .into_iter()
-        .next()
-        .expect("should have at least one peer");
-    let result = client
-        .chunk_put_with_proof(content, invalid_proof, &target_peer, &target_addrs)
-        .await;
-
-    // The node should reject this — either a deserialization error or payment verification failure
-    assert!(result.is_err(), "PUT with invalid proof should be rejected");
-
-    // Verify the chunk was NOT stored on the network
-    let get_result = client
-        .chunk_get(&address)
-        .await
-        .expect("chunk_get should succeed");
-    assert!(
-        get_result.is_none(),
-        "Chunk with invalid proof should not be stored on the network"
-    );
-
-    drop(client);
-    testnet.teardown().await;
-}
-
-#[tokio::test(flavor = "multi_thread")]
-#[serial]
-async fn test_chunk_put_no_wallet_fails() {
-    let testnet = MiniTestnet::start(DEFAULT_NODE_COUNT).await;
-    let node = testnet.node(3).expect("Node 3 should exist");
-
-    // Client WITHOUT wallet
-    let client = Client::from_node(Arc::clone(&node), test_client_config());
-
-    let content = Bytes::from("chunk_put without wallet test");
-    let result = client.chunk_put(content).await;
-
-    assert!(result.is_err(), "chunk_put without wallet should fail");
-    let err_msg = format!("{}", result.expect_err("should have error"));
-    let err_lower = err_msg.to_lowercase();
-    assert!(
-        err_lower.contains("wallet"),
-        "Error should mention wallet, got: {err_msg}"
-    );
-
-    drop(client);
-    testnet.teardown().await;
-}
-
-#[tokio::test(flavor = "multi_thread")]
-#[serial]
-async fn test_chunk_put_duplicate_skips_payment() {
-    let (client, testnet) = setup().await;
+/// A second PUT of stored content finds it stored and pays nothing.
+async fn duplicate_skips_payment(testnet: Arc<MiniTestnet>) {
+    let client = testnet.client();
 
     let content = Bytes::from("duplicate payment prevention test");
-
-    // First put — should succeed with payment
     let addr1 = client
         .chunk_put(content.clone())
         .await
         .expect("first put should succeed");
 
-    // Get wallet balance BEFORE the second put
-    let balance_before = client
-        .wallet()
-        .expect("wallet should be set")
-        .balance_of_tokens()
-        .await
-        .expect("balance query should succeed");
-
-    // Second put of same content — should detect existence and skip payment
+    let wallet = client.wallet().expect("wallet should be set");
+    let balance_before = wallet.balance_of_tokens().await.expect("balance");
     let addr2 = client
         .chunk_put(content)
         .await
         .expect("duplicate put should succeed");
-
     assert_eq!(addr1, addr2, "duplicate put should return same address");
-
-    // Wallet balance should be unchanged (no on-chain payment for the duplicate)
-    let balance_after = client
-        .wallet()
-        .expect("wallet should be set")
-        .balance_of_tokens()
-        .await
-        .expect("balance query should succeed");
-
     assert_eq!(
-        balance_before, balance_after,
+        wallet.balance_of_tokens().await.expect("balance"),
+        balance_before,
         "duplicate chunk_put should not spend any tokens"
     );
+}
 
-    drop(client);
-    testnet.teardown().await;
+/// A chunk nobody stored and a pointer nobody wrote read as absent, not as
+/// errors.
+async fn absent_reads(testnet: Arc<MiniTestnet>) {
+    let client = testnet.client();
+
+    let missing_address = [0xDE; 32];
+    assert!(
+        client
+            .chunk_get(&missing_address)
+            .await
+            .expect("get for missing address should not error")
+            .is_none(),
+        "Should return None for non-existent chunk"
+    );
+    assert!(
+        !client
+            .chunk_exists(&missing_address)
+            .await
+            .expect("exists for missing should succeed"),
+        "exists() should return false for missing chunk"
+    );
+
+    let (pk, _sk) = ml_dsa_65().generate_keypair().expect("keypair");
+    assert!(
+        client
+            .pointer_get(&pointer_address(&pk))
+            .await
+            .expect("a read of an empty address is not an error")
+            .is_none(),
+        "nothing was ever written here"
+    );
+}
+
+/// A client without a wallet can't store: the PUT fails, naming the wallet.
+async fn no_wallet_fails(testnet: Arc<MiniTestnet>) {
+    let node = testnet.node(CLIENT_NODE).expect("client node");
+    let client = Client::from_node(node, test_client_config());
+
+    let result = client
+        .chunk_put(Bytes::from("chunk_put without wallet test"))
+        .await;
+    let err_msg = result
+        .expect_err("chunk_put without wallet should fail")
+        .to_string();
+    assert!(
+        err_msg.to_lowercase().contains("wallet"),
+        "Error should mention wallet, got: {err_msg}"
+    );
 }
