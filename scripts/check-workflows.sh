@@ -13,7 +13,7 @@
 # - release.yml runs only for v*+ds.* tags and grants no permissions unless
 #   a job asks for them;
 # - its checks job makes sure the release environment exists and asks for
-#   approval (required reviewers);
+#   approval (required reviewers), and runs darwin-node-pin.py --release;
 # - it waits for the tagged commit's Test and Build runs and
 #   fails unless both succeeded, the Test run from the push to main or one
 #   run by hand, the Build run from the push to main;
@@ -132,6 +132,10 @@ else
     require "release.yml's checks job no longer makes sure the release environment asks for approval" "${checks}" \
         'gh api "repos/$GH_REPO/environments/release"' \
         'if [[ ",$rules," != *",required_reviewers,"* ]]; then'
+
+    # It checks the darwin-node revision the tests ran against may be
+    # released against.
+    require "release.yml's checks job no longer checks the darwin-node revision may be released against" "${checks}"         'run: python3 scripts/darwin-node-pin.py --release'
 
     # It waits for the commit's Test and Build runs, and fails unless both
     # succeeded.

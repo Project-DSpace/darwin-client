@@ -1113,7 +1113,11 @@ darwin-node nodes, at the revision `ant-core/Cargo.toml` pins, and a local Anvil
 chain, so `anvil` (Foundry) must be on PATH. CI runs every test target:
 `scripts/test-targets.py` lists where each one runs, or why it is skipped, and
 `scripts/darwin-node-pin.py` checks that the darwin-node revision is pinned
-alike everywhere and that `vendor/ant-protocol` is darwin-node's copy.
+alike everywhere and that `vendor/ant-protocol` is darwin-node's copy. Before a
+client release is published, its `--release` check also requires the revision to
+be on darwin-node's main and not one listed as too old to release against: the
+darwin-node main of before node release 1a, which client release 1a's busy
+handling has never run against.
 
 ## License
 

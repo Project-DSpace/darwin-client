@@ -130,6 +130,10 @@ edit "${RELEASE}" 'if [[ ",$rules," != *",required_reviewers,"* ]]; then' 'if fa
 expect "the release environment's approval not checked" "no longer makes sure the release environment asks for approval"
 
 fresh
+edit "${RELEASE}" 'run: python3 scripts/darwin-node-pin.py --release' 'run: python3 scripts/darwin-node-pin.py'
+expect "the darwin-node revision not checked for release" "no longer checks the darwin-node revision may be released against"
+
+fresh
 edit "${RELEASE}" 'actions/workflows/test.yml/runs' 'actions/workflows/build.yml/runs'
 expect "no Test run looked for" "missing: actions/workflows/test.yml/runs"
 
