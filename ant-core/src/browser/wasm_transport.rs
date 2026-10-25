@@ -102,7 +102,6 @@ const READ_RESPONSE_RESERVATION: usize =
     3 * (MAX_BROWSER_RESPONSE_BYTES + PQ_ENCRYPTED_OVERHEAD_BYTES);
 const MAX_BROWSER_RANGE_BYTES: usize = 4 * 1024 * 1024;
 const MAX_RANGE_CACHE_BYTES: usize = 32 * 1024 * 1024;
-const MAX_UPLOAD_CHECKPOINT_BYTES: usize = 128 * 1024 * 1024;
 // A 1 GB self-encrypted file needs only a few hundred records. Keep malformed
 // JavaScript metadata from creating unbounded quote work.
 const MAX_UPLOAD_RECORDS: usize = 4096;
@@ -2261,51 +2260,69 @@ impl RecordPlacement {
 struct UploadCheckpoint {
     mode: PaymentMode,
     merkle_wallet: Option<js_sys::Function>,
-    snapshot: Option<String>,
+    snapshot: Option<SavedSnapshot>,
     callback: Option<js_sys::Function>,
 }
 
-#[derive(Serialize, Deserialize)]
-struct UploadCheckpointEnvelope {
-    scope: String,
-    state: String,
+/// A checkpoint the page handed back: the bytes this client saves, or the
+/// JSON text the browser client before them saved, which is still read.
+#[derive(Clone)]
+enum SavedSnapshot {
+    Bytes(Vec<u8>),
+    Json(String),
+}
+
+impl SavedSnapshot {
+    /// The checkpoint the page passed, if any: a `Uint8Array` (or an
+    /// `ArrayBuffer`) of the bytes saved, or the JSON text an earlier client
+    /// saved.
+    fn from_js(value: &JsValue) -> Result<Option<Self>, JsValue> {
+        if value.is_undefined() || value.is_null() {
+            return Ok(None);
+        }
+        if let Some(text) = value.as_string() {
+            return Ok(Some(Self::Json(text)));
+        }
+        if value.is_instance_of::<Uint8Array>() || value.is_instance_of::<js_sys::ArrayBuffer>() {
+            return Ok(Some(Self::Bytes(Uint8Array::new(value).to_vec())));
+        }
+        Err(JsValue::from_str(
+            "an upload checkpoint is the bytes an earlier upload saved",
+        ))
+    }
+
+    /// Its scope and state, checked.
+    fn read(&self) -> Result<(String, crate::data::client::upload_state::UploadState), String> {
+        use crate::data::client::upload_state::{BrowserSnapshot, UploadState};
+        let snapshot = match self {
+            Self::Bytes(bytes) => BrowserSnapshot::Bytes(bytes),
+            Self::Json(text) => BrowserSnapshot::Json(text),
+        };
+        UploadState::read_snapshot(snapshot).map_err(|e| e.to_string())
+    }
 }
 
 impl UploadCheckpoint {
     fn from_js(
         payment_mode: Option<String>,
         merkle_wallet: Option<js_sys::Function>,
-        snapshot: Option<String>,
+        snapshot: JsValue,
         callback: Option<js_sys::Function>,
     ) -> Result<Self, JsValue> {
         Ok(Self {
             mode: parse_payment_mode(payment_mode.as_deref())?,
             merkle_wallet,
-            snapshot,
+            snapshot: SavedSnapshot::from_js(&snapshot)?,
             callback,
         })
     }
 
-    fn envelope(snapshot: &str) -> Result<UploadCheckpointEnvelope, String> {
-        if snapshot.len() > MAX_UPLOAD_CHECKPOINT_BYTES {
-            return Err("upload checkpoint too large".into());
-        }
-        serde_json::from_str(snapshot).map_err(|e| e.to_string())
-    }
-
+    /// The bytes to save for `state`: binary, with its scope in them.
     fn encode(
         scope: &str,
         state: &crate::data::client::upload_state::UploadState,
-    ) -> Result<String, String> {
-        let snapshot = serde_json::to_string(&UploadCheckpointEnvelope {
-            scope: scope.into(),
-            state: hex::encode(state.checkpoint().map_err(|e| e.to_string())?),
-        })
-        .map_err(|e| e.to_string())?;
-        if snapshot.len() > MAX_UPLOAD_CHECKPOINT_BYTES {
-            return Err("upload checkpoint too large".into());
-        }
-        Ok(snapshot)
+    ) -> Result<Vec<u8>, String> {
+        state.snapshot(scope).map_err(|e| e.to_string())
     }
 
     fn restore(
@@ -2315,12 +2332,11 @@ impl UploadCheckpoint {
         let Some(snapshot) = &self.snapshot else {
             return Ok(Default::default());
         };
-        let envelope = Self::envelope(snapshot)?;
-        if envelope.scope != scope {
+        let (saved_scope, state) = snapshot.read()?;
+        if saved_scope != scope {
             return Err("upload checkpoint belongs to a different file or payment network".into());
         }
-        let bytes = hex::decode(&envelope.state).map_err(|e| e.to_string())?;
-        crate::data::client::upload_state::UploadState::restore(&bytes).map_err(|e| e.to_string())
+        Ok(state)
     }
 
     async fn save(
@@ -2334,7 +2350,7 @@ impl UploadCheckpoint {
         if let Some(callback) = &self.callback {
             let value = Self::encode(scope, state)?;
             let result = callback
-                .call1(&JsValue::NULL, &JsValue::from_str(&value))
+                .call1(&JsValue::NULL, &Uint8Array::from(value.as_slice()).into())
                 .map_err(js_error_message)?;
             JsFuture::from(Promise::resolve(&result))
                 .await
@@ -2500,6 +2516,11 @@ impl BrowserNetworkClient {
     }
 
     /// Self-encrypt, quote, pay through a wallet callback, and store a public file.
+    ///
+    /// `on_checkpoint` receives the upload's checkpoint, a `Uint8Array`, each
+    /// time it changes; pass the last one back as `checkpoint` to resume. The
+    /// JSON text earlier clients gave is still read, and the next checkpoint
+    /// saved replaces it.
     #[wasm_bindgen(js_name = uploadPublicFile)]
     #[allow(clippy::too_many_arguments)] // Preserve the existing JS argument order; recovery is additive.
     pub async fn upload_public_file(
@@ -2510,7 +2531,7 @@ impl BrowserNetworkClient {
         payment_network: JsValue,
         pay_for_quotes: js_sys::Function,
         on_progress: Option<js_sys::Function>,
-        checkpoint: Option<String>,
+        checkpoint: JsValue,
         on_checkpoint: Option<js_sys::Function>,
         payment_mode: Option<String>,
         pay_for_merkle: Option<js_sys::Function>,
@@ -2547,7 +2568,7 @@ impl BrowserNetworkClient {
         load_record: js_sys::Function,
         pay_for_quotes: js_sys::Function,
         on_progress: Option<js_sys::Function>,
-        checkpoint: Option<String>,
+        checkpoint: JsValue,
         on_checkpoint: Option<js_sys::Function>,
         payment_mode: Option<String>,
         pay_for_merkle: Option<js_sys::Function>,
@@ -2588,7 +2609,7 @@ impl BrowserNetworkClient {
         load_record: js_sys::Function,
         pay_for_quotes: js_sys::Function,
         on_progress: Option<js_sys::Function>,
-        checkpoint: Option<String>,
+        checkpoint: JsValue,
         on_checkpoint: Option<js_sys::Function>,
         payment_mode: Option<String>,
         pay_for_merkle: Option<js_sys::Function>,

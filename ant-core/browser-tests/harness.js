@@ -14,7 +14,7 @@ globalThis.runIntegration = async ({ endpoint, payment, rpcUrl }) => {
   const vault = new Contract(payment.payment_vault_address,
     ["function payForQuotes((address rewardsAddress,uint256 amount,bytes32 quoteHash)[] payments)"], signer);
   let payments = 0, checkpoint, paid = false;
-  const save = value => { checkpoint = value; localStorage.setItem("checkpoint", value); };
+  const save = value => { checkpoint = value; localStorage.setItem("checkpoint", Array.from(value, byte => byte.toString(16).padStart(2, "0")).join("")); };
   const pay = async (_, quotes, submitted) => {
     payments++;
     const totalAmount = quotes.reduce((sum, quote) => sum + BigInt(quote.amount), 0n);

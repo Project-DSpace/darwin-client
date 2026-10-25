@@ -107,14 +107,14 @@ for (const mode of ["single", "merkle"]) {
       const reconciled = await client.reconcileFailedUploadPayment(checkpoint, (attempt, scope) => {
         assert.equal(attempt.merkle, mode === "merkle");
         assert.equal(attempt.submissions.length, 0);
-        assert.equal(scope, JSON.parse(checkpoint).scope);
+        assert.match(scope, /^[0-9a-f]{64}$/);
         return notSubmitted();
       }, async value => {
         await new Promise(resolve => setTimeout(resolve, 5));
         checkpoint = value;
         persisted++;
       });
-      assert.equal(reconciled, checkpoint);
+      assert.deepEqual(reconciled, checkpoint);
       assert.equal(persisted, 1);
       assert.equal(calls, 1, "reconciliation never invokes payment");
       await upload();

@@ -80,6 +80,10 @@ pub use client::pointer::{
     SeedsView,
 };
 pub use client::upload::{MerkleUploadPayment, UploadPayment};
+#[cfg(feature = "native")]
+pub use client::upload_checkpoint::{
+    upload_checkpoint_files, UploadCheckpointFiles, UPLOAD_CHECKPOINT_EXTENSIONS,
+};
 
 // Re-export self-encryption types
 pub use self_encryption::DataMap;

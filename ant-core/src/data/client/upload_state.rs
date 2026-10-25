@@ -2,9 +2,37 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! Portable prepared/paid upload state. Storage and wallet adapters own persistence and I/O.
+//!
+//! # The checkpoint's format
+//!
+//! A checkpoint starts with [`CHECKPOINT_MAGIC`] and [`CHECKPOINT_FORMAT`],
+//! followed by its body in msgpack. Proofs are kept as byte strings, not as
+//! arrays of integers. An older client parses a whole checkpoint as msgpack,
+//! where the magic's first byte reads as an integer, so its parse fails and
+//! its upload stops with an error instead of paying again.
+//!
+//! A checkpoint written before the magic, a msgpack [`UploadState`], is still
+//! read: native files are migrated to the new format when they are opened
+//! (`upload_checkpoint`), and a browser's JSON snapshot is read as it is.
+//!
+//! # Restoring a saved plan
+//!
+//! A saved plan's quotes must be signed by the nodes they name. Its amounts
+//! must equal one of exactly two recomputations from those signed quotes:
+//! the full amount (3 × the median quote), or the weighted amount for the
+//! size class of the plan's own `data_size` (`weighted_amount` with
+//! `record_weight`; a pointer's plan is sized at its 5,303 bytes, which is in
+//! a pointer's own class). Never a range. So a checkpoint saved by a client
+//! paying either way restores, on either side of the pricing switch.
+//!
+//! A plan that matches neither and that no pending payment names is dropped,
+//! and its record quoted again. A plan named by a pending payment may have
+//! been shown to a payer: it is never dropped, and the whole checkpoint is
+//! refused instead. So is a checkpoint with a bad signature or identity.
 
 use super::batch::{
     build_plan_proof, proof_is_safely_fresh, ChunkPaymentPlan, PaidChunk, PreparedChunk,
+    SingleNodeQuotePayment,
 };
 use crate::data::error::{Error, Result};
 use ant_protocol::{
@@ -14,9 +42,42 @@ use ant_protocol::{
 };
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
+    sync::atomic::{AtomicU64, Ordering},
     time::{Duration, SystemTime},
 };
+
+/// What a checkpoint in this format starts with.
+pub const CHECKPOINT_MAGIC: [u8; 4] = *b"DSCK";
+
+/// The largest browser snapshot a browser upload saves or reads.
+#[cfg(any(test, all(target_arch = "wasm32", feature = "browser-wasm")))]
+pub(crate) const MAX_BROWSER_SNAPSHOT_BYTES: usize = 128 * 1024 * 1024;
+
+/// A browser snapshot as the page hands it back: the bytes this client
+/// saves, or the JSON text the browser client before [`CHECKPOINT_MAGIC`]
+/// saved.
+#[cfg(any(test, all(target_arch = "wasm32", feature = "browser-wasm")))]
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum BrowserSnapshot<'a> {
+    /// What [`UploadState::snapshot`] gives.
+    Bytes(&'a [u8]),
+    /// `{"scope", "state"}`, the state a hex msgpack [`UploadState`].
+    Json(&'a str),
+}
+
+#[cfg(any(test, all(target_arch = "wasm32", feature = "browser-wasm")))]
+impl BrowserSnapshot<'_> {
+    fn len(&self) -> usize {
+        match self {
+            Self::Bytes(bytes) => bytes.len(),
+            Self::Json(text) => text.len(),
+        }
+    }
+}
+
+/// The format version that follows [`CHECKPOINT_MAGIC`].
+pub const CHECKPOINT_FORMAT: u8 = 1;
 
 /// A payment may have reached the wallet or chain. Never submit it again merely
 /// because receipt parsing or observation failed.
@@ -40,12 +101,27 @@ struct FailedPaymentAttempt {
     resolution: serde_json::Value,
 }
 
+/// Each proof put into any [`UploadState`] gets the next serial, so a file
+/// that keeps proofs apart (`upload_checkpoint`) can tell which it has
+/// written without comparing their bytes.
+static NEXT_PROOF_SERIAL: AtomicU64 = AtomicU64::new(1);
+
+fn next_proof_serial() -> u64 {
+    NEXT_PROOF_SERIAL.fetch_add(1, Ordering::Relaxed)
+}
+
 /// Prepared plans and confirmed proofs keyed by content address.
 /// Checkpoints contain no file bytes or wallet secrets.
+///
+/// Its serde form is the checkpoint format before [`CHECKPOINT_MAGIC`],
+/// which is only read now: [`UploadState::checkpoint`] writes the new one.
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct UploadState {
     plans: HashMap<XorName, ChunkPaymentPlan>,
     proofs: HashMap<XorName, Vec<u8>>,
+    /// The serial of each proof ([`next_proof_serial`]); never saved.
+    #[serde(skip)]
+    proof_serials: HashMap<XorName, u64>,
     #[serde(default)]
     pub(crate) pending_merkle: Option<super::merkle::PreparedMerkleBatch>,
     /// Submission journal; an unresolved attempt must be reconciled before another payment.
@@ -53,6 +129,52 @@ pub struct UploadState {
     pub pending_payment: Option<PaymentAttempt>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     failed_payments: Vec<FailedPaymentAttempt>,
+}
+
+/// A checkpoint's body, as written after the magic and format.
+#[derive(Serialize)]
+struct BodyOut<'a> {
+    /// What the checkpoint is for: a browser snapshot's file and payment
+    /// network. Native files are named by it instead.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    scope: Option<&'a str>,
+    plans: &'a HashMap<XorName, ChunkPaymentPlan>,
+    /// Kept apart in a native file's proof file, so empty there.
+    proofs: HashMap<&'a XorName, &'a serde_bytes::Bytes>,
+    pending_merkle: &'a Option<super::merkle::PreparedMerkleBatch>,
+    pending_payment: &'a Option<PaymentAttempt>,
+    failed_payments: &'a [FailedPaymentAttempt],
+}
+
+/// [`BodyOut`], read back.
+#[derive(Deserialize)]
+struct BodyIn {
+    #[serde(default)]
+    scope: Option<String>,
+    #[serde(default)]
+    plans: HashMap<XorName, ChunkPaymentPlan>,
+    #[serde(default)]
+    proofs: HashMap<XorName, serde_bytes::ByteBuf>,
+    #[serde(default)]
+    pending_merkle: Option<super::merkle::PreparedMerkleBatch>,
+    #[serde(default)]
+    pending_payment: Option<PaymentAttempt>,
+    #[serde(default)]
+    failed_payments: Vec<FailedPaymentAttempt>,
+}
+
+/// A checkpoint as read, before it is checked ([`UploadState::validated`]).
+pub(crate) struct Parsed {
+    /// What it holds.
+    pub(crate) state: UploadState,
+    /// A browser snapshot's scope.
+    #[cfg_attr(
+        not(any(test, all(target_arch = "wasm32", feature = "browser-wasm"))),
+        allow(dead_code)
+    )]
+    pub(crate) scope: Option<String>,
+    /// Whether it was in the format before [`CHECKPOINT_MAGIC`].
+    pub(crate) legacy: bool,
 }
 
 /// Native proof expiry, shared by every client adapter.
@@ -91,6 +213,75 @@ pub(crate) fn merkle_fresh(timestamp: u64, now: SystemTime) -> bool {
             timestamp <= now.as_secs()
                 && now.as_secs() - timestamp < ant_protocol::evm::MERKLE_PAYMENT_EXPIRATION
         })
+}
+
+/// A plan's quote tuples, in order, as compared on restore.
+fn quote_tuples(
+    quotes: &[ant_protocol::payment::QuotePaymentInfo],
+) -> Vec<(
+    QuoteHash,
+    ant_protocol::evm::RewardsAddress,
+    ant_protocol::evm::Amount,
+    ant_protocol::evm::Amount,
+)> {
+    quotes
+        .iter()
+        .map(|q| (q.quote_hash, q.rewards_address, q.amount, q.price))
+        .collect()
+}
+
+/// Whether `plan`'s amounts are one of the two recomputations from its
+/// signed quotes: the full amount, or the weighted amount for the class of
+/// its own `data_size`.
+pub(crate) fn plan_amounts_recomputed(plan: &ChunkPaymentPlan) -> bool {
+    let Ok(full) = SingleNodeQuotePayment::from_quotes(
+        plan.peer_quotes
+            .iter()
+            .map(|(_, quote)| quote.clone())
+            .collect(),
+    ) else {
+        return false;
+    };
+    let recorded = quote_tuples(&plan.payment.quotes);
+    if recorded == quote_tuples(&full.quotes) {
+        return true;
+    }
+    // A pointer's plan is sized at POINTER_WIRE_LEN, which a chunk of that
+    // size shares its class with, so one function covers both.
+    let weight = ant_protocol::payment::pricing::record_weight(
+        ant_protocol::DATA_TYPE_CHUNK,
+        usize::try_from(plan.data_size).unwrap_or(usize::MAX),
+    );
+    let weighted = full
+        .quotes
+        .iter()
+        .map(|q| {
+            let amount = if q.amount.is_zero() {
+                Some(q.amount)
+            } else {
+                ant_protocol::payment::pricing::weighted_amount(q.price, weight)
+            };
+            amount.map(|amount| (q.quote_hash, q.rewards_address, amount, q.price))
+        })
+        .collect::<Option<Vec<_>>>();
+    weighted.is_some_and(|weighted| weighted == recorded)
+}
+
+/// Whether every quote is for `address` and signed by the node its peer id
+/// names.
+fn quotes_signed_for(
+    address: &XorName,
+    quotes: &[(
+        ant_protocol::evm::EncodedPeerId,
+        ant_protocol::evm::PaymentQuote,
+    )],
+) -> bool {
+    quotes.iter().all(|(peer, quote)| {
+        quote.content.0 == *address
+            && *peer
+                == ant_protocol::evm::EncodedPeerId::new(*blake3::hash(&quote.pub_key).as_bytes())
+            && ant_protocol::payment::verify_quote_signature(quote)
+    })
 }
 
 impl UploadState {
@@ -138,8 +329,55 @@ impl UploadState {
             .collect()
     }
 
+    /// Keep `bytes` as the proof of `address`, replacing any it had.
+    fn insert_proof(&mut self, address: XorName, bytes: Vec<u8>) {
+        self.proof_serials.insert(address, next_proof_serial());
+        self.proofs.insert(address, bytes);
+    }
+
+    /// Forget the proof of `address`, and return it.
+    pub(crate) fn drop_proof(&mut self, address: &XorName) -> Option<Vec<u8>> {
+        self.proof_serials.remove(address);
+        self.proofs.remove(address)
+    }
+
+    /// Every proof, with its serial ([`next_proof_serial`]).
+    #[cfg(feature = "native")]
+    pub(crate) fn proof_entries(&self) -> impl Iterator<Item = (&XorName, &Vec<u8>, u64)> {
+        self.proofs.iter().map(|(address, bytes)| {
+            (
+                address,
+                bytes,
+                self.proof_serials.get(address).copied().unwrap_or_default(),
+            )
+        })
+    }
+
+    /// The serial of the proof of `address`, if it has one.
+    #[cfg(test)]
+    pub(crate) fn proof_serial(&self, address: &XorName) -> Option<u64> {
+        self.proof_serials.get(address).copied()
+    }
+
+    /// The addresses that have a proof.
+    #[cfg(test)]
+    pub(crate) fn proof_addresses(&self) -> HashSet<XorName> {
+        self.proofs.keys().copied().collect()
+    }
+
+    /// Give every proof a serial, as after reading them.
+    fn renumber(&mut self) {
+        self.proof_serials = self
+            .proofs
+            .keys()
+            .map(|address| (*address, next_proof_serial()))
+            .collect();
+    }
+
     pub(crate) fn insert_merkle(&mut self, result: super::merkle::MerkleBatchPaymentResult) {
-        self.proofs.extend(result.proofs);
+        for (address, bytes) in result.proofs {
+            self.insert_proof(address, bytes);
+        }
         self.pending_merkle = None;
         self.pending_payment = None;
     }
@@ -172,8 +410,7 @@ impl UploadState {
             crate::runtime::system_time(),
         )?;
         let proof_bytes = state
-            .proofs
-            .remove(&chunk.address)
+            .drop_proof(&chunk.address)
             .ok_or_else(|| Error::Payment("confirmed proof missing".into()))?;
         Ok(PaidChunk {
             content: chunk.content,
@@ -185,13 +422,16 @@ impl UploadState {
 
     /// Import the same per-content proofs used by native disk receipts.
     pub fn from_proofs(proofs: HashMap<XorName, Vec<u8>>) -> Self {
-        Self {
+        let mut state = Self {
             plans: HashMap::new(),
             proofs,
+            proof_serials: HashMap::new(),
             pending_merkle: None,
             pending_payment: None,
             failed_payments: Vec::new(),
-        }
+        };
+        state.renumber();
+        state
     }
 
     /// Reuse a previously prepared plan after a wallet callback was interrupted.
@@ -228,7 +468,7 @@ impl UploadState {
         self.plans.insert(plan.address, plan);
     }
 
-    /// Whether a confirmed, safely fresh proof already covers this record.
+    /// Whether a confirmed proof that is still usable covers this record.
     pub fn is_paid(&self, address: &XorName, now: SystemTime) -> bool {
         self.proofs
             .get(address)
@@ -254,7 +494,9 @@ impl UploadState {
                 build_plan_proof(plan, transactions).map(|proof| (*address, proof))
             })
             .collect::<Result<Vec<_>>>()?;
-        self.proofs.extend(proofs);
+        for (address, proof) in proofs {
+            self.insert_proof(address, proof);
+        }
         if self.pending_payment.as_ref().is_some_and(|attempt| {
             !attempt.merkle
                 && attempt
@@ -308,60 +550,209 @@ impl UploadState {
         })
     }
 
-    /// Serialize a local recovery checkpoint. Treat it like a native payment receipt.
+    /// Serialize a local recovery checkpoint, proofs included. Treat it like
+    /// a native payment receipt.
     pub fn checkpoint(&self) -> Result<Vec<u8>> {
-        rmp_serde::to_vec_named(self).map_err(|e| Error::Serialization(e.to_string()))
+        self.encode(None, true)
     }
 
-    /// Restore a local checkpoint, validating payment amounts and signed quote identities.
+    /// A browser's snapshot: the whole checkpoint, with `scope` (its file
+    /// and payment network) in it, no larger than
+    /// [`MAX_BROWSER_SNAPSHOT_BYTES`].
+    #[cfg(any(test, all(target_arch = "wasm32", feature = "browser-wasm")))]
+    pub(crate) fn snapshot(&self, scope: &str) -> Result<Vec<u8>> {
+        let bytes = self.encode(Some(scope), true)?;
+        if bytes.len() > MAX_BROWSER_SNAPSHOT_BYTES {
+            return Err(Error::InvalidData("upload checkpoint too large".into()));
+        }
+        Ok(bytes)
+    }
+
+    /// Read a browser's snapshot, in either format: the bytes
+    /// [`Self::snapshot`] gives, or the JSON text the browser client before
+    /// [`CHECKPOINT_MAGIC`] gave (`{"scope", "state"}`, the state a hex
+    /// msgpack [`UploadState`]). Returns its scope and its state, checked.
+    #[cfg(any(test, all(target_arch = "wasm32", feature = "browser-wasm")))]
+    pub(crate) fn read_snapshot(snapshot: BrowserSnapshot<'_>) -> Result<(String, Self)> {
+        if snapshot.len() > MAX_BROWSER_SNAPSHOT_BYTES {
+            return Err(Error::InvalidData("upload checkpoint too large".into()));
+        }
+        let (scope, parsed) = match snapshot {
+            BrowserSnapshot::Bytes(bytes) => {
+                let parsed = Self::parse(bytes)?;
+                if parsed.legacy {
+                    return Err(Error::InvalidData(
+                        "an upload checkpoint's bytes must start with its format".into(),
+                    ));
+                }
+                let scope = parsed.scope.clone().ok_or_else(|| {
+                    Error::InvalidData("the upload checkpoint names no file".into())
+                })?;
+                (scope, parsed)
+            }
+            BrowserSnapshot::Json(text) => {
+                #[derive(Deserialize)]
+                struct Legacy {
+                    scope: String,
+                    state: String,
+                }
+                let legacy: Legacy =
+                    serde_json::from_str(text).map_err(|e| Error::Serialization(e.to_string()))?;
+                let bytes =
+                    hex::decode(&legacy.state).map_err(|e| Error::Serialization(e.to_string()))?;
+                (legacy.scope, Self::parse(&bytes)?)
+            }
+        };
+        Ok((scope, parsed.state.validated()?))
+    }
+
+    /// The checkpoint without its proofs, which a native file keeps apart,
+    /// one appended at a time (`upload_checkpoint`).
+    #[cfg(feature = "native")]
+    pub(crate) fn checkpoint_without_proofs(&self) -> Result<Vec<u8>> {
+        self.encode(None, false)
+    }
+
+    fn encode(&self, scope: Option<&str>, with_proofs: bool) -> Result<Vec<u8>> {
+        let body = BodyOut {
+            scope,
+            plans: &self.plans,
+            proofs: if with_proofs {
+                self.proofs
+                    .iter()
+                    .map(|(address, bytes)| (address, serde_bytes::Bytes::new(bytes)))
+                    .collect()
+            } else {
+                HashMap::new()
+            },
+            pending_merkle: &self.pending_merkle,
+            pending_payment: &self.pending_payment,
+            failed_payments: &self.failed_payments,
+        };
+        let mut bytes = Vec::with_capacity(5);
+        bytes.extend_from_slice(&CHECKPOINT_MAGIC);
+        bytes.push(CHECKPOINT_FORMAT);
+        rmp_serde::encode::write_named(&mut bytes, &body)
+            .map_err(|e| Error::Serialization(e.to_string()))?;
+        Ok(bytes)
+    }
+
+    /// The checkpoint as the client before [`CHECKPOINT_MAGIC`] wrote it.
+    #[cfg(test)]
+    pub(crate) fn legacy_checkpoint(&self) -> Vec<u8> {
+        rmp_serde::to_vec_named(self).unwrap_or_default()
+    }
+
+    /// Read a checkpoint, in either format, without checking it.
+    pub(crate) fn parse(bytes: &[u8]) -> Result<Parsed> {
+        let Some(rest) = bytes.strip_prefix(&CHECKPOINT_MAGIC) else {
+            let mut state: Self =
+                rmp_serde::from_slice(bytes).map_err(|e| Error::Serialization(e.to_string()))?;
+            state.renumber();
+            return Ok(Parsed {
+                state,
+                scope: None,
+                legacy: true,
+            });
+        };
+        let (&format, body) = rest
+            .split_first()
+            .ok_or_else(|| Error::InvalidData("checkpoint ends after its magic".into()))?;
+        if format != CHECKPOINT_FORMAT {
+            return Err(Error::InvalidData(format!(
+                "checkpoint format {format} is not one this client reads; \
+                 finish the upload with the client that saved it"
+            )));
+        }
+        let body: BodyIn =
+            rmp_serde::from_slice(body).map_err(|e| Error::Serialization(e.to_string()))?;
+        let mut state = Self {
+            plans: body.plans,
+            proofs: body
+                .proofs
+                .into_iter()
+                .map(|(address, bytes)| (address, bytes.into_vec()))
+                .collect(),
+            proof_serials: HashMap::new(),
+            pending_merkle: body.pending_merkle,
+            pending_payment: body.pending_payment,
+            failed_payments: body.failed_payments,
+        };
+        state.renumber();
+        Ok(Parsed {
+            state,
+            scope: body.scope,
+            legacy: false,
+        })
+    }
+
+    /// Add proofs read from a native file's proof file to a parsed
+    /// checkpoint, before it is checked.
+    #[cfg(feature = "native")]
+    pub(crate) fn add_parsed_proofs(&mut self, proofs: HashMap<XorName, Vec<u8>>) {
+        for (address, bytes) in proofs {
+            self.insert_proof(address, bytes);
+        }
+    }
+
+    /// Restore a local checkpoint, in either format, validating payment
+    /// amounts and signed quote identities.
     pub fn restore(bytes: &[u8]) -> Result<Self> {
-        let state: Self =
-            rmp_serde::from_slice(bytes).map_err(|e| Error::Serialization(e.to_string()))?;
-        for (address, plan) in &state.plans {
+        Self::parse(bytes)?.state.validated()
+    }
+
+    /// Check a parsed checkpoint (see the module docs): every quote signed
+    /// by the node it names; every plan's amounts one of the two
+    /// recomputations, or the plan dropped if no pending payment names it;
+    /// the journal and every proof well formed.
+    pub(crate) fn validated(mut self) -> Result<Self> {
+        let pending = self
+            .pending_payment
+            .as_ref()
+            .filter(|attempt| !attempt.merkle)
+            .map(|attempt| attempt.addresses.iter().copied().collect::<HashSet<_>>())
+            .unwrap_or_default();
+        let mut dropped = Vec::new();
+        for (address, plan) in &self.plans {
             if address != &plan.address
                 || plan.peer_quotes.is_empty()
-                || plan.peer_quotes.iter().any(|(peer, quote)| {
-                    quote.content.0 != *address
-                        || *peer
-                            != ant_protocol::evm::EncodedPeerId::new(
-                                *blake3::hash(&quote.pub_key).as_bytes(),
-                            )
-                        || !ant_protocol::payment::verify_quote_signature(quote)
-                })
+                || !quotes_signed_for(address, &plan.peer_quotes)
             {
                 return Err(Error::InvalidData("invalid checkpoint quote".into()));
             }
-            let canonical = super::batch::SingleNodeQuotePayment::from_quotes(
-                plan.peer_quotes
-                    .iter()
-                    .map(|(_, quote)| quote.clone())
-                    .collect(),
-            )?;
-            let signature = |quotes: &[ant_protocol::payment::QuotePaymentInfo]| {
-                quotes
-                    .iter()
-                    .map(|q| (q.quote_hash, q.rewards_address, q.amount, q.price))
-                    .collect::<Vec<_>>()
-            };
-            if signature(&canonical.quotes) != signature(&plan.payment.quotes) {
-                return Err(Error::InvalidData(
-                    "checkpoint payment differs from signed quotes".into(),
-                ));
+            if plan_amounts_recomputed(plan) {
+                continue;
             }
+            if pending.contains(address) {
+                return Err(Error::InvalidData(format!(
+                    "the pending payment's plan for {} matches neither the full nor the \
+                     weighted amount of its signed quotes",
+                    hex::encode(address)
+                )));
+            }
+            dropped.push(*address);
         }
-        if let Some(prepared) = &state.pending_merkle {
+        for address in dropped {
+            tracing::warn!(
+                "Dropping the saved plan for {}: its amounts are neither the full nor the \
+                 weighted amount of its signed quotes; the record is quoted again",
+                hex::encode(address)
+            );
+            self.plans.remove(&address);
+        }
+        if let Some(prepared) = &self.pending_merkle {
             prepared.validate_checkpoint()?;
         }
-        if let Some(attempt) = &state.pending_payment {
-            if attempt.submissions.len() > 256 || (attempt.merkle && state.pending_merkle.is_none())
+        if let Some(attempt) = &self.pending_payment {
+            if attempt.submissions.len() > 256 || (attempt.merkle && self.pending_merkle.is_none())
             {
                 return Err(Error::InvalidData("invalid payment journal".into()));
             }
             if !attempt.merkle {
-                state.pending_plans()?;
+                self.pending_plans()?;
             }
         }
-        for (address, bytes) in &state.proofs {
+        for (address, bytes) in &self.proofs {
             if let Ok(proof) = ant_protocol::payment::deserialize_merkle_proof(bytes) {
                 if proof.address.0 != *address
                     || !proof.data_proof.verify()
@@ -378,67 +769,114 @@ impl UploadState {
                 .map_err(Error::InvalidData)?;
             if proof.tx_hashes.is_empty()
                 || proof.proof_of_payment.peer_quotes.is_empty()
-                || proof
-                    .proof_of_payment
-                    .peer_quotes
-                    .iter()
-                    .any(|(peer, quote)| {
-                        quote.content.0 != *address
-                            || *peer
-                                != ant_protocol::evm::EncodedPeerId::new(
-                                    *blake3::hash(&quote.pub_key).as_bytes(),
-                                )
-                            || !ant_protocol::payment::verify_quote_signature(quote)
-                    })
+                || !quotes_signed_for(address, &proof.proof_of_payment.peer_quotes)
             {
                 return Err(Error::InvalidData(
                     "invalid checkpoint payment proof".into(),
                 ));
             }
         }
-        Ok(state)
+        Ok(self)
     }
 }
 
+/// Plans and proofs for the checkpoint's tests, here and in the files that
+/// keep checkpoints.
 #[cfg(test)]
-mod tests {
-    use super::super::batch::{finalize_batch_payment, SingleNodeQuotePayment};
+#[allow(clippy::unwrap_used)]
+pub(crate) mod test_state {
     use super::*;
     use ant_protocol::{
         evm::{Amount, EncodedPeerId, PaymentQuote, RewardsAddress},
         transport::NodeIdentity,
     };
-    use bytes::Bytes;
 
-    fn plan(content: &[u8], timestamp: SystemTime) -> ChunkPaymentPlan {
-        let identity = NodeIdentity::generate().unwrap();
-        let mut quote = PaymentQuote {
-            content: xor_name::XorName(ant_protocol::compute_address(content)),
-            timestamp,
-            price: Amount::from(10),
-            rewards_address: RewardsAddress::new([1; 20]),
-            pub_key: identity.public_key().as_bytes().to_vec(),
-            signature: Vec::new(),
-            committed_key_count: 0,
-            commitment_pin: None,
-        };
-        quote.signature = identity
-            .sign(&quote.bytes_for_sig())
-            .unwrap()
-            .as_bytes()
-            .to_vec();
+    /// A plan for `content`, with one quote at each of `prices`, each from
+    /// a new node, signed at `timestamp`.
+    pub(crate) fn plan_priced(
+        content: &[u8],
+        timestamp: SystemTime,
+        prices: &[u64],
+    ) -> ChunkPaymentPlan {
+        let address = ant_protocol::compute_address(content);
+        let peer_quotes = prices
+            .iter()
+            .map(|price| {
+                let identity = NodeIdentity::generate().unwrap();
+                let mut quote = PaymentQuote {
+                    content: xor_name::XorName(address),
+                    timestamp,
+                    price: Amount::from(*price),
+                    rewards_address: RewardsAddress::new([1; 20]),
+                    pub_key: identity.public_key().as_bytes().to_vec(),
+                    signature: Vec::new(),
+                    committed_key_count: 0,
+                    commitment_pin: None,
+                };
+                quote.signature = identity
+                    .sign(&quote.bytes_for_sig())
+                    .unwrap()
+                    .as_bytes()
+                    .to_vec();
+                (
+                    EncodedPeerId::new(*blake3::hash(&quote.pub_key).as_bytes()),
+                    quote,
+                )
+            })
+            .collect::<Vec<_>>();
         ChunkPaymentPlan {
-            address: quote.content.0,
+            address,
             data_size: content.len() as u64,
             quoted_peers: Vec::new(),
-            payment: SingleNodeQuotePayment::from_quotes(vec![quote.clone()]).unwrap(),
-            peer_quotes: vec![(
-                EncodedPeerId::new(*blake3::hash(&quote.pub_key).as_bytes()),
-                quote,
-            )],
+            payment: SingleNodeQuotePayment::from_quotes(
+                peer_quotes.iter().map(|(_, q)| q.clone()).collect(),
+            )
+            .unwrap(),
+            peer_quotes,
             commitment_sidecars: Vec::new(),
         }
     }
+
+    /// A plan for `content` with one quote, signed at `timestamp`.
+    pub(crate) fn plan(content: &[u8], timestamp: SystemTime) -> ChunkPaymentPlan {
+        plan_priced(content, timestamp, &[10])
+    }
+
+    /// `plan` paid at the weighted amount of its class, as a client past the
+    /// pricing switch pays.
+    pub(crate) fn weighted(mut plan: ChunkPaymentPlan) -> ChunkPaymentPlan {
+        let weight = ant_protocol::payment::pricing::record_weight(
+            ant_protocol::DATA_TYPE_CHUNK,
+            plan.data_size as usize,
+        );
+        for quote in &mut plan.payment.quotes {
+            if !quote.amount.is_zero() {
+                quote.amount =
+                    ant_protocol::payment::pricing::weighted_amount(quote.price, weight).unwrap();
+            }
+        }
+        plan
+    }
+
+    /// A transaction for each paid quote of `plan`.
+    pub(crate) fn transactions(plan: &ChunkPaymentPlan) -> HashMap<QuoteHash, TxHash> {
+        plan.payment
+            .quotes
+            .iter()
+            .filter(|quote| !quote.amount.is_zero())
+            .map(|quote| (quote.quote_hash, TxHash::from([7; 32])))
+            .collect()
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::super::batch::finalize_batch_payment;
+    use super::test_state::{plan, plan_priced, transactions, weighted};
+    use super::*;
+    use ant_protocol::evm::Amount;
+    use bytes::Bytes;
 
     #[test]
     fn checkpoint_reuses_original_proof_with_new_quotes_and_matches_native_finalization() {
@@ -473,6 +911,8 @@ mod tests {
         assert_eq!(recovered.proof_bytes, native[0].proof_bytes);
     }
 
+    /// Two plans are confirmed together or not at all, by one transaction
+    /// each, and a paid proof is only for its own record.
     #[test]
     fn confirmation_is_atomic_and_supports_distinct_transactions() {
         let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
@@ -488,7 +928,6 @@ mod tests {
         state.confirm(&[a.address, b.address], &txs, now).unwrap();
         assert!(state.is_paid(&a.address, now));
         assert!(state.is_paid(&b.address, now));
-        assert!(!state.is_paid(&a.address, now + Duration::from_secs(24 * 60 * 60 - 299)));
         assert!(!reusable_proof(&b.address, &state.proofs[&a.address], now));
     }
 
@@ -497,33 +936,282 @@ mod tests {
         let mut state = UploadState::default();
         let mut a = plan(b"first", SystemTime::UNIX_EPOCH);
         a.payment.quotes[0].amount += Amount::from(1);
-        state.prepare(a);
+        state.prepare(a.clone());
+        // Unpaid, it is dropped and quoted again.
+        let restored = UploadState::restore(&state.checkpoint().unwrap()).unwrap();
+        assert!(restored.plans.is_empty());
+        // Named by a pending payment, the whole checkpoint is refused.
+        state.start_payment(false, vec![a.address]).unwrap();
         assert!(UploadState::restore(&state.checkpoint().unwrap()).is_err());
     }
+
+    /// A checkpoint starts with the magic and its format, and the format
+    /// before it (a msgpack `UploadState`) can't parse it, so a client that
+    /// writes only that one stops with an error rather than paying again.
     #[test]
-    fn expired_proof_allows_a_fresh_plan_without_discarding_payment_evidence() {
-        let issued = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
-        let old = plan(b"expired upload", issued);
+    fn a_new_checkpoint_stops_the_previous_clients_restore() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+        let a = plan(b"first", now);
         let mut state = UploadState::default();
-        state.prepare(old.clone());
+        state.prepare(a.clone());
+        state.confirm(&[a.address], &transactions(&a), now).unwrap();
+        state.prepare(plan(b"second", now));
+        let bytes = state.checkpoint().unwrap();
+        assert_eq!(&bytes[..4], b"DSCK");
+        assert_eq!(bytes[4], CHECKPOINT_FORMAT);
+        // How the previous client restores: a msgpack `UploadState`.
+        assert!(rmp_serde::from_slice::<UploadState>(&bytes).is_err());
+        // A later format is refused here, for the same reason.
+        let mut later = bytes.clone();
+        later[4] = CHECKPOINT_FORMAT + 1;
+        assert!(UploadState::restore(&later).is_err());
+    }
+
+    /// A checkpoint in the format before the magic restores, plans, proofs
+    /// and journal alike.
+    #[test]
+    fn an_old_format_checkpoint_restores() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+        let paid = plan(b"paid", now);
+        let pending = plan(b"pending", now);
+        let mut state = UploadState::default();
+        state.prepare(paid.clone());
         state
-            .confirm(
-                &[old.address],
-                &HashMap::from([(old.payment.quotes[0].quote_hash, TxHash::from([7; 32]))]),
-                issued,
-            )
+            .confirm(&[paid.address], &transactions(&paid), now)
             .unwrap();
-        let evidence = state.proof(&old.address).cloned().unwrap();
-        let now = issued + Duration::from_secs(25 * 60 * 60);
-        let fresh = plan(b"expired upload", now);
-        state.prepare(fresh.clone());
-        let state = UploadState::restore(&state.checkpoint().unwrap()).unwrap();
-        assert!(state
-            .retained_plan(&old.address, old.data_size, issued)
-            .is_none());
-        assert!(state
-            .retained_plan(&fresh.address, fresh.data_size, now)
-            .is_some());
-        assert_eq!(state.proof(&old.address), Some(&evidence));
+        state.prepare(pending.clone());
+        state.start_payment(false, vec![pending.address]).unwrap();
+        let legacy = state.legacy_checkpoint();
+        assert_ne!(&legacy[..4], b"DSCK");
+        let parsed = UploadState::parse(&legacy).unwrap();
+        assert!(parsed.legacy);
+        let restored = parsed.state.validated().unwrap();
+        assert_eq!(restored.proof(&paid.address), state.proof(&paid.address));
+        assert_eq!(
+            restored.pending_plans().unwrap()[0].address,
+            pending.address
+        );
+    }
+
+    /// Proofs are byte strings in the new format, not arrays of integers:
+    /// the same state takes less room.
+    #[test]
+    fn proofs_take_less_room_as_bytes() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+        let mut state = UploadState::default();
+        for i in 0..8u8 {
+            let p = plan_priced(&[i; 64], now, &[10, 20, 30, 40, 50, 60, 70]);
+            state.prepare(p.clone());
+            state.confirm(&[p.address], &transactions(&p), now).unwrap();
+        }
+        let new = state.checkpoint().unwrap().len();
+        let old = state.legacy_checkpoint().len();
+        assert!(new * 4 < old * 3, "new {new} bytes, old {old}");
+    }
+
+    /// A plan saved at either amount restores; one at any other amount
+    /// doesn't, and is dropped unless a pending payment names it. The full
+    /// amount, the weighted amount of a small record, of a pointer at its
+    /// 5,303 bytes and of a full chunk (the same as the full amount) are all
+    /// recomputed exactly.
+    #[test]
+    fn a_plan_restores_at_the_full_or_the_weighted_amount_and_nothing_else() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+        for content in [
+            vec![1u8; 1000],
+            vec![2u8; 5303],
+            vec![3u8; 300 * 1024],
+            vec![4u8; ant_protocol::MAX_CHUNK_SIZE],
+        ] {
+            let full = plan_priced(&content, now, &[10_000_000, 20_000_000, 30_000_000]);
+            let weighted = weighted(full.clone());
+            assert!(plan_amounts_recomputed(&full));
+            assert!(plan_amounts_recomputed(&weighted));
+            if content.len() < ant_protocol::MAX_CHUNK_SIZE {
+                assert_ne!(
+                    full.payment.total_amount(),
+                    weighted.payment.total_amount(),
+                    "{} bytes",
+                    content.len()
+                );
+            }
+            for paid in [full.clone(), weighted.clone()] {
+                let mut state = UploadState::default();
+                state.prepare(paid.clone());
+                state.start_payment(false, vec![paid.address]).unwrap();
+                let restored = UploadState::restore(&state.checkpoint().unwrap()).unwrap();
+                assert_eq!(
+                    quote_tuples(&restored.pending_plans().unwrap()[0].payment.quotes),
+                    quote_tuples(&paid.payment.quotes)
+                );
+            }
+            // Between the two: neither form.
+            let mut between = full.clone();
+            for quote in &mut between.payment.quotes {
+                if !quote.amount.is_zero() {
+                    quote.amount -= Amount::from(1);
+                }
+            }
+            assert!(!plan_amounts_recomputed(&between));
+            // A weighted amount for another class: neither form either. (A
+            // full chunk's weighted amount is its full amount.)
+            if content.len() < ant_protocol::MAX_CHUNK_SIZE {
+                let mut other_class = weighted.clone();
+                other_class.data_size = if content.len() > 64 * 1024 {
+                    1000
+                } else {
+                    1_000_000
+                };
+                assert!(!plan_amounts_recomputed(&other_class));
+            }
+        }
+    }
+
+    /// One bad unpaid plan is dropped; the paid proofs and the good plans
+    /// beside it stay.
+    #[test]
+    fn one_bad_unpaid_plan_doesnt_discard_paid_proofs() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+        let paid = plan(b"paid", now);
+        let good = plan(b"good", now);
+        let mut bad = plan(b"bad", now);
+        bad.payment.quotes[0].amount += Amount::from(7);
+        let mut state = UploadState::default();
+        state.prepare(paid.clone());
+        state
+            .confirm(&[paid.address], &transactions(&paid), now)
+            .unwrap();
+        state.prepare(good.clone());
+        state.prepare(bad.clone());
+        let restored = UploadState::restore(&state.checkpoint().unwrap()).unwrap();
+        assert!(restored.is_paid(&paid.address, now));
+        assert!(restored.plans.contains_key(&good.address));
+        assert!(!restored.plans.contains_key(&bad.address));
+    }
+
+    /// A bad signature, or a quote whose peer id isn't its key's, refuses
+    /// the whole checkpoint.
+    #[test]
+    fn a_bad_signature_or_identity_refuses_the_whole_checkpoint() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+        let mut forged = plan(b"forged", now);
+        forged.peer_quotes[0].1.signature[0] ^= 1;
+        let mut state = UploadState::default();
+        state.prepare(forged);
+        assert!(UploadState::restore(&state.checkpoint().unwrap()).is_err());
+
+        let mut renamed = plan(b"renamed", now);
+        renamed.peer_quotes[0].0 = ant_protocol::evm::EncodedPeerId::new([9; 32]);
+        let mut state = UploadState::default();
+        state.prepare(renamed);
+        assert!(UploadState::restore(&state.checkpoint().unwrap()).is_err());
+    }
+
+    /// A browser's snapshot is binary, and names its file; the JSON
+    /// snapshot the browser client saved before reads as it is.
+    #[test]
+    fn browser_snapshots_old_and_new_restore() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+        let paid = plan(b"paid", now);
+        let pending = plan(b"pending", now);
+        let mut state = UploadState::default();
+        state.prepare(paid.clone());
+        state
+            .confirm(&[paid.address], &transactions(&paid), now)
+            .unwrap();
+        state.prepare(pending.clone());
+        state.start_payment(false, vec![pending.address]).unwrap();
+
+        let snapshot = state.snapshot("scope-a").unwrap();
+        assert_eq!(&snapshot[..4], b"DSCK");
+        let (scope, restored) =
+            UploadState::read_snapshot(BrowserSnapshot::Bytes(&snapshot)).unwrap();
+        assert_eq!(scope, "scope-a");
+        assert_eq!(restored.proof(&paid.address), state.proof(&paid.address));
+        assert!(restored.pending_payment.is_some());
+
+        // As the browser client before this one saved it.
+        let json = serde_json::json!({
+            "scope": "scope-b",
+            "state": hex::encode(state.legacy_checkpoint()),
+        })
+        .to_string();
+        let (scope, restored) = UploadState::read_snapshot(BrowserSnapshot::Json(&json)).unwrap();
+        assert_eq!(scope, "scope-b");
+        assert_eq!(restored.proof(&paid.address), state.proof(&paid.address));
+        assert_eq!(
+            restored.pending_plans().unwrap()[0].address,
+            pending.address
+        );
+        // A native checkpoint, which names no file, isn't a snapshot.
+        assert!(
+            UploadState::read_snapshot(BrowserSnapshot::Bytes(&state.checkpoint().unwrap()))
+                .is_err()
+        );
+        assert!(
+            UploadState::read_snapshot(BrowserSnapshot::Bytes(&state.legacy_checkpoint())).is_err()
+        );
+    }
+
+    /// A 1 GB browser upload's snapshot stays under the cap: every record's
+    /// paid proof (a 1 GB file is about 240 records of 4 MiB; 260 here) at
+    /// 160 KB each, above the 150 KB proofs measured, with a whole wave of
+    /// 64 plans of seven quotes still to pay. As hex JSON with proofs as
+    /// integer arrays, the format before, the same state took more than
+    /// twice the room.
+    #[test]
+    fn a_one_gigabyte_browser_upload_stays_under_the_cap() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+        let proofs = (0..260u32)
+            .map(|i| {
+                let mut address = [0u8; 32];
+                address[..4].copy_from_slice(&i.to_le_bytes());
+                let proof = (0..160 * 1024u32)
+                    .map(|j| (j.wrapping_mul(2_654_435_761).wrapping_add(i) >> 13) as u8)
+                    .collect::<Vec<_>>();
+                (address, proof)
+            })
+            .collect::<HashMap<_, _>>();
+        let mut state = UploadState::from_proofs(proofs);
+        let template = plan_priced(b"wave", now, &[1, 2, 3, 4, 5, 6, 7]);
+        for i in 0..64u8 {
+            let mut planned = template.clone();
+            planned.address = [i; 32];
+            state.plans.insert(planned.address, planned);
+        }
+        let snapshot = state.snapshot("scope").unwrap();
+        assert!(
+            snapshot.len() <= MAX_BROWSER_SNAPSHOT_BYTES,
+            "{} bytes",
+            snapshot.len()
+        );
+        let before = serde_json::json!({
+            "scope": "scope",
+            "state": hex::encode(state.legacy_checkpoint()),
+        })
+        .to_string();
+        assert!(
+            before.len() > 2 * snapshot.len(),
+            "before {} bytes, now {}",
+            before.len(),
+            snapshot.len()
+        );
+    }
+
+    /// Dropping a proof forgets it, so the record is paid again; serials
+    /// tell each proof put in apart.
+    #[test]
+    fn a_dropped_proof_is_gone_and_serials_change_with_each_proof() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+        let p = plan(b"serials", now);
+        let mut state = UploadState::default();
+        state.prepare(p.clone());
+        state.confirm(&[p.address], &transactions(&p), now).unwrap();
+        let first = state.proof_serial(&p.address).unwrap();
+        assert!(state.drop_proof(&p.address).is_some());
+        assert!(!state.is_paid(&p.address, now));
+        state.prepare(p.clone());
+        state.confirm(&[p.address], &transactions(&p), now).unwrap();
+        assert_ne!(state.proof_serial(&p.address), Some(first));
     }
 }

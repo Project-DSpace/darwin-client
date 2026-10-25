@@ -46,6 +46,8 @@ pub mod payment;
 pub mod pointer;
 pub mod quote;
 pub mod upload;
+#[cfg(feature = "native")]
+pub mod upload_checkpoint;
 pub mod upload_state;
 
 use crate::client_engine::single_flight::SingleFlight;

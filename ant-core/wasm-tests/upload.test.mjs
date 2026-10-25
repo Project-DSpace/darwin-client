@@ -435,7 +435,8 @@ test("paid checkpoint survives a staged-loader failure and restores on a new cli
       async index => { if (signer.calls.length) throw new Error("staged storage temporarily unavailable"); return encrypted.records[index].content; }, signer.pay,
       undefined, undefined, value => { checkpoint = value; }), /staged storage temporarily unavailable/);
     assert.equal(signer.calls.length, 1);
-    assert.equal(typeof checkpoint, "string");
+    assert.ok(checkpoint instanceof Uint8Array);
+    assert.equal(new TextDecoder().decode(checkpoint.subarray(0, 4)), "DSCK");
     client.close();
     // Fresh discovery now issues quotes with a different signed timestamp.
     await new Promise(resolve => setTimeout(resolve, 1100));

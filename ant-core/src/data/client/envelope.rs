@@ -735,6 +735,41 @@ mod tests {
         }
     }
 
+    /// The envelope's paid quote is the one the single-node rule pays, read
+    /// from the proof, which carries no amounts: the median quote whether
+    /// the plan paid the full or the weighted amount. So the record of an
+    /// upload resumed across the pricing switch names the quote either
+    /// client paid.
+    #[cfg(feature = "native")]
+    #[test]
+    fn the_envelopes_paid_quote_is_the_median_at_either_amount() {
+        use crate::data::client::upload_state::test_state::{plan_priced, weighted};
+        use ant_protocol::evm::{Amount, TxHash};
+        let now = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000);
+        let full = plan_priced(&[5u8; 3000], now, &[10_000_000, 30_000_000, 20_000_000]);
+        let weighted = weighted(full.clone());
+        assert_ne!(full.payment.total_amount(), weighted.payment.total_amount());
+        let paid = |plan: &super::super::batch::ChunkPaymentPlan| {
+            let transactions = plan
+                .payment
+                .quotes
+                .iter()
+                .filter(|quote| !quote.amount.is_zero())
+                .map(|quote| (quote.quote_hash, TxHash::from([7; 32])))
+                .collect();
+            let proof = super::super::batch::build_plan_proof(plan, &transactions).unwrap();
+            paid_quote(&proof).unwrap().paid.hash()
+        };
+        let median = full
+            .peer_quotes
+            .iter()
+            .find(|(_, quote)| quote.price == Amount::from(20_000_000u64))
+            .map(|(_, quote)| quote.hash())
+            .unwrap();
+        assert_eq!(paid(&full), median);
+        assert_eq!(paid(&weighted), median);
+    }
+
     /// The library's upload shortcuts store an envelope: the private one
     /// `darwin file upload` stores by default, and for the public ones the
     /// unlisted one `--public` stores. Neither stores a bare data map or no

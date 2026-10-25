@@ -59,6 +59,34 @@ Prepared Merkle checkpoints preserve the exact salted tree and payment request;
 confirmed checkpoints retain native tagged proofs. Native file checkpoints are
 atomically persisted under a file/payment-network scope and protected by a file
 lock. Browser adapters use the awaited persistence callback described above.
+
+A checkpoint starts with `DSCK` and a format version byte, then its body in
+msgpack, with proofs as byte strings. A client from before the format parses
+the whole checkpoint as msgpack, fails, and stops with an error rather than
+paying again. A native checkpoint (`<stem>.msgpack`) keeps its paid proofs
+apart, in `<stem>.proofs`: `DSPF` and a version byte, then one record per
+proof (its 32-byte address, a 4-byte little-endian length, the proof, and the
+first 8 bytes of a BLAKE3 hash of the three; a length of 0 forgets the
+address's proof), appended once each rather than rewritten at every step. A
+torn last record is left out on reading and cut off before the next append.
+`upload_checkpoint_files` lists a checkpoint's files (`.msgpack`, `.proofs`,
+`.salt`, `.lock`), for servers that remove what ended uploads leave. The
+browser's checkpoint is the same format as one `Uint8Array`, with its
+file/payment-network scope inside; the JSON text earlier browser clients saved
+is still read, and the next checkpoint saved replaces it. A native checkpoint
+in the format before (one msgpack file holding every proof) is migrated when
+opened: its proofs are written to a new proof file first, then the new
+checkpoint replaces the old one by rename.
+
+Restoring checks every saved plan's quotes against their signatures and the
+nodes they name, and its amounts against exactly two recomputations from
+those signed quotes: the full amount (three times the median quote), or the
+weighted amount for the size class of the plan's own `data_size` (a pointer's
+plan at its 5,303 bytes). So a checkpoint saved by a client that pays either
+way restores in either. A plan matching neither is dropped and its record
+quoted again, unless a pending payment names it: then the whole checkpoint is
+refused, and the error names the file and says not to delete it, since it may
+hold a payment still to be settled.
 The SDK ethers and wagmi providers submit calldata encoded by evmlib and decode
 settlement with its canonical event ABI. Custom providers can implement
 `payMerkle`; applications using only single-node payments can select `single`.

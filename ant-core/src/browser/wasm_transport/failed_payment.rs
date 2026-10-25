@@ -91,27 +91,31 @@ impl BrowserNetworkClient {
     /// verification, just as payment callbacks own confirmation. Failure evidence is
     /// archived, confirmed proofs are retained, and persistence is awaited before return.
     /// Resume the normal upload explicitly with the returned checkpoint.
+    ///
+    /// `snapshot` is the checkpoint an upload's `on_checkpoint` received (a
+    /// `Uint8Array`), or the JSON text earlier clients saved; the returned
+    /// checkpoint is a `Uint8Array`.
     #[wasm_bindgen(js_name = reconcileFailedUploadPayment)]
     pub async fn reconcile_failed_upload_payment(
         &self,
-        snapshot: String,
+        snapshot: JsValue,
         verify_failure: js_sys::Function,
         on_checkpoint: js_sys::Function,
-    ) -> Result<String, JsValue> {
+    ) -> Result<JsValue, JsValue> {
+        let snapshot = SavedSnapshot::from_js(&snapshot)?
+            .ok_or_else(|| JsValue::from_str("no upload checkpoint"))?;
         let result = async {
-            let envelope = UploadCheckpoint::envelope(&snapshot)?;
+            let (scope, mut state) = snapshot.read()?;
             let checkpoint = UploadCheckpoint {
-                snapshot: Some(snapshot),
                 callback: Some(on_checkpoint),
                 ..Default::default()
             };
-            let mut state = checkpoint.restore(&envelope.scope)?;
             let attempt = state.pending_payment.as_ref().ok_or("no pending payment")?;
             let input = attempt
                 .serialize(&serde_wasm_bindgen::Serializer::new().serialize_maps_as_objects(true))
                 .map_err(|e| e.to_string())?;
             let returned = verify_failure
-                .call2(&JsValue::NULL, &input, &JsValue::from_str(&envelope.scope))
+                .call2(&JsValue::NULL, &input, &JsValue::from_str(&scope))
                 .map_err(js_error_message)?;
             let value = JsFuture::from(Promise::resolve(&returned))
                 .await
@@ -124,10 +128,12 @@ impl BrowserNetworkClient {
             state
                 .record_failed_payment(raw)
                 .map_err(|e| e.to_string())?;
-            checkpoint.save(&envelope.scope, &state).await?;
-            UploadCheckpoint::encode(&envelope.scope, &state)
+            checkpoint.save(&scope, &state).await?;
+            UploadCheckpoint::encode(&scope, &state)
         }
         .await;
-        result.map_err(|error: String| JsValue::from_str(&error))
+        result
+            .map(|bytes| Uint8Array::from(bytes.as_slice()).into())
+            .map_err(|error: String| JsValue::from_str(&error))
     }
 }

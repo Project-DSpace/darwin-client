@@ -14,9 +14,7 @@ use ant_protocol::evm::journal::{PaymentReceipt, PaymentRequest, PaymentStatus, 
 use ant_protocol::evm::Network;
 use ant_protocol::XorName;
 use serde::{Deserialize, Serialize};
-use std::io::Write;
-use std::path::{Path, PathBuf};
-use tracing::warn;
+use std::path::Path;
 
 /// How long a payment whose outcome is unknown waits before it is
 /// reconciled, so the RPC has caught up with the transaction.
@@ -48,7 +46,7 @@ pub(super) const RECORD_CHECKPOINTS: &str = "payments/record";
 /// pointer's `state_id`), and its lock is held while the record is paid for
 /// and stored.
 pub(super) struct RecordCheckpoint {
-    path: PathBuf,
+    files: super::upload_checkpoint::UploadCheckpointFiles,
     _lock: std::fs::File,
 }
 
@@ -83,26 +81,13 @@ impl RecordCheckpoint {
         })
         .await
         .map_err(|e| Error::Io(std::io::Error::other(e.to_string())))??;
-        let state = match std::fs::read(&path) {
-            Ok(bytes) => UploadState::restore(&bytes)?,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => UploadState::default(),
-            Err(error) => return Err(Error::Io(error)),
-        };
-        Ok((Self { path, _lock: lock }, state))
+        let (files, state) = super::upload_checkpoint::UploadCheckpointFiles::open(path)?;
+        Ok((Self { files, _lock: lock }, state.unwrap_or_default()))
     }
 
-    /// Save `state`, whole or not at all.
+    /// Save `state`: its new proofs appended, the rest whole or not at all.
     pub(super) fn save(&self, state: &UploadState) -> Result<()> {
-        let bytes = state.checkpoint()?;
-        let directory = self
-            .path
-            .parent()
-            .ok_or_else(|| Error::Config("missing checkpoint directory".into()))?;
-        let mut file = tempfile::NamedTempFile::new_in(directory)?;
-        file.write_all(&bytes)?;
-        file.as_file().sync_all()?;
-        file.persist(&self.path).map_err(|e| Error::Io(e.error))?;
-        Ok(())
+        self.files.save(state)
     }
 
     /// Remove the checkpoint, once the record is stored or its proof is in
@@ -110,11 +95,7 @@ impl RecordCheckpoint {
     /// logged, and the next attempt for the record finds its proof stored or
     /// still usable.
     pub(super) fn finish(self) {
-        if let Err(e) = std::fs::remove_file(&self.path) {
-            if e.kind() != std::io::ErrorKind::NotFound {
-                warn!("Could not remove {}: {e}", self.path.display());
-            }
-        }
+        self.files.remove();
     }
 }
 
@@ -434,6 +415,7 @@ pub(super) mod test_plans {
     use ant_protocol::evm::{RewardsAddress, TxHash};
     use ant_protocol::transport::NodeIdentity;
     use std::collections::HashMap;
+    use std::path::PathBuf;
 
     /// The plan of a record of `data_size` bytes at `address`: one quote,
     /// signed by a fresh node at `timestamp`.
@@ -546,7 +528,7 @@ mod tests {
                     .unwrap();
             assert!(state.pending_payment.is_none() && state.proof(&address).is_none());
             checkpoint.save(&state).unwrap();
-            paths.insert(checkpoint.path.clone());
+            paths.insert(checkpoint.files.path().to_path_buf());
         }
         assert_eq!(paths.len(), 4);
         assert_eq!(checkpoints(directory.path()).len(), 4);
@@ -605,12 +587,12 @@ mod tests {
             tokio::spawn(async move {
                 RecordCheckpoint::open(&directory, &net, &payer, &address)
                     .await
-                    .map(|(checkpoint, _)| checkpoint.path.clone())
+                    .map(|(checkpoint, _)| checkpoint.files.path().to_path_buf())
             })
         };
         tokio::time::sleep(Duration::from_millis(300)).await;
         assert!(!second.is_finished(), "the second attempt must wait");
-        let path = first.path.clone();
+        let path = first.files.path().to_path_buf();
         first.finish();
         let opened = tokio::time::timeout(Duration::from_secs(10), second)
             .await

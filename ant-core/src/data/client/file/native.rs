@@ -1308,7 +1308,7 @@ fn upload_checkpoint_scope(
     .map_err(|e| Error::Serialization(e.to_string()))
 }
 
-/// Open the checkpoint for uploading `records` on `network`: its path, the
+/// Open the checkpoint for uploading `records` on `network`: its files, the
 /// lock held while the upload runs, and the state an earlier, interrupted
 /// attempt saved (`None` if there was none).
 ///
@@ -1327,7 +1327,7 @@ async fn open_upload_checkpoint(
     envelope: Option<&[u8]>,
     payer: Option<&[u8]>,
 ) -> Result<(
-    PathBuf,
+    super::super::upload_checkpoint::UploadCheckpointFiles,
     std::fs::File,
     Option<super::super::upload_state::UploadState>,
 )> {
@@ -1358,12 +1358,8 @@ async fn open_upload_checkpoint(
     })
     .await
     .map_err(|e| Error::Io(std::io::Error::other(e.to_string())))??;
-    let saved = match std::fs::read(&cache_path) {
-        Ok(bytes) => Some(super::super::upload_state::UploadState::restore(&bytes)?),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-        Err(error) => return Err(Error::Io(error)),
-    };
-    Ok((cache_path, lock, saved))
+    let (files, saved) = super::super::upload_checkpoint::UploadCheckpointFiles::open(cache_path)?;
+    Ok((files, lock, saved))
 }
 
 /// `directory` in the form Windows takes past MAX_PATH (260 characters):
@@ -1506,7 +1502,11 @@ fn finish_upload_checkpoint(checkpoint: &Path, envelope: Option<&UploadEnvelope>
             return;
         }
     }
-    for path in [checkpoint.with_extension("salt"), checkpoint.to_path_buf()] {
+    for path in [
+        checkpoint.with_extension("salt"),
+        checkpoint.to_path_buf(),
+        checkpoint.with_extension(super::super::upload_checkpoint::PROOFS_EXTENSION),
+    ] {
         if let Err(e) = std::fs::remove_file(&path) {
             if e.kind() != std::io::ErrorKind::NotFound {
                 warn!("Could not remove {}: {e}", path.display());
@@ -2063,7 +2063,7 @@ struct SpillUploadAdapter<'a> {
     client: &'a Client,
     source: ChunkSource<'a>,
     progress: Option<&'a mpsc::Sender<UploadEvent>>,
-    checkpoint: &'a Path,
+    checkpoint: &'a super::super::upload_checkpoint::UploadCheckpointFiles,
     payer: Option<&'a dyn UploadPayer>,
 }
 
@@ -2161,18 +2161,7 @@ impl super::super::upload::UploadAdapter for SpillUploadAdapter<'_> {
         state: &super::super::upload_state::UploadState,
         _: Option<&super::super::upload::UploadPayment>,
     ) -> Result<()> {
-        use std::io::Write;
-        let bytes = state.checkpoint()?;
-        let directory = self
-            .checkpoint
-            .parent()
-            .ok_or_else(|| Error::Config("missing checkpoint directory".into()))?;
-        let mut file = tempfile::NamedTempFile::new_in(directory)?;
-        file.write_all(&bytes)?;
-        file.as_file().sync_all()?;
-        file.persist(self.checkpoint)
-            .map_err(|e| Error::Io(e.error))?;
-        Ok(())
+        self.checkpoint.save(state)
     }
     fn stored(&self, stored: usize, total: usize) {
         if let Some(progress) = self.progress {
@@ -3868,7 +3857,7 @@ impl Client {
         let envelope_scope = visibility
             .envelope_options()
             .map(|options| envelope_checkpoint_scope(options, &payer_scope));
-        let (cache_path, _lock, saved) = open_upload_checkpoint(
+        let (checkpoint_files, _lock, saved) = open_upload_checkpoint(
             network,
             &records,
             envelope_scope.as_deref(),
@@ -3880,7 +3869,7 @@ impl Client {
                 let salt = if options.readable {
                     None
                 } else {
-                    Some(upload_salt(&cache_path)?)
+                    Some(upload_salt(checkpoint_files.path())?)
                 };
                 let (envelope, serialized) = build_upload_envelope(options, &data_map, salt)?;
                 spill.push(&serialized)?;
@@ -3929,7 +3918,7 @@ impl Client {
             client: self,
             source: ChunkSource::Spill(&spill),
             progress: progress.as_ref(),
-            checkpoint: &cache_path,
+            checkpoint: &checkpoint_files,
             payer,
         };
         // A payment this wallet sent may have gone through although the RPC
@@ -3977,7 +3966,8 @@ impl Client {
             // Without a payment of its own the envelope was already stored:
             // by this payer's earlier upload, if it kept a record for it.
             let kept = proof.is_none().then(|| {
-                cache_path
+                checkpoint_files
+                    .path()
                     .parent()
                     .and_then(|directory| kept_upload_record(directory, envelope, &payer_scope))
             });
@@ -3995,7 +3985,7 @@ impl Client {
             }
         }
         finish_upload_checkpoint(
-            &cache_path,
+            checkpoint_files.path(),
             envelope.as_ref().map(|(envelope, _)| envelope),
             &payer_scope,
         );
