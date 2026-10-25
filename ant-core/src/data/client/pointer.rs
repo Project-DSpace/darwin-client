@@ -130,6 +130,10 @@ struct Answered {
     refusal: Option<Error>,
     /// How many peers refused.
     refusals: usize,
+    /// How many of the peers that failed were busy: held off for having
+    /// declined a browser session while busy
+    /// ([`crate::data::network::Network::refused_peers`]).
+    busy: usize,
 }
 
 impl Answered {
@@ -747,6 +751,7 @@ async fn pointer_finality_from<L, LF, G, GF>(
     close_group_size: usize,
     bootstrap: &[(PeerId, Vec<MultiAddr>)],
     get: G,
+    busy: impl Fn(&PeerId) -> bool,
 ) -> Result<PointerFinality>
 where
     L: Fn() -> LF,
@@ -759,8 +764,15 @@ where
     if !matches!(census.status, FinalityStatus::Open { .. }) {
         return Ok(census);
     }
-    let read =
-        read_pointer_with_seeds(address, close_group(), close_group_size, bootstrap, &get).await;
+    let read = read_pointer_with_seeds(
+        address,
+        close_group(),
+        close_group_size,
+        bootstrap,
+        &get,
+        busy,
+    )
+    .await;
     with_the_read(census, &replies, read)
 }
 
@@ -880,6 +892,16 @@ impl ReadTally {
         self.replies.add(found);
     }
 
+    /// One peer's failure. `busy` says the peer is held off for having
+    /// declined a session while busy, which makes a shortfall it causes a
+    /// busy network rather than too few holders.
+    fn fail(&mut self, e: Error, busy: bool) {
+        if busy {
+            self.answered.busy += 1;
+        }
+        self.answered.fail(e);
+    }
+
     /// Whether [`read_quorum`] of the set has answered.
     fn has_quorum(&self) -> bool {
         self.answered.count >= read_quorum(self.peers)
@@ -954,6 +976,19 @@ impl ReadTally {
     fn outcome(self, address: &XorName, asked: Asked) -> Result<Option<Pointer>> {
         let needed = corroboration(self.peers);
         let majority = read_quorum(self.peers);
+        // Too few answered and some of those that did not were busy: asked
+        // again once their hold-off ends they may answer, so say so, in the
+        // words a chunk read uses, rather than report too few holders. A
+        // refusal still comes first when no peer answered, since it says why.
+        let busy = !self.has_quorum()
+            && self.answered.busy > 0
+            && (self.answered.count > 0 || self.answered.refusal.is_none());
+        if busy {
+            return Err(Error::Network(format!(
+                "the nodes that may hold pointer {} are busy; try again shortly",
+                hex::encode(address)
+            )));
+        }
         if self.answered.count == 0 {
             return Err(self.answered.failure().unwrap_or_else(|| {
                 Error::Protocol(format!("no {} answered for the pointer", asked.member()))
@@ -1012,18 +1047,21 @@ struct SetRead {
 }
 
 /// Read the pointer at `address` from one set of peers, all asked at once:
-/// `in_flight` holds their verified replies, and `peers` is how many there are.
+/// `in_flight` holds their verified replies, each with the peer that gave it,
+/// `peers` is how many there are, and `busy` says whether a peer that failed
+/// is held off for having declined a session while busy.
 /// It stops as soon as the set's answer is settled, and the requests still in
 /// flight are dropped, so one slow peer cannot stall the read behind the store
 /// timeout.
 async fn read_pointer_from(
-    mut in_flight: FuturesUnordered<impl Future<Output = Result<Option<Pointer>>>>,
+    mut in_flight: FuturesUnordered<impl Future<Output = (PeerId, Result<Option<Pointer>>)>>,
     peers: usize,
     address: &XorName,
     asked: Asked,
+    busy: impl Fn(&PeerId) -> bool,
 ) -> SetRead {
     let mut tally = ReadTally::new(peers);
-    while let Some(result) = in_flight.next().await {
+    while let Some((peer, result)) = in_flight.next().await {
         match result {
             Ok(found) => {
                 tally.answer(found);
@@ -1031,7 +1069,7 @@ async fn read_pointer_from(
                     break;
                 }
             }
-            Err(e) => tally.answered.fail(e),
+            Err(e) => tally.fail(e, busy(&peer)),
         }
     }
     tally.finish(address, asked)
@@ -1059,19 +1097,25 @@ async fn read_pointer_from(
 /// `close_group_size`, or more peers if the lookup returned more, so a lookup
 /// that comes back short is a shortfall rather than a smaller group. The
 /// bootstrap peers' are counted over the peers asked.
+///
+/// `busy` says whether a peer that failed is held off for having declined a
+/// session while busy ([`crate::data::network::Network::refused_peers`]). A
+/// close group too few of which answered, some of the rest busy, fails with
+/// "busy; try again shortly" rather than a shortfall ([`ReadTally::outcome`]).
 async fn read_pointer<L, G, GF>(
     address: &XorName,
     close_group: L,
     close_group_size: usize,
     bootstrap: &[(PeerId, Vec<MultiAddr>)],
     get: G,
+    busy: impl Fn(&PeerId) -> bool,
 ) -> Result<Option<Pointer>>
 where
     L: Future<Output = Result<Vec<(PeerId, Vec<MultiAddr>)>>>,
     G: Fn(PeerId, Vec<MultiAddr>) -> GF,
     GF: Future<Output = Result<Option<Pointer>>>,
 {
-    read_pointer_with_seeds(address, close_group, close_group_size, bootstrap, get)
+    read_pointer_with_seeds(address, close_group, close_group_size, bootstrap, get, busy)
         .await
         .found
 }
@@ -1116,12 +1160,17 @@ async fn read_pointer_with_seeds<L, G, GF>(
     close_group_size: usize,
     bootstrap: &[(PeerId, Vec<MultiAddr>)],
     get: G,
+    busy: impl Fn(&PeerId) -> bool,
 ) -> PointerRead
 where
     L: Future<Output = Result<Vec<(PeerId, Vec<MultiAddr>)>>>,
     G: Fn(PeerId, Vec<MultiAddr>) -> GF,
     GF: Future<Output = Result<Option<Pointer>>>,
 {
+    let ask = |peer: PeerId, addrs: Vec<MultiAddr>| {
+        let reply = get(peer, addrs);
+        async move { (peer, reply.await) }
+    };
     if bootstrap.is_empty() {
         let peers = match close_group.await {
             Ok(peers) => peers,
@@ -1134,20 +1183,16 @@ where
         };
         let in_flight = peers
             .iter()
-            .map(|(peer, addrs)| get(*peer, addrs.clone()))
+            .map(|(peer, addrs)| ask(*peer, addrs.clone()))
             .collect();
         let width = quorum_width(peers.len(), close_group_size);
         return PointerRead {
-            found: read_pointer_from(in_flight, width, address, Asked::CloseGroup)
+            found: read_pointer_from(in_flight, width, address, Asked::CloseGroup, busy)
                 .await
                 .outcome,
             seeds: None,
         };
     }
-    let ask = |peer: PeerId, addrs: Vec<MultiAddr>| {
-        let reply = get(peer, addrs);
-        async move { (peer, reply.await) }
-    };
     let mut seeds = HashSet::new();
     let mut in_flight = FuturesUnordered::new();
     for (peer, addrs) in bootstrap {
@@ -1218,7 +1263,7 @@ where
                             close_waiting = close_waiting.saturating_sub(1);
                             match reply {
                                 Ok(found) => tally.answer(found),
-                                Err(e) => tally.answered.fail(e),
+                                Err(e) => tally.fail(e, busy(&peer)),
                             }
                         }
                     }
@@ -1256,7 +1301,7 @@ where
                         if !close_done {
                             match reply {
                                 Ok(found) => tally.answer(found),
-                                Err(e) => tally.answered.fail(e),
+                                Err(e) => tally.fail(e, busy(&peer)),
                             }
                         }
                     }
@@ -1859,6 +1904,7 @@ impl Client {
             self.config().close_group_size,
             &bootstrap,
             |peer, addrs| self.send_pointer_get(*address, peer, addrs),
+            |peer| self.held_off_busy(peer),
         )
         .await
     }
@@ -2294,8 +2340,19 @@ impl Client {
             self.config().close_group_size,
             &bootstrap,
             |peer, addrs| self.send_pointer_get(*address, peer, addrs),
+            |peer| self.held_off_busy(peer),
         )
         .await
+    }
+
+    /// Whether `peer` is held off for having declined a browser session while
+    /// busy ([`crate::data::network::Network::refused_peers`]); a native
+    /// client has none.
+    fn held_off_busy(&self, peer: &PeerId) -> bool {
+        self.network()
+            .refused_peers()
+            .iter()
+            .any(|(refused, _)| refused == peer)
     }
 
     /// Follow a pointer chain to the chunk it ends at.
@@ -2660,6 +2717,7 @@ mod tests {
             last_error: None,
             refusal,
             refusals,
+            busy: 0,
         }
     }
 
@@ -3032,6 +3090,23 @@ mod tests {
         Duration,
         std::collections::HashMap<u8, usize>,
     ) {
+        simulated_busy_read(address, lookup, close_group, bootstrap, answers, &[]).await
+    }
+
+    /// [`simulated_read`], with the peers in `busy` held off for having
+    /// declined a session while busy.
+    async fn simulated_busy_read(
+        address: XorName,
+        lookup: u64,
+        close_group: impl IntoIterator<Item = u8>,
+        bootstrap: impl IntoIterator<Item = u8>,
+        answers: Answers,
+        busy: &[u8],
+    ) -> (
+        Result<Option<Pointer>>,
+        Duration,
+        std::collections::HashMap<u8, usize>,
+    ) {
         let close_group: Vec<(PeerId, Vec<MultiAddr>)> = close_group
             .into_iter()
             .map(|n| (id(n), Vec::new()))
@@ -3065,6 +3140,7 @@ mod tests {
                     reply
                 }
             },
+            |peer| busy.contains(&peer.as_bytes()[0]),
         )
         .await;
         (read, started.elapsed(), asked.into_inner())
@@ -3072,6 +3148,65 @@ mod tests {
 
     fn read_state_id(read: Result<Option<Pointer>>) -> XorName {
         read.expect("a read").expect("a state").state_id()
+    }
+
+    /// A pointer read most of whose close group is held off for having
+    /// declined a session while busy says the nodes are busy, in the words a
+    /// chunk read uses, rather than that too few answered; with the bootstrap
+    /// peers asked beside it too. Busy peers that are not needed for the
+    /// quorum change nothing, and a shortfall with no busy peer is still a
+    /// shortfall.
+    #[tokio::test(start_paused = true)]
+    async fn busy_holders_make_a_pointer_read_busy_not_short() {
+        let address = [9u8; 32];
+        let busy_failure = || {
+            Err(Error::Network(
+                "pointer GET send failed: refused".to_string(),
+            ))
+        };
+        // Three of seven answer that they hold nothing; four fail at once.
+        let answers = || {
+            joined([
+                answering(1..=3, 5, || Ok(None)),
+                answering(4..=7, 1, busy_failure),
+            ])
+        };
+        let busy = [4, 5, 6, 7];
+        let is_busy = |found: &Result<Option<Pointer>>| {
+            matches!(found, Err(Error::Network(message))
+                if message.contains("are busy; try again shortly")
+                    && message.contains(&hex::encode(address)))
+        };
+
+        let (found, _, _) =
+            simulated_busy_read(address, 0, 1..=7, std::iter::empty(), answers(), &busy).await;
+        assert!(is_busy(&found), "{found:?}");
+        let (found, _, _) = simulated_busy_read(
+            address,
+            0,
+            1..=7,
+            101..=102,
+            joined([answers(), answering(101..=102, 5, || Ok(None))]),
+            &busy,
+        )
+        .await;
+        assert!(is_busy(&found), "{found:?}");
+
+        // The same failures from peers not held off: a shortfall.
+        let (found, _, _) = simulated_read(address, 0, 1..=7, std::iter::empty(), answers()).await;
+        assert!(
+            matches!(found, Err(Error::CloseGroupShortfall(_))),
+            "{found:?}"
+        );
+
+        // Four answer, a quorum of seven: one busy peer is no failure.
+        let answers = joined([
+            answering(1..=4, 5, || Ok(None)),
+            answering(5..=7, 1, busy_failure),
+        ]);
+        let (found, _, _) =
+            simulated_busy_read(address, 0, 1..=7, std::iter::empty(), answers, &[5]).await;
+        assert!(matches!(found, Ok(None)), "{found:?}");
     }
 
     /// A state the bootstrap peers corroborate is the answer when the close
@@ -4282,6 +4417,7 @@ mod tests {
                     reply
                 }
             },
+            |_| false,
         )
         .await;
         (finality, asked.into_inner())

@@ -394,8 +394,10 @@ commit `darwin --version` prints. Upstream's entries follow.
   address) and every other failure keep the 30 minutes. `BrowserNetwork::refused_peers` lists
   the peers held off, with the time left; a read whose possible holders declined waits for the
   first of them to come back, up to 3 times, and then fails with "the nodes that may hold chunk
-  ... are busy; try again shortly", not as a missing chunk. With every seed held off, `connect()`
-  says how many are busy.
+  ... are busy; try again shortly", not as a missing chunk. A pointer read too few of whose close
+  group answered, some of the rest held off, fails at once with "the nodes that may hold pointer
+  ... are busy; try again shortly" in place of a shortfall; it does not wait for them to come
+  back. With every seed held off, `connect()` says how many are busy.
 - The library's default chunk cache (`ChunkCache::default`, every client's) holds at most 1,024
   chunks and an eighth of the memory free for use when the client is built, at least 4 MiB and
   at most 256 MiB (`default_cache_bytes`); before, up to 1,024 full chunks, 4 GiB, whatever
