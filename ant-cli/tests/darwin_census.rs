@@ -452,7 +452,7 @@ const STORE_SITES: &[Site] = &[
         "ant-core/src/data/client/chunk.rs",
         "Client::chunk_put",
         "chunk_put_to_close_group",
-        2,
+        3,
         RAW_CHUNK,
     ),
     (
@@ -466,7 +466,7 @@ const STORE_SITES: &[Site] = &[
         "ant-core/src/data/client/chunk.rs",
         "Client::chunk_put",
         "pay_for_record",
-        1,
+        2,
         RAW_CHUNK,
     ),
     (
@@ -1611,9 +1611,9 @@ const DECODE_SITES: &[Site] = &[
     ),
     (
         "ant-core/src/data/client/upload_state.rs",
-        "UploadState::restore",
+        "UploadState::parse",
         "rmp_serde::from_slice",
-        1,
+        2,
         LOCAL_FILE,
     ),
     (
