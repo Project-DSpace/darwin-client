@@ -18,7 +18,11 @@ The check fails when a test target would be neither run nor skipped: when
 Cargo's test targets of ant-core aren't exactly the files in ant-core/tests
 (a target the matrix can't see, or a file Cargo doesn't build), when a name
 below isn't a test target, when a target is both run and skipped, or when a
-target requires a feature its job doesn't enable.
+target requires a feature its job doesn't enable. It also fails when a case
+file in ant-core/tests/e2e isn't declared in tests/e2e.rs: Cargo doesn't
+discover those files, so one left out is never built or run. (A file declared
+there whose cases() main() doesn't run is unused code, which clippy's
+-D warnings run in build.yml refuses.)
 
     test-targets.py e2e        the end-to-end targets, as a JSON array
     test-targets.py no-nodes   build.yml's targets, as cargo test arguments
@@ -30,11 +34,18 @@ and cargo (for `cargo metadata --no-deps`, which fetches nothing).
 
 import json
 import pathlib
+import re
 import subprocess
 import sys
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 TESTS = ROOT / "ant-core" / "tests"
+
+# The e2e target's case files, each built only through a
+# `#[path = "e2e/<file>.rs"]` module line in tests/e2e.rs.
+E2E_CASES = TESTS / "e2e"
+E2E_MAIN = TESTS / "e2e.rs"
+E2E_PATH = re.compile(r'^\s*#\[path\s*=\s*"e2e/([^"/]+\.rs)"\s*\]', re.MULTILINE)
 
 # Targets that start neither nodes nor a chain; build.yml runs them with the
 # unit tests. daemon_integration and node_add_integration test the node
@@ -93,6 +104,26 @@ def cargo_test_targets():
     }
 
 
+def e2e_case_problems():
+    """The case files in tests/e2e that tests/e2e.rs doesn't build, and back."""
+    files = {path.name for path in E2E_CASES.glob("*.rs")}
+    if not files:
+        return []
+    if not E2E_MAIN.is_file():
+        return ["ant-core/tests/e2e holds case files but ant-core/tests/e2e.rs is missing"]
+    declared = set(E2E_PATH.findall(E2E_MAIN.read_text(encoding="utf-8")))
+    problems = [
+        f"ant-core/tests/e2e/{name} is not declared in tests/e2e.rs "
+        f'(#[path = "e2e/{name}"]), so Cargo never builds or runs it'
+        for name in sorted(files - declared)
+    ]
+    problems += [
+        f'tests/e2e.rs declares #[path = "e2e/{name}"], which is not in ant-core/tests/e2e'
+        for name in sorted(declared - files)
+    ]
+    return problems
+
+
 def plan():
     """(e2e, no_nodes, problems): where each target runs, and what's wrong."""
     files = {path.stem for path in TESTS.glob("*.rs")}
@@ -129,6 +160,7 @@ def plan():
                 )
     if not e2e:
         problems.append("no end-to-end targets: the matrix would be empty")
+    problems += e2e_case_problems()
     return e2e, NO_NODES, problems
 
 

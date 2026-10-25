@@ -1,8 +1,19 @@
 //! Payment verification of proofs built the client's way: each case
 //! collects real quotes, tampers with the proof or the payment in one way,
-//! and asserts the network refuses it. darwin-node's own
-//! `security_attacks.rs` covers malformed proofs only, so these are not
-//! repeated there.
+//! and asserts the network refuses it. darwin-node's own tests cover
+//! malformed proofs, so these are not repeated there.
+//!
+//! A proof that is not a proof at all (0 bytes, or random bytes) is refused
+//! by darwin-node's tests, so this client no longer sends one; its
+//! `test_chunk_put_with_insufficient_proof_rejected`,
+//! `test_chunk_put_with_invalid_proof_rejected` and the garbage-proof half of
+//! `test_payment_required_enforcement` went for them. At the revision
+//! ant-core/Cargo.toml pins (94bf342) they are `test_attack_empty_proof_bytes`
+//! and `test_attack_garbage_bytes_as_proof` in `tests/e2e/security_attacks.rs`.
+//! darwin-node's test-cleanse branch folds them into the table of
+//! `test_chunk_rejected_without_payment` in `tests/e2e/data_types/chunk.rs`,
+//! its rows "0 bytes" and "garbage". A pin bump checks that one or the other
+//! exists at the new revision (the update-ant-node-ref skill, Step 5).
 
 use crate::support::runner::Case;
 use crate::support::MiniTestnet;
