@@ -77,7 +77,8 @@ commit `darwin --version` prints. Upstream's entries follow.
   earlier way are read and rewritten), and each start makes the order `rejected.json` lists its
   rows in, and the deferrals' reasons, match the rows an earlier version left.
   A node that misses 3 polls and isn't found by the lookups that close its leaf is probed before
-  it leaves the census (pinged over the producer's connection to it, or dialed afresh, not taking
+  it leaves the census (pinged over the producer's connection to it, and if that doesn't answer
+  within a second, the connection dropped and the node dialed afresh, not taking
   the word of the 30-minute dial-failure cache), and one that left is probed each cycle for a day
   and is back in the census on its first answer; an id that answered no lookup is looked for again
   when a node names it again. `darwin listings refresh-census --state-dir DIR` has the producer's

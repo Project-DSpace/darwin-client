@@ -49,8 +49,10 @@
 //!   in it share that closing.
 //! - **Leaving, and coming back.** A member that closing would take out
 //!   (not found answering, and silent at its latest poll) is probed first
-//!   ([`probe_peer`]): pinged over the client's connection to it, or with
-//!   none, dialed afresh at the addresses the census keeps for it. The
+//!   ([`probe_peer`]): pinged over the client's connection to it, and if
+//!   that doesn't answer within [`PING_TIMEOUT`], or there is none, dialed
+//!   afresh at the addresses the census keeps for it, the connection that
+//!   didn't answer dropped first, as a stale one is after a restart. The
 //!   client's own dials (the poll's requests, the lookups) skip an address
 //!   for 30 minutes after a dial of it failed, as saorsa-core's dial-failure
 //!   cache has it, so a node back from a restart would otherwise be passed
@@ -146,12 +148,19 @@ pub const PROBE_CONCURRENCY: usize = super::listings_serve::POLL_CONCURRENCY;
 /// The longest a probe of a node takes ([`probe_peer`]): saorsa-core's
 /// budget for its own probe of whether a peer is alive
 /// (`STALE_REVALIDATION_BUDGET`), a fresh identity exchange
-/// ([`IDENTITY_TIMEOUT`]) and a ping's round trip of a second.
+/// ([`IDENTITY_TIMEOUT`]) and a ping's round trip of a second
+/// ([`PING_TIMEOUT`]).
 pub const PROBE_TIMEOUT: Duration = Duration::from_secs(6);
 
 /// How long a node a probe dials has to give its identity: as long as
 /// saorsa-core waits for a dialed peer's (`IDENTITY_EXCHANGE_TIMEOUT`).
 pub const IDENTITY_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How long a probe waits for a ping over a connection the client already
+/// has: the round trip of a second that [`PROBE_TIMEOUT`] allows for, so a
+/// fresh dial still fits after it. A node that restarted while the client
+/// held its connection never answers over that connection.
+pub const PING_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// The first node release that keeps a change feed and answers
 /// `ChangesRequest` and `RangeListRequest`: `ds.15`, as a node's user agent
@@ -1835,32 +1844,46 @@ pub async fn user_agent_of(network: &Network, peer: &PeerId) -> Option<String> {
 }
 
 /// Whether `peer` answers a probe now, within [`PROBE_TIMEOUT`]: a DHT ping
-/// over the client's connection to it, or with none, a dial of each of
-/// `addresses` (the QUIC ones, in turn) until one of them authenticates as
-/// `peer`. These dials are made here, not through the DHT's dialer, so an
-/// address isn't skipped for a dial of it that failed in the last 30
-/// minutes, as saorsa-core's dial-failure cache has the poll's requests and
-/// the lookups skip it: a node back from a restart answers. A node that
-/// dials into gives another identity isn't `peer`; the connection is left
-/// to the transport, as saorsa-core leaves one after such a dial.
+/// over the client's connection to it, answered within [`PING_TIMEOUT`]; or,
+/// with no connection or none answering, a fresh dial of each of `addresses`
+/// (the QUIC ones, in turn) until one of them authenticates as `peer`.
+///
+/// A connection that doesn't answer is dropped before the dials: it may be
+/// stale, one a node that restarted dropped without closing, which the
+/// transport would otherwise reuse at the same address. The dials are made
+/// here, not through the DHT's dialer, so an address isn't skipped for a
+/// dial of it that failed in the last 30 minutes, as saorsa-core's
+/// dial-failure cache has the poll's requests and the lookups skip it: a
+/// node back from a restart answers. A node that dials into gives another
+/// identity isn't `peer`; the connection is left to the transport, as
+/// saorsa-core leaves one after such a dial.
 pub async fn probe_peer(network: &Network, peer: &PeerId, addresses: &[MultiAddr]) -> bool {
-    let probe = Box::pin(probe_within(network, peer, addresses));
-    tokio::time::timeout(PROBE_TIMEOUT, probe)
+    let deadline = tokio::time::Instant::now() + PROBE_TIMEOUT;
+    let probe = Box::pin(probe_within(network, peer, addresses, deadline));
+    tokio::time::timeout_at(deadline, probe)
         .await
         .unwrap_or(false)
 }
 
-/// [`probe_peer`], with no time limit of its own.
-async fn probe_within(network: &Network, peer: &PeerId, addresses: &[MultiAddr]) -> bool {
+/// [`probe_peer`], its dials' identity exchanges cut short at `deadline`.
+async fn probe_within(
+    network: &Network,
+    peer: &PeerId,
+    addresses: &[MultiAddr],
+    deadline: tokio::time::Instant,
+) -> bool {
     let node = network.node();
     if network.is_peer_connected(peer).await {
-        return match node.dht_manager().ping(peer).await {
-            Ok(_) => true,
-            Err(e) => {
-                debug!("Census: {peer} answered no ping over its connection: {e}");
-                false
-            }
-        };
+        match tokio::time::timeout(PING_TIMEOUT, node.dht_manager().ping(peer)).await {
+            Ok(Ok(_)) => return true,
+            Ok(Err(e)) => debug!("Census: {peer} answered no ping over its connection: {e}"),
+            Err(_) => debug!(
+                "Census: {peer} answered no ping over its connection within {PING_TIMEOUT:?}"
+            ),
+        }
+        if let Err(e) = node.disconnect_peer(peer).await {
+            debug!("Census: the connection to {peer} could not be dropped: {e}");
+        }
     }
     for address in addresses {
         if address.dialable_socket_addr().is_none() {
@@ -1873,8 +1896,9 @@ async fn probe_within(network: &Network, peer: &PeerId, addresses: &[MultiAddr])
                 continue;
             }
         };
+        let left = deadline.saturating_duration_since(tokio::time::Instant::now());
         match node
-            .wait_for_peer_identity(&channel, IDENTITY_TIMEOUT)
+            .wait_for_peer_identity(&channel, IDENTITY_TIMEOUT.min(left))
             .await
         {
             Ok(answered) if answered == *peer => return true,

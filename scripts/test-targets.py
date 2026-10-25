@@ -37,8 +37,10 @@ TESTS = ROOT / "ant-core" / "tests"
 
 # Targets that start neither nodes nor a chain; build.yml runs them with the
 # unit tests. daemon_integration and node_add_integration test the node
-# manager the node image ships.
+# manager the node image ships. census_probe starts two of the network
+# library's peers on loopback, no storage node, to probe one that restarted.
 NO_NODES = [
+    "census_probe",
     "daemon_integration",
     "datamap_file",
     "log_forward_integration",
