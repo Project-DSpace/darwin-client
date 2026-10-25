@@ -2264,30 +2264,30 @@ struct UploadCheckpoint {
     callback: Option<js_sys::Function>,
 }
 
-/// A checkpoint the page handed back: the bytes this client saves, or the
-/// JSON text the browser client before them saved, which is still read.
+/// A checkpoint the page handed back: text, as `on_checkpoint` gave it (or
+/// as the browser client before this one gave it, JSON), or its bytes.
 #[derive(Clone)]
 enum SavedSnapshot {
     Bytes(Vec<u8>),
-    Json(String),
+    Text(String),
 }
 
 impl SavedSnapshot {
-    /// The checkpoint the page passed, if any: a `Uint8Array` (or an
-    /// `ArrayBuffer`) of the bytes saved, or the JSON text an earlier client
-    /// saved.
+    /// The checkpoint the page passed, if any: the text `on_checkpoint`
+    /// gave (base64; or its bytes as hex), the JSON text an earlier client
+    /// gave, or its bytes as a `Uint8Array` (or an `ArrayBuffer`).
     fn from_js(value: &JsValue) -> Result<Option<Self>, JsValue> {
         if value.is_undefined() || value.is_null() {
             return Ok(None);
         }
         if let Some(text) = value.as_string() {
-            return Ok(Some(Self::Json(text)));
+            return Ok(Some(Self::Text(text)));
         }
         if value.is_instance_of::<Uint8Array>() || value.is_instance_of::<js_sys::ArrayBuffer>() {
             return Ok(Some(Self::Bytes(Uint8Array::new(value).to_vec())));
         }
         Err(JsValue::from_str(
-            "an upload checkpoint is the bytes an earlier upload saved",
+            crate::data::client::upload_state::SNAPSHOT_TEXT_REFUSED,
         ))
     }
 
@@ -2296,7 +2296,7 @@ impl SavedSnapshot {
         use crate::data::client::upload_state::{BrowserSnapshot, UploadState};
         let snapshot = match self {
             Self::Bytes(bytes) => BrowserSnapshot::Bytes(bytes),
-            Self::Json(text) => BrowserSnapshot::Json(text),
+            Self::Text(text) => BrowserSnapshot::Text(text),
         };
         UploadState::read_snapshot(snapshot).map_err(|e| e.to_string())
     }
@@ -2317,12 +2317,14 @@ impl UploadCheckpoint {
         })
     }
 
-    /// The bytes to save for `state`: binary, with its scope in them.
+    /// The text to save for `state`: its snapshot, with its scope in it,
+    /// as base64, so a page that stores text (`localStorage`, `JSON`,
+    /// `String(...)`) stores it whole.
     fn encode(
         scope: &str,
         state: &crate::data::client::upload_state::UploadState,
-    ) -> Result<Vec<u8>, String> {
-        state.snapshot(scope).map_err(|e| e.to_string())
+    ) -> Result<String, String> {
+        state.snapshot_text(scope).map_err(|e| e.to_string())
     }
 
     fn restore(
@@ -2350,7 +2352,7 @@ impl UploadCheckpoint {
         if let Some(callback) = &self.callback {
             let value = Self::encode(scope, state)?;
             let result = callback
-                .call1(&JsValue::NULL, &Uint8Array::from(value.as_slice()).into())
+                .call1(&JsValue::NULL, &JsValue::from_str(&value))
                 .map_err(js_error_message)?;
             JsFuture::from(Promise::resolve(&result))
                 .await
@@ -2517,10 +2519,12 @@ impl BrowserNetworkClient {
 
     /// Self-encrypt, quote, pay through a wallet callback, and store a public file.
     ///
-    /// `on_checkpoint` receives the upload's checkpoint, a `Uint8Array`, each
-    /// time it changes; pass the last one back as `checkpoint` to resume. The
-    /// JSON text earlier clients gave is still read, and the next checkpoint
-    /// saved replaces it.
+    /// `on_checkpoint` receives the upload's checkpoint, a string (its bytes
+    /// as base64), each time it changes; store it as text, as it is, and
+    /// pass the last one back as `checkpoint` to resume. The checkpoint's
+    /// bytes are also taken as a `Uint8Array`, or as hex; text such as
+    /// `Uint8Array.toString()` gives is refused. The JSON text earlier
+    /// clients gave is still read, and the next checkpoint saved replaces it.
     #[wasm_bindgen(js_name = uploadPublicFile)]
     #[allow(clippy::too_many_arguments)] // Preserve the existing JS argument order; recovery is additive.
     pub async fn upload_public_file(

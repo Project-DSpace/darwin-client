@@ -22,6 +22,11 @@ commit `darwin --version` prints. Upstream's entries follow.
   uploads is CI output, not for deployment.
 - The default network is ours: Robinhood Chain (chain ID 4663), with the seeds, token, vault and
   RPCs bundled in `ant-core/resources/`.
+- Upload checkpoints have a format of their own (`DSCK` and a version byte, then msgpack). The
+  browser core still hands `on_checkpoint` a string, now the checkpoint's bytes as base64: store
+  it as text, as it is, and pass it back to resume. It also takes the bytes as a `Uint8Array` or
+  as hex, and reads the JSON text earlier browser clients saved. A native checkpoint keeps its
+  paid proofs in `<stem>.proofs`, appended once each.
 - Payments in DARWIN (`0x511f76A3…`, vault `0xE0f62798…`), priced like Autonomi with a price
   multiplier of 32 in the vendored ant-protocol. Builds before `0995cba` pay the retired test token.
 - Listings v2: envelopes on every visibility, optional payment fields, upload records and proofs

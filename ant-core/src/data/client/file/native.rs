@@ -3910,16 +3910,18 @@ impl Client {
         let mut state = match saved {
             Some(state) => state,
             None => {
-                let mut proofs =
+                let (mut proofs, paid_again) =
                     crate::data::client::cached_single::try_load_for_file(&file_path_key)
-                        .map(|(_, receipt)| receipt.proofs)
+                        .map(|(_, receipt)| (receipt.proofs, receipt.paid_again))
                         .unwrap_or_default();
                 if let Some((_, receipt)) =
                     crate::data::client::cached_merkle::try_load_for_file(&file_path_key)
                 {
                     proofs.extend(receipt.proofs);
                 }
-                super::super::upload_state::UploadState::from_proofs(proofs)
+                let mut state = super::super::upload_state::UploadState::from_proofs(proofs);
+                state.add_paid_again(paid_again);
+                state
             }
         };
         let adapter = SpillUploadAdapter {

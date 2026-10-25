@@ -663,15 +663,19 @@ impl Client {
         _resume_key: Option<&str>,
     ) -> Result<(Vec<XorName>, String, u128, WaveAggregateStats)> {
         #[cfg(feature = "native")]
-        let proofs = _resume_key
+        let (proofs, paid_again) = _resume_key
             .and_then(crate::data::client::cached_single::try_load_for_file)
             .map(|(_, receipt)| {
-                readable_cached_proofs(_resume_key.unwrap_or_default(), receipt.proofs)
+                (
+                    readable_cached_proofs(_resume_key.unwrap_or_default(), receipt.proofs),
+                    receipt.paid_again,
+                )
             })
             .unwrap_or_default();
         #[cfg(not(feature = "native"))]
-        let proofs = HashMap::new();
+        let (proofs, paid_again) = (HashMap::new(), std::collections::HashSet::new());
         let mut state = super::upload_state::UploadState::from_proofs(proofs);
+        state.add_paid_again(paid_again);
         let records = chunks
             .iter()
             .enumerate()

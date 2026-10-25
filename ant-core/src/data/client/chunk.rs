@@ -573,7 +573,23 @@ pub(crate) fn chunk_get_outcome(result: &Result<Option<DataChunk>>) -> Outcome {
     }
 }
 
+/// Whether every chunk PUT this process sends is answered as a node answers a
+/// proof it refuses ([`ProtocolError::PaymentFailed`]), without being sent:
+/// for tests ([`Client::refuse_puts_as_unpaid`]).
+#[cfg(feature = "test-utils")]
+static REFUSE_PUTS_AS_UNPAID: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 impl Client {
+    /// Answer every chunk PUT of every client in this process, while `on`,
+    /// as a node answers a payment proof it refuses
+    /// ([`ProtocolError::PaymentFailed`]), without sending it: for tests of
+    /// what a client does when every storer refuses its proof.
+    #[cfg(feature = "test-utils")]
+    pub fn refuse_puts_as_unpaid(on: bool) {
+        REFUSE_PUTS_AS_UNPAID.store(on, std::sync::atomic::Ordering::SeqCst);
+    }
+
     /// Store a chunk on the Autonomi network with payment.
     ///
     /// A raw building block: the chunk is stored on its own, with no
@@ -591,8 +607,12 @@ impl Client {
     /// [`Client::pay_for_storage_split`] describes, and its proof is kept in
     /// the chunk's payment checkpoint until the chunk is stored: if the store
     /// fails, the next `chunk_put` of the same content with the same wallet
-    /// stores it with that proof instead of paying again. Browser builds
-    /// keep nothing.
+    /// stores it with that proof instead of paying again. If every storer
+    /// that fails the store refuses that kept proof, the chunk is paid again
+    /// at once, once: never a second time across calls, never for a proof
+    /// this call paid or settled from the journal, and not while the
+    /// payment's record can't be read from the chain (the proof is then
+    /// kept). Browser builds keep nothing.
     ///
     /// # Errors
     ///
@@ -618,11 +638,24 @@ impl Client {
                     .await
                 {
                     // Every storer refused the proof an earlier attempt
-                    // paid: pay once more, at once, rather than stall.
-                    Err(error) if paid.reused && proof_refused(&error) => {
+                    // paid: pay once more, at once, rather than stall; but
+                    // never a second time, and never while the payment
+                    // can't be read from the chain (the proof is kept).
+                    Err(error) if paid.reused && !paid.paid_again && proof_refused(&error) => {
+                        if self.kept_payment(&paid.proof).await
+                            == crate::data::client::occupied::KeptPayment::Unreadable
+                        {
+                            warn!(
+                                "every storer refused the proof kept for chunk {}, and its \
+                                 payment can't be read from the chain; keeping the proof \
+                                 rather than paying again",
+                                hex::encode(address)
+                            );
+                            return Err(error);
+                        }
                         warn!(
                             "every storer that failed to store chunk {} refused the proof an \
-                             earlier attempt paid for it ({error}); paying for it again",
+                             earlier attempt paid for it ({error}); paying for it again, once",
                             hex::encode(address)
                         );
                         paid.refused()?;
@@ -842,6 +875,13 @@ impl Client {
         peer_addrs: &[MultiAddr],
     ) -> Result<XorName> {
         let address = compute_address(&content);
+        #[cfg(feature = "test-utils")]
+        if REFUSE_PUTS_AS_UNPAID.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(Error::RemotePut {
+                address: hex::encode(address),
+                source: ProtocolError::PaymentFailed("refused by a test".into()),
+            });
+        }
         let node = self.network();
         let timeout =
             store_response_timeout_for_proof(&proof, self.config().merkle_store_timeout_secs);

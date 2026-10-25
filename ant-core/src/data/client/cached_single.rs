@@ -22,7 +22,7 @@
 //!
 //! Lifecycle
 //! ---------
-//! * **append_wave** — called once per successfully paid wave, before
+//! * **append_wave_marked** — called once per successfully paid wave, before
 //!   the PUT phase. Adds the wave's `(addr, proof_bytes)` entries to
 //!   the on-disk receipt and updates the cumulative cost figures.
 //! * **load_for_file** — called once at the top of the upload. If a
@@ -83,7 +83,7 @@ use crate::error::Result;
 use ant_protocol::evm::Amount;
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, DirEntry, File, OpenOptions};
 use std::io::{BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
@@ -130,6 +130,11 @@ pub struct SingleNodeReceipt {
     pub storage_cost_atto: String,
     /// Cumulative gas cost in wei, summed across all paid waves.
     pub gas_cost_wei: u128,
+    /// The chunks paid again because every storer refused a kept proof:
+    /// never paid again a second time. Empty, and not written, for a
+    /// receipt with none.
+    #[serde(default, skip_serializing_if = "HashSet::is_empty")]
+    pub paid_again: HashSet<[u8; 32]>,
 }
 
 /// Highest schema version this binary knows how to read. Receipts
@@ -145,6 +150,7 @@ impl SingleNodeReceipt {
             first_pay_timestamp: now_secs,
             storage_cost_atto: "0".to_string(),
             gas_cost_wei: 0,
+            paid_again: HashSet::new(),
         }
     }
 }
@@ -212,9 +218,34 @@ fn receipt_path(dir: &Path, ts: u64, key: &str) -> PathBuf {
 /// last-writer-wins on the receipt content. The write itself is
 /// `tmp + fsync + rename` so an interrupted write never leaves a
 /// truncated or partial receipt on disk.
+///
+/// The upload engine appends through [`append_wave_marked`]; this, with
+/// nothing marked, is for tests.
+#[cfg(test)]
 pub fn append_wave(
     file_path: &str,
     new_proofs: HashMap<[u8; 32], Vec<u8>>,
+    wave_storage_cost_atto: &str,
+    wave_gas_cost_wei: u128,
+) -> Result<PathBuf> {
+    append_wave_marked(
+        file_path,
+        new_proofs,
+        &HashSet::new(),
+        wave_storage_cost_atto,
+        wave_gas_cost_wei,
+    )
+}
+
+/// Append a wave as `append_wave` describes, also marking `paid_again` paid again once already
+/// ([`SingleNodeReceipt::paid_again`]). A marked chunk's proof in the
+/// receipt is the one in `new_proofs`, or none: the refused proof it was
+/// paid again for is dropped, so a resume quotes and pays it rather than
+/// offer the refused proof again.
+pub(crate) fn append_wave_marked(
+    file_path: &str,
+    new_proofs: HashMap<[u8; 32], Vec<u8>>,
+    paid_again: &HashSet<[u8; 32]>,
     wave_storage_cost_atto: &str,
     wave_gas_cost_wei: u128,
 ) -> Result<PathBuf> {
@@ -243,6 +274,12 @@ pub fn append_wave(
     };
     let new_path = receipt_path(&dir, now, &key);
 
+    for address in paid_again {
+        if !new_proofs.contains_key(address) {
+            receipt.proofs.remove(address);
+        }
+    }
+    receipt.paid_again.extend(paid_again.iter().copied());
     receipt.proofs.extend(new_proofs);
     // Sum costs as U256 (Amount). A wave's storage cost is wei-scale
     // atto-token and a multi-TB upload's cumulative can plausibly
@@ -373,20 +410,20 @@ pub fn try_drop_proofs_for_file(file_path: &str, expected: &[([u8; 32], Vec<u8>)
     }
 }
 
-/// Best-effort `append_wave`. Logs on failure, returns nothing.
-///
-/// Intended for the hot path: if we can't persist the receipt the
-/// upload still proceeds, the user just loses resume capability for
-/// that wave.
-pub fn try_append_wave(
+/// Best-effort [`append_wave_marked`], for the hot path: if the receipt
+/// can't be persisted the upload still proceeds, and only loses resume
+/// capability for that wave. Logs on failure, returns nothing.
+pub(crate) fn try_append_wave_marked(
     file_path: &str,
     new_proofs: HashMap<[u8; 32], Vec<u8>>,
+    paid_again: &HashSet<[u8; 32]>,
     wave_storage_cost_atto: &str,
     wave_gas_cost_wei: u128,
 ) {
-    if let Err(e) = append_wave(
+    if let Err(e) = append_wave_marked(
         file_path,
         new_proofs,
+        paid_again,
         wave_storage_cost_atto,
         wave_gas_cost_wei,
     ) {
@@ -644,7 +681,13 @@ fn dedupe_canonical_receipts(dir: &Path, key: &str) {
                 // write semantics newer should hold the same proof
                 // unless a buggier binary wrote independently).
                 let mut added = 0usize;
+                // A chunk paid again keeps only the winner's proof: the
+                // older sibling's may be the one storers refused.
+                winner.paid_again.extend(other.paid_again);
                 for (addr, bytes) in other.proofs {
+                    if winner.paid_again.contains(&addr) {
+                        continue;
+                    }
                     winner.proofs.entry(addr).or_insert_with(|| {
                         added += 1;
                         bytes
@@ -914,6 +957,51 @@ impl Drop for ReceiptLock {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A chunk marked paid again loses its refused proof from the receipt,
+    /// keeps the mark across loads, and takes the new proof once paid.
+    #[test]
+    fn a_chunk_paid_again_is_marked_and_its_refused_proof_dropped() -> Result<()> {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let file_path = format!("/tmp/darwin-paid-again-test-{nanos}");
+        let (refused, other) = ([1u8; 32], [2u8; 32]);
+        append_wave(
+            &file_path,
+            HashMap::from([(refused, vec![1]), (other, vec![2])]),
+            "10",
+            20,
+        )?;
+        // Marked before the new payment: the refused proof goes.
+        let marked = HashSet::from([refused]);
+        append_wave_marked(
+            &file_path,
+            HashMap::from([(other, vec![2])]),
+            &marked,
+            "0",
+            0,
+        )?;
+        let (_, receipt) = load_for_file(&file_path)?.expect("the receipt");
+        assert!(!receipt.proofs.contains_key(&refused));
+        assert_eq!(receipt.proofs.get(&other), Some(&vec![2]));
+        assert_eq!(receipt.paid_again, marked);
+        // Paid again: the new proof, the mark kept.
+        append_wave_marked(
+            &file_path,
+            HashMap::from([(refused, vec![3]), (other, vec![2])]),
+            &marked,
+            "10",
+            20,
+        )?;
+        let (_, receipt) = load_for_file(&file_path)?.expect("the receipt");
+        assert_eq!(receipt.proofs.get(&refused), Some(&vec![3]));
+        assert_eq!(receipt.paid_again, marked);
+        assert_eq!(receipt.storage_cost_atto, "20");
+        delete_for_file(&file_path)?;
+        Ok(())
+    }
 
     #[test]
     fn file_hash_key_is_stable() {
@@ -1768,6 +1856,7 @@ mod tests {
             first_pay_timestamp: now,
             storage_cost_atto: "10".to_string(),
             gas_cost_wei: 20,
+            paid_again: HashSet::new(),
         };
         write_receipt_atomic(&canonical, &receipt)?;
         assert!(canonical.exists());

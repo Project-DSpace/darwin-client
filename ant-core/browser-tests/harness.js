@@ -13,8 +13,8 @@ globalThis.runIntegration = async ({ endpoint, payment, rpcUrl }) => {
   const token = new Contract(payment.payment_token_address, ["function approve(address,uint256) returns (bool)"], signer);
   const vault = new Contract(payment.payment_vault_address,
     ["function payForQuotes((address rewardsAddress,uint256 amount,bytes32 quoteHash)[] payments)"], signer);
-  let payments = 0, checkpoint, paid = false;
-  const save = value => { checkpoint = value; localStorage.setItem("checkpoint", Array.from(value, byte => byte.toString(16).padStart(2, "0")).join("")); };
+  let payments = 0, paid = false;
+  const save = value => { localStorage.setItem("checkpoint", value); };
   const pay = async (_, quotes, submitted) => {
     payments++;
     const totalAmount = quotes.reduce((sum, quote) => sum + BigInt(quote.amount), 0n);
@@ -40,7 +40,7 @@ globalThis.runIntegration = async ({ endpoint, payment, rpcUrl }) => {
   client.free();
   client = new BrowserNetworkClient([endpoint]);
   const result = await client.uploadStagedPublicFile(staged, payment, index => encrypted.records[index].content,
-    () => { throw new Error("Recovery tried to pay again"); }, undefined, checkpoint, save, "single");
+    () => { throw new Error("Recovery tried to pay again"); }, undefined, localStorage.getItem("checkpoint"), save, "single");
   client.close(); client.free();
   const reader = new BrowserNetworkClient([endpoint]);
   const downloaded = await reader.downloadPublicFile(result.file.address, 4);

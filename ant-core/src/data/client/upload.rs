@@ -5,7 +5,9 @@
 
 use super::batch::{ChunkPaymentPlan, PaidChunk, WaveAggregateStats, WaveResult};
 use super::merkle::PaymentMode;
-use super::occupied::{occupied_error, skipped_amount, OccupiedQuote, MAX_OCCUPIED_REQUOTES};
+use super::occupied::{
+    occupied_error, skipped_amount, KeptPayment, OccupiedQuote, MAX_OCCUPIED_REQUOTES,
+};
 use super::upload_state::{paid_node, UploadState};
 use super::{adaptive::observe_op, classify_error, Client};
 use crate::data::error::{Error, PartialUploadSpend, Result};
@@ -404,8 +406,12 @@ impl Client {
         }
         let total = records.len() + usize::from(last.is_some());
         let mut unique = records.to_vec();
+        // The records this run paid for, at once, again, or by settling a
+        // payment an earlier run journaled: a proof among them that storers
+        // refuse is a failure, never paid for again.
+        let mut paid_now = HashSet::new();
         let preparation = async {
-            self.reconcile_upload_payment(state, adapter).await?;
+            paid_now.extend(self.reconcile_upload_payment(state, adapter).await?);
             self.prepare_upload_merkle(&mut unique, state, adapter, mode, outcome)
                 .await
         }
@@ -454,9 +460,6 @@ impl Client {
         let mut prefetched = None;
         let mut failed = Vec::new();
         let mut held = None;
-        // The records this run paid for, at once or again: a proof among
-        // them that storers refuse is a failure, never paid for again.
-        let mut paid_now = HashSet::new();
         for (wave_index, wave) in waves.iter().enumerate() {
             let mut plans = match prefetched.take() {
                 Some(plans) => plans?,
@@ -520,6 +523,7 @@ impl Client {
             if fatal {
                 break;
             }
+            let refused = self.payable_again(refused, state, &mut failed).await;
             if refused.is_empty() {
                 continue;
             }
@@ -561,6 +565,7 @@ impl Client {
                 .await;
             let refused =
                 absorb_stores(results, state, &paid_now, outcome, &mut failed, &mut fatal);
+            let refused = self.payable_again(refused, state, &mut failed).await;
             if !refused.is_empty() {
                 paid_now.extend(refused);
                 let plans = self
@@ -674,11 +679,13 @@ impl Client {
         for record in records {
             tracing::warn!(
                 "every storer that failed to store {} refused the proof an earlier run \
-                 paid for it; paying for it again",
+                 paid for it; paying for it again, once",
                 hex::encode(record.address)
             );
+            state.mark_paid_again(record.address);
             state.drop_proof(&record.address);
         }
+        // Saved before anything is paid, so no later run pays again.
         adapter.checkpoint(state, None).await?;
         let mut plans = self
             .prepare_upload_wave(records, state, adapter, total)
@@ -719,11 +726,15 @@ impl Client {
             .collect())
     }
 
+    /// Settle the payment an earlier run journaled, from the chain. Returns
+    /// the records it paid for (none for a Merkle batch): their proofs are
+    /// this run's, so a refusal of them is a failure, never paid for again.
     async fn reconcile_upload_payment<A: UploadAdapter>(
         &self,
         state: &mut UploadState,
         adapter: &A,
-    ) -> Result<()> {
+    ) -> Result<Vec<[u8; 32]>> {
+        let mut confirmed = Vec::new();
         if let Some(attempt) = state.pending_payment.clone() {
             if attempt.merkle {
                 let batch = state
@@ -741,13 +752,14 @@ impl Client {
                 // below quote them again.
                 let occupied = self.occupied_quotes(&plans).await;
                 let released = state.release_occupied(&occupied);
+                confirmed = attempt
+                    .addresses
+                    .iter()
+                    .copied()
+                    .filter(|address| !released.contains(address))
+                    .collect::<Vec<_>>();
                 state.confirm(
-                    &attempt
-                        .addresses
-                        .iter()
-                        .copied()
-                        .filter(|address| !released.contains(address))
-                        .collect::<Vec<_>>(),
+                    &confirmed,
                     &payment.transactions,
                     crate::runtime::system_time(),
                 )?;
@@ -755,7 +767,49 @@ impl Client {
             // Recovered receipts are previous spend, not new payments by this invocation.
             adapter.checkpoint(state, None).await?;
         }
-        Ok(())
+        Ok(confirmed)
+    }
+
+    /// Of the records `refused` names ([`absorb_stores`]: an earlier run's
+    /// proof every failing storer refused, with the store's error), those to
+    /// pay for again. The vault's record of each proof's payment is read
+    /// back first ([`Client::kept_payment`]): a record whose payment can't
+    /// be read, as when the chain's RPCs fail the nodes and this client
+    /// alike, is a failure, its proof kept, so an outage never pays again.
+    async fn payable_again(
+        &self,
+        refused: HashMap<[u8; 32], String>,
+        state: &UploadState,
+        failed: &mut Vec<([u8; 32], String)>,
+    ) -> HashSet<[u8; 32]> {
+        let mut payable = HashSet::new();
+        for (address, error) in refused {
+            let kept = match state.proof(&address) {
+                Some(proof) => self.kept_payment(proof).await,
+                None => KeptPayment::NotChecked,
+            };
+            if kept == KeptPayment::Unreadable {
+                tracing::warn!(
+                    "every storer refused the proof kept for {}, and its payment can't be \
+                     read from the chain; keeping the proof rather than paying again",
+                    hex::encode(address)
+                );
+                failed.push((
+                    address,
+                    format!(
+                        "{error}; the payment record couldn't be read, so the proof is kept \
+                         and the record not paid for again"
+                    ),
+                ));
+            } else {
+                tracing::info!(
+                    "the vault's record of the refused proof of {}: {kept:?}",
+                    hex::encode(address)
+                );
+                payable.insert(address);
+            }
+        }
+        payable
     }
 
     /// Pay a wave's `payable` plans, then read every paid quote's vault record
@@ -1373,19 +1427,21 @@ pub(crate) fn paid_outside_width(
 
 /// Take in the stores of `results` ([`Client::store_planned`]): stored
 /// records into `outcome`, failed ones into `failed`, and `fatal` set if a
-/// record couldn't be sent at all. Returns the records to pay for again:
-/// those whose single-node proof an earlier run paid (not in `paid_now`)
-/// and every storer that failed the store refused
-/// ([`proof_refused`](super::chunk::proof_refused)), left out of `failed`.
+/// record couldn't be sent at all. Returns the records to pay for again,
+/// with their store's error: those whose single-node proof an earlier run
+/// paid (not in `paid_now`) and every storer that failed the store refused
+/// ([`proof_refused`](super::chunk::proof_refused)), left out of `failed`,
+/// unless they were paid again once already
+/// ([`UploadState::was_paid_again`]): those are failures.
 pub(crate) fn absorb_stores(
     results: Vec<([u8; 32], Result<WaveResult>)>,
-    state: &UploadState,
+    state: &mut UploadState,
     paid_now: &HashSet<[u8; 32]>,
     outcome: &mut UploadOutcome,
     failed: &mut Vec<([u8; 32], String)>,
     fatal: &mut bool,
-) -> HashSet<[u8; 32]> {
-    let mut refused = HashSet::new();
+) -> HashMap<[u8; 32], String> {
+    let mut refused = HashMap::new();
     for (address, result) in results {
         let result = match result {
             Ok(result) => result,
@@ -1398,19 +1454,28 @@ pub(crate) fn absorb_stores(
             }
         };
         outcome.stats.absorb(&result);
+        for address in &result.stored {
+            state.clear_paid_again(address);
+        }
         outcome.addresses.extend(result.stored);
-        refused.extend(result.refused.into_iter().filter(|address| {
-            !paid_now.contains(address)
-                && state
-                    .proof(address)
-                    .is_some_and(|bytes| paid_node(bytes).is_some())
-        }));
-        failed.extend(
-            result
-                .failed
-                .into_iter()
-                .filter(|(address, _)| !refused.contains(address)),
-        );
+        let again = result
+            .refused
+            .into_iter()
+            .filter(|address| {
+                !paid_now.contains(address)
+                    && !state.was_paid_again(address)
+                    && state
+                        .proof(address)
+                        .is_some_and(|bytes| paid_node(bytes).is_some())
+            })
+            .collect::<HashSet<_>>();
+        for (address, error) in result.failed {
+            if again.contains(&address) {
+                refused.insert(address, error);
+            } else {
+                failed.push((address, error));
+            }
+        }
     }
     refused
 }
@@ -1570,12 +1635,20 @@ impl UploadAdapter for MemoryUploadAdapter<'_> {
     }
     async fn checkpoint(&self, state: &UploadState, payment: Option<&UploadPayment>) -> Result<()> {
         #[cfg(feature = "native")]
-        if let (Some(key), Some(payment)) = (self.resume_key, payment) {
-            super::cached_single::try_append_wave(
+        if let Some(key) = self.resume_key {
+            // A wave's payment, or the mark that records are paid again
+            // (saved before that payment is sent).
+            let (amount, gas) = match payment {
+                Some(payment) => (payment.amount.to_string(), payment.gas),
+                None if !state.paid_again().is_empty() => ("0".to_string(), 0),
+                None => return Ok(()),
+            };
+            super::cached_single::try_append_wave_marked(
                 key,
                 state.proofs().clone(),
-                &payment.amount.to_string(),
-                payment.gas,
+                state.paid_again(),
+                &amount,
+                gas,
             );
         }
         #[cfg(not(feature = "native"))]
@@ -1959,6 +2032,7 @@ mod tests {
             plan(b"earlier", now),
             plan(b"this run", now),
             plan(b"full", now),
+            plan(b"paid again", now),
         ];
         let mut state = UploadState::default();
         for record in &records {
@@ -1967,7 +2041,9 @@ mod tests {
                 .confirm(&[record.address], &transactions(record), now)
                 .unwrap();
         }
-        let [earlier, this_run, full] = records.map(|record| record.address);
+        let [earlier, this_run, full, paid_again] = records.map(|record| record.address);
+        // Paid again once already, in this run or an earlier one.
+        state.mark_paid_again(paid_again);
         let result = |address: [u8; 32], refused: bool| WaveResult {
             stored: Vec::new(),
             failed: vec![(address, "short of a quorum".into())],
@@ -1980,24 +2056,60 @@ mod tests {
             (earlier, Ok(result(earlier, true))),
             (this_run, Ok(result(this_run, true))),
             (full, Ok(result(full, false))),
+            (paid_again, Ok(result(paid_again, true))),
         ];
         let mut outcome = UploadOutcome::default();
         let mut failed = Vec::new();
         let mut fatal = false;
         let again = absorb_stores(
             results,
-            &state,
+            &mut state,
             &HashSet::from([this_run]),
             &mut outcome,
             &mut failed,
             &mut fatal,
         );
-        assert_eq!(again, HashSet::from([earlier]));
+        assert_eq!(
+            again,
+            HashMap::from([(earlier, "short of a quorum".to_string())])
+        );
         let failed = failed
             .into_iter()
             .map(|(address, _)| address)
             .collect::<HashSet<_>>();
-        assert_eq!(failed, HashSet::from([this_run, full]));
+        assert_eq!(failed, HashSet::from([this_run, full, paid_again]));
         assert!(!fatal);
+
+        // Stored, a record paid again is forgotten as such.
+        let stored = WaveResult {
+            stored: vec![paid_again],
+            failed: Vec::new(),
+            refused: Vec::new(),
+            chunk_attempts_total: 1,
+            store_durations_ms: Vec::new(),
+            retries_per_chunk: Vec::new(),
+        };
+        absorb_stores(
+            vec![(paid_again, Ok(stored))],
+            &mut state,
+            &HashSet::new(),
+            &mut outcome,
+            &mut Vec::new(),
+            &mut fatal,
+        );
+        assert!(!state.was_paid_again(&paid_again));
+    }
+
+    /// The mark that a record was paid again is saved with the checkpoint
+    /// and read back, so a later run never pays for it a third time.
+    #[test]
+    fn the_paid_again_mark_survives_a_checkpoint() {
+        let mut state = UploadState::default();
+        state.mark_paid_again([7; 32]);
+        let restored = UploadState::restore(&state.checkpoint().unwrap()).unwrap();
+        assert!(restored.was_paid_again(&[7; 32]));
+        assert!(!restored.was_paid_again(&[8; 32]));
+        let none = UploadState::restore(&UploadState::default().checkpoint().unwrap()).unwrap();
+        assert!(none.paid_again().is_empty());
     }
 }

@@ -435,8 +435,8 @@ test("paid checkpoint survives a staged-loader failure and restores on a new cli
       async index => { if (signer.calls.length) throw new Error("staged storage temporarily unavailable"); return encrypted.records[index].content; }, signer.pay,
       undefined, undefined, value => { checkpoint = value; }), /staged storage temporarily unavailable/);
     assert.equal(signer.calls.length, 1);
-    assert.ok(checkpoint instanceof Uint8Array);
-    assert.equal(new TextDecoder().decode(checkpoint.subarray(0, 4)), "DSCK");
+    assert.equal(typeof checkpoint, "string");
+    assert.equal(Buffer.from(checkpoint, "base64").subarray(0, 4).toString(), "DSCK");
     client.close();
     // Fresh discovery now issues quotes with a different signed timestamp.
     await new Promise(resolve => setTimeout(resolve, 1100));
@@ -451,6 +451,59 @@ test("paid checkpoint survives a staged-loader failure and restores on a new cli
     for (const request of rtc.requests.filter(request => request.method === "put_chunk")) {
       assert.equal(request.quoteHash.replace(/^0x/, ""), original.get(request.address).replace(/^0x/, ""));
     }
+  } finally { client.close(); }
+});
+
+// A page stores the checkpoint as text, as pages and the SDK's window
+// wrapper do: through JSON.stringify, and a store that keeps String(value)
+// (localStorage, IndexedDB read back with String(...)). Each form a page may
+// hand back resumes the paid upload with no second payment: that text, the
+// bytes as a Uint8Array, and the bytes as hex in either case.
+test("a checkpoint stored as text resumes a paid upload without paying again", async () => {
+  const rtc = mockWebRtc(Array.from({ length: 7 }, () => ({})));
+  const encrypted = encryptPublicFile(content);
+  const staged = {
+    ...encrypted, name: "stored-as-text.txt", content_type: "text/plain", size: content.length,
+    records: encrypted.records.map(record => ({ address: record.address, size: record.content.length })),
+  };
+  const store = new Map();
+  const localStorage = {
+    setItem: (key, value) => store.set(key, String(value)),
+    getItem: key => store.get(key) ?? null,
+  };
+  const wrap = value => JSON.stringify({ kind: "window", checkpoint: value });
+  const unwrap = text => {
+    const { checkpoint } = JSON.parse(text);
+    if (typeof checkpoint !== "string") throw new Error("Unsupported or malformed windowed upload checkpoint");
+    return checkpoint;
+  };
+  const signer = wallet();
+  let client = new BrowserNetworkClient(rtc.endpoints);
+  try {
+    await assert.rejects(client.uploadStagedPublicFile(staged, paymentNetwork,
+      async index => { if (signer.calls.length) throw new Error("staged storage temporarily unavailable"); return encrypted.records[index].content; }, signer.pay,
+      undefined, undefined, value => { localStorage.setItem("checkpoint", wrap(value)); }), /staged storage temporarily unavailable/);
+    assert.equal(signer.calls.length, 1);
+    client.close();
+    const text = unwrap(localStorage.getItem("checkpoint"));
+    const bytes = Uint8Array.from(Buffer.from(text, "base64"));
+    const forms = [text, bytes, Buffer.from(bytes).toString("hex"), Buffer.from(bytes).toString("hex").toUpperCase()];
+    for (const saved of forms) {
+      client = new BrowserNetworkClient(rtc.endpoints);
+      const result = await client.uploadStagedPublicFile(staged, paymentNetwork,
+        async index => encrypted.records[index].content,
+        async () => { throw new Error("already paid records must not request payment"); },
+        undefined, saved, () => {});
+      assert.equal(result.storageCostAtto, "0");
+      client.close();
+    }
+    assert.equal(signer.calls.length, 1, "one payment in all");
+    // The bytes turned into text another way are refused, with why.
+    client = new BrowserNetworkClient(rtc.endpoints);
+    await assert.rejects(client.uploadStagedPublicFile(staged, paymentNetwork,
+      async index => encrypted.records[index].content,
+      async () => { throw new Error("must not pay"); },
+      undefined, bytes.toString(), () => {}), /Uint8Array/);
   } finally { client.close(); }
 });
 

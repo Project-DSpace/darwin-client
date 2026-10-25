@@ -17,6 +17,12 @@
 //! one transaction for both, and recover it the same way: each file's
 //! records are charged once, in the first run and in a rerun from each
 //! file's journal.
+//!
+//! A kept proof that every storer refuses (here, with every PUT of the
+//! process answered as a node answers a proof it refuses) is paid again at
+//! most once across runs, never when the run that refuses it settled it
+//! from the journal, and never while the vault's record of its payment
+//! can't be read.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
@@ -74,6 +80,11 @@ impl Proxy {
     /// The RPC answers again.
     fn restore(&self) {
         self.down.store(false, Ordering::SeqCst);
+    }
+
+    /// The RPC answers nothing but errors, until [`Proxy::restore`].
+    fn go_down(&self) {
+        self.down.store(true, Ordering::SeqCst);
     }
 
     fn sends(&self) -> usize {
@@ -232,6 +243,28 @@ fn random_file() -> tempfile::NamedTempFile {
 
 fn random_chunk() -> Bytes {
     Bytes::from((0..1024).map(|_| rand::random::<u8>()).collect::<Vec<_>>())
+}
+
+/// Every chunk PUT of this process is answered as a proof refused, until
+/// dropped.
+struct Refusing;
+
+impl Refusing {
+    fn start() -> Self {
+        Client::refuse_puts_as_unpaid(true);
+        Self
+    }
+}
+
+impl Drop for Refusing {
+    fn drop(&mut self) {
+        Client::refuse_puts_as_unpaid(false);
+    }
+}
+
+/// The transactions the wallet has sent, from Anvil.
+async fn sent(wallet: &Wallet) -> u64 {
+    spent(wallet).await.0
 }
 
 /// `chunk_put` whose payment the RPC answered with an error pays once: in
@@ -441,6 +474,193 @@ async fn files_sharing_a_wave_the_rpc_errored_on_pay_once() {
     assert!(after.1 < before.1, "and it paid");
     assert_eq!(
         upload_checkpoints(),
+        checkpoints,
+        "nothing kept once stored"
+    );
+
+    testnet.teardown().await;
+}
+
+/// A payment a run left journaled, settled by the next run, whose storers
+/// all refuse its proof in that run, is not paid for again: the refusal is
+/// a failure, the proof kept, and a later run stores the record with it.
+/// For a chunk put and for a file upload.
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn a_payment_settled_from_the_journal_is_not_paid_again_when_refused() {
+    let (testnet, proxy, direct, proxied) = setup().await;
+    let checkpoints = (record_checkpoints(), upload_checkpoints());
+
+    let content = random_chunk();
+    let before = sent(&direct).await;
+    proxy.fail_next_send_then_go_down();
+    client(&testnet, &proxied)
+        .chunk_put(content.clone())
+        .await
+        .expect_err("the payment's outcome can't be seen");
+    proxy.restore();
+    {
+        let _refusing = Refusing::start();
+        client(&testnet, &proxied)
+            .chunk_put(content.clone())
+            .await
+            .expect_err("every storer refuses the settled proof");
+    }
+    assert_eq!(
+        sent(&direct).await,
+        before + 1,
+        "the payment settled from the journal is not paid again"
+    );
+    client(&testnet, &proxied)
+        .chunk_put(content.clone())
+        .await
+        .expect("stored with the settled proof");
+    assert_eq!(sent(&direct).await, before + 1, "one transaction in all");
+
+    let file = random_file();
+    let before = sent(&direct).await;
+    proxy.fail_next_send_then_go_down();
+    client(&testnet, &proxied)
+        .file_upload_with_mode(file.path(), PaymentMode::Single)
+        .await
+        .expect_err("the payment's outcome can't be seen");
+    proxy.restore();
+    {
+        let _refusing = Refusing::start();
+        client(&testnet, &proxied)
+            .file_upload_with_mode(file.path(), PaymentMode::Single)
+            .await
+            .expect_err("every storer refuses the settled proofs");
+    }
+    assert_eq!(
+        sent(&direct).await,
+        before + 1,
+        "the payment settled from the journal is not paid again"
+    );
+    client(&testnet, &proxied)
+        .file_upload_with_mode(file.path(), PaymentMode::Single)
+        .await
+        .expect("stored with the settled proofs");
+    assert_eq!(sent(&direct).await, before + 1, "one transaction in all");
+    assert_eq!(
+        (record_checkpoints(), upload_checkpoints()),
+        checkpoints,
+        "nothing kept once stored"
+    );
+
+    testnet.teardown().await;
+}
+
+/// Storers that refuse every proof on every run, as when the nodes can't
+/// read the chain, cost at most one more payment per record across runs: the
+/// first run pays; the second, offered the first's proof and refused, pays
+/// again once; the third pays nothing. For a chunk put and for a file
+/// upload, each stored afterwards.
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn refusals_on_every_run_pay_again_at_most_once() {
+    let (testnet, _proxy, direct, proxied) = setup().await;
+    let checkpoints = (record_checkpoints(), upload_checkpoints());
+
+    let content = random_chunk();
+    let before = sent(&direct).await;
+    {
+        let _refusing = Refusing::start();
+        for run in 1..=3u64 {
+            client(&testnet, &proxied)
+                .chunk_put(content.clone())
+                .await
+                .expect_err("every storer refuses");
+            assert_eq!(
+                sent(&direct).await,
+                before + run.min(2),
+                "run {run}: at most one payment more than the first"
+            );
+        }
+    }
+    client(&testnet, &proxied)
+        .chunk_put(content.clone())
+        .await
+        .expect("stored with the kept proof");
+    assert_eq!(sent(&direct).await, before + 2);
+
+    let file = random_file();
+    let before = sent(&direct).await;
+    {
+        let _refusing = Refusing::start();
+        for run in 1..=3u64 {
+            client(&testnet, &proxied)
+                .file_upload_with_mode(file.path(), PaymentMode::Single)
+                .await
+                .expect_err("every storer refuses");
+            assert_eq!(
+                sent(&direct).await,
+                before + run.min(2),
+                "run {run}: at most one payment more than the first"
+            );
+        }
+    }
+    client(&testnet, &proxied)
+        .file_upload_with_mode(file.path(), PaymentMode::Single)
+        .await
+        .expect("stored with the kept proofs");
+    assert_eq!(sent(&direct).await, before + 2);
+    assert_eq!(
+        (record_checkpoints(), upload_checkpoints()),
+        checkpoints,
+        "nothing kept once stored"
+    );
+
+    testnet.teardown().await;
+}
+
+/// A kept proof every storer refuses while the vault's record of its
+/// payment can't be read (every RPC failing, for the nodes and this client
+/// alike) is kept, and nothing is paid; once the chain answers and storers
+/// take it, the record is stored with it. For a chunk put and for a file
+/// upload.
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn a_refused_proof_whose_payment_cant_be_read_is_kept() {
+    let (testnet, proxy, direct, proxied) = setup().await;
+    let checkpoints = (record_checkpoints(), upload_checkpoints());
+
+    let content = random_chunk();
+    let file = random_file();
+    let before = sent(&direct).await;
+    {
+        let _refusing = Refusing::start();
+        client(&testnet, &proxied)
+            .chunk_put(content.clone())
+            .await
+            .expect_err("every storer refuses");
+        client(&testnet, &proxied)
+            .file_upload_with_mode(file.path(), PaymentMode::Single)
+            .await
+            .expect_err("every storer refuses");
+        let paid = sent(&direct).await;
+        assert_eq!(paid, before + 2, "each paid once");
+        proxy.go_down();
+        let chunk = client(&testnet, &proxied).chunk_put(content.clone()).await;
+        let upload = client(&testnet, &proxied)
+            .file_upload_with_mode(file.path(), PaymentMode::Single)
+            .await;
+        proxy.restore();
+        chunk.expect_err("refused, and its payment can't be read");
+        upload.expect_err("refused, and its payment can't be read");
+        assert_eq!(sent(&direct).await, paid, "nothing paid again");
+    }
+    client(&testnet, &proxied)
+        .chunk_put(content)
+        .await
+        .expect("stored with the kept proof");
+    client(&testnet, &proxied)
+        .file_upload_with_mode(file.path(), PaymentMode::Single)
+        .await
+        .expect("stored with the kept proofs");
+    assert_eq!(sent(&direct).await, before + 2, "no payment but the first");
+    assert_eq!(
+        (record_checkpoints(), upload_checkpoints()),
         checkpoints,
         "nothing kept once stored"
     );

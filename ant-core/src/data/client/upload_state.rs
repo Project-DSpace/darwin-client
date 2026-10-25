@@ -62,27 +62,29 @@ pub const CHECKPOINT_MAGIC: [u8; 4] = *b"DSCK";
 #[cfg(any(test, all(target_arch = "wasm32", feature = "browser-wasm")))]
 pub(crate) const MAX_BROWSER_SNAPSHOT_BYTES: usize = 128 * 1024 * 1024;
 
-/// A browser snapshot as the page hands it back: the bytes this client
-/// saves, or the JSON text the browser client before [`CHECKPOINT_MAGIC`]
-/// saved.
+/// A browser snapshot as the page hands it back: text, as this client gives
+/// it ([`UploadState::snapshot_text`]) or as the browser client before
+/// [`CHECKPOINT_MAGIC`] gave it, or the snapshot's bytes.
 #[cfg(any(test, all(target_arch = "wasm32", feature = "browser-wasm")))]
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum BrowserSnapshot<'a> {
     /// What [`UploadState::snapshot`] gives.
     Bytes(&'a [u8]),
-    /// `{"scope", "state"}`, the state a hex msgpack [`UploadState`].
-    Json(&'a str),
+    /// What [`UploadState::snapshot_text`] gives: those bytes as base64, or
+    /// as hex in either case; or `{"scope", "state"}`, the state a hex
+    /// msgpack [`UploadState`], as the browser client before
+    /// [`CHECKPOINT_MAGIC`] gave it.
+    Text(&'a str),
 }
 
+/// Why a browser snapshot given as text was refused: it is neither the text
+/// this client gives nor the JSON the client before it gave.
 #[cfg(any(test, all(target_arch = "wasm32", feature = "browser-wasm")))]
-impl BrowserSnapshot<'_> {
-    fn len(&self) -> usize {
-        match self {
-            Self::Bytes(bytes) => bytes.len(),
-            Self::Json(text) => text.len(),
-        }
-    }
-}
+pub(crate) const SNAPSHOT_TEXT_REFUSED: &str =
+    "an upload checkpoint given as text must be the text on_checkpoint gave (base64), its \
+     bytes as hex, or the JSON an earlier client gave; text such as Uint8Array.toString()'s \
+     is not accepted: pass the text on_checkpoint gave, or the checkpoint's bytes as a \
+     Uint8Array";
 
 /// The format version that follows [`CHECKPOINT_MAGIC`].
 pub const CHECKPOINT_FORMAT: u8 = 1;
@@ -144,6 +146,11 @@ pub struct UploadState {
     pub pending_payment: Option<PaymentAttempt>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     failed_payments: Vec<FailedPaymentAttempt>,
+    /// The records paid again because every storer refused a kept proof
+    /// ([`Self::mark_paid_again`]): never more than once each, whatever
+    /// the number of runs.
+    #[serde(default, skip_serializing_if = "HashSet::is_empty")]
+    paid_again: HashSet<XorName>,
 }
 
 /// A checkpoint's body, as written after the magic and format.
@@ -159,6 +166,12 @@ struct BodyOut<'a> {
     pending_merkle: &'a Option<super::merkle::PreparedMerkleBatch>,
     pending_payment: &'a Option<PaymentAttempt>,
     failed_payments: &'a [FailedPaymentAttempt],
+    #[serde(skip_serializing_if = "no_address")]
+    paid_again: &'a HashSet<XorName>,
+}
+
+fn no_address(addresses: &&HashSet<XorName>) -> bool {
+    addresses.is_empty()
 }
 
 /// [`BodyOut`], read back.
@@ -176,6 +189,8 @@ struct BodyIn {
     pending_payment: Option<PaymentAttempt>,
     #[serde(default)]
     failed_payments: Vec<FailedPaymentAttempt>,
+    #[serde(default)]
+    paid_again: HashSet<XorName>,
 }
 
 /// A checkpoint as read, before it is checked ([`UploadState::validated`]).
@@ -190,6 +205,23 @@ pub(crate) struct Parsed {
     pub(crate) scope: Option<String>,
     /// Whether it was in the format before [`CHECKPOINT_MAGIC`].
     pub(crate) legacy: bool,
+}
+
+/// The bytes of a browser snapshot given as text: base64 (what
+/// [`UploadState::snapshot_text`] gives) or hex in either case, decoded to
+/// bytes that start with [`CHECKPOINT_MAGIC`]. `None` for any other text.
+#[cfg(any(test, all(target_arch = "wasm32", feature = "browser-wasm")))]
+fn decode_snapshot_text(text: &str) -> Option<Vec<u8>> {
+    use base64::Engine as _;
+    base64::engine::general_purpose::STANDARD
+        .decode(text)
+        .ok()
+        .filter(|bytes| bytes.starts_with(&CHECKPOINT_MAGIC))
+        .or_else(|| {
+            hex::decode(text)
+                .ok()
+                .filter(|bytes| bytes.starts_with(&CHECKPOINT_MAGIC))
+        })
 }
 
 /// Native proof expiry, shared by every client adapter.
@@ -221,6 +253,15 @@ pub fn reusable_proof(address: &XorName, bytes: &[u8], now: SystemTime) -> bool 
 /// non-zero amount under the single-node rule (the median). `None` for a
 /// Merkle proof or one that can't be read.
 pub(crate) fn paid_node(bytes: &[u8]) -> Option<[u8; 32]> {
+    paid_quote(bytes).map(|(node, _, _)| node)
+}
+
+/// The quote a single-node proof paid ([`paid_node`]): its issuer, its hash
+/// and its rewards address. `None` for a Merkle proof or one that can't be
+/// read.
+pub(crate) fn paid_quote(
+    bytes: &[u8],
+) -> Option<([u8; 32], QuoteHash, ant_protocol::evm::RewardsAddress)> {
     if ant_protocol::payment::deserialize_merkle_proof(bytes).is_ok() {
         return None;
     }
@@ -238,7 +279,7 @@ pub(crate) fn paid_node(bytes: &[u8]) -> Option<[u8; 32]> {
         .peer_quotes
         .iter()
         .find(|(_, quote)| quote.hash() == paid.quote_hash)
-        .map(|(peer, _)| *peer.as_bytes())
+        .map(|(peer, _)| (*peer.as_bytes(), paid.quote_hash, paid.rewards_address))
 }
 
 pub(crate) fn merkle_fresh(timestamp: u64, now: SystemTime) -> bool {
@@ -378,6 +419,36 @@ impl UploadState {
         self.proofs.remove(address)
     }
 
+    /// Record that `address` is being paid again because every storer
+    /// refused its kept proof. Saved before the new payment is sent, so a
+    /// record is paid again at most once across runs: a refusal of its next
+    /// proof is a failure, and the proof is kept.
+    pub(crate) fn mark_paid_again(&mut self, address: XorName) {
+        self.paid_again.insert(address);
+    }
+
+    /// Whether `address` was paid again once already ([`Self::mark_paid_again`]).
+    pub(crate) fn was_paid_again(&self, address: &XorName) -> bool {
+        self.paid_again.contains(address)
+    }
+
+    /// The records paid again once already ([`Self::mark_paid_again`]).
+    #[cfg(feature = "native")]
+    pub(crate) fn paid_again(&self) -> &HashSet<XorName> {
+        &self.paid_again
+    }
+
+    /// Mark `addresses` paid again once already, as read from a kept
+    /// receipt.
+    pub(crate) fn add_paid_again(&mut self, addresses: impl IntoIterator<Item = XorName>) {
+        self.paid_again.extend(addresses);
+    }
+
+    /// Forget that `address` was paid again: it is stored.
+    pub(crate) fn clear_paid_again(&mut self, address: &XorName) {
+        self.paid_again.remove(address);
+    }
+
     /// Every proof, with its serial ([`next_proof_serial`]).
     #[cfg(feature = "native")]
     pub(crate) fn proof_entries(&self) -> impl Iterator<Item = (&XorName, &Vec<u8>, u64)> {
@@ -466,6 +537,7 @@ impl UploadState {
             pending_merkle: None,
             pending_payment: None,
             failed_payments: Vec::new(),
+            paid_again: HashSet::new(),
         };
         state.renumber();
         state
@@ -608,17 +680,44 @@ impl UploadState {
         Ok(bytes)
     }
 
-    /// Read a browser's snapshot, in either format: the bytes
-    /// [`Self::snapshot`] gives, or the JSON text the browser client before
+    /// A browser's snapshot ([`Self::snapshot`]) as the text a page saves:
+    /// its bytes as standard base64, padded.
+    #[cfg(any(test, all(target_arch = "wasm32", feature = "browser-wasm")))]
+    pub(crate) fn snapshot_text(&self, scope: &str) -> Result<String> {
+        use base64::Engine as _;
+        Ok(base64::engine::general_purpose::STANDARD.encode(self.snapshot(scope)?))
+    }
+
+    /// Read a browser's snapshot, in any form a page hands back
+    /// ([`BrowserSnapshot`]): the bytes [`Self::snapshot`] gives, as they
+    /// are or as the text [`Self::snapshot_text`] gives (or as hex, in either
+    /// case), or the JSON text the browser client before
     /// [`CHECKPOINT_MAGIC`] gave (`{"scope", "state"}`, the state a hex
-    /// msgpack [`UploadState`]). Returns its scope and its state, checked.
+    /// msgpack [`UploadState`]). No more than
+    /// [`MAX_BROWSER_SNAPSHOT_BYTES`] of bytes, after any decoding, and of
+    /// JSON. Returns its scope and its state, checked.
     #[cfg(any(test, all(target_arch = "wasm32", feature = "browser-wasm")))]
     pub(crate) fn read_snapshot(snapshot: BrowserSnapshot<'_>) -> Result<(String, Self)> {
-        if snapshot.len() > MAX_BROWSER_SNAPSHOT_BYTES {
-            return Err(Error::InvalidData("upload checkpoint too large".into()));
-        }
+        let too_large = || Error::InvalidData("upload checkpoint too large".into());
+        let decoded;
+        let snapshot = match snapshot {
+            BrowserSnapshot::Text(text) if !text.trim_start().starts_with('{') => {
+                let text = text.trim();
+                // Hex is the longest text form: twice the bytes.
+                if text.len() > 2 * MAX_BROWSER_SNAPSHOT_BYTES {
+                    return Err(too_large());
+                }
+                decoded = decode_snapshot_text(text)
+                    .ok_or_else(|| Error::InvalidData(SNAPSHOT_TEXT_REFUSED.into()))?;
+                BrowserSnapshot::Bytes(&decoded)
+            }
+            snapshot => snapshot,
+        };
         let (scope, parsed) = match snapshot {
             BrowserSnapshot::Bytes(bytes) => {
+                if bytes.len() > MAX_BROWSER_SNAPSHOT_BYTES {
+                    return Err(too_large());
+                }
                 let parsed = Self::parse(bytes)?;
                 if parsed.legacy {
                     return Err(Error::InvalidData(
@@ -630,7 +729,10 @@ impl UploadState {
                 })?;
                 (scope, parsed)
             }
-            BrowserSnapshot::Json(text) => {
+            BrowserSnapshot::Text(text) => {
+                if text.len() > MAX_BROWSER_SNAPSHOT_BYTES {
+                    return Err(too_large());
+                }
                 #[derive(Deserialize)]
                 struct Legacy {
                     scope: String,
@@ -668,6 +770,7 @@ impl UploadState {
             pending_merkle: &self.pending_merkle,
             pending_payment: &self.pending_payment,
             failed_payments: &self.failed_payments,
+            paid_again: &self.paid_again,
         };
         let mut bytes = Vec::with_capacity(5);
         bytes.extend_from_slice(&CHECKPOINT_MAGIC);
@@ -717,6 +820,7 @@ impl UploadState {
             pending_merkle: body.pending_merkle,
             pending_payment: body.pending_payment,
             failed_payments: body.failed_payments,
+            paid_again: body.paid_again,
         };
         state.renumber();
         Ok(Parsed {
@@ -1234,13 +1338,39 @@ mod tests {
         assert_eq!(restored.proof(&paid.address), state.proof(&paid.address));
         assert!(restored.pending_payment.is_some());
 
+        // As the text a page saves: base64, as given, or the bytes as hex
+        // in either case, with or without surrounding space.
+        let text = state.snapshot_text("scope-a").unwrap();
+        for form in [
+            text.clone(),
+            format!(" {text}\n"),
+            hex::encode(&snapshot),
+            hex::encode_upper(&snapshot),
+        ] {
+            let (scope, restored) =
+                UploadState::read_snapshot(BrowserSnapshot::Text(&form)).unwrap();
+            assert_eq!(scope, "scope-a");
+            assert_eq!(restored.proof(&paid.address), state.proof(&paid.address));
+        }
+        // Text that is neither: the bytes as `Uint8Array.toString()` gives
+        // them, or base64 of something else.
+        let joined = snapshot
+            .iter()
+            .map(u8::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        for wrong in [joined.as_str(), "aGVsbG8=", ""] {
+            let error = UploadState::read_snapshot(BrowserSnapshot::Text(wrong)).unwrap_err();
+            assert!(error.to_string().contains("Uint8Array"), "{error}");
+        }
+
         // As the browser client before this one saved it.
         let json = serde_json::json!({
             "scope": "scope-b",
             "state": hex::encode(state.legacy_checkpoint()),
         })
         .to_string();
-        let (scope, restored) = UploadState::read_snapshot(BrowserSnapshot::Json(&json)).unwrap();
+        let (scope, restored) = UploadState::read_snapshot(BrowserSnapshot::Text(&json)).unwrap();
         assert_eq!(scope, "scope-b");
         assert_eq!(restored.proof(&paid.address), state.proof(&paid.address));
         assert_eq!(

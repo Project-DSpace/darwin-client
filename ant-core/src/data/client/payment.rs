@@ -49,8 +49,15 @@ pub(crate) struct PaidRecord {
     pub(crate) put_peers: Vec<(PeerId, Vec<MultiAddr>)>,
     /// Whether the proof is one an earlier attempt paid, kept in the
     /// checkpoint: if every storer refuses it, the record is paid again
-    /// ([`Self::refused`]).
+    /// ([`Self::refused`]). Not for a proof this attempt paid, or settled
+    /// from the journal an earlier attempt left.
     pub(crate) reused: bool,
+    /// Whether the record was paid again once already because every storer
+    /// refused a kept proof ([`Self::refused`]): it is never paid again a
+    /// second time, and a refusal of its proof is a failure.
+    pub(crate) paid_again: bool,
+    /// The record's address (a pointer's `state_id`).
+    address: [u8; 32],
     checkpoint: RecordCheckpoint,
 }
 
@@ -63,13 +70,17 @@ impl PaidRecord {
 
     /// Every storer that failed to store the record refused its proof, one
     /// an earlier attempt paid ([`Self::reused`]): forget the proof, so the
-    /// next payment for the record pays again rather than reuse it.
+    /// next payment for the record pays again rather than reuse it, and
+    /// mark the record paid again ([`Self::paid_again`]). The mark is saved
+    /// before anything is paid, so no later attempt pays a third time.
     ///
     /// # Errors
     ///
     /// If the checkpoint can't be written.
     pub(crate) fn refused(self) -> Result<()> {
-        self.checkpoint.save(&UploadState::default())
+        let mut state = UploadState::default();
+        state.mark_paid_again(self.address);
+        self.checkpoint.save(&state)
     }
 
     /// Hand the proof and the PUT targets to a caller that stores the record
@@ -257,6 +268,8 @@ impl Client {
                         proof,
                         put_peers,
                         reused,
+                        paid_again: state.was_paid_again(content),
+                        address: *content,
                         checkpoint,
                     })
                 }
@@ -293,7 +306,9 @@ impl Client {
     /// reused; otherwise the record is quoted and paid, and the paid quote is
     /// read back and the record quoted and paid again if someone recorded it
     /// first, up to [`MAX_OCCUPIED_REQUOTES`] times. Returns the proof, the
-    /// PUT targets, and whether the proof is one an earlier attempt paid.
+    /// PUT targets, and whether the proof is one an earlier attempt paid: a
+    /// proof settled here from the journal is this attempt's, so a refusal
+    /// of it is a failure, never paid for again.
     ///
     /// A kept proof has no age limit: a chunk's is reused while its paid
     /// node is among the [`PUT_TARGET_WIDTH`](crate::quote_policy::PUT_TARGET_WIDTH)
@@ -309,7 +324,8 @@ impl Client {
         checkpoint: &RecordCheckpoint,
     ) -> Result<(Vec<u8>, Vec<(PeerId, Vec<MultiAddr>)>, bool)> {
         let mut history = Vec::new();
-        if state.pending_payment.is_some() {
+        let reconciled = state.pending_payment.is_some();
+        if reconciled {
             history = self
                 .reconcile_record_payment(content, state, checkpoint)
                 .await?;
@@ -335,10 +351,11 @@ impl Client {
             } else {
                 Vec::new()
             };
-            let paid_outside = data_type == ant_protocol::DATA_TYPE_CHUNK
+            let paid_outside = !reconciled
+                && data_type == ant_protocol::DATA_TYPE_CHUNK
                 && paid_outside_width(&proof, &put_peers);
             if !paid_outside {
-                return Ok((proof, put_peers, true));
+                return Ok((proof, put_peers, !reconciled));
             }
             info!(
                 "the node an earlier attempt paid for {} is no longer among its {} nearest \

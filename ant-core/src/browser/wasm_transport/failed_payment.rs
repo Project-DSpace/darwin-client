@@ -93,8 +93,8 @@ impl BrowserNetworkClient {
     /// Resume the normal upload explicitly with the returned checkpoint.
     ///
     /// `snapshot` is the checkpoint an upload's `on_checkpoint` received (a
-    /// `Uint8Array`), or the JSON text earlier clients saved; the returned
-    /// checkpoint is a `Uint8Array`.
+    /// string), in any form an upload takes it; the returned checkpoint is a
+    /// string, as `on_checkpoint` receives it.
     #[wasm_bindgen(js_name = reconcileFailedUploadPayment)]
     pub async fn reconcile_failed_upload_payment(
         &self,
@@ -133,7 +133,7 @@ impl BrowserNetworkClient {
         }
         .await;
         result
-            .map(|bytes| Uint8Array::from(bytes.as_slice()).into())
+            .map(|text| JsValue::from_str(&text))
             .map_err(|error: String| JsValue::from_str(&error))
     }
 }

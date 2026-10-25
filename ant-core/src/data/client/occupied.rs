@@ -323,6 +323,73 @@ impl Client {
     pub(crate) async fn occupied_quotes(&self, _plans: &[ChunkPaymentPlan]) -> Vec<OccupiedQuote> {
         Vec::new()
     }
+
+    /// Read back the vault's record of the payment a kept single-node
+    /// `proof` carries, before the record it pays for is paid again because
+    /// every storer refused the proof. Read as [`Self::occupied_quotes`]
+    /// reads, through the payment network's RPC and those it falls back to,
+    /// up to 3 times 2 seconds apart while no RPC answers.
+    #[cfg(feature = "native")]
+    pub(crate) async fn kept_payment(&self, proof: &[u8]) -> KeptPayment {
+        /// Reads while no RPC answers, and the pause between them.
+        const READS: usize = 3;
+        const PAUSE: std::time::Duration = std::time::Duration::from_secs(2);
+
+        let Some(network) = self.evm_network.as_ref() else {
+            return KeptPayment::NotChecked;
+        };
+        let Some((_, hash, rewards)) = super::upload_state::paid_quote(proof) else {
+            return KeptPayment::NotChecked;
+        };
+        let chain = match read_back_chain(network) {
+            Ok(chain) => chain,
+            Err(error) => {
+                tracing::warn!("cannot read the kept proof's payment record ({error})");
+                return KeptPayment::Unreadable;
+            }
+        };
+        for read in 0..READS {
+            if read > 0 {
+                crate::runtime::sleep(PAUSE).await;
+            }
+            match chain.completed_payment(&hash).await {
+                Ok(record) => {
+                    return if !record.amount.is_zero()
+                        && record.rewards_prefix[..] == rewards.as_slice()[..16]
+                    {
+                        KeptPayment::Recorded
+                    } else {
+                        KeptPayment::NotRecorded
+                    };
+                }
+                Err(error) => {
+                    tracing::debug!("reading the vault record of {hash:#x} failed: {error}");
+                }
+            }
+        }
+        KeptPayment::Unreadable
+    }
+
+    /// Browser builds read no records back: the wallet callback owns the RPC.
+    #[cfg(not(feature = "native"))]
+    pub(crate) async fn kept_payment(&self, _proof: &[u8]) -> KeptPayment {
+        KeptPayment::NotChecked
+    }
+}
+
+/// What the vault holds for the payment a kept proof carries
+/// ([`Client::kept_payment`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(feature = "native"), allow(dead_code))]
+pub(crate) enum KeptPayment {
+    /// A payment to the paid quote's rewards address.
+    Recorded,
+    /// No payment, or another payment's record.
+    NotRecorded,
+    /// No RPC answered: the record is not paid again, and its proof is kept.
+    Unreadable,
+    /// Not read: a browser build, or a client with no EVM network.
+    NotChecked,
 }
 
 /// The reader [`Client::occupied_quotes`] reads paid quotes back through:

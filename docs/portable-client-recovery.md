@@ -71,9 +71,17 @@ address's proof), appended once each rather than rewritten at every step. A
 torn last record is left out on reading and cut off before the next append.
 `upload_checkpoint_files` lists a checkpoint's files (`.msgpack`, `.proofs`,
 `.salt`, `.lock`), for servers that remove what ended uploads leave. The
-browser's checkpoint is the same format as one `Uint8Array`, with its
-file/payment-network scope inside; the JSON text earlier browser clients saved
-is still read, and the next checkpoint saved replaces it. A native checkpoint
+browser's checkpoint is the same format, with its file/payment-network scope
+inside, handed to `on_checkpoint` as text: its bytes as standard base64, a
+string, as the browser client before it handed its JSON. Store it as text, as
+it is (`localStorage.setItem`, a JSON field, an IndexedDB string), and pass it
+back as `checkpoint` to resume. An upload also takes the checkpoint's bytes as
+a `Uint8Array`, or as hex in either case, and still reads the JSON text
+earlier browser clients saved; the next checkpoint saved replaces it. Other
+text, such as `Uint8Array.toString()` gives (`68,83,67,75,...`), is refused
+with an error that says so, and nothing is paid. `reconcileFailedUploadPayment`
+takes and returns the checkpoint the same way. A snapshot is at most 128 MiB
+of bytes, counted after its text is decoded. A native checkpoint
 in the format before (one msgpack file holding every proof) is migrated when
 opened: its proofs are written to a new proof file first, then the new
 checkpoint replaces the old one by rename.
