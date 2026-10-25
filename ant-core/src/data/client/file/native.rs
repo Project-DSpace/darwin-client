@@ -5208,11 +5208,20 @@ mod tests {
         assert_eq!(missing, vec![unpaid_b, unpaid_d]);
     }
 
-    /// The real storer wording, as `ant_protocol::client_update_required_message`
-    /// builds it. Used verbatim so the tests exercise the "nothing was charged"
-    /// clause that has to be scoped before it is quoted.
-    fn real_refusal() -> String {
-        ant_protocol::client_update_required_message(1, 2)
+    /// The refusal text these reasons receive: quote collection has already
+    /// turned the storer's wording into darwin's own (pinned in `quote`'s
+    /// tests), so the reasons quote darwin's update instruction. It also
+    /// carries the "nothing was charged" clause that has to be scoped before
+    /// it is quoted.
+    fn darwin_refusal() -> String {
+        crate::data::client::quote::update_required_message(1, 2)
+    }
+
+    /// The reasons pass darwin's update instruction on whole, and none of
+    /// the storer's wording for another client.
+    fn assert_darwins_instruction(reason: &str) {
+        assert!(reason.contains("Build a new darwin"), "{reason}");
+        assert!(!reason.contains("ant update"), "{reason}");
     }
 
     /// The defect: a multi-batch merkle payment stops when storers refuse this
@@ -5223,15 +5232,12 @@ mod tests {
     /// instruction, which is the only thing that makes the next attempt work.
     #[test]
     fn the_partial_reason_carries_a_refusal_instead_of_a_bogus_shortfall() {
-        let refusal = real_refusal();
-        assert!(
-            refusal.contains("ant update"),
-            "the storer wording must carry the instruction: {refusal}"
-        );
+        let refusal = darwin_refusal();
+        assert_darwins_instruction(&refusal);
 
         // Every failed chunk is one the payment never covered.
         let all_proofless = merkle_partial_reason(3, 3, 4, Some(&refusal));
-        assert!(all_proofless.contains("ant update"), "{all_proofless}");
+        assert_darwins_instruction(&all_proofless);
         assert!(
             !all_proofless.contains("short of quorum"),
             "{all_proofless}"
@@ -5240,7 +5246,7 @@ mod tests {
         // Mixed: two with no proof, one genuinely short of quorum. Both halves
         // survive and the counts still add up to the three that failed.
         let mixed = merkle_partial_reason(3, 2, 4, Some(&refusal));
-        assert!(mixed.contains("ant update"), "{mixed}");
+        assert_darwins_instruction(&mixed);
         assert!(mixed.contains("2 chunk(s) have no merkle proof"), "{mixed}");
         assert!(
             mixed.contains("1 chunk(s) short of quorum after 4 attempts"),
@@ -5263,7 +5269,7 @@ mod tests {
     /// unscoped would read as "spent X ... nothing was charged".
     #[test]
     fn the_refusal_is_scoped_before_its_nothing_was_charged_clause_is_quoted() {
-        let refusal = real_refusal();
+        let refusal = darwin_refusal();
         assert!(
             refusal.contains("nothing was charged"),
             "precondition: {refusal}"
@@ -5278,8 +5284,9 @@ mod tests {
             .expect("the reason must scope the refusal");
         let charged = reason
             .find("nothing was charged")
-            .expect("the storer wording must still be quoted in full");
+            .expect("the refusal must still be quoted in full");
         assert!(scope < charged, "scope must precede the claim: {reason}");
+        assert_darwins_instruction(&reason);
     }
 
     /// The ordinary case — every chunk had a proof and simply could not reach
@@ -5293,7 +5300,7 @@ mod tests {
         // A refusal is irrelevant when nothing is missing a proof: the
         // failures really are quorum shortfalls.
         assert_eq!(
-            merkle_partial_reason(2, 0, 4, Some(&real_refusal())),
+            merkle_partial_reason(2, 0, 4, Some(&darwin_refusal())),
             "2 chunk(s) short of quorum after 4 attempts"
         );
     }
@@ -5304,8 +5311,8 @@ mod tests {
     /// or it tells the user their money is safe when it is not.
     #[test]
     fn the_reason_never_claims_a_proofless_chunk_went_unpaid() {
-        // The clause the store path contributes, with no storer wording mixed
-        // in, so this asserts on our own words only.
+        // The clause the store path contributes, with no refusal text mixed
+        // in, so this asserts on that clause's words only.
         let ours = proofless_clause(2, None).expect("two proofless chunks produce a clause");
         assert_eq!(ours, "2 chunk(s) have no merkle proof");
         assert!(!ours.contains("paid"), "{ours}");
@@ -5313,7 +5320,7 @@ mod tests {
 
         assert!(proofless_clause(0, None).is_none());
         assert!(
-            proofless_clause(0, Some(&real_refusal())).is_none(),
+            proofless_clause(0, Some(&darwin_refusal())).is_none(),
             "no proofless chunks means no clause, refusal or not"
         );
     }
@@ -5325,11 +5332,11 @@ mod tests {
     #[test]
     fn a_fatal_store_abort_still_reports_the_refusal() {
         let abort = "merkle chunk store aborted: connection reset";
-        let refusal = real_refusal();
+        let refusal = darwin_refusal();
 
         let both = merkle_fatal_reason(abort, 5, Some(&refusal));
         assert!(both.starts_with(abort), "the abort leads: {both}");
-        assert!(both.contains("ant update"), "{both}");
+        assert_darwins_instruction(&both);
         assert!(both.contains("5 chunk(s) have no merkle proof"), "{both}");
 
         // Every chunk had a proof, so there is nothing to add.

@@ -461,11 +461,37 @@ pub(crate) fn update_required_message(
     client_settlement_version: u32,
     min_settlement_version: u32,
 ) -> String {
-    #[cfg(feature = "native")]
-    let remedy =
-        "Build a new darwin from https://github.com/Project-DSpace/darwin-client (see its README).";
-    #[cfg(not(feature = "native"))]
-    let remedy = "Reload the page to use a newer one.";
+    update_required_text(
+        client_settlement_version,
+        min_settlement_version,
+        remedy(cfg!(feature = "native")),
+    )
+}
+
+/// How a native build's user gets a darwin that settles at the current version.
+const NATIVE_REMEDY: &str =
+    "Build a new darwin from https://github.com/Project-DSpace/darwin-client (see its README).";
+/// How a browser's user does: a reload fetches the core the page serves now,
+/// and a page whose core is pinned (served from the storage network, say)
+/// needs its site to serve a newer one.
+const BROWSER_REMEDY: &str =
+    "Reload the page; if this persists, the site serving it needs a newer darwin core.";
+
+/// The remedy for a native build or a browser one. Both are compiled into
+/// every build, so the native tests check the browser's wording too.
+const fn remedy(native: bool) -> &'static str {
+    if native {
+        NATIVE_REMEDY
+    } else {
+        BROWSER_REMEDY
+    }
+}
+
+fn update_required_text(
+    client_settlement_version: u32,
+    min_settlement_version: u32,
+    remedy: &str,
+) -> String {
     format!(
         "Your darwin client is too old to pay the current storage rate (it settles under \
          version {client_settlement_version}; the network requires at least \
@@ -2995,6 +3021,29 @@ mod tests {
         let vendored = ant_protocol::client_update_required_message(1, 2);
         assert!(vendored.contains("ant update"), "{vendored}");
         assert_ne!(msg, vendored);
+    }
+
+    /// A browser build's text, checked here because the browser tests do not
+    /// run in CI's native lib run: it names darwin, tells the user to reload,
+    /// and says what to do when a reload does not help. A page has no use for
+    /// the repository link, so it is not required here.
+    #[test]
+    fn the_browser_update_message_is_darwins_own_and_actionable() {
+        let msg = update_required_text(1, 2, remedy(false));
+        assert!(msg.contains("darwin"), "{msg}");
+        assert!(msg.contains("Reload"), "{msg}");
+        assert!(!msg.contains("ant update"), "{msg}");
+        assert!(!msg.contains("WithAutonomi"), "{msg}");
+        assert!(msg.contains("nothing was charged"), "{msg}");
+        assert!(
+            msg.ends_with("if this persists, the site serving it needs a newer darwin core."),
+            "{msg}"
+        );
+        // This build's own text carries the native remedy.
+        assert_eq!(
+            update_required_message(1, 2),
+            update_required_text(1, 2, NATIVE_REMEDY)
+        );
     }
 
     /// Quote collection's error when every storer refused for rate, built
