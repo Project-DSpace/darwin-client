@@ -249,6 +249,9 @@ impl Client {
         adapter: &A,
         mode: PaymentMode,
     ) -> Result<UploadOutcome> {
+        // Counted while it runs, so a shared wave knows whom to wait for.
+        #[cfg(feature = "native")]
+        let _upload = self.shared_waves().upload();
         let mut original = records.iter().map(|r| r.address).collect::<Vec<_>>();
         let mut sizes = HashMap::new();
         let mut unique = Vec::new();
@@ -1476,7 +1479,7 @@ impl UploadAdapter for MemoryUploadAdapter<'_> {
         plans: &[ChunkPaymentPlan],
         state: &mut UploadState,
     ) -> Result<UploadPayment> {
-        super::native_payment::pay(self.client, self, plans, state).await
+        super::native_payment::pay_shared(self.client, self, plans, state).await
     }
     #[cfg(feature = "native")]
     async fn reconcile_payment(
@@ -1484,7 +1487,7 @@ impl UploadAdapter for MemoryUploadAdapter<'_> {
         plans: &[ChunkPaymentPlan],
         state: &mut UploadState,
     ) -> Result<UploadPayment> {
-        super::native_payment::pay(self.client, self, plans, state).await
+        super::native_payment::pay_shared(self.client, self, plans, state).await
     }
     #[cfg(feature = "native")]
     async fn submit_merkle_payment(

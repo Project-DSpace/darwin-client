@@ -45,6 +45,8 @@ pub mod occupied;
 pub mod payment;
 pub mod pointer;
 pub mod quote;
+#[cfg(feature = "native")]
+pub(crate) mod shared_wave;
 pub mod upload;
 #[cfg(feature = "native")]
 pub mod upload_checkpoint;
@@ -757,6 +759,10 @@ pub struct Client {
     /// agree, which a genuine incompatibility reaches immediately (every
     /// upgraded peer refuses) and a lone attacker cannot reach at all.
     settlement_refusals: SettlementRefusals,
+    /// The shared payment waves of this client's wallet
+    /// ([`shared_wave`]).
+    #[cfg(feature = "native")]
+    shared_waves: Arc<shared_wave::SharedWaves>,
 }
 
 impl Client {
@@ -780,6 +786,8 @@ impl Client {
             unversioned_quote_peers: Arc::new(Mutex::new(HashSet::new())),
             versioned_capable_peers: Arc::new(Mutex::new(HashSet::new())),
             settlement_refusals: SettlementRefusals::default(),
+            #[cfg(feature = "native")]
+            shared_waves: Arc::default(),
         }
     }
 
@@ -822,6 +830,7 @@ impl Client {
             unversioned_quote_peers: Arc::new(Mutex::new(HashSet::new())),
             versioned_capable_peers: Arc::new(Mutex::new(HashSet::new())),
             settlement_refusals: SettlementRefusals::default(),
+            shared_waves: Arc::default(),
             controller,
             persist_path,
             peer_cache_path,
@@ -880,6 +889,7 @@ impl Client {
             unversioned_quote_peers: Arc::new(Mutex::new(HashSet::new())),
             versioned_capable_peers: Arc::new(Mutex::new(HashSet::new())),
             settlement_refusals: SettlementRefusals::default(),
+            shared_waves: Arc::default(),
             controller,
             persist_path,
             peer_cache_path: None,
@@ -980,6 +990,20 @@ impl Client {
     #[must_use]
     pub fn wallet(&self) -> Option<&Arc<Wallet>> {
         self.wallet.as_ref()
+    }
+
+    /// The shared payment waves of this client's wallet ([`shared_wave`]).
+    #[cfg(feature = "native")]
+    pub(crate) fn shared_waves(&self) -> &Arc<shared_wave::SharedWaves> {
+        &self.shared_waves
+    }
+
+    /// Keep a shared payment wave open this long for others to join, in
+    /// place of [`shared_wave::SHARED_WAVE_WAIT`]: for tests that need two
+    /// uploads to share a wave whatever their timing.
+    #[cfg(all(feature = "native", feature = "test-utils"))]
+    pub fn set_shared_wave_wait(&self, wait: std::time::Duration) {
+        self.shared_waves.set_wait(wait);
     }
 
     /// Set the in-memory cache budget for this client.

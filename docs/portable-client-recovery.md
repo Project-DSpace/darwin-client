@@ -87,6 +87,21 @@ way restores in either. A plan matching neither is dropped and its record
 quoted again, unless a pending payment names it: then the whole checkpoint is
 refused, and the error names the file and says not to delete it, since it may
 hold a payment still to be settled.
+
+Native uploads paying from the client's own wallet share payment waves: a
+payment of fewer records than a wave (64) joins the wallet's open wave, and
+the wave pays every member's quotes in one transaction, still one in flight
+per wallet. The wave closes once every member has journaled its place, and it
+is full, or holds every upload the client has in progress, or 500 ms have
+passed since it opened. Each member's journal names the wave before anything
+is signed for it, and saves the signed transaction before it is sent; the
+transaction is also written whole to `payments/waves/<id>.json` until every
+member has saved it. No member is quoted again before the wave ends: a resume
+reconciles the wave's transaction from that file, else from the member's own
+copy, and a member left out of the wave starts afresh. Each member's payment
+record, proofs and reported cost show only its own quotes and its share of
+the gas. Waves are per client process: for higher rates, run one wallet per
+worker, as the gateway's agents each pay from their own.
 The SDK ethers and wagmi providers submit calldata encoded by evmlib and decode
 settlement with its canonical event ABI. Custom providers can implement
 `payMerkle`; applications using only single-node payments can select `single`.

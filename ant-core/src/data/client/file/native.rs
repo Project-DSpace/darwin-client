@@ -2088,7 +2088,7 @@ impl super::super::upload::UploadAdapter for SpillUploadAdapter<'_> {
     ) -> Result<super::super::upload::UploadPayment> {
         match self.payer {
             Some(payer) => payer.pay_quotes(plans).await,
-            None => super::super::native_payment::pay(self.client, self, plans, state).await,
+            None => super::super::native_payment::pay_shared(self.client, self, plans, state).await,
         }
     }
     #[cfg(feature = "native")]
@@ -2099,7 +2099,7 @@ impl super::super::upload::UploadAdapter for SpillUploadAdapter<'_> {
     ) -> Result<super::super::upload::UploadPayment> {
         match self.payer {
             Some(payer) => payer.pay_quotes(plans).await,
-            None => super::super::native_payment::pay(self.client, self, plans, state).await,
+            None => super::super::native_payment::pay_shared(self.client, self, plans, state).await,
         }
     }
     #[cfg(feature = "native")]

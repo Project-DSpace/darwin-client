@@ -3,15 +3,16 @@
 
 //! Native wallet journal: persist a signed payment before any storage broadcast.
 use super::{
-    batch::ChunkPaymentPlan,
+    batch::{ChunkPaymentPlan, PAYMENT_WAVE_SIZE},
     merkle::PreparedMerkleBatch,
+    shared_wave::{Member, QuoteTuple, Step, WaveEnd, WaveSigned},
     upload::{MerkleUploadPayment, UploadAdapter, UploadPayment, UploadRecord},
     upload_state::{PaymentAttempt, UploadState},
     Client,
 };
 use crate::data::error::{Error, Result};
 use ant_protocol::evm::journal::{PaymentReceipt, PaymentRequest, PaymentStatus, SignedPayment};
-use ant_protocol::evm::Network;
+use ant_protocol::evm::{Network, Wallet};
 use ant_protocol::XorName;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
@@ -122,6 +123,7 @@ impl UploadAdapter for RecordCheckpoint {
     }
 }
 
+/// A payment attempt's journal: the one entry of its `submissions`.
 #[derive(Serialize, Deserialize)]
 #[serde(
     tag = "native_payment_v1",
@@ -129,8 +131,45 @@ impl UploadAdapter for RecordCheckpoint {
     rename_all = "snake_case"
 )]
 enum Journal {
+    /// Nothing is signed for the attempt yet.
     Preparing,
+    /// The attempt's own transaction, saved before it was sent.
     Signed(SignedPayment),
+    /// The attempt joined the shared wave with this id (hex), saved before
+    /// anything was signed for the wave. The wave's file
+    /// ([`super::shared_wave::read_wave_file`]) says whether anything was.
+    Wave(String),
+    /// The shared wave's transaction, as the attempt saved it before it was
+    /// sent: the wave's file, while it is there, has the latest.
+    WaveSigned(WaveSigned),
+}
+
+/// The journal of `state`'s pending attempt.
+fn journal_of(state: &UploadState) -> Result<Journal> {
+    let attempt = state
+        .pending_payment
+        .as_ref()
+        .ok_or_else(|| Error::Payment("missing native payment attempt".into()))?;
+    match attempt.submissions.as_slice() {
+        [value] => serde_json::from_value(value.clone()).map_err(|_| {
+            Error::Payment(
+                "unknown native payment journal; reconciliation evidence is required".into(),
+            )
+        }),
+        _ => Err(Error::Payment(
+            "legacy pending payment has no transaction identity; reconcile it before retrying"
+                .into(),
+        )),
+    }
+}
+
+/// Make `journal` the journal of `state`'s pending attempt.
+fn set_journal(state: &mut UploadState, journal: &Journal) -> Result<()> {
+    let value = serde_json::to_value(journal).map_err(|e| Error::Serialization(e.to_string()))?;
+    if let Some(attempt) = &mut state.pending_payment {
+        attempt.submissions = vec![value];
+    }
+    Ok(())
 }
 
 pub(super) fn initialize(attempt: &mut PaymentAttempt) {
@@ -138,19 +177,55 @@ pub(super) fn initialize(attempt: &mut PaymentAttempt) {
     attempt.submissions = vec![serde_json::json!({ "native_payment_v1": "preparing" })];
 }
 
+/// The quotes `plans` pay: each with a non-zero amount, in order.
+fn quotes_of(plans: &[ChunkPaymentPlan]) -> Vec<QuoteTuple> {
+    plans
+        .iter()
+        .flat_map(|p| p.payment.quotes.iter())
+        .filter(|q| q.amount != ant_protocol::evm::Amount::ZERO)
+        .map(|q| (q.quote_hash, q.rewards_address, q.amount))
+        .collect()
+}
+
+/// Pay for `plans` with the client's wallet, on their own, journaled in
+/// `state` ([`pay_shared`] lets them share a wave). An attempt `state`
+/// already journals is reconciled, a shared wave's too.
 pub(super) async fn pay<A: UploadAdapter>(
     client: &Client,
     adapter: &A,
     plans: &[ChunkPaymentPlan],
     state: &mut UploadState,
 ) -> Result<UploadPayment> {
-    let quotes = plans
-        .iter()
-        .flat_map(|p| p.payment.quotes.iter())
-        .filter(|q| q.amount != ant_protocol::evm::Amount::ZERO)
-        .map(|q| (q.quote_hash, q.rewards_address, q.amount))
-        .collect::<Vec<_>>();
-    let hashes = quotes.iter().map(|q| q.0).collect::<Vec<_>>();
+    pay_with(client, adapter, plans, state, false).await
+}
+
+/// [`pay`], in a shared wave ([`super::shared_wave`]) when `plans` are
+/// fewer than a wave's [`PAYMENT_WAVE_SIZE`] records: an upload's payments,
+/// which small files of one wallet's uploads share.
+pub(super) async fn pay_shared<A: UploadAdapter>(
+    client: &Client,
+    adapter: &A,
+    plans: &[ChunkPaymentPlan],
+    state: &mut UploadState,
+) -> Result<UploadPayment> {
+    pay_with(
+        client,
+        adapter,
+        plans,
+        state,
+        plans.len() < PAYMENT_WAVE_SIZE,
+    )
+    .await
+}
+
+async fn pay_with<A: UploadAdapter>(
+    client: &Client,
+    adapter: &A,
+    plans: &[ChunkPaymentPlan],
+    state: &mut UploadState,
+    share: bool,
+) -> Result<UploadPayment> {
+    let quotes = quotes_of(plans);
     let fresh = |state: &UploadState| {
         plans.iter().all(|p| {
             state
@@ -158,22 +233,220 @@ pub(super) async fn pay<A: UploadAdapter>(
                 .is_some()
         })
     };
-    let receipt = execute(
-        client,
-        adapter,
-        &PaymentRequest::Quotes(quotes),
-        state,
-        fresh,
-    )
-    .await?;
+    let paid = match journal_of(state)? {
+        Journal::Wave(wave) => {
+            reconcile_wave(client, adapter, &wave, None, &quotes, state, &fresh).await?
+        }
+        Journal::WaveSigned(own) => {
+            let wave = own.wave.clone();
+            reconcile_wave(client, adapter, &wave, Some(own), &quotes, state, &fresh).await?
+        }
+        Journal::Preparing | Journal::Signed(_) => None,
+    };
+    let (receipt, wave_quotes) = match paid {
+        Some(paid) => paid,
+        None => match journal_of(state)? {
+            Journal::Preparing if share => {
+                pay_in_wave(client, adapter, &quotes, state, &fresh).await?
+            }
+            _ => {
+                let request = PaymentRequest::Quotes(quotes.clone());
+                let receipt = execute(client, adapter, &request, state, fresh).await?;
+                (receipt, quotes.len())
+            }
+        },
+    };
+    let share = super::shared_wave::share_of(&receipt, &quotes, wave_quotes)?;
     Ok(UploadPayment {
-        transactions: hashes
-            .into_iter()
-            .map(|h| (h, receipt.transaction_hash))
+        transactions: quotes
+            .iter()
+            .map(|q| (q.0, receipt.transaction_hash))
             .collect(),
-        amount: receipt.amount,
-        gas: receipt.gas_cost_wei,
+        amount: share.amount,
+        gas: share.gas,
     })
+}
+
+/// Pay `quotes` in the shared wave of the client's wallet
+/// ([`super::shared_wave`]): join it, save its id in `state`'s journal, and
+/// wait for its transaction, sending it if this attempt leads the wave.
+/// Returns the receipt and how many quotes the wave paid.
+async fn pay_in_wave<A: UploadAdapter, F: Fn(&UploadState) -> bool + Send + Sync>(
+    client: &Client,
+    adapter: &A,
+    quotes: &[QuoteTuple],
+    state: &mut UploadState,
+    fresh: &F,
+) -> Result<(PaymentReceipt, usize)> {
+    let wallet = client.require_wallet()?;
+    if let Some(refusal) = client.corroborated_settlement_refusal() {
+        state.pending_payment = None;
+        adapter.checkpoint(state, None).await?;
+        return Err(Error::ClientUpdateRequired(refusal));
+    }
+    if !fresh(state) {
+        state.pending_payment = None;
+        adapter.checkpoint(state, None).await?;
+        return Err(Error::Payment(
+            "unsubmitted payment quotes expired; retry to prepare fresh quotes".into(),
+        ));
+    }
+    let member = client.shared_waves().join(quotes.len());
+    set_journal(state, &Journal::Wave(member.wave_id()))?;
+    if let Err(error) = adapter.checkpoint(state, None).await {
+        // Nothing of the wave is on disk: the attempt is as it was.
+        if let Some(attempt) = &mut state.pending_payment {
+            initialize(attempt);
+        }
+        return Err(error);
+    }
+    member.ready(quotes.to_vec());
+    let steps = async {
+        loop {
+            match member.next().await {
+                Step::Save(round, journal) => {
+                    let saved = save_wave_journal(adapter, state, journal).await;
+                    member.saved(round, saved);
+                }
+                Step::Ended(ended) => break ended,
+            }
+        }
+    };
+    let ended = if member.leads() {
+        let (ended, ()) = futures::join!(steps, lead(client, wallet, &member));
+        ended
+    } else {
+        steps.await
+    };
+    let receipt = finish_wave(adapter, state, ended.ended).await?;
+    Ok((receipt, ended.quotes))
+}
+
+/// Save the wave's signed transaction in `state`'s journal before it is
+/// sent. Returns whether it was saved.
+async fn save_wave_journal<A: UploadAdapter>(
+    adapter: &A,
+    state: &mut UploadState,
+    journal: WaveSigned,
+) -> bool {
+    set_journal(state, &Journal::WaveSigned(journal)).is_ok()
+        && adapter.checkpoint(state, None).await.is_ok()
+}
+
+/// Send the wave `member` leads, once it closes
+/// ([`super::shared_wave::Member::close`]): sign one transaction paying
+/// every member's quotes, write the wave's file, have every member save it,
+/// send it, and tell the members how it ended.
+async fn lead(client: &Client, wallet: &Wallet, member: &Member) {
+    // One transaction in flight per wallet: the wave stays open for others
+    // to join while an earlier one is in flight.
+    let _wallet_lock = wallet.lock().await;
+    let quotes = member.close(client.shared_waves()).await;
+    if quotes.is_empty() {
+        member.end(WaveEnd::NotSent(Error::Payment(
+            "every payment of the shared wave left it".into(),
+        )));
+        return;
+    }
+    let request = PaymentRequest::Quotes(quotes.clone());
+    for round in 0..2 {
+        if let Some(refusal) = client.corroborated_settlement_refusal() {
+            member.end(WaveEnd::NotSent(Error::ClientUpdateRequired(refusal)));
+            return;
+        }
+        let signed = match wallet.prepare_payment(&request).await {
+            Ok(signed) => signed,
+            Err(message) => {
+                member.end(WaveEnd::NotSent(Error::Payment(message)));
+                return;
+            }
+        };
+        let journal = WaveSigned {
+            wave: member.wave_id(),
+            transaction: signed.clone(),
+            quotes: quotes.clone(),
+        };
+        // On disk, whole, before any member saves it or anything is sent:
+        // the one record of what the wave signed.
+        if let Err(error) = super::shared_wave::write_wave_file(&journal) {
+            member.end(WaveEnd::NotSent(error));
+            return;
+        }
+        if member.publish(journal).await {
+            // Every member saved it: none needs the file.
+            super::shared_wave::remove_wave_file(&member.wave_id());
+        }
+        match settle(client, wallet, &signed, &request, true, || true).await {
+            Settled::StaleUnsent if round == 0 => {}
+            Settled::StaleUnsent => {
+                member.end(WaveEnd::StaleUnsent);
+                return;
+            }
+            settled => {
+                member.end(WaveEnd::Settled(settled));
+                return;
+            }
+        }
+    }
+}
+
+/// Take how the wave ended into `state`'s journal, as [`finish`] does for a
+/// payment of its own.
+async fn finish_wave<A: UploadAdapter>(
+    adapter: &A,
+    state: &mut UploadState,
+    ended: WaveEnd,
+) -> Result<PaymentReceipt> {
+    match ended {
+        WaveEnd::Settled(settled) => finish(adapter, state, settled).await,
+        WaveEnd::StaleUnsent => finish(adapter, state, Settled::StaleUnsent).await,
+        WaveEnd::NotSent(error) => {
+            // Nothing was sent for the wave: nothing is left to reconcile.
+            state.pending_payment = None;
+            adapter.checkpoint(state, None).await?;
+            Err(error)
+        }
+        WaveEnd::Stopped => Err(Error::Payment(
+            "the shared wave's payment stopped before it ended; retry will reconcile it from \
+             its journal"
+                .into(),
+        )),
+    }
+}
+
+/// Reconcile the shared wave `wave` that `state`'s attempt joined
+/// (`own`, its signed transaction if the attempt saved it): from the
+/// wave's file if it is there, which holds the latest transaction the wave
+/// signed, else from `own`, sending at most that transaction again. When
+/// nothing was signed for the attempt ([`super::shared_wave::wave_payment`]),
+/// it starts afresh (`None`), its journal back to preparing. Returns the
+/// receipt and how many quotes the wave paid.
+async fn reconcile_wave<A: UploadAdapter, F: Fn(&UploadState) -> bool + Send + Sync>(
+    client: &Client,
+    adapter: &A,
+    wave: &str,
+    own: Option<WaveSigned>,
+    quotes: &[QuoteTuple],
+    state: &mut UploadState,
+    fresh: &F,
+) -> Result<Option<(PaymentReceipt, usize)>> {
+    let wallet = client.require_wallet()?;
+    let _wallet_lock = wallet.lock().await;
+    let file = super::shared_wave::read_wave_file(wave)?;
+    let Some(signed) = super::shared_wave::wave_payment(file, own, quotes)? else {
+        if let Some(attempt) = &mut state.pending_payment {
+            initialize(attempt);
+        }
+        adapter.checkpoint(state, None).await?;
+        return Ok(None);
+    };
+    let request = PaymentRequest::Quotes(signed.quotes.clone());
+    let settled = settle(client, wallet, &signed.transaction, &request, false, || {
+        fresh(state)
+    })
+    .await;
+    let receipt = finish(adapter, state, settled).await?;
+    Ok(Some((receipt, signed.quotes.len())))
 }
 
 pub(super) async fn pay_merkle<A: UploadAdapter>(
@@ -239,29 +512,18 @@ async fn execute_once<A: UploadAdapter, F: Fn(&UploadState) -> bool + Send + Syn
     state: &mut UploadState,
     fresh: &F,
 ) -> Result<PaymentReceipt> {
-    let attempt = state
-        .pending_payment
-        .as_ref()
-        .ok_or_else(|| Error::Payment("missing native payment attempt".into()))?;
-    let journal: Journal =
-        match attempt.submissions.as_slice() {
-            [value] => serde_json::from_value(value.clone()).map_err(|_| {
-                Error::Payment(
-                    "unknown native payment journal; reconciliation evidence is required".into(),
-                )
-            })?,
-            _ => return Err(Error::Payment(
-                "legacy pending payment has no transaction identity; reconcile it before retrying"
-                    .into(),
-            )),
-        };
+    let journal = journal_of(state)?;
     let wallet = client.require_wallet()?;
     let _wallet_lock = wallet.lock().await;
     // True only for bytes signed below, in this call: they have never been
     // broadcast, so there is nothing on chain to observe before sending them.
-    let mut unsent = false;
-    let signed = match journal {
-        Journal::Signed(signed) => signed,
+    let (signed, unsent) = match journal {
+        Journal::Signed(signed) => (signed, false),
+        Journal::Wave(_) | Journal::WaveSigned(_) => {
+            return Err(Error::Payment(
+                "a shared wave's payment is reconciled with its wave".into(),
+            ))
+        }
         Journal::Preparing => {
             // This marker proves no storage payment was broadcast by this implementation.
             let prepared = if let Some(refusal) = client.corroborated_settlement_refusal() {
@@ -284,78 +546,79 @@ async fn execute_once<A: UploadAdapter, F: Fn(&UploadState) -> bool + Send + Syn
                     return Err(error);
                 }
             };
-            let value = serde_json::to_value(Journal::Signed(signed.clone()))
-                .map_err(|e| Error::Serialization(e.to_string()))?;
-            if let Some(attempt) = &mut state.pending_payment {
-                attempt.submissions = vec![value];
-            }
+            set_journal(state, &Journal::Signed(signed.clone()))?;
             adapter.checkpoint(state, None).await?;
-            unsent = true;
-            signed
+            (signed, true)
         }
     };
+    let settled = settle(client, wallet, &signed, request, unsent, || fresh(state)).await;
+    finish(adapter, state, settled).await
+}
+
+/// How a signed payment ended, as [`settle`] saw it.
+pub(crate) enum Settled {
+    /// Included in the chain.
+    Confirmed(PaymentReceipt),
+    /// It reverted in a finalized block: it can't charge anything now.
+    Reverted,
+    /// Another transaction took its nonce in a finalized block.
+    Replaced(ant_protocol::evm::TxHash),
+    /// The first send of bytes signed for it was refused for a stale nonce:
+    /// they were never sent, and can never be mined.
+    StaleUnsent,
+    /// Its outcome is unknown, or it was refused for good before it was
+    /// sent: its journal stays.
+    Kept(Error),
+}
+
+/// Send `signed` (if `unsent`, at once; else only if the chain doesn't show
+/// it and `fresh` says its quotes are still fresh, the same bytes again) and
+/// observe it, for up to 30 seconds. The caller holds the wallet's lock.
+async fn settle<F: Fn() -> bool>(
+    client: &Client,
+    wallet: &Wallet,
+    signed: &SignedPayment,
+    request: &PaymentRequest,
+    unsent: bool,
+    fresh: F,
+) -> Settled {
     let mut broadcast = false;
     let observation = async {
         loop {
             if unsent && !broadcast {
                 // Freshness and settlement refusal were checked moments ago,
                 // before signing. A rejected nonce here can only be a stale
-                // nonce read: discard the journal and let `execute` prepare
-                // again. Any other rejection is final for this attempt.
-                match wallet.broadcast_payment(&signed, request).await {
+                // nonce read: the caller prepares again. Any other rejection
+                // is final for this attempt.
+                match wallet.broadcast_payment(signed, request).await {
                     Ok(_) => broadcast = true,
-                    Err(message) if is_stale_nonce(&message) => {
-                        if let Some(attempt) = &mut state.pending_payment {
-                            initialize(attempt);
-                        }
-                        adapter.checkpoint(state, None).await?;
-                        return Err(Error::Payment(STALE_UNSENT_NONCE.into()));
-                    }
-                    Err(message) => return Err(Error::Payment(message)),
+                    Err(message) if is_stale_nonce(&message) => return Settled::StaleUnsent,
+                    Err(message) => return Settled::Kept(Error::Payment(message)),
                 }
             }
-            match wallet
-                .observe_payment(&signed, request)
-                .await
-                .map_err(Error::Payment)?
-            {
-                PaymentStatus::Confirmed(receipt) => {
-                    if let Some(attempt) = &mut state.pending_payment {
-                        attempt.receipt = Some(
-                            serde_json::to_value(&receipt)
-                                .map_err(|e| Error::Serialization(e.to_string()))?,
-                        );
-                    }
-                    adapter.checkpoint(state, None).await?;
-                    return Ok(receipt);
-                }
-                PaymentStatus::Reverted => {
-                    state.pending_payment = None;
-                    adapter.checkpoint(state, None).await?;
-                    return Err(Error::Payment(
-                        "payment reverted on-chain; retry is safe".into(),
-                    ));
-                }
+            let status = match wallet.observe_payment(signed, request).await {
+                Ok(status) => status,
+                Err(message) => return Settled::Kept(Error::Payment(message)),
+            };
+            match status {
+                PaymentStatus::Confirmed(receipt) => return Settled::Confirmed(receipt),
+                PaymentStatus::Reverted => return Settled::Reverted,
                 PaymentStatus::Finalizing => {
-                    return Err(Error::Payment(
+                    return Settled::Kept(Error::Payment(
                         "payment outcome is awaiting chain finality; retain its journal and retry later"
                             .into(),
-                    ));
+                    ))
                 }
                 PaymentStatus::Replaced { transaction_hash } => {
-                    state.pending_payment = None;
-                    adapter.checkpoint(state, None).await?;
-                    return Err(Error::Payment(format!(
-                        "payment nonce was finalized by transaction {transaction_hash}; retry is safe"
-                    )));
+                    return Settled::Replaced(transaction_hash)
                 }
                 PaymentStatus::Pending => {
                     if !broadcast {
                         if let Some(refusal) = client.corroborated_settlement_refusal() {
-                            return Err(Error::ClientUpdateRequired(refusal));
+                            return Settled::Kept(Error::ClientUpdateRequired(refusal));
                         }
-                        if !fresh(state) {
-                            return Err(Error::Payment("pending payment has expired quotes; retain its transaction journal for reconciliation".into()));
+                        if !fresh() {
+                            return Settled::Kept(Error::Payment("pending payment has expired quotes; retain its transaction journal for reconciliation".into()));
                         }
                         // An ambiguous send only ever retries these exact signed bytes.
                         // A nonce rejection means the nonce is used: by these bytes,
@@ -363,14 +626,14 @@ async fn execute_once<A: UploadAdapter, F: Fn(&UploadState) -> bool + Send + Syn
                         // a load-balanced endpoint), or by another transaction, which
                         // finality turns into `Replaced`. Either way, keep observing
                         // until the timeout below rather than fail at once.
-                        match wallet.broadcast_payment(&signed, request).await {
+                        match wallet.broadcast_payment(signed, request).await {
                             Ok(_) => {}
                             Err(message) if is_stale_nonce(&message) => {
                                 tracing::debug!(
                                     "re-sent payment's nonce is already used ({message}); observing"
                                 );
                             }
-                            Err(message) => return Err(Error::Payment(message)),
+                            Err(message) => return Settled::Kept(Error::Payment(message)),
                         }
                         broadcast = true;
                     }
@@ -381,11 +644,56 @@ async fn execute_once<A: UploadAdapter, F: Fn(&UploadState) -> bool + Send + Syn
     };
     crate::runtime::timeout(std::time::Duration::from_secs(30), observation)
         .await
-        .map_err(|_| {
-            Error::Payment(
+        .unwrap_or_else(|_| {
+            Settled::Kept(Error::Payment(
                 "payment outcome pending; retry will reconcile the journaled transaction".into(),
-            )
-        })?
+            ))
+        })
+}
+
+/// Take how a payment `settled` into `state`'s journal, saved through
+/// `adapter`: a receipt kept with it, an attempt that can't charge anything
+/// ended, bytes that were never sent back to preparing, and anything else
+/// kept for reconciliation.
+async fn finish<A: UploadAdapter>(
+    adapter: &A,
+    state: &mut UploadState,
+    settled: Settled,
+) -> Result<PaymentReceipt> {
+    match settled {
+        Settled::Confirmed(receipt) => {
+            if let Some(attempt) = &mut state.pending_payment {
+                attempt.receipt = Some(
+                    serde_json::to_value(&receipt)
+                        .map_err(|e| Error::Serialization(e.to_string()))?,
+                );
+            }
+            adapter.checkpoint(state, None).await?;
+            Ok(receipt)
+        }
+        Settled::Reverted => {
+            state.pending_payment = None;
+            adapter.checkpoint(state, None).await?;
+            Err(Error::Payment(
+                "payment reverted on-chain; retry is safe".into(),
+            ))
+        }
+        Settled::Replaced(transaction_hash) => {
+            state.pending_payment = None;
+            adapter.checkpoint(state, None).await?;
+            Err(Error::Payment(format!(
+                "payment nonce was finalized by transaction {transaction_hash}; retry is safe"
+            )))
+        }
+        Settled::StaleUnsent => {
+            if let Some(attempt) = &mut state.pending_payment {
+                initialize(attempt);
+            }
+            adapter.checkpoint(state, None).await?;
+            Err(Error::Payment(STALE_UNSENT_NONCE.into()))
+        }
+        Settled::Kept(error) => Err(error),
+    }
 }
 
 #[cfg(feature = "test-utils")]

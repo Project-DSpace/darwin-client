@@ -65,6 +65,7 @@ const STORES: Counting = &[
     (None, "pay_for_storage*"),
     (None, "pay_for_record*"),
     (None, "batch_pay"),
+    (None, "prepare_payment"),
     (None, "batch_upload_chunks*"),
     (None, "upload_records"),
     (None, "upload_records_then"),
@@ -147,6 +148,7 @@ const FINALIZE: &str = "Finishes a prepared file upload with the envelope chosen
     prepared; paid per chunk through the upload coordinator, which reads paid quotes back.";
 const PER_CHUNK: &str = "Per-chunk payment in the network's token through the client's \
     chain-bound wallet; paid quotes are read back from the vault and occupied ones quoted again.";
+const JOURNALED: &str = "Per-chunk payment in the network's token through the client's     chain-bound wallet, signed and journaled before it is sent: a payment of its own, or a     shared wave of one wallet's small payments, each member's journal and payment record     holding only its own quotes and its share.";
 const RAW_CHUNK_PUT: &str = "raw, by the caller's choice: no envelope. `darwin chunk put` \
     stores one raw chunk; its help names `darwin file upload` as the standard way. Paid per chunk \
     with the read-back.";
@@ -657,6 +659,20 @@ const STORE_SITES: &[Site] = &[
         "pay_for_merkle_tree",
         1,
         MERKLE,
+    ),
+    (
+        "ant-core/src/data/client/native_payment.rs",
+        "execute_once",
+        "prepare_payment",
+        1,
+        JOURNALED,
+    ),
+    (
+        "ant-core/src/data/client/native_payment.rs",
+        "lead",
+        "prepare_payment",
+        1,
+        JOURNALED,
     ),
     (
         "ant-core/src/data/client/payment.rs",
@@ -1608,6 +1624,13 @@ const DECODE_SITES: &[Site] = &[
         "rmp_serde::from_slice",
         1,
         NOT_A_MAP,
+    ),
+    (
+        "ant-core/src/data/client/shared_wave.rs",
+        "read_wave_file",
+        "serde_json::from_slice",
+        1,
+        LOCAL_FILE,
     ),
     (
         "ant-core/src/data/client/upload_state.rs",
