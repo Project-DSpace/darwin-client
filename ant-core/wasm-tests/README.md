@@ -27,9 +27,17 @@ operations; the standalone `BrowserNodeClient` and `BrowserNodeSession` exports
 have been removed. Real-browser integration exercises the production client.
 
 Bootstrap regressions cover first-ready authentication in the retained network
-pool, discovery before a slow seed completes, late-seed fallback, the four-dial
-bootstrap bound, cancellation and payment-policy rejection. A fast seed from the
-wrong network cannot win or re-enter through discovery or ordinary GET fallback.
+pool, discovery before a slow seed completes, late-seed fallback, sessions with
+three seeds taken in a random order (each that fails or declines replaced by the
+next), cancellation and payment-policy rejection. A fast seed from the wrong
+network cannot win or re-enter through discovery or ordinary GET fallback.
+
+`capacity-refusal.test.mjs` and `refused-holder.test.mjs` cover busy nodes. A
+node that declines a dial, at its transport or its application, fails the dial
+at once and is dialled again after the 15 s refusal hold-off, while a DTLS
+failure keeps the 30-minute cooldown. A read whose only holder declines waits
+out the hold-off instead of reporting the record not found, and a read whose
+holder keeps declining reports it busy after three waits.
 
 Upload fixtures follow native policy: seven initial peers, authenticated
 witness views, a supported paid median, and four successful stores. Tests
@@ -152,20 +160,21 @@ while preserving the two-GET maximum even when discovery completes. Shared tests
 cover the delay, slot handoff, deduplication, and fatal integrity errors. The lane
 tests check that a failed cold dial is not repeated by the other queued lane.
 Early candidates use authenticated connections, with WebRTC preconnections
-publishing hints once ready. The seeds are the exception: as bootstrap peers,
-the nine nearest the record (all of them when there are fewer) are read from the
-start of every read, connected or not, one at a time in a GET slot of their own,
-and each is asked before a read reports a record missing. Download regressions
-cover cold closer addresses blocking neither slot ahead of a ready holder,
-retaining the twenty-peer fallback allowance after more than seven early misses,
-a record only the farthest of eight seeds holds, a record only a seed outside
-the nine nearest holds, which is not looked for there, and a missing record
-reported once the nine nearest seeds and the usual candidates have answered. The
-bootstrap tests check that a slow seed delays neither authentication nor the
-read, nearer to the record or not. `pointer.test.mjs` reads a pointer that only
-seeds outside its close group hold, leaves a seed the seed policy rejected out
-of the bootstrap peers a read waits for, and of twelve seeds asks the nine
-nearest the pointer, not the three farther ones, even when only those hold it.
+publishing hints once ready. The seeds, as bootstrap peers, are read once
+discovery answers: of the nine nearest the record, those discovery's view leaves
+among the nine nearest, or all nine when it finds no node, one at a time in a GET
+slot of their own, each asked before a read reports a record missing. Download
+regressions cover cold closer addresses blocking neither slot ahead of a ready
+holder, retaining the twenty-peer fallback allowance after more than seven early
+misses, a record only a far seed holds, which is not looked for there once
+discovery finds nearer nodes, a record only a seed holds when discovery finds no
+node, and a missing record reported once the nearest seeds and the usual
+candidates have answered. The bootstrap tests check that a slow seed delays
+neither authentication nor the read, nearer to the record or not.
+`pointer.test.mjs` reads a pointer that only seeds outside its close group hold,
+leaves a seed the seed policy rejected out of the bootstrap peers a read waits
+for, and of twelve seeds asks the two its close group's lookup leaves among the
+nine nearest the pointer, not the ten farther ones, even when only those hold it.
 
 `parallel-lanes.test.mjs` checks the two-channel transport profile: discovery and
 quotes use the control channel; GET/PUT use an independent authenticated data

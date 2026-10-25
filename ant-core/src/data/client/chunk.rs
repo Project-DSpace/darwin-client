@@ -942,9 +942,9 @@ impl Client {
             // speculation on stale hints before a live holder is discovered.
             // The final close-group size and absence rules still use peer_count.
             crate::client_engine::read::MAX_GET_FALLBACK_PEERS,
-            // The bootstrap peers nearest the chunk, nine at most: asked from
-            // the start alongside discovery, nearest first, and before the
-            // read can report the chunk absent.
+            // The bootstrap peers nearest the chunk, nine at most: those
+            // discovery leaves among the nearest are asked once it answers,
+            // nearest first, before the read can report the chunk absent.
             self.network().bootstrap_peers_near(address),
             |sender| {
                 #[cfg(feature = "native")]
@@ -1066,6 +1066,19 @@ impl Client {
                 }
             },
             |error| bad_bytes.retry_on_next_peer(error),
+            || {
+                self.network()
+                    .refused_peers()
+                    .into_iter()
+                    .map(|(peer, remaining)| (*peer.as_bytes(), remaining))
+                    .collect()
+            },
+            || {
+                Error::Network(format!(
+                    "the nodes that may hold chunk {} are busy; try again shortly",
+                    hex::encode(address)
+                ))
+            },
             crate::runtime::sleep,
         )
         .await?;
@@ -1654,6 +1667,8 @@ mod tests {
                 async move { answer }
             },
             |error| bad_bytes.retry_on_next_peer(error),
+            Vec::new,
+            || unreachable!("no peer is refused"),
             |_| async {},
         ));
         let result = found.and_then(|found| bad_bytes.result(found));
@@ -1685,8 +1700,9 @@ mod tests {
         let silent = || Err(Error::Timeout("no answer".into()));
         let bad = || Err(Error::InvalidData("BLAKE3 mismatch".into()));
         // The close group holds none, or does not answer: the bootstrap
-        // peers' lane asks them nearest first, and bad bytes from one move it
-        // to the next. Here it answers before the close group is asked.
+        // peers' lane asks them nearest first once discovery answers, and bad
+        // bytes from one move it to the next. Here it answers before the close
+        // group is asked.
         for closest in [none(), [silent(), silent(), silent()]] {
             let (result, asked) = read_with_bootstrap(&closest, &[bad(), Ok(Some(7))]);
             assert!(matches!(result, Ok(Some(7))), "{result:?}");
@@ -1748,25 +1764,29 @@ mod tests {
                 async move { Ok::<_, Error>((Some(n) == holder).then_some(n)) }
             },
             |_| true,
+            Vec::new,
+            || unreachable!("no peer is refused"),
             |_| async {},
         ));
         (found, asked.into_inner().unwrap())
     }
 
     #[test]
-    fn a_chunk_read_asks_the_nine_bootstrap_peers_nearest_the_chunk() {
-        // The ninth nearest seed holds the chunk: it is read.
-        let (result, asked) = read_with_sixteen_seeds(Some(109));
-        assert!(matches!(result, Ok(Some(109))), "{result:?}");
-        assert!(asked.iter().all(|&n| n <= 109), "{asked:?}");
-        // A seed past the ninth holds it, or nobody does: it is not looked for
+    fn a_chunk_read_asks_only_the_seeds_its_lookup_leaves_among_the_nine_nearest() {
+        // The close group is nearer the chunk than every seed: of the nine
+        // seeds nearest it, the read asks the two that are among the nine
+        // nearest of what it knows. The second of them holds the chunk: read.
+        let (result, asked) = read_with_sixteen_seeds(Some(102));
+        assert!(matches!(result, Ok(Some(102))), "{result:?}");
+        assert!(asked.iter().all(|&n| n <= 102), "{asked:?}");
+        // A seed past those two holds it, or nobody does: it is not looked for
         // there, and the chunk is reported missing once the close group and
-        // the nine nearest seeds have answered, each once.
-        for holder in [Some(110), Some(116), None] {
+        // the two seeds have answered, each once.
+        for holder in [Some(103), Some(109), Some(116), None] {
             let (result, mut asked) = read_with_sixteen_seeds(holder);
             assert!(matches!(result, Ok(None)), "{result:?}");
             asked.sort_unstable();
-            assert_eq!(asked, (1..=7).chain(101..=109).collect::<Vec<u8>>());
+            assert_eq!(asked, (1..=7).chain(101..=102).collect::<Vec<u8>>());
         }
     }
 

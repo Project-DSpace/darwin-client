@@ -97,7 +97,8 @@ pub struct Network {
 /// Peer identities and the addresses that can reach them.
 pub type PeerAddresses = Vec<(PeerId, Vec<MultiAddr>)>;
 
-/// The most bootstrap peers a read asks: the nine nearest the address read.
+/// The most bootstrap peers a read asks: of the nine nearest the address
+/// read, those its lookup leaves among the nine nearest ([`seeds_for_read`]).
 ///
 /// Nine is the nodes' storage retention width: the close group
 /// ([`ant_protocol::CLOSE_GROUP_SIZE`], seven) plus the storage admission
@@ -116,10 +117,11 @@ pub type PeerAddresses = Vec<(PeerId, Vec<MultiAddr>)>;
 /// ninth is not looked for there.
 pub(crate) const MAX_BOOTSTRAP_READ_PEERS: usize = ant_protocol::CLOSE_GROUP_SIZE + 2;
 
-/// The bootstrap peers among `seeds` that a read of `target` asks: the
+/// The bootstrap peers among `seeds` that a read of `target` may ask: the
 /// [`MAX_BOOTSTRAP_READ_PEERS`] nearest to it by XOR distance, or all of them
 /// when there are fewer, nearest first, each with all of its addresses. Only
-/// addresses that carry a peer ID count, and the local peer is left out.
+/// addresses that carry a peer ID count, and the local peer is left out. Of
+/// these, the read asks those [`seeds_for_read`] picks once its lookup answers.
 pub(crate) fn bootstrap_read_peers(
     seeds: &[MultiAddr],
     target: &[u8; 32],
@@ -150,6 +152,55 @@ pub(crate) fn bootstrap_read_peers(
     peers.sort_by_key(|(peer, _)| ant_protocol::transport::xor_distance(peer.as_bytes(), target));
     peers.truncate(MAX_BOOTSTRAP_READ_PEERS);
     peers
+}
+
+/// `seeds` in a random order, the order a client tries them in when it
+/// starts. Each start stops dialling once it has enough connections, so with
+/// the seeds listed in one fixed order every client would start on the same
+/// first few; in a random order, starts spread over all of them.
+pub fn in_random_order<T>(mut seeds: Vec<T>, rng: &mut impl rand::Rng) -> Vec<T> {
+    use rand::seq::SliceRandom as _;
+    seeds.shuffle(rng);
+    seeds
+}
+
+/// The bootstrap peers among `seeds` a read of `target` asks once its own
+/// lookup has answered: every one when the lookup found no peer, and otherwise
+/// only those its view leaves among the [`MAX_BOOTSTRAP_READ_PEERS`] nearest
+/// `target`. The view is `found`, the peers the lookup found, together with
+/// the seeds themselves.
+///
+/// A seed that many nearer peers pass over is not among the nodes that keep
+/// the record, so asking it costs that seed a request, and a browser a session
+/// with it, with little chance of a copy. While seeds are most of the network
+/// they are most of every view's nearest nodes, and are asked as before; as
+/// other nodes join, each read asks fewer seeds, and none of those farther out.
+pub(crate) fn seeds_for_read<P: Clone>(
+    seeds: &[P],
+    found: impl IntoIterator<Item = [u8; 32]>,
+    target: &[u8; 32],
+    key: impl Fn(&P) -> [u8; 32],
+) -> Vec<P> {
+    let found: std::collections::HashSet<[u8; 32]> = found.into_iter().collect();
+    if found.is_empty() {
+        return seeds.to_vec();
+    }
+    let mut view = found;
+    view.extend(seeds.iter().map(&key));
+    seeds
+        .iter()
+        .filter(|seed| {
+            let id = key(seed);
+            let distance = ant_protocol::transport::xor_distance(&id, target);
+            view.iter()
+                .filter(|peer| {
+                    **peer != id && ant_protocol::transport::xor_distance(peer, target) < distance
+                })
+                .count()
+                < MAX_BOOTSTRAP_READ_PEERS
+        })
+        .cloned()
+        .collect()
 }
 
 /// Bounded, latest-value hints for an immutable read in progress. Hints only
@@ -236,10 +287,17 @@ pub trait BrowserNetwork {
     fn connected_read_peers(&self) -> Vec<PeerId> {
         Vec::new()
     }
-    /// Bootstrap addresses that chunk and pointer reads also ask, alongside
-    /// discovery: of those carrying a peer ID, the nine nearest the address
-    /// read. Adapters without them read through discovery alone.
+    /// Bootstrap addresses that chunk and pointer reads may also ask: of those
+    /// carrying a peer ID, the nine nearest the address read
+    /// ([`Network::bootstrap_peers_near`]). Adapters without them read through
+    /// discovery alone.
     fn bootstrap_peers(&self) -> Vec<MultiAddr> {
+        Vec::new()
+    }
+    /// Peers that declined a session because they were busy, each with the
+    /// time until the adapter dials them again. Discovery and reads skip them
+    /// until then. Adapters that never skip a peer for that report none.
+    fn refused_peers(&self) -> Vec<(PeerId, std::time::Duration)> {
         Vec::new()
     }
     /// Whether `peer` would take a paid pointer write from this client, as
@@ -345,7 +403,7 @@ impl Network {
         // silently drop legitimate testnet peers that share an IP or /24.
         core_config.diversity_config = Some(IPDiversityConfig::permissive());
 
-        core_config.bootstrap_peers = seeds.clone();
+        core_config.bootstrap_peers = in_random_order(seeds.clone(), &mut rand::thread_rng());
 
         let node = P2PNode::new(core_config)
             .await
@@ -627,13 +685,14 @@ impl Network {
         }
     }
 
-    /// The bootstrap peers a read of `target` also asks, nearest first: the
+    /// The bootstrap peers a read of `target` may also ask, nearest first: the
     /// [`MAX_BOOTSTRAP_READ_PEERS`] nearest it of those whose configured
-    /// address carries a peer ID ([`bootstrap_read_peers`]). Native clients
-    /// use the addresses they connected through or were given; browser clients
-    /// use their seeds, less any whose node the seed policy rejected. Empty
-    /// when no bootstrap address carries a peer ID, and reads then use
-    /// discovery alone.
+    /// address carries a peer ID ([`bootstrap_read_peers`]), of which the read
+    /// asks those its lookup leaves among the nearest ([`seeds_for_read`]).
+    /// Native clients use the addresses they connected through or were given;
+    /// browser clients use their seeds, less any whose node the seed policy
+    /// rejected. Empty when no bootstrap address carries a peer ID, and reads
+    /// then use discovery alone.
     pub(crate) fn bootstrap_peers_near(&self, target: &[u8; 32]) -> PeerAddresses {
         #[cfg(feature = "native")]
         {
@@ -648,9 +707,9 @@ impl Network {
     /// Speculate on already-connected peers on both platforms. Discovery owns
     /// cold dialing; a dead address must not occupy an early GET slot while a
     /// reachable holder is being discovered. Ordinary fallback still sees all
-    /// known peers, including those requiring a new connection. Bootstrap
-    /// peers are the exception: reads ask them from the start, connected or
-    /// not, in a GET slot of their own ([`Network::bootstrap_peers_near`]).
+    /// known peers, including those requiring a new connection. A bootstrap
+    /// peer is read early only as a connected peer is: the read asks the others
+    /// it needs once discovery answers ([`Network::bootstrap_peers_near`]).
     pub(crate) async fn seed_read_candidates(&self, progress: &ReadProgress) {
         #[cfg(feature = "native")]
         let connected = self.node.connected_peers().await;
@@ -667,6 +726,20 @@ impl Network {
                 })
                 .collect(),
         );
+    }
+
+    /// Peers skipped for now because they declined a session while busy,
+    /// each with the time until they are tried again. Only browser sessions
+    /// are refused this way, so native reports none.
+    pub(crate) fn refused_peers(&self) -> Vec<(PeerId, std::time::Duration)> {
+        #[cfg(feature = "native")]
+        {
+            Vec::new()
+        }
+        #[cfg(not(feature = "native"))]
+        {
+            self.backend.refused_peers()
+        }
     }
 
     /// Whether `peer` would take a paid pointer write from this client, as
@@ -896,6 +969,66 @@ mod tests {
             (1..=9).collect::<Vec<_>>()
         );
         assert!(peers.iter().all(|(_, addrs)| addrs.len() == 2));
+    }
+
+    /// Seeds are tried in a random order: every order is a reordering of the
+    /// same seeds, and each seed comes first about as often as any other.
+    #[test]
+    fn seeds_are_tried_in_a_random_order() {
+        use rand::SeedableRng as _;
+        let mut rng = rand::rngs::StdRng::seed_from_u64(7);
+        let seeds: Vec<u8> = (0..16).collect();
+        let mut first = [0usize; 16];
+        for _ in 0..16_000 {
+            let order = in_random_order(seeds.clone(), &mut rng);
+            let mut sorted = order.clone();
+            sorted.sort_unstable();
+            assert_eq!(sorted, seeds);
+            first[usize::from(order[0])] += 1;
+        }
+        // About a thousand each.
+        assert!(first.iter().all(|&n| (800..1200).contains(&n)), "{first:?}");
+    }
+
+    /// Of the nine seeds nearest a record, a read asks only those its lookup
+    /// leaves among the nine nearest of what it knows: the seeds themselves and
+    /// the peers the lookup found.
+    #[test]
+    fn a_read_asks_the_seeds_its_lookup_leaves_among_the_nine_nearest() {
+        let asked = |seeds: &[u8], found: &[u8], target: [u8; 32]| -> Vec<u8> {
+            seeds_for_read(seeds, found.iter().map(|&n| [n; 32]), &target, |&n: &u8| {
+                [n; 32]
+            })
+        };
+        let nine: Vec<u8> = (101..=109).collect();
+        // A close group nearer than every seed: the two nearest seeds complete
+        // the nine nearest, and the seven farther are not asked.
+        assert_eq!(
+            asked(&nine, &[1, 2, 3, 4, 5, 6, 7], [0; 32]),
+            vec![101, 102]
+        );
+        // Nine peers nearer: no seed is.
+        assert!(asked(&nine, &[1, 2, 3, 4, 5, 6, 7, 8, 9], [0; 32]).is_empty());
+        // While seeds are most of the network they are most of the nearest:
+        // a lookup that found mostly seeds leaves them all.
+        assert_eq!(asked(&nine, &[101, 102, 103, 104, 5], [0; 32]), {
+            let mut expected = nine.clone();
+            expected.truncate(8);
+            expected
+        });
+        // A lookup that found nobody: every seed.
+        assert_eq!(asked(&nine, &[], [0; 32]), nine);
+        // A seed the lookup found counts once.
+        assert_eq!(asked(&[1, 101], &[1, 2], [0; 32]), vec![1, 101]);
+        // Nearness is to the record: the nearest seeds to another target.
+        assert_eq!(
+            asked(
+                &[0x81, 0x82, 0x01],
+                &[0x80, 0x83, 0x84, 0x85, 0x86, 0x87, 0x88],
+                [0x80; 32]
+            ),
+            vec![0x81, 0x82]
+        );
     }
 
     /// A client node built from seeds reads from those of them that carry a

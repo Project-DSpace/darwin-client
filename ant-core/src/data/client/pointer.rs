@@ -1076,6 +1076,27 @@ where
         .found
 }
 
+/// The bootstrap peers a pointer read asks beside the close group: of `seeds`,
+/// the nine nearest `address` of those the client knows by peer ID
+/// ([`crate::data::network::bootstrap_read_peers`]), those the close group's
+/// lookup, `group`, leaves among the nine nearest, or every one when the lookup
+/// failed or found nobody ([`crate::data::network::seeds_for_read`]).
+fn seeds_beside(
+    group: Option<&[(PeerId, Vec<MultiAddr>)]>,
+    seeds: Vec<(PeerId, Vec<MultiAddr>)>,
+    address: &XorName,
+) -> Vec<(PeerId, Vec<MultiAddr>)> {
+    match group {
+        Some(group) => crate::data::network::seeds_for_read(
+            &seeds,
+            group.iter().map(|(peer, _)| *peer.as_bytes()),
+            address,
+            |(peer, _)| *peer.as_bytes(),
+        ),
+        None => seeds,
+    }
+}
+
 /// A pointer read, and what the bootstrap peers asked beside the close group
 /// said.
 struct PointerRead {
@@ -1807,8 +1828,9 @@ impl Client {
     ///
     /// When no peer of the close group that answered holds a final state,
     /// the pointer is then read as [`Self::pointer_get`] reads it, from the
-    /// close group and the bootstrap peers nearest it, so a state only they
-    /// hold is not missed: the pointer is reported open at the counter of the
+    /// close group and the bootstrap peers its lookup leaves among the nine
+    /// nearest, so a state only they hold is not missed: the census and the
+    /// read share one lookup. The pointer is reported open at the counter of the
     /// state that read returns, settling on a final state only the bootstrap
     /// peers hold, and open with no state only when neither set holds one,
     /// once every bootstrap peer asked has answered or failed
@@ -1820,11 +1842,19 @@ impl Client {
     /// few of the group answer to speak for it, or, when the pointer is open,
     /// with the error that read gives.
     pub async fn pointer_finality(&self, address: &XorName) -> Result<PointerFinality> {
+        // One lookup serves the census and the read after it, and decides
+        // which bootstrap peers that read asks.
+        let group = self.pointer_group(address).await?;
+        let bootstrap = seeds_beside(
+            Some(&group),
+            self.network().bootstrap_peers_near(address),
+            address,
+        );
         pointer_finality_from(
             address,
-            || self.pointer_group(address),
+            || std::future::ready(Ok(group.clone())),
             self.config().close_group_size,
-            &self.network().bootstrap_peers_near(address),
+            &bootstrap,
             |peer, addrs| self.send_pointer_get(*address, peer, addrs),
         )
         .await
@@ -2222,11 +2252,12 @@ impl Client {
     /// state a majority of it holds; two final states and no majority holding
     /// either are a fork, with no state to return.
     ///
-    /// The close group is asked, and at the same time so are the bootstrap
-    /// peers nearest the address, nine at most of those the client knows by
-    /// peer ID, as a second set with its own quorum and corroboration (five
-    /// answers and two naming the state, of nine); a peer in both is asked
-    /// once. The close group's quorums are counted over the configured
+    /// The close group is looked up, then asked, and at the same time so are
+    /// the bootstrap peers that lookup leaves among the nine nearest the
+    /// address, of the nine nearest of those the client knows by peer ID, or
+    /// all nine when the lookup fails ([`seeds_beside`]), as a second set with
+    /// its own quorum and corroboration (five answers and two naming the
+    /// state, of nine); a peer in both is asked once. The close group's quorums are counted over the configured
     /// close-group size, or more peers if its lookup returned more. Its read
     /// does not stop on a state while a newer one has been named by too few
     /// peers to corroborate it, or on a final state too few hold to be a
@@ -2248,11 +2279,17 @@ impl Client {
     /// [`Error::PointerForked`] when the close group names a fork, or the
     /// bootstrap peers do and the close group answered without a final state.
     pub async fn pointer_get(&self, address: &XorName) -> Result<Option<Pointer>> {
+        let group = self.pointer_group(address).await;
+        let bootstrap = seeds_beside(
+            group.as_deref().ok(),
+            self.network().bootstrap_peers_near(address),
+            address,
+        );
         read_pointer(
             address,
-            self.pointer_group(address),
+            std::future::ready(group),
             self.config().close_group_size,
-            &self.network().bootstrap_peers_near(address),
+            &bootstrap,
             |peer, addrs| self.send_pointer_get(*address, peer, addrs),
         )
         .await
@@ -3269,8 +3306,33 @@ mod tests {
         assert!(found.expect("a read").is_none());
     }
 
+    /// `pointer_get` and `pointer_finality` give a read the bootstrap peers
+    /// their lookup leaves among the nine nearest the pointer, and all of the
+    /// nine nearest when the lookup failed.
+    #[test]
+    fn a_pointer_read_asks_the_seeds_its_lookup_leaves_among_the_nine_nearest() {
+        let id = |n: u8| PeerId::from_bytes([n; 32]);
+        let seeds: Vec<(PeerId, Vec<MultiAddr>)> =
+            (101..=109).map(|n| (id(n), Vec::new())).collect();
+        let group: Vec<(PeerId, Vec<MultiAddr>)> = (1..=7).map(|n| (id(n), Vec::new())).collect();
+        let asked = |group: Option<&[(PeerId, Vec<MultiAddr>)]>| {
+            seeds_beside(group, seeds.clone(), &[0; 32])
+                .into_iter()
+                .map(|(peer, _)| peer.as_bytes()[0])
+                .collect::<Vec<u8>>()
+        };
+        // Seven peers nearer than every seed: the two nearest seeds complete
+        // the nine nearest, and only they are asked.
+        assert_eq!(asked(Some(&group)), vec![101, 102]);
+        // A thin lookup leaves more of them among the nearest.
+        assert_eq!(asked(Some(&group[..2])), (101..=107).collect::<Vec<u8>>());
+        // No lookup, or an empty one: all nine.
+        assert_eq!(asked(None), (101..=109).collect::<Vec<u8>>());
+        assert_eq!(asked(Some(&[])), (101..=109).collect::<Vec<u8>>());
+    }
+
     /// A read given the bootstrap peers `bootstrap_read_peers` chooses from
-    /// sixteen seeds, as `pointer_get` is, asks the nine nearest the pointer
+    /// sixteen seeds, the most `pointer_get` gives one, asks the nine nearest the pointer
     /// and never the seven farther ones: two of the nine naming the state are
     /// enough on five answers, and a state only the farther seeds hold is not
     /// looked for there.

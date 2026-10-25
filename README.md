@@ -388,7 +388,7 @@ Download complete!
 
 A private file's envelope address can't be downloaded from: its envelope stores only a salted hash of the data map, and the download says so. Use `--datamap`, or `--proof` with a proof that reveals it.
 
-Every chunk read is checked against its address. A node that serves bytes that don't match is passed over for the next nearest node (and named in the `-v` log); a read fails on bad bytes only when no node serves the chunk intact. The same holds in the browser build. Reads also ask the bootstrap peers nearest the chunk, from the start; see [Bootstrap multiaddresses and browser defaults](#bootstrap-multiaddresses-and-browser-defaults).
+Every chunk read is checked against its address. A node that serves bytes that don't match is passed over for the next nearest node (and named in the `-v` log); a read fails on bad bytes only when no node serves the chunk intact. The same holds in the browser build. Reads may also ask the bootstrap peers nearest the chunk, once their lookup answers; see [Bootstrap multiaddresses and browser defaults](#bootstrap-multiaddresses-and-browser-defaults).
 
 #### `darwin file prove <RECORD>`
 
@@ -613,8 +613,8 @@ Ask every peer of the close group whether a pointer is final, and on what.
 it reports a pointer open with no state only when neither holds one. While
 the close group shows no final state, the pointer is read as
 `darwin pointer get` reads it, from the close group and the bootstrap peers
-nearest it (nine at most), and a `seeds:` line says how many of those were
-asked and answered and what they hold. Final, unconfirmed, settling and
+nearest it that its lookup leaves among the nine nearest, and a `seeds:` line
+says how many of those were asked and answered and what they hold. Final, unconfirmed, settling and
 forked are otherwise the close group's to decide.
 
 - `open` — no peer of the close group that answered holds a final state, and
@@ -1135,44 +1135,56 @@ the config directory, which takes precedence over the bundled seeds. Only QUIC s
 are selected for native dialing. `darwin -v` logs "using N bundled bootstrap
 seed(s)" when it falls back to the bundled ones.
 
-Chunk and pointer reads also ask the bootstrap peers whose peer IDs the client
-knows (the selected QUIC seeds that carry `/p2p/<peer-id>`, or a browser
-client's seeds): the nine nearest the address read, or all of them when there
-are fewer. The nodes that were nearest to a record when it was stored may still
-hold it after the nodes nearest to it have changed. Nine is the nodes' storage
-retention width, the close group of seven plus a margin of two: a node is
-responsible for a record, and replication stores it there, while the node is
-among the nine nodes nearest the record by its own routing table. A bootstrap
-peer that is among the nine nodes nearest an address out of the whole network is
-also among the nine nearest out of the bootstrap peers, so the nine bootstrap
-peers nearest the address include every bootstrap peer responsible for the
-record. An upload can also leave a chunk farther out: it moves past close-group
-nodes that fail or are full to the next nearest, up to the twentieth, and nodes
-keep what they hold while their disk has room. A copy left that way on a
-bootstrap peer past the ninth is not looked for there.
+Chunk and pointer reads may also ask the bootstrap peers whose peer IDs the
+client knows (the selected QUIC seeds that carry `/p2p/<peer-id>`, or a browser
+client's seeds): of the nine nearest the address read, those the read's own
+lookup leaves among the nine nearest of what it knows, the seeds and the peers
+the lookup found, or all nine when the lookup finds no peer. Nine is the nodes'
+storage retention width, the close group of seven plus a margin of two: a node
+is responsible for a record, and replication stores it there, while the node is
+among the nine nodes nearest the record by its own routing table. A seed that
+nine nearer peers pass over is not responsible for the record, so asking it
+costs that seed a request, and a browser a session with it, with little chance
+of a copy. While the seeds are most of the network they are most of every
+read's nearest nodes and are asked as before; as other nodes join, each read
+asks fewer seeds, and none of those farther out. A copy a seed keeps after it
+stops being among a record's nearest nodes is then found only through the nodes
+now nearest, which replication copies it to. An upload can also leave a chunk
+farther out: it moves past close-group nodes that fail or are full to the next
+nearest, up to the twentieth, and nodes keep what they hold while their disk has
+room; such a copy is not looked for on a seed.
 
-A chunk read asks them from the start of each round, nearest to the chunk first
-and one at a time, in one of its two GET slots; discovery's hints, then the
-close group, keep the other, so a slow or silent bootstrap peer holds up only
-the next one. It reports a chunk missing only once each of them has answered.
-A pointer read asks them from the start and the close group once it is found,
+A chunk read asks no seed before its lookup answers, except as it reads any
+connected peer early. Then it asks the seeds the lookup leaves among the
+nearest, nearest to the chunk first and one at a time, in one of its two GET
+slots, while the close group keeps the other, so a slow or silent seed holds up
+only the next one, and it reports a chunk missing only once each of them has
+answered. A pointer read looks its close group up, then asks it and those seeds,
 each set on its own quorum and corroboration (a peer in both is asked once; of
 nine bootstrap peers, five must answer and two name the state), and returns the
 newer of the two states: a state the bootstrap peers agree on is returned even
 when the close group holds none or does not answer. When the close group has a
 state, the read waits for a quorum of the bootstrap peers; when it has none, for
 all of them, so it takes as long as the slower set, up to the GET timeout when a
-bootstrap peer doesn't answer. Bootstrap addresses without a peer ID are only
-dialled, as before.
+bootstrap peer doesn't answer. `darwin pointer finality` uses the same lookup
+for its census and that read. Bootstrap addresses without a peer ID are only
+dialled, as before. A chunk read can still reach other seeds the way it reaches
+any node: as discovery's hints, or among the known peers (20 at most) a round
+falls back to before it reports a chunk missing.
 
-So every read reaches the bootstrap peers: a chunk read sends its first GET to
-the one nearest the chunk, connected or not, and one to each of them in a round
-that finds nothing; a pointer read sends one to each of them that is not in the
-close group, all at once, dialling any it is not yet connected to. With the 16
-bundled seeds, a read asks nine of them as bootstrap peers, not all 16. A chunk
-read can still reach other seeds the way it reaches any node: as discovery's
-hints, or among the known peers (20 at most) a round falls back to before it
-reports a chunk missing.
+A client dials its seeds in a random order: a native client after the peers it
+cached, so client starts spread over every seed instead of landing on the first
+few listed. A browser client keeps sessions with three of its seeds, not all of
+them, and takes three more only when lookups through those fall short: lookups
+find every other node through them, and a seed's session stays
+open until the node closes it for idleness, so a seed that holds a record is read
+on its open session. A seed that declines a session because it is busy (its
+transport refuses the connection check within 3 seconds, or it closes the
+session right after the handshake) is held off for 15 seconds, not the 30
+minutes a seed whose dial fails is, and the next seed in the random order is
+dialled in its place. A read whose possible holders declined waits for the
+first of them to come back, up to three times, and then reports the holders
+busy, to try again shortly, rather than the chunk missing.
 
 The config directory is `ant`'s: `~/.config/ant` on Linux,
 `~/Library/Application Support/ant` on macOS, `%APPDATA%\ant` on Windows.
