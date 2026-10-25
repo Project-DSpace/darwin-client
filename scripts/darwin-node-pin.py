@@ -46,6 +46,9 @@ VENDORED = "vendor/ant-protocol"
 # waiting on refused peers at most MAX_REFUSAL_WAITS times) needs nodes that
 # refuse a browser session while busy, which node release 1a brings: it has
 # to have run against those nodes before it is released.
+# Node release 1a has no commit on darwin-node main yet, so this is a
+# deny-list of main's head today; once it lands, a lower bound replaces it
+# (the revision must have node release 1a's main commit as an ancestor).
 TOO_OLD = {
     "94bf3425e31f77e150bc98306d02705fc33b1037": (
         "darwin-node main from before node release 1a; client release 1a's busy "
