@@ -331,6 +331,9 @@ mod settlement_refusal_tests {
 /// - `ClientUpdateRequired` -> `ApplicationError` (the storer refused to quote
 ///   a client that settles under superseded rules — a terminal verdict about
 ///   this build, not about link capacity, and no retry rate clears it)
+/// - `BatchPaymentsRefused` -> `ApplicationError` (the nodes answered that
+///   they take per-chunk payments only — a verdict about the payment kind,
+///   given over a working link)
 /// - `CloseGroupShortfall` -> `ApplicationError` (a quorum shortfall caused
 ///   by close-group dial/relay churn with no PUT-response timeouts — remote
 ///   peer churn, not local backpressure; a timeout-bearing shortfall keeps
@@ -369,6 +372,9 @@ pub(crate) fn classify_error(err: &Error) -> Outcome {
         // run on the basis of a fault no retry can clear.
         | Error::ClientUpdateRequired(_)
         | Error::StorerUpdateRequired(_)
+        // The nodes take per-chunk payments only: an answer about the
+        // payment kind, given over a working link.
+        | Error::BatchPaymentsRefused(_)
         // A pointer that is final, or whose owner forked it, is a verdict
         // about that pointer read over a working link. No retry rate changes
         // it.
@@ -1335,6 +1341,7 @@ mod tests {
             | Error::RemotePut { .. }
             | Error::ClientUpdateRequired(_)
             | Error::StorerUpdateRequired(_)
+            | Error::BatchPaymentsRefused(_)
             | Error::PointerFinal(_)
             | Error::PointerForked(_)
             | Error::CloseGroupShortfall(_) => (),

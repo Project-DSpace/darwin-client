@@ -2733,9 +2733,11 @@ impl Client {
                             merkle_plan.already_stored,
                         )
                     }
-                    Err(Error::InsufficientPeers(ref msg)) => {
+                    Err(
+                        Error::InsufficientPeers(ref msg) | Error::BatchPaymentsRefused(ref msg),
+                    ) => {
                         info!(
-                            "External merkle preparation needs more peers ({msg}); preparing wave-batch payment"
+                            "External merkle preparation found no batch to pay ({msg}); preparing wave-batch payment"
                         );
                         let chunk_data = spill.read_chunks(&merkle_plan.to_upload)?;
                         let (payment_info, mut wave_already_stored) = self
@@ -3752,8 +3754,10 @@ impl Client {
     /// and a checkpoint saved before every payment lets an interrupted upload
     /// resume (the payer is then asked to recover the same payment) without
     /// paying twice. In [`PaymentMode::Merkle`] a network too small for a batch
-    /// payment fails before any payment; [`PaymentMode::Auto`] falls back to
-    /// per-chunk payments. An envelope upload is paid and stored as
+    /// payment, or one whose nodes refuse batch payments
+    /// ([`Error::BatchPaymentsRefused`], as darwin-node's do), fails before
+    /// any payment; [`PaymentMode::Auto`] falls back to per-chunk payments.
+    /// An envelope upload is paid and stored as
     /// [`Client::file_upload_with_visibility_and_progress`] describes. The
     /// upload's checkpoint, and an envelope upload's kept record, belong to
     /// the payer ([`UploadPayer::checkpoint_scope`]), so a payer serving

@@ -80,19 +80,21 @@ pub async fn wallet_spend(wallet: &Wallet) -> (u64, ant_protocol::evm::U256) {
     (sent, tokens)
 }
 
-/// Check that `error` is darwin-node's refusal of a batch payment: the nodes
-/// refused the merkle candidate requests, so no batch was quoted, let alone
-/// paid. It is not a refusal of this client's settlement version, which would
-/// stop the client paying per chunk too.
+/// Check that `error` is darwin-node's refusal of a batch payment, typed as
+/// such ([`ant_core::data::Error::BatchPaymentsRefused`]) and carrying the
+/// nodes' sentence: the nodes refused the merkle candidate requests, so no
+/// batch was quoted, let alone paid. It is not a refusal of this client's
+/// settlement version (`ClientUpdateRequired`), which would stop the client
+/// paying per chunk too.
 pub fn assert_batch_refused(error: &ant_core::data::Error) {
     let text = error.to_string();
     assert!(
-        text.contains(BATCH_PAYMENTS_REFUSED),
-        "expected darwin-node's refusal of batch payments, got: {text}"
+        matches!(error, ant_core::data::Error::BatchPaymentsRefused(_)),
+        "expected darwin-node's refusal of batch payments (BatchPaymentsRefused), got: {error:?}"
     );
     assert!(
-        !matches!(error, ant_core::data::Error::ClientUpdateRequired(_)),
-        "a batch refusal is not a settlement-version refusal: {text}"
+        text.contains(BATCH_PAYMENTS_REFUSED),
+        "the refusal must carry the nodes' sentence, got: {text}"
     );
 }
 

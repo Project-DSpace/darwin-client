@@ -1106,7 +1106,13 @@ impl Client {
                 .await
             {
                 Ok(batch) => batch,
-                Err(Error::InsufficientPeers(_)) if mode == PaymentMode::Auto => return Ok(()),
+                // A network too small for a batch, or one whose nodes refuse
+                // batches (darwin-node's): `Auto` pays per chunk instead.
+                Err(Error::InsufficientPeers(_) | Error::BatchPaymentsRefused(_))
+                    if mode == PaymentMode::Auto =>
+                {
+                    return Ok(())
+                }
                 Err(error) => return Err(error),
             };
             for record in records

@@ -44,6 +44,18 @@ fn test_single_mode() {
     assert!(!should_use_merkle(1000, PaymentMode::Single));
 }
 
+/// The client tells darwin-node's refusal of a batch payment apart from
+/// other quote failures by the nodes' own sentence, and reports it as
+/// `Error::BatchPaymentsRefused`, so its copy of the sentence must be the
+/// node's word for word, at the darwin-node revision the tests run.
+#[test]
+fn the_clients_copy_of_the_batch_refusal_is_the_nodes() {
+    assert_eq!(
+        ant_core::data::BATCH_PAYMENTS_REFUSED,
+        ant_node::payment::BATCH_PAYMENTS_REFUSED
+    );
+}
+
 /// Counts covering the minimum tree, the merkle threshold, either side of a
 /// full batch, and the `1 mod MAX_LEAVES` counts a naive `chunks(MAX_LEAVES)`
 /// split turned into an unpayable one-address tail.

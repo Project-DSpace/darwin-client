@@ -129,6 +129,19 @@ pub enum Error {
     #[error("{0}")]
     StorerUpdateRequired(String),
 
+    /// The nodes asked for a merkle batch's candidate quotes refused batch
+    /// payments: they take per-chunk payments only, as darwin-node's nodes
+    /// do ([`BATCH_PAYMENTS_REFUSED`](crate::data::client::merkle::BATCH_PAYMENTS_REFUSED),
+    /// which the message carries). Raised at quote time, before the batch is
+    /// signed or paid.
+    ///
+    /// Not a verdict about this client, unlike [`Self::ClientUpdateRequired`]:
+    /// it sets no settlement-refusal latch, per-chunk payment goes on, and
+    /// `PaymentMode::Auto` falls back to it, as it does when a network is too
+    /// small for a batch.
+    #[error("batch payment refused: {0}")]
+    BatchPaymentsRefused(String),
+
     /// BLS signature verification failed.
     #[error("signature verification failed: {0}")]
     SignatureVerification(String),
@@ -275,6 +288,7 @@ impl Error {
             Self::InsufficientPeers(m) => Self::InsufficientPeers(m.clone()),
             Self::ClientUpdateRequired(m) => Self::ClientUpdateRequired(m.clone()),
             Self::StorerUpdateRequired(m) => Self::StorerUpdateRequired(m.clone()),
+            Self::BatchPaymentsRefused(m) => Self::BatchPaymentsRefused(m.clone()),
             Self::SignatureVerification(m) => Self::SignatureVerification(m.clone()),
             Self::Encryption(m) => Self::Encryption(m.clone()),
             Self::Cancelled(m) => Self::Cancelled(m.clone()),

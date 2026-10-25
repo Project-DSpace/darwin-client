@@ -168,6 +168,72 @@ fn pool_commitment_with_payment_multiplier(
     Ok(commitment)
 }
 
+/// darwin-node's answer to a merkle candidate quote request, and to a PUT
+/// carrying a merkle proof: its nodes take per-chunk payments only, and say
+/// so before anything is signed. Word for word darwin-node's
+/// `ant_node::payment::BATCH_PAYMENTS_REFUSED` (`merkle_unit.rs` pins the
+/// two equal), so this client tells the refusal apart from other quote
+/// failures and reports it as [`Error::BatchPaymentsRefused`].
+pub const BATCH_PAYMENTS_REFUSED: &str = "merkle (batch) payments are not accepted; pay per chunk";
+
+/// Which failure a fully drained set of candidate pools should report.
+///
+/// Pools are drained rather than short-circuited, so more than one can fail.
+/// Three ranks, highest first:
+///
+/// 1. A settlement refusal ([`Error::ClientUpdateRequired`]): if one pool runs
+///    out of peers while another declares this client unable to settle, the
+///    second is the answer that keeps the caller from falling back to a payment
+///    path and spending.
+/// 2. A refusal of batch payments ([`Error::BatchPaymentsRefused`]): the nodes
+///    take per-chunk payments only. It outranks the ordinary failures, so a
+///    pool that heard no answer in time (a timeout, a short lookup) doesn't
+///    hide what the pools that did hear one were told. It is not a verdict
+///    about this client and never stops per-chunk payment.
+/// 3. The first ordinary failure.
+#[derive(Default)]
+struct PoolVerdict {
+    refusal: Option<Error>,
+    batch_refusal: Option<Error>,
+    first_failure: Option<Error>,
+}
+
+impl PoolVerdict {
+    fn note(&mut self, e: Error) {
+        let slot = match e {
+            Error::ClientUpdateRequired(_) => &mut self.refusal,
+            Error::BatchPaymentsRefused(_) => &mut self.batch_refusal,
+            _ => &mut self.first_failure,
+        };
+        if slot.is_none() {
+            *slot = Some(e);
+        }
+    }
+
+    fn into_error(self) -> Option<Error> {
+        self.refusal.or(self.batch_refusal).or(self.first_failure)
+    }
+}
+
+/// The error a candidate pool that came up short reports: what the nodes
+/// asked answered, with each peer's failure. If any of them refused batch
+/// payments, the pool reports that refusal ([`Error::BatchPaymentsRefused`])
+/// whatever else failed, since a pool on a network that refuses batches
+/// can't fill however long it waits; otherwise it ran short of peers.
+fn short_pool_error(valid: usize, batch_refusals: usize, failures: &[String]) -> Error {
+    let detail = format!(
+        "Got {valid} merkle candidates, need {CANDIDATES_PER_POOL}. Failures: [{}]",
+        failures.join("; ")
+    );
+    if batch_refusals > 0 {
+        Error::BatchPaymentsRefused(format!(
+            "{BATCH_PAYMENTS_REFUSED}, said {batch_refusals} of the nodes asked. {detail}"
+        ))
+    } else {
+        Error::InsufficientPeers(detail)
+    }
+}
+
 /// Turn a merkle candidate quote response into the candidate it carries, or
 /// the error that explains why there is none.
 ///
@@ -178,40 +244,9 @@ fn pool_commitment_with_payment_multiplier(
 /// deliberately. It is the one rejection that is about this client rather than
 /// about this request, it already carries wording aimed at the person running
 /// the upload, and it must not be retried in a shape that would get a quote
-/// anyway.
-/// Which failure a fully drained set of candidate pools should report.
-///
-/// Pools are drained rather than short-circuited, so more than one can fail.
-/// A refusal outranks an ordinary failure: if one pool runs out of peers while
-/// another declares this client unable to settle, the second is the answer that
-/// keeps the caller from falling back to a payment path and spending.
-#[derive(Default)]
-struct PoolVerdict {
-    refusal: Option<Error>,
-    first_failure: Option<Error>,
-}
-
-impl PoolVerdict {
-    fn note(&mut self, e: Error) {
-        match e {
-            e @ Error::ClientUpdateRequired(_) => {
-                if self.refusal.is_none() {
-                    self.refusal = Some(e);
-                }
-            }
-            e => {
-                if self.first_failure.is_none() {
-                    self.first_failure = Some(e);
-                }
-            }
-        }
-    }
-
-    fn into_error(self) -> Option<Error> {
-        self.refusal.or(self.first_failure)
-    }
-}
-
+/// anyway. A node's refusal of batch payments is lifted out too, as
+/// [`Error::BatchPaymentsRefused`]: an answer about the payment kind, not this
+/// client.
 fn map_merkle_candidate_response(
     peer_id: PeerId,
     body: ChunkMessageBody,
@@ -245,6 +280,12 @@ fn map_merkle_candidate_response(
         ChunkMessageBody::MerkleCandidateQuoteResponse(MerkleCandidateQuoteResponse::Error(
             behind @ ProtocolError::StorerUpdateRequired { .. },
         )) => Some(Err(Error::StorerUpdateRequired(behind.to_string()))),
+        // darwin-node takes per-chunk payments only. Neither a settlement
+        // refusal (it sets no latch, and per-chunk payment goes on) nor a
+        // reason to ask again in the legacy shape: the node understood us.
+        ChunkMessageBody::MerkleCandidateQuoteResponse(MerkleCandidateQuoteResponse::Error(
+            ProtocolError::QuoteFailed(reason),
+        )) if reason == BATCH_PAYMENTS_REFUSED => Some(Err(Error::BatchPaymentsRefused(reason))),
         ChunkMessageBody::MerkleCandidateQuoteResponse(MerkleCandidateQuoteResponse::Error(e)) => {
             Some(Err(Error::Protocol(format!(
                 "Merkle quote error from {peer_id}: {e}"
@@ -1341,7 +1382,9 @@ impl Client {
         //
         // A refusal outranks an ordinary failure for the same reason. If one
         // pool runs out of peers while another declares this client unable to
-        // settle, the second is the answer worth returning.
+        // settle, the second is the answer worth returning. Below it, a
+        // refusal of batch payments outranks a pool that heard nothing in
+        // time (`PoolVerdict`).
         let mut pools = Vec::with_capacity(midpoint_proofs.len());
         let mut verdict = PoolVerdict::default();
         while let Some(result) = pool_futures.next().await {
@@ -1615,6 +1658,7 @@ impl Client {
     ) -> Result<[MerklePaymentCandidateNode; CANDIDATES_PER_POOL]> {
         let mut valid: Vec<(PeerId, MerklePaymentCandidateNode)> = Vec::new();
         let mut failures: Vec<String> = Vec::new();
+        let mut batch_refusals = 0usize;
 
         while let Some((peer_id, result)) = futures.next().await {
             match result {
@@ -1695,6 +1739,13 @@ impl Client {
                     warn!("Merkle candidate {peer_id} refused this client's settlement version; awaiting corroboration");
                     failures.push(format!("{peer_id}: {e}"));
                 }
+                // Counted, so a pool that comes up short says the nodes
+                // refuse batches, whatever else failed (`short_pool_error`).
+                Err(e @ Error::BatchPaymentsRefused(_)) => {
+                    debug!("Merkle candidate {peer_id} refused batch payments");
+                    batch_refusals += 1;
+                    failures.push(format!("{peer_id}: {e}"));
+                }
                 Err(e) => {
                     debug!("Failed to get merkle candidate from {peer_id}: {e}");
                     failures.push(format!("{peer_id}: {e}"));
@@ -1703,11 +1754,7 @@ impl Client {
         }
 
         if valid.len() < CANDIDATES_PER_POOL {
-            return Err(Error::InsufficientPeers(format!(
-                "Got {} merkle candidates, need {CANDIDATES_PER_POOL}. Failures: [{}]",
-                valid.len(),
-                failures.join("; ")
-            )));
+            return Err(short_pool_error(valid.len(), batch_refusals, &failures));
         }
 
         let target_peer = PeerId::from_bytes(*target_address);
@@ -4050,5 +4097,113 @@ mod tests {
 
         // Every pool succeeded, so there is nothing to report.
         assert!(PoolVerdict::default().into_error().is_none());
+    }
+
+    /// A pool that heard darwin-node's refusal of batch payments reports it,
+    /// even when another pool failed first in an ordinary way, for example a
+    /// candidate that timed out before the nodes' answers arrived. A
+    /// settlement refusal still outranks it: that one stops every payment,
+    /// the batch refusal none.
+    #[test]
+    fn a_batch_refusal_outranks_an_ordinary_failure_and_not_a_settlement_refusal() {
+        let batch = || Error::BatchPaymentsRefused(BATCH_PAYMENTS_REFUSED.to_string());
+        let timeout = || Error::Timeout("Timeout waiting for merkle candidate".to_string());
+        let settlement = || Error::ClientUpdateRequired("run ant update".to_string());
+
+        // An ordinary failure first, the batch refusal after it.
+        let mut verdict = PoolVerdict::default();
+        verdict.note(timeout());
+        verdict.note(batch());
+        assert!(
+            matches!(verdict.into_error(), Some(Error::BatchPaymentsRefused(_))),
+            "a later batch refusal must outrank an earlier ordinary failure"
+        );
+
+        // The batch refusal first: an ordinary failure doesn't displace it.
+        let mut verdict = PoolVerdict::default();
+        verdict.note(batch());
+        verdict.note(Error::InsufficientPeers(
+            "Found 9 peers, need 16".to_string(),
+        ));
+        assert!(
+            matches!(verdict.into_error(), Some(Error::BatchPaymentsRefused(_))),
+            "an earlier batch refusal must not be displaced by a later failure"
+        );
+
+        // A settlement refusal outranks it, in either order.
+        for settlement_first in [true, false] {
+            let mut verdict = PoolVerdict::default();
+            if settlement_first {
+                verdict.note(settlement());
+                verdict.note(batch());
+            } else {
+                verdict.note(timeout());
+                verdict.note(batch());
+                verdict.note(settlement());
+            }
+            assert!(
+                matches!(verdict.into_error(), Some(Error::ClientUpdateRequired(_))),
+                "a settlement refusal must outrank a batch refusal (first: {settlement_first})"
+            );
+        }
+    }
+
+    /// darwin-node's refusal of a merkle candidate request comes back typed,
+    /// with the node's sentence, and as an answer: it is never retried in
+    /// the legacy request shape, and never taken for a settlement refusal.
+    /// Any other quote failure stays a protocol error.
+    #[test]
+    fn a_nodes_refusal_of_batch_payments_is_typed() {
+        let peer_id = PeerId::from_bytes([0x72; 32]);
+        let answer = |reason: &str| {
+            map_merkle_candidate_response(
+                peer_id,
+                ChunkMessageBody::MerkleCandidateQuoteResponse(
+                    MerkleCandidateQuoteResponse::Error(ProtocolError::QuoteFailed(
+                        reason.to_string(),
+                    )),
+                ),
+            )
+        };
+
+        match answer(BATCH_PAYMENTS_REFUSED) {
+            Some(Err(error @ Error::BatchPaymentsRefused(_))) => {
+                assert!(
+                    error.to_string().contains(BATCH_PAYMENTS_REFUSED),
+                    "{error}"
+                );
+                assert!(!is_version_unaware(&error), "an answer, not silence");
+            }
+            other => panic!("expected BatchPaymentsRefused, got {other:?}"),
+        }
+
+        let other = answer("rate limited");
+        assert!(matches!(other, Some(Err(Error::Protocol(_)))), "{other:?}");
+    }
+
+    /// A pool that came up short says the nodes refuse batches if any node
+    /// asked said so, whatever else failed, with every peer's failure; with
+    /// no refusal among them, it ran short of peers.
+    #[test]
+    fn a_short_pool_reports_a_batch_refusal_any_node_gave() {
+        let failures = vec![
+            "peer-a: timeout: Timeout waiting for merkle candidate from peer-a".to_string(),
+            format!("peer-b: batch payment refused: {BATCH_PAYMENTS_REFUSED}"),
+        ];
+        match short_pool_error(0, 1, &failures) {
+            Error::BatchPaymentsRefused(message) => {
+                assert!(message.contains(BATCH_PAYMENTS_REFUSED), "{message}");
+                assert!(message.contains("1 of the nodes asked"), "{message}");
+                assert!(message.contains("need 16"), "{message}");
+                assert!(message.contains("peer-a: timeout"), "{message}");
+            }
+            other => panic!("expected BatchPaymentsRefused, got {other:?}"),
+        }
+
+        let failures = vec!["peer-a: timeout".to_string()];
+        assert!(matches!(
+            short_pool_error(15, 0, &failures),
+            Error::InsufficientPeers(message) if message.contains("Got 15 merkle candidates")
+        ));
     }
 }

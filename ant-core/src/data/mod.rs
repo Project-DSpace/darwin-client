@@ -72,7 +72,7 @@ pub use client::file::{
 };
 pub use client::merkle::{
     finalize_merkle_batch, MerkleBatchPaymentResult, PaymentMode, PreparedMerkleBatch,
-    DEFAULT_MERKLE_THRESHOLD,
+    BATCH_PAYMENTS_REFUSED, DEFAULT_MERKLE_THRESHOLD,
 };
 pub use client::occupied::{OccupiedQuote, VaultRecord, MAX_OCCUPIED_REQUOTES, QUOTES_OCCUPIED};
 pub use client::pointer::{

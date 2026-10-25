@@ -200,6 +200,12 @@ told apart by the commit `darwin --version` prints. Upstream's entries follow.
 - `PaymentMode::Single` is the default of the library (`PaymentMode::default()`,
   `Client::file_upload`, `file_prepare_upload`) and of the browser API, so programs built on
   ant-core pay per chunk unless they ask for batches.
+- darwin-node's refusal of batch payments (`BATCH_PAYMENTS_REFUSED`, its own sentence) comes back
+  typed, as `Error::BatchPaymentsRefused`, when a candidate pool can't fill because a node asked
+  refused: before anything is paid, and ranked above a pool that heard no answer in time, so a
+  timeout or a short lookup no longer hides it. `PaymentMode::Auto` and the external signer's
+  prepare pay per chunk instead, as for a network too small for a batch; a forced
+  `PaymentMode::Merkle` fails with it. It is not a settlement refusal and sets no latch.
 - Reads of payments fall back to other RPCs, and uploads recover a payment the RPC errored on.
 - Records paid one at a time recover a payment the RPC errored on, as uploads do:
   `darwin chunk put`, `darwin pointer create`, `update` and `transfer`, and the data maps
