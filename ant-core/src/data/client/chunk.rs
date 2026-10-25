@@ -263,6 +263,17 @@ fn classify_put_failure(error: &Error) -> PutRejection {
     }
 }
 
+/// Whether `error`, a close-group store's ([`Client::chunk_put_to_close_group`]),
+/// says that every storer that failed refused the payment proof: each
+/// answered that the payment wasn't enough or wasn't found
+/// ([`PutRejection::PriceFloor`]), none timed out, none was out of reach and
+/// none refused for another reason (such as being full). A proof paid by an
+/// earlier run that storers refuse so is paid again, once: the decision
+/// rests on the kind of each answer, never on its text.
+pub(crate) fn proof_refused(error: &Error) -> bool {
+    matches!(classify_put_failure(error), PutRejection::PriceFloor)
+}
+
 /// Decide the error for a close-group store that fell short of quorum.
 ///
 /// Only genuine local backpressure should push the store AIMD limiter down.
@@ -602,9 +613,34 @@ impl Client {
         match paid {
             #[cfg(feature = "native")]
             Ok(paid) => {
-                let stored = self
-                    .chunk_put_to_close_group(content, paid.proof.clone(), &paid.put_peers)
-                    .await?;
+                let stored = match self
+                    .chunk_put_to_close_group(content.clone(), paid.proof.clone(), &paid.put_peers)
+                    .await
+                {
+                    // Every storer refused the proof an earlier attempt
+                    // paid: pay once more, at once, rather than stall.
+                    Err(error) if paid.reused && proof_refused(&error) => {
+                        warn!(
+                            "every storer that failed to store chunk {} refused the proof an \
+                             earlier attempt paid for it ({error}); paying for it again",
+                            hex::encode(address)
+                        );
+                        paid.refused()?;
+                        let paid = match self
+                            .pay_for_record(&address, &address, data_size, CHUNK_DATA_TYPE)
+                            .await
+                        {
+                            Err(Error::AlreadyStored) => return Ok(address),
+                            paid => paid?,
+                        };
+                        let stored = self
+                            .chunk_put_to_close_group(content, paid.proof.clone(), &paid.put_peers)
+                            .await?;
+                        paid.stored();
+                        return Ok(stored);
+                    }
+                    stored => stored?,
+                };
                 paid.stored();
                 Ok(stored)
             }
@@ -710,12 +746,18 @@ impl Client {
         let mut other_remote = 0usize;
         let mut timeout = 0usize;
         let mut dial = 0usize;
-        let mut first_app_rejection: Option<Error> = None;
+        // The first application-level decline that isn't a payment
+        // refusal, and the first that is: the representative error prefers
+        // the first, so a payment refusal surfaces only when every decline
+        // was one ([`proof_refused`]).
+        let mut first_other_rejection: Option<Error> = None;
+        let mut first_payment_refusal: Option<Error> = None;
 
         for ((peer_id, _), error) in outcome.failures {
             warn!("Failed to store chunk on {peer_id}: {error}");
             failures.push(format!("{peer_id}: {error}"));
-            match classify_put_failure(&error) {
+            let kind = classify_put_failure(&error);
+            match kind {
                 PutRejection::Full => full += 1,
                 PutRejection::PriceFloor => price_floor += 1,
                 PutRejection::OtherRemote => other_remote += 1,
@@ -726,12 +768,18 @@ impl Client {
             // rejection) or `Error::Payment` (`PaymentRequired`): capture the
             // first so an all-application shortfall surfaces as
             // `ApplicationError`, not `InsufficientPeers` (`NetworkError`).
-            if matches!(error, Error::RemotePut { .. } | Error::Payment(_))
-                && first_app_rejection.is_none()
-            {
-                first_app_rejection = Some(error);
+            if matches!(error, Error::RemotePut { .. } | Error::Payment(_)) {
+                let first = if matches!(kind, PutRejection::PriceFloor) {
+                    &mut first_payment_refusal
+                } else {
+                    &mut first_other_rejection
+                };
+                if first.is_none() {
+                    *first = Some(error);
+                }
             }
         }
+        let first_app_rejection = first_other_rejection.or(first_payment_refusal);
 
         if outcome.reached {
             debug!(
@@ -1468,6 +1516,31 @@ mod tests {
             classify_put_failure(&Error::Network("dial failed".to_string())),
             PutRejection::Dial
         ));
+    }
+
+    /// Only a payment refusal says the proof was refused: a full storer,
+    /// another rejection, a timeout or a shortfall from churn don't.
+    #[test]
+    fn only_a_payment_refusal_says_the_proof_was_refused() {
+        let remote = |source| Error::RemotePut {
+            address: "test-addr".to_string(),
+            source,
+        };
+        assert!(proof_refused(&Error::Payment(
+            "Payment required: more".into()
+        )));
+        assert!(proof_refused(&remote(ProtocolError::PaymentFailed(
+            "not paid".into()
+        ))));
+        assert!(!proof_refused(&remote(ProtocolError::StorageFailed(
+            "full".into()
+        ))));
+        assert!(!proof_refused(&remote(ProtocolError::Internal(
+            "boom".into()
+        ))));
+        assert!(!proof_refused(&Error::Timeout("no response".into())));
+        assert!(!proof_refused(&Error::InsufficientPeers("short".into())));
+        assert!(!proof_refused(&Error::CloseGroupShortfall("churn".into())));
     }
 
     #[test]

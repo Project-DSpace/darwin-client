@@ -28,13 +28,14 @@
 //! What can't be restored is never deleted: the error names the file and
 //! says to keep it, since it may hold a payment that is still to be settled.
 
-use super::upload_state::{UploadState, CHECKPOINT_MAGIC};
+use super::upload_state::{UploadState, CHECKPOINT_MAGIC, UNRESUMED_PROOFS_BACKSTOP};
 use crate::data::error::{Error, Result};
 use ant_protocol::XorName;
 use std::collections::HashMap;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+use std::time::SystemTime;
 use tracing::{info, warn};
 
 /// The extension of a checkpoint's main file.
@@ -335,6 +336,104 @@ fn write_whole(path: &Path, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
+/// How often a process looks through a directory of checkpoints for those
+/// [`remove_unresumed`] removes: at most once an hour, so a server opening
+/// many uploads doesn't read the whole directory for each.
+const UNRESUMED_SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60 * 60);
+
+/// Remove the checkpoints in `directory` that no upload has touched for
+/// [`UNRESUMED_PROOFS_BACKSTOP`]: the proofs of uploads never resumed. One
+/// holding a pending payment is kept whatever its age, as is one whose lock
+/// is held, or one this client can't read. Its lock file stays, as the
+/// engine leaves locks. A process does this for a directory at most once
+/// every [`UNRESUMED_SWEEP_INTERVAL`]. Returns how many checkpoints were
+/// removed.
+pub(crate) fn remove_unresumed(directory: &Path) -> usize {
+    static SWEPT: Mutex<Option<HashMap<PathBuf, std::time::Instant>>> = Mutex::new(None);
+    {
+        let mut swept = SWEPT
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let swept = swept.get_or_insert_with(HashMap::new);
+        let now = std::time::Instant::now();
+        if swept
+            .get(directory)
+            .is_some_and(|at| now.duration_since(*at) < UNRESUMED_SWEEP_INTERVAL)
+        {
+            return 0;
+        }
+        swept.insert(directory.to_path_buf(), now);
+    }
+    remove_unresumed_before(directory, SystemTime::now() - UNRESUMED_PROOFS_BACKSTOP)
+}
+
+/// [`remove_unresumed`], for checkpoints last written before `before`.
+pub(crate) fn remove_unresumed_before(directory: &Path, before: SystemTime) -> usize {
+    let Ok(entries) = std::fs::read_dir(directory) else {
+        return 0;
+    };
+    let mut removed = 0;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let is_checkpoint = path.extension().is_some_and(|e| e == CHECKPOINT_EXTENSION)
+            && path.file_stem().is_some_and(|stem| {
+                let stem = stem.to_string_lossy();
+                stem.len() == 64 && stem.bytes().all(|b| b.is_ascii_hexdigit())
+            });
+        if !is_checkpoint {
+            continue;
+        }
+        let files = [
+            path.clone(),
+            path.with_extension(PROOFS_EXTENSION),
+            path.with_extension("salt"),
+        ];
+        let untouched = files.iter().all(|file| match std::fs::metadata(file) {
+            Ok(metadata) => metadata.modified().is_ok_and(|at| at < before),
+            Err(error) => error.kind() == std::io::ErrorKind::NotFound,
+        });
+        if !untouched {
+            continue;
+        }
+        let Ok(lock) = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(path.with_extension("lock"))
+        else {
+            continue;
+        };
+        if fs2::FileExt::try_lock_exclusive(&lock).is_err() {
+            continue;
+        }
+        let pending = std::fs::read(&path)
+            .map_err(Error::Io)
+            .and_then(|bytes| UploadState::parse(&bytes))
+            .map(|parsed| parsed.state.pending_payment.is_some());
+        match pending {
+            Ok(false) => {
+                info!(
+                    "Removing the upload checkpoint {}, untouched for {} days",
+                    path.display(),
+                    UNRESUMED_PROOFS_BACKSTOP.as_secs() / 86_400
+                );
+                for file in files {
+                    let _ = std::fs::remove_file(file);
+                }
+                removed += 1;
+            }
+            Ok(true) => {}
+            Err(error) => warn!(
+                "Keeping the old upload checkpoint {}, which can't be read: {error}",
+                path.display()
+            ),
+        }
+        drop(lock);
+    }
+    removed
+}
+
 /// Whether `bytes` start as a checkpoint in the current format.
 #[must_use]
 pub fn is_current_format(bytes: &[u8]) -> bool {
@@ -346,7 +445,7 @@ pub fn is_current_format(bytes: &[u8]) -> bool {
 mod tests {
     use super::super::upload_state::test_state::{plan, plan_priced, transactions, weighted};
     use super::*;
-    use std::time::SystemTime;
+    use std::time::Duration;
 
     fn now() -> SystemTime {
         crate::runtime::system_time()
@@ -527,6 +626,40 @@ mod tests {
                 saved.payment.total_amount()
             );
         }
+    }
+
+    /// The backstop removes checkpoints untouched for 30 days, but never
+    /// one with a pending payment, one in use, or one it can't read.
+    #[test]
+    fn the_backstop_removes_only_old_unpending_checkpoints() {
+        let dir = tempfile::tempdir().unwrap();
+        let write = |fill: u8, state: &UploadState| {
+            let path = dir
+                .path()
+                .join(format!("{}.msgpack", hex::encode([fill; 32])));
+            let (files, _) = UploadCheckpointFiles::open(path.clone()).unwrap();
+            files.save(state).unwrap();
+            path
+        };
+        let old_paid = write(1, &state_with(&[b"a"], None));
+        let old_pending = write(2, &state_with(&[b"b"], Some(b"c")));
+        let in_use = write(3, &state_with(&[b"d"], None));
+        let unreadable = dir.path().join(format!("{}.msgpack", hex::encode([4; 32])));
+        std::fs::write(&unreadable, b"DSCK\x09").unwrap();
+        let held = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(in_use.with_extension("lock"))
+            .unwrap();
+        fs2::FileExt::lock_exclusive(&held).unwrap();
+        // Nothing is old enough yet.
+        assert_eq!(remove_unresumed(dir.path()), 0);
+        let later = SystemTime::now() + Duration::from_secs(60);
+        assert_eq!(remove_unresumed_before(dir.path(), later), 1);
+        assert!(!old_paid.exists() && !old_paid.with_extension(PROOFS_EXTENSION).exists());
+        assert!(old_pending.exists() && old_pending.with_extension(PROOFS_EXTENSION).exists());
+        assert!(in_use.exists() && unreadable.exists());
     }
 
     /// The files of a checkpoint, as a server removing ended uploads lists

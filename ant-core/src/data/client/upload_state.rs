@@ -29,6 +29,14 @@
 //! and its record quoted again. A plan named by a pending payment may have
 //! been shown to a payer: it is never dropped, and the whole checkpoint is
 //! refused instead. So is a checkpoint with a bad signature or identity.
+//!
+//! # Paid proofs
+//!
+//! A paid single-node proof has no age limit: it is kept until its record is
+//! stored. The upload decides whether to reuse it by where its paid node
+//! stands in a fresh lookup, and by whether storers take it, never by its
+//! age. An unpaid plan keeps its age limit ([`UploadState::retained_plan`]),
+//! and a Merkle proof its one-week check.
 
 use super::batch::{
     build_plan_proof, proof_is_safely_fresh, ChunkPaymentPlan, PaidChunk, PreparedChunk,
@@ -78,6 +86,13 @@ impl BrowserSnapshot<'_> {
 
 /// The format version that follows [`CHECKPOINT_MAGIC`].
 pub const CHECKPOINT_FORMAT: u8 = 1;
+
+/// How long the proofs of an upload that is never resumed are kept: a
+/// checkpoint, or a cached receipt, untouched for this long, and holding no
+/// pending payment, is removed. Claude's proposal (2026-10-24): paid proofs
+/// are kept until stored, and this bounds what a client keeps for uploads
+/// abandoned for good.
+pub const UNRESUMED_PROOFS_BACKSTOP: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 
 /// A payment may have reached the wallet or chain. Never submit it again merely
 /// because receipt parsing or observation failed.
@@ -178,6 +193,10 @@ pub(crate) struct Parsed {
 }
 
 /// Native proof expiry, shared by every client adapter.
+///
+/// A paid single-node proof is reusable whatever its age, as long as it is
+/// one for `address`: it is kept until its record is stored. A Merkle proof
+/// keeps its one-week check.
 pub fn reusable_proof(address: &XorName, bytes: &[u8], now: SystemTime) -> bool {
     if let Ok(proof) = ant_protocol::payment::deserialize_merkle_proof(bytes) {
         return proof.address.0 == *address
@@ -196,14 +215,30 @@ pub fn reusable_proof(address: &XorName, bytes: &[u8], now: SystemTime) -> bool 
             .peer_quotes
             .iter()
             .all(|(_, quote)| quote.content.0 == *address)
-        && proof_is_safely_fresh(
-            &proof,
-            now,
-            Duration::from_secs(
-                super::batch::CACHED_PROOF_MAX_AGE_SECS
-                    - super::batch::CACHED_PROOF_SAFETY_MARGIN_SECS,
-            ),
-        )
+}
+
+/// The node a single-node proof paid: the issuer of its one quote with a
+/// non-zero amount under the single-node rule (the median). `None` for a
+/// Merkle proof or one that can't be read.
+pub(crate) fn paid_node(bytes: &[u8]) -> Option<[u8; 32]> {
+    if ant_protocol::payment::deserialize_merkle_proof(bytes).is_ok() {
+        return None;
+    }
+    let (proof, _) = deserialize_proof(bytes).ok()?;
+    let payment = SingleNodeQuotePayment::from_quotes(
+        proof
+            .peer_quotes
+            .iter()
+            .map(|(_, quote)| quote.clone())
+            .collect(),
+    )
+    .ok()?;
+    let paid = payment.quotes.iter().find(|q| !q.amount.is_zero())?;
+    proof
+        .peer_quotes
+        .iter()
+        .find(|(_, quote)| quote.hash() == paid.quote_hash)
+        .map(|(peer, _)| *peer.as_bytes())
 }
 
 pub(crate) fn merkle_fresh(timestamp: u64, now: SystemTime) -> bool {
@@ -335,7 +370,9 @@ impl UploadState {
         self.proofs.insert(address, bytes);
     }
 
-    /// Forget the proof of `address`, and return it.
+    /// Forget the proof of `address`, so the record is quoted and paid
+    /// again: its paid node has left the storers' width, or every storer
+    /// refused it. Returns it.
     pub(crate) fn drop_proof(&mut self, address: &XorName) -> Option<Vec<u8>> {
         self.proof_serials.remove(address);
         self.proofs.remove(address)
@@ -436,6 +473,8 @@ impl UploadState {
 
     /// Reuse a previously prepared plan after a wallet callback was interrupted.
     /// Paid records are re-discovered so current storage targets replace stale ones.
+    ///
+    /// An unpaid plan keeps its age limit: its quotes are only an offer.
     pub fn retained_plan(
         &self,
         address: &XorName,
@@ -468,7 +507,8 @@ impl UploadState {
         self.plans.insert(plan.address, plan);
     }
 
-    /// Whether a confirmed proof that is still usable covers this record.
+    /// Whether a confirmed proof that is still usable covers this record:
+    /// a single-node one whatever its age, a Merkle one within its week.
     pub fn is_paid(&self, address: &XorName, now: SystemTime) -> bool {
         self.proofs
             .get(address)
@@ -912,7 +952,8 @@ mod tests {
     }
 
     /// Two plans are confirmed together or not at all, by one transaction
-    /// each, and a paid proof is only for its own record.
+    /// each; a paid proof stays paid whatever its age, and only for its own
+    /// record.
     #[test]
     fn confirmation_is_atomic_and_supports_distinct_transactions() {
         let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
@@ -928,6 +969,7 @@ mod tests {
         state.confirm(&[a.address, b.address], &txs, now).unwrap();
         assert!(state.is_paid(&a.address, now));
         assert!(state.is_paid(&b.address, now));
+        assert!(state.is_paid(&a.address, now + Duration::from_secs(40 * 24 * 60 * 60)));
         assert!(!reusable_proof(&b.address, &state.proofs[&a.address], now));
     }
 
@@ -943,6 +985,68 @@ mod tests {
         // Named by a pending payment, the whole checkpoint is refused.
         state.start_payment(false, vec![a.address]).unwrap();
         assert!(UploadState::restore(&state.checkpoint().unwrap()).is_err());
+    }
+
+    /// A paid proof is kept and reused whatever its age; an unpaid plan
+    /// past its age is quoted again.
+    #[test]
+    fn a_paid_proof_has_no_age_and_an_unpaid_plan_keeps_its_own() {
+        let issued = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+        let old = plan(b"kept upload", issued);
+        let mut state = UploadState::default();
+        state.prepare(old.clone());
+        state
+            .confirm(&[old.address], &transactions(&old), issued)
+            .unwrap();
+        let evidence = state.proof(&old.address).cloned().unwrap();
+        let now = issued + Duration::from_secs(25 * 60 * 60);
+        let state = UploadState::restore(&state.checkpoint().unwrap()).unwrap();
+        assert!(state.is_paid(&old.address, now), "25 hours on, still paid");
+        assert_eq!(state.proof(&old.address), Some(&evidence));
+        // Stored with it, at the targets a fresh lookup names, with no new
+        // payment: the proof sent is the one paid.
+        let content = Bytes::from_static(b"kept upload");
+        let refreshed = plan(&content, now).with_content(content).unwrap();
+        assert_eq!(
+            state.reuse_prepared(&refreshed, now).unwrap().proof_bytes,
+            evidence
+        );
+        assert!(state
+            .retained_plan(&old.address, old.data_size, now)
+            .is_none());
+
+        let unpaid = plan(b"unpaid upload", issued);
+        let mut state = UploadState::default();
+        state.prepare(unpaid.clone());
+        assert!(state
+            .retained_plan(&unpaid.address, unpaid.data_size, issued)
+            .is_some());
+        assert!(state
+            .retained_plan(&unpaid.address, unpaid.data_size, now)
+            .is_none());
+    }
+
+    /// The paid node is the issuer of the median quote.
+    #[test]
+    fn the_paid_node_is_the_median_quotes_issuer() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+        let three = plan_priced(b"three quotes", now, &[30, 10, 20]);
+        let mut state = UploadState::default();
+        state.prepare(three.clone());
+        state
+            .confirm(&[three.address], &transactions(&three), now)
+            .unwrap();
+        let median = three
+            .peer_quotes
+            .iter()
+            .find(|(_, quote)| quote.price == Amount::from(20))
+            .map(|(peer, _)| *peer.as_bytes())
+            .unwrap();
+        assert_eq!(
+            paid_node(state.proof(&three.address).unwrap()),
+            Some(median)
+        );
+        assert_eq!(paid_node(b"not a proof"), None);
     }
 
     /// A checkpoint starts with the magic and its format, and the format

@@ -53,7 +53,10 @@ pub(super) struct RecordCheckpoint {
 impl RecordCheckpoint {
     /// Open the checkpoint of `payer`'s payment for the record at `address`
     /// on `network`, in `directory`: wait for its lock, and read the state an
-    /// earlier attempt saved (an empty one if there was none).
+    /// earlier attempt saved (an empty one if there was none). Once the lock
+    /// is held, other records' checkpoints untouched for 30 days with no
+    /// pending payment are removed
+    /// ([`remove_unresumed`](super::upload_checkpoint::remove_unresumed)).
     pub(super) async fn open(
         directory: &Path,
         network: &Network,
@@ -81,6 +84,7 @@ impl RecordCheckpoint {
         })
         .await
         .map_err(|e| Error::Io(std::io::Error::other(e.to_string())))??;
+        super::upload_checkpoint::remove_unresumed(&directory);
         let (files, state) = super::upload_checkpoint::UploadCheckpointFiles::open(path)?;
         Ok((Self { files, _lock: lock }, state.unwrap_or_default()))
     }

@@ -1321,6 +1321,10 @@ fn upload_checkpoint_scope(
 /// (`payer`) too, so payers uploading the same file neither resume each
 /// other's payments nor wait on each other's lock, which an upload holds
 /// while it waits for its payment.
+///
+/// Once this upload's lock is held, the checkpoints of other uploads left
+/// untouched for 30 days with no pending payment are removed
+/// ([`remove_unresumed`](super::super::upload_checkpoint::remove_unresumed)).
 async fn open_upload_checkpoint(
     network: &ant_protocol::evm::Network,
     records: &[super::super::upload::UploadRecord],
@@ -1358,6 +1362,7 @@ async fn open_upload_checkpoint(
     })
     .await
     .map_err(|e| Error::Io(std::io::Error::other(e.to_string())))??;
+    super::super::upload_checkpoint::remove_unresumed(&cache_dir);
     let (files, saved) = super::super::upload_checkpoint::UploadCheckpointFiles::open(cache_path)?;
     Ok((files, lock, saved))
 }
@@ -3592,6 +3597,7 @@ impl Client {
             .await;
         result.stored.extend(last.stored);
         result.failed.extend(last.failed);
+        result.refused.extend(last.refused);
         result.chunk_attempts_total += last.chunk_attempts_total;
         result.store_durations_ms.extend(last.store_durations_ms);
         result.retries_per_chunk.extend(last.retries_per_chunk);
@@ -4826,6 +4832,7 @@ mod tests {
         let wave_result = WaveResult {
             stored: vec![a],
             failed: Vec::new(),
+            refused: Vec::new(),
             chunk_attempts_total: 1,
             store_durations_ms: vec![5],
             retries_per_chunk: vec![0],
@@ -4861,6 +4868,7 @@ mod tests {
         let wave_result = WaveResult {
             stored: vec![a],
             failed: vec![(b, "quorum".into()), (c, "quorum".into())],
+            refused: Vec::new(),
             chunk_attempts_total: 3,
             store_durations_ms: vec![5],
             retries_per_chunk: vec![0],
@@ -4917,6 +4925,7 @@ mod tests {
                 occupied[0].clone(),
                 (e, crate::data::client::upload::HELD_BACK.into()),
             ],
+            refused: Vec::new(),
             chunk_attempts_total: 1,
             store_durations_ms: vec![5],
             retries_per_chunk: vec![0],

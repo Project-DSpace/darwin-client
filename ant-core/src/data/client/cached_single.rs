@@ -33,8 +33,8 @@
 //!   remove the receipt so a future re-upload of the same path pays
 //!   anew.
 //! * **cleanup_outdated** — called opportunistically inside
-//!   `load_for_file` to garbage-collect receipts past the expiry
-//!   window.
+//!   `load_for_file` to remove the receipts of uploads never resumed:
+//!   untouched for the backstop (below).
 //!
 //! Filename format
 //! ---------------
@@ -46,10 +46,13 @@
 //!
 //! Expiry
 //! ------
-//! On-chain quote receipts have a finite validity window
-//! (`QUOTE_MAX_AGE_SECS` in `ant-node`, currently 24 h). After that,
-//! storers reject the proof even if the file is otherwise resumable.
-//! The cache uses a conservative 24 h expiry to match.
+//! A paid proof has no age limit: it is kept until its chunk is stored,
+//! as the upload checkpoint keeps it (darwin-node accepts an old paid
+//! quote; it has no `QUOTE_MAX_AGE_SECS`). A receipt goes once its upload
+//! completes; one never resumed goes once untouched for
+//! [`UNRESUMED_PROOFS_BACKSTOP`] (30 days). Its file name carries the time
+//! of its latest wave, so a resumed upload that pays another wave starts
+//! the count again.
 //!
 //! Failure-mode tolerance
 //! ----------------------
@@ -74,6 +77,7 @@
 //! reported problem the right fix is a per-host instance lock on
 //! `payments/single/.exclusive` at the daemon level.
 
+use super::upload_state::UNRESUMED_PROOFS_BACKSTOP;
 use crate::config;
 use crate::error::Result;
 use ant_protocol::evm::Amount;
@@ -86,12 +90,10 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{debug, info, warn};
 
-/// Cached single-node receipts older than this are removed from disk.
-///
-/// Conservative match for `QUOTE_MAX_AGE_SECS` in `ant-node` (24 h).
-/// After that window, storers will reject the cached proof even if
-/// the file is otherwise resumable, so keeping the cache wouldn't help.
-const PAYMENT_EXPIRATION_SECS: u64 = 24 * 60 * 60;
+/// Cached single-node receipts untouched for longer than this, the
+/// receipts of uploads never resumed, are removed from disk
+/// ([`UNRESUMED_PROOFS_BACKSTOP`]).
+const PAYMENT_EXPIRATION_SECS: u64 = UNRESUMED_PROOFS_BACKSTOP.as_secs();
 
 /// Subdirectory under the platform-appropriate data dir.
 ///
@@ -122,8 +124,7 @@ pub struct SingleNodeReceipt {
     pub version: u8,
     /// Per-chunk serialized `PaymentProof` bytes, keyed by content address.
     pub proofs: HashMap<[u8; 32], Vec<u8>>,
-    /// Unix timestamp (seconds) the first wave was paid. Used for the
-    /// 24 h expiry check.
+    /// Unix timestamp (seconds) the first wave was paid.
     pub first_pay_timestamp: u64,
     /// Cumulative storage cost in atto, summed across all paid waves.
     pub storage_cost_atto: String,
@@ -191,18 +192,17 @@ fn receipt_path(dir: &Path, ts: u64, key: &str) -> PathBuf {
 ///
 /// Why the filename rotates on every append
 /// ----------------------------------------
-/// The 24-hour TTL is enforced by parsing the timestamp prefix from
+/// The backstop TTL is enforced by parsing the timestamp prefix from
 /// the canonical filename (`cleanup_outdated` + `is_expired_filename`).
 /// If we kept the original filename across waves, a receipt holding a
-/// wave paid 23 h ago plus a wave paid 1 minute ago would be deleted
-/// wholesale at the 24-hour mark — stranding the fresh wave's
-/// payment. Rotating the filename to `<now>_<key>` on every successful
-/// append makes the on-disk TTL track "time since most recent paid
-/// wave" instead of "time since first wave", matching the semantic
+/// wave paid long ago plus a wave paid 1 minute ago would be deleted
+/// wholesale when the first reached the backstop — stranding the fresh
+/// wave's payment. Rotating the filename to `<now>_<key>` on every
+/// successful append makes the on-disk TTL track "time since most recent
+/// paid wave" instead of "time since first wave", matching the semantic
 /// users expect: the cache survives as long as it keeps being used.
-/// Individual stale proofs inside the receipt are pruned by
-/// `prune_locally_expired_proofs` in `batch.rs`, which checks each
-/// `quote.timestamp` against the storer's per-quote budget.
+/// Proofs inside the receipt are never dropped for their age;
+/// `readable_cached_proofs` in `batch.rs` drops only unreadable ones.
 ///
 /// Atomicity & concurrency
 /// -----------------------
@@ -730,7 +730,7 @@ fn find_existing(dir: &Path, key: &str) -> Result<Option<(PathBuf, SingleNodeRec
             }
             Err(e) => {
                 // Unlink so corrupt receipts can't accumulate on
-                // disk for up to 24 h (the filename-timestamp
+                // disk until the backstop (the filename-timestamp
                 // expiry doesn't reap them — only the canonical
                 // timestamp is checked, and a corrupt-but-recent
                 // receipt would be silently kept). Callers always
@@ -1777,5 +1777,26 @@ mod tests {
         assert!(!canonical.exists(), "rejected receipt must be unlinked");
 
         Ok(())
+    }
+
+    /// A receipt is kept whatever the age of its proofs, until untouched
+    /// for the 30-day backstop: one last touched 25 hours ago, or 29 days
+    /// ago, stays.
+    #[test]
+    fn a_receipt_is_kept_until_the_backstop() {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        assert_eq!(PAYMENT_EXPIRATION_SECS, 30 * 24 * 60 * 60);
+        assert!(!is_expired_filename(&format!("{}_abc", now - 25 * 60 * 60)));
+        assert!(!is_expired_filename(&format!(
+            "{}_abc",
+            now - 29 * 24 * 60 * 60
+        )));
+        assert!(is_expired_filename(&format!(
+            "{}_abc",
+            now - 31 * 24 * 60 * 60
+        )));
     }
 }

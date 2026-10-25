@@ -18,7 +18,7 @@ use crate::data::client::quote::median_paid_quote_issuer;
 #[cfg(feature = "native")]
 use crate::data::client::upload::{validate_payment_total, UploadPayment};
 #[cfg(feature = "native")]
-use crate::data::client::upload_state::{reusable_proof, UploadState};
+use crate::data::client::upload_state::{paid_node, reusable_proof, UploadState};
 use crate::data::client::Client;
 use crate::data::error::{Error, Result};
 #[cfg(not(feature = "native"))]
@@ -47,6 +47,10 @@ pub(crate) struct PaidRecord {
     /// pointer state an earlier attempt paid for: its write looks up the
     /// close group itself.
     pub(crate) put_peers: Vec<(PeerId, Vec<MultiAddr>)>,
+    /// Whether the proof is one an earlier attempt paid, kept in the
+    /// checkpoint: if every storer refuses it, the record is paid again
+    /// ([`Self::refused`]).
+    pub(crate) reused: bool,
     checkpoint: RecordCheckpoint,
 }
 
@@ -55,6 +59,17 @@ impl PaidRecord {
     /// The record is stored: its checkpoint, and the proof kept in it, go.
     pub(crate) fn stored(self) {
         self.checkpoint.finish();
+    }
+
+    /// Every storer that failed to store the record refused its proof, one
+    /// an earlier attempt paid ([`Self::reused`]): forget the proof, so the
+    /// next payment for the record pays again rather than reuse it.
+    ///
+    /// # Errors
+    ///
+    /// If the checkpoint can't be written.
+    pub(crate) fn refused(self) -> Result<()> {
+        self.checkpoint.save(&UploadState::default())
     }
 
     /// Hand the proof and the PUT targets to a caller that stores the record
@@ -237,10 +252,11 @@ impl Client {
             ))
             .await;
             match settled {
-                Ok((proof, put_peers)) => {
+                Ok((proof, put_peers, reused)) => {
                     return Ok(PaidRecord {
                         proof,
                         put_peers,
+                        reused,
                         checkpoint,
                     })
                 }
@@ -276,8 +292,12 @@ impl Client {
     /// the chain, never paid again; a proof still fresh enough to store is
     /// reused; otherwise the record is quoted and paid, and the paid quote is
     /// read back and the record quoted and paid again if someone recorded it
-    /// first, up to [`MAX_OCCUPIED_REQUOTES`] times. Returns the proof and
-    /// the PUT targets.
+    /// first, up to [`MAX_OCCUPIED_REQUOTES`] times. Returns the proof, the
+    /// PUT targets, and whether the proof is one an earlier attempt paid.
+    ///
+    /// A kept proof has no age limit: a chunk's is reused while its paid
+    /// node is among the [`PUT_TARGET_WIDTH`](crate::quote_policy::PUT_TARGET_WIDTH)
+    /// nearest storers a fresh quote names, and paid again otherwise.
     #[cfg(feature = "native")]
     async fn settle_record(
         &self,
@@ -287,7 +307,7 @@ impl Client {
         data_type: u32,
         state: &mut UploadState,
         checkpoint: &RecordCheckpoint,
-    ) -> Result<(Vec<u8>, Vec<(PeerId, Vec<MultiAddr>)>)> {
+    ) -> Result<(Vec<u8>, Vec<(PeerId, Vec<MultiAddr>)>, bool)> {
         let mut history = Vec::new();
         if state.pending_payment.is_some() {
             history = self
@@ -315,7 +335,24 @@ impl Client {
             } else {
                 Vec::new()
             };
-            return Ok((proof, put_peers));
+            let paid_outside = data_type == ant_protocol::DATA_TYPE_CHUNK
+                && paid_node(&proof).is_some_and(|paid| {
+                    !put_peers
+                        .iter()
+                        .take(crate::quote_policy::PUT_TARGET_WIDTH)
+                        .any(|(peer, _)| *peer.as_bytes() == paid)
+                });
+            if !paid_outside {
+                return Ok((proof, put_peers, true));
+            }
+            info!(
+                "the node an earlier attempt paid for {} is no longer among its {} nearest \
+                 storers; paying for it again",
+                hex::encode(content),
+                crate::quote_policy::PUT_TARGET_WIDTH
+            );
+            state.drop_proof(content);
+            checkpoint.save(state)?;
         }
         for requote in 0..=MAX_OCCUPIED_REQUOTES {
             let (plan, payment) = self
@@ -323,7 +360,7 @@ impl Client {
                 .await?;
             let occupied = self.occupied_quotes(std::slice::from_ref(&plan)).await;
             if let Some(proof) = confirm_record(&plan, &payment, &occupied, state, checkpoint)? {
-                return Ok((proof, plan.quoted_peers));
+                return Ok((proof, plan.quoted_peers, false));
             }
             history.extend(occupied);
             if requote < MAX_OCCUPIED_REQUOTES {
@@ -720,18 +757,25 @@ mod tests {
         assert!(checkpoints(directory.path()).is_empty());
     }
 
-    /// A kept proof too old for nodes to take is not used: the state is
-    /// quoted and paid again, which this client can't do.
+    /// A kept proof has no age limit: one paid 25 hours ago is reused, with
+    /// nothing asked of the network or the chain, as darwin-node takes it
+    /// (its `test_old_quote_uses_storage_delta_not_timestamp`). Refused by
+    /// every storer, it is forgotten, and the state quoted and paid again,
+    /// which this client can't do.
     #[tokio::test]
-    async fn a_kept_proof_too_old_to_store_is_not_reused() {
+    async fn a_kept_proof_is_reused_whatever_its_age_until_refused() {
         let directory = tempfile::tempdir().unwrap();
         let (client, _node) = offline_client().await;
         let record = pointer();
         let issued = crate::runtime::system_time() - Duration::from_secs(25 * 60 * 60);
-        kept_proof(&client, directory.path(), &record, issued).await;
+        let kept = kept_proof(&client, directory.path(), &record, issued).await;
+        let paid = pay(&client, directory.path(), &record)
+            .await
+            .expect("the 25-hour-old proof, with no new quote and no payment");
+        assert_eq!(paid.proof, kept);
+        assert!(paid.reused);
+        paid.refused().unwrap();
         assert!(pay(&client, directory.path(), &record).await.is_err());
-        // The old proof, evidence of the earlier payment, stays.
-        assert_eq!(checkpoints(directory.path()).len(), 1);
     }
 
     /// An attempt that fails holding neither a journal nor a proof, such as
