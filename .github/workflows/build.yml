@@ -162,11 +162,12 @@ jobs:
       - name: Vendored ant-protocol
         run: cargo test --locked --manifest-path vendor/ant-protocol/Cargo.toml --target-dir target
 
-      # darwin-nodes, the storage-node image's node manager, is built beside
-      # `darwin` (one more link) and checked as built for release, where the
-      # linker leaves out code it never reaches: ant-cli/tests/darwin_nodes.rs
-      # checks the same strings in the test build. The image ships its own
-      # release build of it, from the darwin-client commit darwin-node pins.
+      # Only darwin-node's image build ships darwin-nodes, the storage-node
+      # image's node manager, from the darwin-client commit it pins. This
+      # build makes it beside `darwin` (one more link) only to check it as
+      # built for release, where the linker leaves out code it never reaches
+      # (scripts/check-darwin-nodes.sh; ant-cli/tests/darwin_nodes.rs checks
+      # the same strings in the test build), and never packages it.
       - name: Build
         run: cargo build --release --locked -p ant-cli --bin darwin --bin darwin-nodes
 

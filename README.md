@@ -687,10 +687,11 @@ earlier build are managed with Autonomi's `ant`.
 
 ### `darwin-nodes` — the storage-node image's node manager
 
-A second binary of `ant-cli`, built for the storage-node image only: darwin-node's image build
+A second binary of `ant-cli`, for the storage-node image only: only darwin-node's image build
 ships it, built with `cargo build --release --locked -p ant-cli --bin darwin-nodes` from a
 darwin-client commit it pins, in place of Autonomi's `ant` 0.3.9, which the image downloaded
-before. It is not `darwin node`, which stays off. It runs and supervises the nodes on one
+before. This repository's CI builds it only to check it (`scripts/check-darwin-nodes.sh`), and
+never packages it. It is not `darwin node`, which stays off. It runs and supervises the nodes on one
 machine with the registry, REST API and node start arguments `ant` 0.3.9 had (`--evm-network
 arbitrum-one` included, which the image's payment settings override in the node), and keeps its
 registry in `$XDG_DATA_HOME/ant` as `ant` did, so an install's nodes keep their ids, ports, data

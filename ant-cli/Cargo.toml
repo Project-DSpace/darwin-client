@@ -13,7 +13,9 @@ path = "src/main.rs"
 
 # The storage-node image's node manager. Only darwin-node's image build ships it, built with
 # `cargo build --release --locked -p ant-cli --bin darwin-nodes` from a darwin-client commit it
-# pins; `darwin node` stays off in the darwin CLI. See src/bin/darwin-nodes/main.rs.
+# pins. This repository's CI builds it only to check it (scripts/check-darwin-nodes.sh), and never
+# packages it; a build or install of ant-cli that doesn't name `--bin darwin` makes it too.
+# `darwin node` stays off in the darwin CLI. See src/bin/darwin-nodes/main.rs.
 [[bin]]
 name = "darwin-nodes"
 path = "src/bin/darwin-nodes/main.rs"
