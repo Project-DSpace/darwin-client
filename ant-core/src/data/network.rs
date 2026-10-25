@@ -218,7 +218,8 @@ pub(crate) fn seeds_for_read<P: Clone>(
     seeds
         .iter()
         .zip(keep)
-        .filter_map(|(seed, k)| k.then(|| seed.clone()))
+        .filter(|&(_, k)| k)
+        .map(|(seed, _)| seed.clone())
         .collect()
 }
 
