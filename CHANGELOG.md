@@ -28,9 +28,11 @@ commit `darwin --version` prints. Upstream's entries follow.
   as hex, and reads the JSON text earlier browser clients saved. A native checkpoint keeps its
   paid proofs in `<stem>.proofs`, appended once each. An earlier client stops with an error on a
   checkpoint in this format: finish interrupted uploads with this client before going back to an
-  earlier one. A `batch_upload_chunks` receipt (`payments/single/`) for a file one of whose chunks
-  was paid again is the exception: an earlier client reads it as damaged, deletes it, and pays
-  again for every chunk of that file whose proofs it held.
+  earlier one. A `batch_upload_chunks` receipt (`payments/single/`) keeps the format earlier
+  clients read: the marks of a file's chunks paid again are kept apart, in
+  `payments/single-marks/`, which they don't read, and the receipt is then named with `_marked` at
+  its end. This client stops an upload whose marks can't be read, or are gone from a receipt named
+  so, rather than pay for a chunk a third time.
 - Payments in DARWIN (`0x511f76A3…`, vault `0xE0f62798…`), priced like Autonomi with a price
   multiplier of 32 in the vendored ant-protocol. Builds before `0995cba` pay the retired test token.
 - Listings v2: envelopes on every visibility, optional payment fields, upload records and proofs

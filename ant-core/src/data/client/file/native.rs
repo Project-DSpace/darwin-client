@@ -3908,9 +3908,14 @@ impl Client {
         let mut state = match saved {
             Some(state) => state,
             None => {
-                let (mut proofs, paid_again) =
+                // The marks of chunks paid again once already stop the
+                // upload if they can't be read: never a third payment.
+                let paid_again =
+                    crate::data::client::cached_single::load_marks_for_file(&file_path_key)
+                        .map_err(crate::data::client::batch::paid_again_marks_unreadable)?;
+                let mut proofs =
                     crate::data::client::cached_single::try_load_for_file(&file_path_key)
-                        .map(|(_, receipt)| (receipt.proofs, receipt.paid_again))
+                        .map(|(_, receipt)| receipt.proofs)
                         .unwrap_or_default();
                 if let Some((_, receipt)) =
                     crate::data::client::cached_merkle::try_load_for_file(&file_path_key)

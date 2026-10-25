@@ -662,14 +662,19 @@ impl Client {
         file_total: usize,
         _resume_key: Option<&str>,
     ) -> Result<(Vec<XorName>, String, u128, WaveAggregateStats)> {
+        // The marks of chunks paid again once already are read first, and
+        // stop the upload if they can't be: never a third payment.
         #[cfg(feature = "native")]
-        let (proofs, paid_again) = _resume_key
+        let paid_again = match _resume_key {
+            Some(key) => crate::data::client::cached_single::load_marks_for_file(key)
+                .map_err(paid_again_marks_unreadable)?,
+            None => std::collections::HashSet::new(),
+        };
+        #[cfg(feature = "native")]
+        let proofs = _resume_key
             .and_then(crate::data::client::cached_single::try_load_for_file)
             .map(|(_, receipt)| {
-                (
-                    readable_cached_proofs(_resume_key.unwrap_or_default(), receipt.proofs),
-                    receipt.paid_again,
-                )
+                readable_cached_proofs(_resume_key.unwrap_or_default(), receipt.proofs)
             })
             .unwrap_or_default();
         #[cfg(not(feature = "native"))]
@@ -929,6 +934,16 @@ pub(super) const CACHED_PROOF_SAFETY_MARGIN_SECS: u64 = 300;
 /// engine pays again only when a fresh lookup puts the paid node outside the
 /// storers' width, or every storer that answers refuses the proof.
 pub(super) const CACHED_PROOF_MAX_AGE_SECS: u64 = 24 * 60 * 60;
+
+/// Why an upload whose cached marks of chunks paid again can't be read
+/// stops: without them a chunk could be paid a third time.
+#[cfg(feature = "native")]
+pub(crate) fn paid_again_marks_unreadable(error: crate::error::Error) -> Error {
+    Error::Payment(format!(
+        "the cached marks of this file's chunks paid again can't be read ({error}); nothing \
+         is paid, so no chunk is paid a third time"
+    ))
+}
 
 /// The cached proofs of `resume_key`'s receipt that can be read: an
 /// unreadable one is dropped from the receipt, so it doesn't sit there for

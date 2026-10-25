@@ -54,6 +54,21 @@
 //! of its latest wave, so a resumed upload that pays another wave starts
 //! the count again.
 //!
+//! Paid-again marks
+//! ----------------
+//! The chunks of a file paid again because every storer refused a kept
+//! proof are never paid again a second time. Their marks are kept apart,
+//! in `<data_dir>/payments/single-marks/<file_hash>`, a directory earlier
+//! clients never read, so a receipt is always the five fields they decode
+//! and an earlier client resumes from it rather than delete it. A receipt
+//! whose file has marks is named `<timestamp>_<file_hash>_marked`, which
+//! earlier clients read like any other: a marked receipt without its marks,
+//! or marks that can't be read, stop the upload
+//! ([`load_marks_for_file`]) rather than let a chunk be paid a third time.
+//! Marks go with the file's receipts ([`delete_for_file`]), and once
+//! untouched for the backstop with no receipt left for their file
+//! ([`cleanup_outdated`]).
+//!
 //! Failure-mode tolerance
 //! ----------------------
 //! All public-facing API (`try_*` variants) swallows IO and
@@ -129,13 +144,26 @@ pub struct SingleNodeReceipt {
     /// Cumulative storage cost in atto, summed across all paid waves.
     pub storage_cost_atto: String,
     /// Cumulative gas cost in wei, summed across all paid waves.
+    ///
+    /// The last field: earlier clients decode a receipt as exactly these
+    /// five, and refuse, then delete, one with more. The chunks paid again
+    /// are kept apart ([`load_marks_for_file`]).
     pub gas_cost_wei: u128,
-    /// The chunks paid again because every storer refused a kept proof:
-    /// never paid again a second time. Empty, and not written, for a
-    /// receipt with none.
-    #[serde(default, skip_serializing_if = "HashSet::is_empty")]
-    pub paid_again: HashSet<[u8; 32]>,
 }
+
+/// The chunks of a file paid again because every storer refused a kept
+/// proof: never paid again a second time. Kept in
+/// `payments/single-marks/<file_hash>`, apart from the receipt.
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct PaidAgainMarks {
+    paid_again: HashSet<[u8; 32]>,
+}
+
+/// The directory of the paid-again marks, beside the receipts' directory.
+const MARKS_SUBDIR: &str = "single-marks";
+
+/// The end of a receipt's file name whose file has paid-again marks.
+const MARKED_SUFFIX: &str = "_marked";
 
 /// Highest schema version this binary knows how to read. Receipts
 /// with a higher version are rejected (the user must have upgraded
@@ -150,9 +178,130 @@ impl SingleNodeReceipt {
             first_pay_timestamp: now_secs,
             storage_cost_atto: "0".to_string(),
             gas_cost_wei: 0,
-            paid_again: HashSet::new(),
         }
     }
+}
+
+/// The marks directory beside the receipts' `dir`.
+fn marks_dir(dir: &Path) -> PathBuf {
+    dir.with_file_name(MARKS_SUBDIR)
+}
+
+fn marks_path(dir: &Path, key: &str) -> PathBuf {
+    marks_dir(dir).join(key)
+}
+
+/// The paid-again marks of the file `key`: none if it has no marks file.
+///
+/// # Errors
+///
+/// If its marks file is there and can't be read.
+fn read_marks(dir: &Path, key: &str) -> Result<Option<HashSet<[u8; 32]>>> {
+    let path = marks_path(dir, key);
+    let handle = match File::open(&path) {
+        Ok(handle) => handle,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e.into()),
+    };
+    let marks: PaidAgainMarks =
+        rmp_serde::decode::from_read(BufReader::new(handle)).map_err(|e| {
+            crate::error::Error::Io(std::io::Error::other(format!(
+                "the paid-again marks {} can't be read: {e}",
+                path.display()
+            )))
+        })?;
+    Ok(Some(marks.paid_again))
+}
+
+/// Write the paid-again marks of the file `key`, whole or not at all.
+fn write_marks(dir: &Path, key: &str, paid_again: &HashSet<[u8; 32]>) -> Result<()> {
+    fs::create_dir_all(marks_dir(dir))?;
+    write_atomic(
+        &marks_path(dir, key),
+        &PaidAgainMarks {
+            paid_again: paid_again.clone(),
+        },
+    )
+}
+
+/// Remove the paid-again marks of the file `key`, and any write of them
+/// left unfinished.
+fn remove_marks(dir: &Path, key: &str) {
+    let path = marks_path(dir, key);
+    let _ = fs::remove_file(tmp_path_for(&path));
+    match fs::remove_file(&path) {
+        Ok(()) => debug!("Deleted paid-again marks {}", path.display()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => warn!("Could not delete paid-again marks {} ({e})", path.display()),
+    }
+}
+
+/// Whether the receipt at `path` is named as one whose file has marks.
+fn is_marked(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|name| name.ends_with(MARKED_SUFFIX))
+}
+
+/// The file key a receipt's file name, `<timestamp>_<key>` with
+/// [`MARKED_SUFFIX`] or not, names.
+fn receipt_key(name: &str) -> Option<&str> {
+    let (_, rest) = name.split_once('_')?;
+    Some(rest.strip_suffix(MARKED_SUFFIX).unwrap_or(rest))
+}
+
+/// The paid-again marks of the file `key`, whose receipts are in `dir`:
+/// none if it has none. Called with the receipt lock held.
+///
+/// # Errors
+///
+/// If the marks can't be read, or a receipt of the file is named as marked
+/// and its marks are gone.
+fn marks_for_key(dir: &Path, key: &str) -> Result<HashSet<[u8; 32]>> {
+    if let Some(marks) = read_marks(dir, key)? {
+        return Ok(marks);
+    }
+    let marked = fs::read_dir(dir).ok().is_some_and(|entries| {
+        entries.flatten().any(|entry| {
+            let path = entry.path();
+            is_marked(&path)
+                && path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|name| {
+                        !name.ends_with(".tmp")
+                            && !is_expired_filename(name)
+                            && receipt_key(name) == Some(key)
+                    })
+        })
+    });
+    if marked {
+        return Err(crate::error::Error::Io(std::io::Error::other(format!(
+            "a cached receipt in {} has chunks paid again, and their marks ({}) are gone",
+            dir.display(),
+            marks_path(dir, key).display()
+        ))));
+    }
+    Ok(HashSet::new())
+}
+
+/// The chunks of `file_path`'s upload paid again once already: none if
+/// nothing was ever cached for it.
+///
+/// # Errors
+///
+/// If the marks can't be read, or its receipt is named as marked and the
+/// marks are gone: the upload stops, so no chunk is paid a third time.
+pub(crate) fn load_marks_for_file(file_path: &str) -> Result<HashSet<[u8; 32]>> {
+    let dir = config::data_dir()?.join(PAYMENTS_SUBDIR);
+    if !dir.exists() && !marks_dir(&dir).exists() {
+        return Ok(HashSet::new());
+    }
+    fs::create_dir_all(&dir)?;
+    let key = file_hash_key(file_path);
+    let _guard = ReceiptLock::acquire(&dir, &key)?;
+    recover_orphaned_tmps(&dir, &key);
+    marks_for_key(&dir, &key)
 }
 
 fn payments_dir() -> Result<PathBuf> {
@@ -185,8 +334,9 @@ fn file_hash_key(file_path: &str) -> String {
     out
 }
 
-fn receipt_path(dir: &Path, ts: u64, key: &str) -> PathBuf {
-    dir.join(format!("{ts}_{key}"))
+fn receipt_path(dir: &Path, ts: u64, key: &str, marked: bool) -> PathBuf {
+    let suffix = if marked { MARKED_SUFFIX } else { "" };
+    dir.join(format!("{ts}_{key}{suffix}"))
 }
 
 /// Append a wave's worth of paid-chunk proofs to the on-disk receipt.
@@ -237,11 +387,17 @@ pub fn append_wave(
     )
 }
 
-/// Append a wave as `append_wave` describes, also marking `paid_again` paid again once already
-/// ([`SingleNodeReceipt::paid_again`]). A marked chunk's proof in the
-/// receipt is the one in `new_proofs`, or none: the refused proof it was
-/// paid again for is dropped, so a resume quotes and pays it rather than
-/// offer the refused proof again.
+/// Append a wave as `append_wave` describes, also marking `paid_again` paid
+/// again once already ([`load_marks_for_file`]). The marks are written
+/// first, apart from the receipt, which is then named as marked. A marked
+/// chunk's proof in the receipt is the one in `new_proofs`, or none: the
+/// refused proof it was paid again for is dropped, so a resume quotes and
+/// pays it rather than offer the refused proof again.
+///
+/// # Errors
+///
+/// As [`append_wave`], and if the file's marks can't be read, or are gone
+/// from a receipt named as marked: nothing is written then.
 pub(crate) fn append_wave_marked(
     file_path: &str,
     new_proofs: HashMap<[u8; 32], Vec<u8>>,
@@ -272,14 +428,21 @@ pub(crate) fn append_wave_marked(
         Some((p, r)) => (Some(p), r),
         None => (None, SingleNodeReceipt::new(now)),
     };
-    let new_path = receipt_path(&dir, now, &key);
+    let mut marks = marks_for_key(&dir, &key)?;
+    marks.extend(paid_again.iter().copied());
+    let marked = !marks.is_empty();
+    if marked {
+        // Before the refused proofs are dropped, and before anything is
+        // paid again.
+        write_marks(&dir, &key, &marks)?;
+    }
+    let new_path = receipt_path(&dir, now, &key, marked);
 
     for address in paid_again {
         if !new_proofs.contains_key(address) {
             receipt.proofs.remove(address);
         }
     }
-    receipt.paid_again.extend(paid_again.iter().copied());
     receipt.proofs.extend(new_proofs);
     // Sum costs as U256 (Amount). A wave's storage cost is wei-scale
     // atto-token and a multi-TB upload's cumulative can plausibly
@@ -491,6 +654,7 @@ pub fn delete_for_file(file_path: &str) -> Result<()> {
             debug!("Deleted cached single-node receipt {}", path.display());
         }
     }
+    remove_marks(&dir, &key);
     Ok(())
 }
 
@@ -503,7 +667,8 @@ pub fn try_delete_for_file(file_path: &str) {
     }
 }
 
-/// Garbage-collect cached receipts past the expiry window.
+/// Garbage-collect cached receipts past the expiry window, and the
+/// paid-again marks of files with no receipt left, untouched as long.
 pub fn cleanup_outdated() {
     let Ok(dir) = payments_dir() else {
         return;
@@ -520,6 +685,71 @@ pub fn cleanup_outdated() {
             );
             let _ = fs::remove_file(path);
         }
+    }
+    cleanup_outdated_marks(&dir, SystemTime::now());
+}
+
+/// Remove the paid-again marks beside `dir` that no write has touched for
+/// the backstop before `now`, and whose file has no receipt in `dir` that
+/// isn't expired: those of uploads never resumed, or whose receipts an
+/// earlier client deleted. Marks whose file's lock is held are left for a
+/// later sweep.
+fn cleanup_outdated_marks(dir: &Path, now: SystemTime) {
+    let Ok(entries) = fs::read_dir(marks_dir(dir)) else {
+        return;
+    };
+    let live = fs::read_dir(dir)
+        .map(|entries| {
+            entries
+                .flatten()
+                .filter_map(|entry| {
+                    let name = entry.file_name().to_str()?.to_string();
+                    if name.ends_with(".tmp")
+                        || name.ends_with(".lock")
+                        || is_expired_filename(&name)
+                    {
+                        return None;
+                    }
+                    receipt_key(&name).map(str::to_string)
+                })
+                .collect::<HashSet<_>>()
+        })
+        .unwrap_or_default();
+    let backstop = now
+        .checked_sub(UNRESUMED_PROOFS_BACKSTOP)
+        .unwrap_or(UNIX_EPOCH);
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        let key = name.strip_suffix(".tmp").unwrap_or(name);
+        let untouched = entry
+            .metadata()
+            .and_then(|metadata| metadata.modified())
+            .is_ok_and(|at| at < backstop);
+        if !untouched || live.contains(key) {
+            continue;
+        }
+        let Ok(lock) = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(dir.join(format!("{key}.lock")))
+        else {
+            continue;
+        };
+        if lock.try_lock_exclusive().is_err() {
+            continue;
+        }
+        info!(
+            "Removing paid-again marks {}, untouched for {} days with no receipt left",
+            path.display(),
+            PAYMENT_EXPIRATION_SECS / 86_400
+        );
+        let _ = fs::remove_file(&path);
+        let _ = FileExt::unlock(&lock);
     }
 }
 
@@ -653,6 +883,16 @@ fn dedupe_canonical_receipts(dir: &Path, key: &str) {
     }
     canonicals.sort_by_key(|c| std::cmp::Reverse(c.0));
 
+    // A chunk paid again keeps only the winner's proof: an older
+    // sibling's may be the one storers refused. Without the marks the
+    // siblings are left as they are, and loading the marks stops the
+    // upload.
+    let Ok(marks) = marks_for_key(dir, key) else {
+        warn!("The paid-again marks for {key} can't be read; its receipts are not merged");
+        return;
+    };
+    let marked = canonicals.iter().any(|(_, path)| is_marked(path));
+
     // Identify the winner (newest), then fold every other readable
     // sibling into it.
     let (winner_ts, winner_path) = canonicals[0].clone();
@@ -681,11 +921,8 @@ fn dedupe_canonical_receipts(dir: &Path, key: &str) {
                 // write semantics newer should hold the same proof
                 // unless a buggier binary wrote independently).
                 let mut added = 0usize;
-                // A chunk paid again keeps only the winner's proof: the
-                // older sibling's may be the one storers refused.
-                winner.paid_again.extend(other.paid_again);
                 for (addr, bytes) in other.proofs {
-                    if winner.paid_again.contains(&addr) {
+                    if marks.contains(&addr) {
                         continue;
                     }
                     winner.proofs.entry(addr).or_insert_with(|| {
@@ -719,11 +956,20 @@ fn dedupe_canonical_receipts(dir: &Path, key: &str) {
         let _ = fs::remove_file(stale);
     }
 
-    if merged_from > 0 {
-        // Rewrite the winner under its own filename with the merged
-        // content. Same path, write-tmp-and-rename keeps the on-disk
-        // state coherent across the rewrite.
-        if let Err(e) = write_receipt_atomic(&winner_path, &winner) {
+    // A sibling named as marked makes the winner so, so that marks gone
+    // later are still noticed.
+    let renamed =
+        (marked && !is_marked(&winner_path)).then(|| receipt_path(dir, winner_ts, key, true));
+    if merged_from > 0 || renamed.is_some() {
+        // Rewrite the winner under its own filename, marked if a sibling
+        // was, with the merged content. Write-tmp-and-rename keeps the
+        // on-disk state coherent across the rewrite.
+        let path = renamed.as_ref().unwrap_or(&winner_path);
+        let written = write_receipt_atomic(path, &winner);
+        if written.is_ok() && renamed.is_some() {
+            let _ = fs::remove_file(&winner_path);
+        }
+        if let Err(e) = written {
             warn!(
                 "Could not rewrite merged canonical receipt {} ({e}); \
                  winner retains pre-merge content and the older proofs \
@@ -732,7 +978,6 @@ fn dedupe_canonical_receipts(dir: &Path, key: &str) {
             );
         }
     }
-    let _ = winner_ts;
 }
 
 fn find_existing(dir: &Path, key: &str) -> Result<Option<(PathBuf, SingleNodeReceipt)>> {
@@ -856,6 +1101,12 @@ fn read_receipt(path: &Path) -> Result<SingleNodeReceipt> {
 /// error during BufWriter drop was silently swallowed and a truncated
 /// msgpack file could be renamed into place.
 fn write_receipt_atomic(path: &Path, receipt: &SingleNodeReceipt) -> Result<()> {
+    write_atomic(path, receipt)
+}
+
+/// [`write_receipt_atomic`], for any value: a receipt, or a file's
+/// paid-again marks.
+fn write_atomic<T: Serialize>(path: &Path, value: &T) -> Result<()> {
     let tmp_path = tmp_path_for(path);
     {
         let handle = OpenOptions::new()
@@ -864,7 +1115,7 @@ fn write_receipt_atomic(path: &Path, receipt: &SingleNodeReceipt) -> Result<()> 
             .truncate(true)
             .open(&tmp_path)?;
         let mut writer = BufWriter::new(handle);
-        if let Err(e) = rmp_serde::encode::write(&mut writer, receipt) {
+        if let Err(e) = rmp_serde::encode::write(&mut writer, value) {
             let _ = fs::remove_file(&tmp_path);
             return Err(crate::error::Error::Io(std::io::Error::other(
                 e.to_string(),
@@ -958,36 +1209,47 @@ impl Drop for ReceiptLock {
 mod tests {
     use super::*;
 
-    /// A chunk marked paid again loses its refused proof from the receipt,
-    /// keeps the mark across loads, and takes the new proof once paid.
-    #[test]
-    fn a_chunk_paid_again_is_marked_and_its_refused_proof_dropped() -> Result<()> {
+    /// A unique file path for a test.
+    fn test_file(name: &str) -> String {
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos();
-        let file_path = format!("/tmp/darwin-paid-again-test-{nanos}");
+        format!("/tmp/darwin-{name}-{nanos}")
+    }
+
+    /// A chunk marked paid again loses its refused proof from the receipt,
+    /// keeps the mark across loads, apart from the receipt, which is named
+    /// as marked, and takes the new proof once paid. Deleting the file's
+    /// receipt deletes its marks.
+    #[test]
+    fn a_chunk_paid_again_is_marked_and_its_refused_proof_dropped() -> Result<()> {
+        let file_path = test_file("paid-again");
         let (refused, other) = ([1u8; 32], [2u8; 32]);
-        append_wave(
+        let path = append_wave(
             &file_path,
             HashMap::from([(refused, vec![1]), (other, vec![2])]),
             "10",
             20,
         )?;
+        assert!(!is_marked(&path));
+        assert!(load_marks_for_file(&file_path)?.is_empty());
         // Marked before the new payment: the refused proof goes.
         let marked = HashSet::from([refused]);
-        append_wave_marked(
+        let path = append_wave_marked(
             &file_path,
             HashMap::from([(other, vec![2])]),
             &marked,
             "0",
             0,
         )?;
+        assert!(is_marked(&path));
         let (_, receipt) = load_for_file(&file_path)?.expect("the receipt");
         assert!(!receipt.proofs.contains_key(&refused));
         assert_eq!(receipt.proofs.get(&other), Some(&vec![2]));
-        assert_eq!(receipt.paid_again, marked);
-        // Paid again: the new proof, the mark kept.
+        assert_eq!(load_marks_for_file(&file_path)?, marked);
+        // Paid again: the new proof, the mark kept, also by a wave that
+        // marks nothing more.
         append_wave_marked(
             &file_path,
             HashMap::from([(refused, vec![3]), (other, vec![2])]),
@@ -995,11 +1257,181 @@ mod tests {
             "10",
             20,
         )?;
+        let path = append_wave(&file_path, HashMap::new(), "0", 0)?;
+        assert!(is_marked(&path));
         let (_, receipt) = load_for_file(&file_path)?.expect("the receipt");
         assert_eq!(receipt.proofs.get(&refused), Some(&vec![3]));
-        assert_eq!(receipt.paid_again, marked);
+        assert_eq!(load_marks_for_file(&file_path)?, marked);
         assert_eq!(receipt.storage_cost_atto, "20");
+
+        let dir = payments_dir()?;
+        let marks = marks_path(&dir, &file_hash_key(&file_path));
+        assert!(marks.exists());
         delete_for_file(&file_path)?;
+        assert!(!marks.exists(), "the marks go with the receipt");
+        assert!(load_marks_for_file(&file_path)?.is_empty());
+        Ok(())
+    }
+
+    /// The receipt as the client before this one reads it: five fields,
+    /// in this order, written as an array.
+    #[derive(Deserialize)]
+    #[allow(dead_code)]
+    struct EarlierReceipt {
+        #[serde(default)]
+        version: u8,
+        proofs: HashMap<[u8; 32], Vec<u8>>,
+        first_pay_timestamp: u64,
+        storage_cost_atto: String,
+        gas_cost_wei: u128,
+    }
+
+    /// A receipt whose file has chunks paid again is read by the client
+    /// before this one, as one of five fields, which it resumes from
+    /// rather than delete; and it finds the file under its marked name.
+    #[test]
+    fn an_earlier_client_reads_a_marked_receipt() -> Result<()> {
+        let file_path = test_file("earlier-reads-marked");
+        let path = append_wave_marked(
+            &file_path,
+            HashMap::from([([4u8; 32], vec![4])]),
+            &HashSet::from([[5u8; 32]]),
+            "10",
+            20,
+        )?;
+        let bytes = fs::read(&path)?;
+        let earlier: EarlierReceipt = rmp_serde::from_slice(&bytes)
+            .map_err(|e| crate::error::Error::Io(std::io::Error::other(e.to_string())))?;
+        assert_eq!(earlier.proofs.get(&[4u8; 32]), Some(&vec![4]));
+        assert_eq!(earlier.storage_cost_atto, "10");
+        // A sixth field, as the marks were written in the receipt before,
+        // is what it refuses.
+        let six = rmp_serde::to_vec(&(
+            SCHEMA_VERSION,
+            HashMap::<[u8; 32], Vec<u8>>::new(),
+            0u64,
+            "0",
+            0u128,
+            vec![[5u8; 32]],
+        ))
+        .map_err(|e| crate::error::Error::Io(std::io::Error::other(e.to_string())))?;
+        assert!(rmp_serde::from_slice::<EarlierReceipt>(&six).is_err());
+        // The earlier client's find_existing: a name holding the key, not
+        // a lock or a write in progress, and not expired.
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or_default();
+        assert!(name.contains(&file_hash_key(&file_path)));
+        assert!(!name.ends_with(".lock") && !name.ends_with(".tmp"));
+        assert!(!is_expired_filename(name));
+        delete_for_file(&file_path)?;
+        Ok(())
+    }
+
+    /// Marks that can't be read, or gone from a receipt named as marked,
+    /// stop the upload ([`load_marks_for_file`]) and the next wave's
+    /// append, rather than let a chunk be paid a third time.
+    #[test]
+    fn marks_unreadable_or_gone_stop_the_upload() -> Result<()> {
+        let dir = payments_dir()?;
+
+        let file_path = test_file("marks-unreadable");
+        let key = file_hash_key(&file_path);
+        append_wave_marked(
+            &file_path,
+            HashMap::from([([6u8; 32], vec![6])]),
+            &HashSet::from([[7u8; 32]]),
+            "0",
+            0,
+        )?;
+        fs::write(marks_path(&dir, &key), b"not marks")?;
+        assert!(load_marks_for_file(&file_path).is_err());
+        assert!(append_wave(&file_path, HashMap::new(), "0", 0).is_err());
+        delete_for_file(&file_path)?;
+
+        let file_path = test_file("marks-gone");
+        let key = file_hash_key(&file_path);
+        append_wave_marked(
+            &file_path,
+            HashMap::from([([6u8; 32], vec![6])]),
+            &HashSet::from([[7u8; 32]]),
+            "0",
+            0,
+        )?;
+        fs::remove_file(marks_path(&dir, &key))?;
+        assert!(load_marks_for_file(&file_path).is_err());
+        assert!(append_wave(&file_path, HashMap::new(), "0", 0).is_err());
+        delete_for_file(&file_path)?;
+        assert!(load_marks_for_file(&file_path)?.is_empty());
+        Ok(())
+    }
+
+    /// Duplicate receipts of a marked file merge into one named as marked,
+    /// without the older sibling's proof of a chunk paid again.
+    #[test]
+    fn merged_receipts_keep_the_mark() -> Result<()> {
+        let file_path = test_file("merge-marked");
+        let key = file_hash_key(&file_path);
+        let dir = payments_dir()?;
+        let (refused, other) = ([8u8; 32], [9u8; 32]);
+        let marked = append_wave_marked(
+            &file_path,
+            HashMap::from([(other, vec![9])]),
+            &HashSet::from([refused]),
+            "0",
+            0,
+        )?;
+        // An older, unmarked sibling still holding the refused proof.
+        let ts = marked
+            .file_name()
+            .and_then(|n| n.to_str())
+            .and_then(|n| n.split_once('_'))
+            .and_then(|(ts, _)| ts.parse::<u64>().ok())
+            .unwrap_or_default();
+        let mut older = SingleNodeReceipt::new(ts - 10);
+        older.proofs.insert(refused, vec![1]);
+        write_receipt_atomic(&receipt_path(&dir, ts - 10, &key, false), &older)?;
+        // And the newest unmarked, so the winner must become marked.
+        let newest = receipt_path(&dir, ts + 1, &key, false);
+        write_receipt_atomic(&newest, &SingleNodeReceipt::new(ts + 1))?;
+
+        let (path, receipt) = load_for_file(&file_path)?.expect("the merged receipt");
+        assert!(is_marked(&path), "{}", path.display());
+        assert!(!newest.exists());
+        assert!(!receipt.proofs.contains_key(&refused));
+        assert_eq!(receipt.proofs.get(&other), Some(&vec![9]));
+        assert_eq!(load_marks_for_file(&file_path)?, HashSet::from([refused]));
+        delete_for_file(&file_path)?;
+        Ok(())
+    }
+
+    /// Marks with no receipt left are removed once untouched for the
+    /// backstop, and kept while a receipt of their file is.
+    #[test]
+    fn marks_with_no_receipt_go_after_the_backstop() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let dir = root.path().join("payments").join("single");
+        fs::create_dir_all(&dir)?;
+        let now = SystemTime::now();
+        let secs = now.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+        let later = now + UNRESUMED_PROOFS_BACKSTOP + std::time::Duration::from_secs(60);
+        let (kept, orphan) = (file_hash_key("with a receipt"), file_hash_key("orphaned"));
+        for key in [&kept, &orphan] {
+            write_marks(&dir, key, &HashSet::from([[1u8; 32]]))?;
+        }
+        // Only one has a receipt: the other's was deleted by an earlier
+        // client, which leaves the marks.
+        write_receipt_atomic(
+            &receipt_path(&dir, secs, &kept, true),
+            &SingleNodeReceipt::new(secs),
+        )?;
+
+        cleanup_outdated_marks(&dir, now);
+        assert!(marks_path(&dir, &orphan).exists(), "not old enough");
+        cleanup_outdated_marks(&dir, later);
+        assert!(!marks_path(&dir, &orphan).exists());
+        assert!(marks_path(&dir, &kept).exists());
         Ok(())
     }
 
@@ -1489,7 +1921,7 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
-        let canonical = receipt_path(&dir, now, &key);
+        let canonical = receipt_path(&dir, now, &key, false);
         let tmp = tmp_path_for(&canonical);
 
         let mut r = SingleNodeReceipt::new(now);
@@ -1540,7 +1972,7 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
-        let canonical = receipt_path(&dir, now, &key);
+        let canonical = receipt_path(&dir, now, &key, false);
         let tmp = tmp_path_for(&canonical);
         fs::write(&tmp, b"not valid msgpack")?;
         assert!(tmp.exists());
@@ -1856,7 +2288,6 @@ mod tests {
             first_pay_timestamp: now,
             storage_cost_atto: "10".to_string(),
             gas_cost_wei: 20,
-            paid_again: HashSet::new(),
         };
         write_receipt_atomic(&canonical, &receipt)?;
         assert!(canonical.exists());
