@@ -25,8 +25,10 @@ serde = { version = "1", features = ["derive"] }
 serde_bytes = "0.11"
 serde_json = "1"
 self_encryption = "0.36.2"
-# Portable WebRTC Direct profile shared with ant-node.
-saorsa-transport = { version = "0.38.1", default-features = false, features = ["webrtc"] }
+# Portable WebRTC Direct profile shared with ant-node. 0.38.2 at least, for its
+# reaping of finished QUIC reader tasks: before it, an endpoint kept every past
+# connection's reader allocated for as long as it lived. `lock_pins` checks the lock.
+saorsa-transport = { version = "0.38.2", default-features = false, features = ["webrtc"] }
 thiserror = "2"
 # NFC normalisation for the portable manifest path rules (ADR-0006).
 unicode-normalization = "0.1"

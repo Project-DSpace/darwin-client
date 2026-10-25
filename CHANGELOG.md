@@ -358,6 +358,10 @@ commit `darwin --version` prints. Upstream's entries follow.
   it. The vendored ant-protocol is 5.0.0, still
   with the price multiplier, darwin-listings is vendored at 0.2.1 to match, and rustls is
   0.23.46, as on upstream's main.
+- saorsa-transport is 0.38.2 at least, in ant-core's requirement and in the lock: it reaps a QUIC
+  reader task once its connection ends, where 0.38.1 kept every past connection's reader
+  allocated for as long as the endpoint lived. A test (`lock_pins`) holds the lock to one copy, at
+  0.38.2 or later.
 
 ## [Unreleased]
 
