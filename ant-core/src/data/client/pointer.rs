@@ -1525,6 +1525,44 @@ where
     )))
 }
 
+/// Follow the pointer chain from `address`, reading each pointer with `get`,
+/// to the first target that is not a pointer: [`Client::pointer_resolve`]'s
+/// walk, refusing a cycle, a missing hop and a chain longer than
+/// [`MAX_POINTER_RESOLVE_DEPTH`].
+async fn resolve_chain<Get, Fut>(address: &XorName, get: Get) -> Result<PointerTarget>
+where
+    Get: Fn(XorName) -> Fut,
+    Fut: Future<Output = Result<Option<Pointer>>>,
+{
+    let mut seen = HashSet::new();
+    let mut at = *address;
+
+    for _ in 0..MAX_POINTER_RESOLVE_DEPTH {
+        if !seen.insert(at) {
+            return Err(Error::InvalidData(format!(
+                "pointer chain cycles back to {}",
+                hex::encode(at)
+            )));
+        }
+        let record = get(at).await?.ok_or_else(|| {
+            Error::InvalidData(format!("pointer chain breaks at {}", hex::encode(at)))
+        })?;
+        let target = record.target();
+        match target.kind() {
+            Some(PointerTargetKind::Pointer) => at = target.address,
+            Some(PointerTargetKind::Chunk) => return Ok(target),
+            // A tag this build does not know. The bytes are authentic — the
+            // record is signed — so report the target rather than pretend
+            // the chain is broken; the caller decides what to do with it.
+            None => return Ok(target),
+        }
+    }
+    Err(Error::InvalidData(format!(
+        "pointer chain from {} is longer than {MAX_POINTER_RESOLVE_DEPTH} hops",
+        hex::encode(address)
+    )))
+}
+
 impl Client {
     /// Create a pointer at counter 0, owned by `owner`.
     ///
@@ -2275,33 +2313,7 @@ impl Client {
     /// an error: the record is signed, so the bytes are authentic, and the
     /// caller is handed the target to decide about.
     pub async fn pointer_resolve(&self, address: &XorName) -> Result<PointerTarget> {
-        let mut seen = HashSet::new();
-        let mut at = *address;
-
-        for _ in 0..MAX_POINTER_RESOLVE_DEPTH {
-            if !seen.insert(at) {
-                return Err(Error::InvalidData(format!(
-                    "pointer chain cycles back to {}",
-                    hex::encode(at)
-                )));
-            }
-            let record = self.pointer_get(&at).await?.ok_or_else(|| {
-                Error::InvalidData(format!("pointer chain breaks at {}", hex::encode(at)))
-            })?;
-            let target = record.target();
-            match target.kind() {
-                Some(PointerTargetKind::Pointer) => at = target.address,
-                Some(PointerTargetKind::Chunk) => return Ok(target),
-                // A tag this build does not know. The bytes are authentic — the
-                // record is signed — so report the target rather than pretend
-                // the chain is broken; the caller decides what to do with it.
-                None => return Ok(target),
-            }
-        }
-        Err(Error::InvalidData(format!(
-            "pointer chain from {} is longer than {MAX_POINTER_RESOLVE_DEPTH} hops",
-            hex::encode(address)
-        )))
+        resolve_chain(address, |at| async move { self.pointer_get(&at).await }).await
     }
 
     /// Send one pointer PUT and check the acknowledgement against what was sent.
@@ -3943,6 +3955,66 @@ mod tests {
         let nowhere = HashMap::new();
         assert!(
             matches!(walk(&nowhere, source, first).await, Err(Error::InvalidData(m)) if m.contains("does not exist")),
+        );
+    }
+
+    /// A resolve, over pointers held in a map.
+    async fn resolve(chain: &HashMap<XorName, Pointer>, from: XorName) -> Result<PointerTarget> {
+        resolve_chain(&from, |at| {
+            let found = chain.get(&at).cloned();
+            async move { Ok(found) }
+        })
+        .await
+    }
+
+    /// A resolve refuses what the node cannot: it never reads a target, so a
+    /// cycle, a broken chain and an over-long chain are all the client's to
+    /// stop. The depth limit is checked on both sides of the boundary.
+    #[tokio::test]
+    async fn a_resolve_refuses_cycles_broken_chains_and_chains_past_its_depth() {
+        let first = pointer_address(&keypair(1).0);
+        let depth = u8::try_from(MAX_POINTER_RESOLVE_DEPTH).expect("small");
+
+        // A pointer that targets itself.
+        let (pk, sk) = keypair(210);
+        let own = pointer_address(&pk);
+        let looped = Pointer::create(
+            &sk,
+            &pk,
+            PointerTarget::new(PointerTargetKind::Pointer, own),
+        )
+        .expect("create");
+        let chain = HashMap::from([(own, looped)]);
+        let err = resolve(&chain, own)
+            .await
+            .expect_err("a cycle must not resolve");
+        assert!(err.to_string().contains("cycles back"), "got: {err}");
+
+        // A pointer to a pointer nobody wrote.
+        let nobody = pointer_address(&keypair(211).0);
+        let dangling = chain_to(1, PointerTarget::new(PointerTargetKind::Pointer, nobody));
+        let err = resolve(&dangling, first)
+            .await
+            .expect_err("a broken chain must not resolve");
+        assert!(err.to_string().contains("breaks at"), "got: {err}");
+
+        // Exactly the limit resolves to the chunk at its end; one pointer
+        // more does not.
+        let at_the_limit = chain_to(depth, chunk_target(9));
+        assert_eq!(
+            resolve(&at_the_limit, first)
+                .await
+                .expect("a chain of exactly the limit resolves"),
+            chunk_target(9)
+        );
+        let too_long = chain_to(depth + 1, chunk_target(9));
+        let err = resolve(&too_long, first)
+            .await
+            .expect_err("a chain past the limit must not resolve");
+        assert!(
+            err.to_string()
+                .contains(&format!("longer than {MAX_POINTER_RESOLVE_DEPTH} hops")),
+            "got: {err}"
         );
     }
 
