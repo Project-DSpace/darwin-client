@@ -96,7 +96,9 @@ is full, or holds every upload the client has in progress, or 500 ms have
 passed since it opened. Each member's journal names the wave before anything
 is signed for it, and saves the signed transaction before it is sent; the
 transaction is also written whole to `payments/waves/<id>.json` until every
-member has saved it. No member is quoted again before the wave ends: a resume
+member has saved it; a wave's file left there, by a member stopped before
+that and never resumed, is removed once untouched for 30 days, as unresumed
+checkpoints are. No member is quoted again before the wave ends: a resume
 reconciles the wave's transaction from that file, else from the member's own
 copy, and a member left out of the wave starts afresh. Each member's payment
 record, proofs and reported cost show only its own quotes and its share of

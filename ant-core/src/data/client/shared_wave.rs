@@ -566,6 +566,7 @@ pub(crate) fn write_wave_file(journal: &WaveSigned) -> Result<()> {
         .parent()
         .ok_or_else(|| Error::Config("missing waves directory".into()))?;
     std::fs::create_dir_all(directory)?;
+    super::upload_checkpoint::remove_old_wave_files(directory);
     let bytes = serde_json::to_vec(journal).map_err(|e| Error::Serialization(e.to_string()))?;
     let mut file = tempfile::NamedTempFile::new_in(directory)?;
     file.write_all(&bytes)?;

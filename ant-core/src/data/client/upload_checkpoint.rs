@@ -15,8 +15,12 @@
 //!   then records of a 32-byte address, a 4-byte little-endian length, the
 //!   proof, and the first 8 bytes of a BLAKE3 hash of the three. A length of
 //!   0 forgets the address's proof. A torn last record, from a crash while
-//!   it was written, is left out when the file is read, and cut off before
-//!   the next record is appended;
+//!   it was written (a part of a record, a whole last record that fails its
+//!   check, or zeros to the end), is left out when the file is read, and cut
+//!   off before the next record is appended. A record that fails its check
+//!   with more after it, or whose length is past the longest proof, is
+//!   damage: the file is refused, and kept. A proof file found shorter than
+//!   its records as last written is written anew;
 //! - `<stem>.salt`, a private upload's envelope salt;
 //! - `<stem>.lock`, held while the checkpoint is in use.
 //!
@@ -53,6 +57,11 @@ pub const UPLOAD_CHECKPOINT_EXTENSIONS: [&str; 4] =
 
 /// What a proof file starts with: "DSPF" and its format version.
 pub const PROOF_FILE_MAGIC: [u8; 5] = *b"DSPF\x01";
+
+/// The longest proof a proof file's record may hold: a proof travels in a
+/// PUT, which is at most [`MAX_WIRE_MESSAGE_SIZE`](ant_protocol::MAX_WIRE_MESSAGE_SIZE)
+/// (forced by the wire). A longer length is a damaged length.
+const MAX_PROOF_RECORD_LEN: usize = ant_protocol::MAX_WIRE_MESSAGE_SIZE;
 
 /// The files a checkpoint whose main file is `checkpoint` may have, in the
 /// order of [`UPLOAD_CHECKPOINT_EXTENSIONS`].
@@ -182,9 +191,26 @@ impl UploadCheckpointFiles {
         std::fs::create_dir_all(directory)?;
         {
             let mut written = self.lock_written();
+            if let Some(length) = written.length {
+                // A proof file shorter than its records as last written
+                // (gone, or cut short outside this client) is written anew
+                // from `state`: extending it would leave a gap of zeros
+                // before the records appended after it.
+                let short = std::fs::metadata(self.proofs_path())
+                    .map(|metadata| metadata.len() < length)
+                    .unwrap_or(true);
+                if short {
+                    warn!(
+                        "{} is shorter than its records as last written; writing it anew",
+                        self.proofs_path().display()
+                    );
+                    written.length = None;
+                }
+            }
             match written.length {
                 None => {
-                    // Written anew: the first save, or a migration.
+                    // Written anew: the first save, a migration, or a file
+                    // found short.
                     let mut bytes = PROOF_FILE_MAGIC.to_vec();
                     let mut proofs = HashMap::new();
                     for (address, proof, serial) in state.proof_entries() {
@@ -290,8 +316,19 @@ fn read_proofs(path: &Path) -> Result<ProofFile> {
     };
     let mut proofs = HashMap::new();
     let mut length = PROOF_FILE_MAGIC.len();
+    let damaged = || {
+        Error::InvalidData(format!(
+            "{} has a damaged record before its end",
+            path.display()
+        ))
+    };
     loop {
-        if rest.len() < 36 {
+        // What may be cut off is only a true tail, from a crash while the
+        // last record was written: fewer bytes than a record's head, a
+        // record that runs past the end, a whole last record that fails its
+        // check, or zeros to the end. A record that fails its check with
+        // more after it is damage, and the file is refused.
+        if rest.len() < 36 || rest.iter().all(|byte| *byte == 0) {
             break;
         }
         let mut address = [0u8; 32];
@@ -299,12 +336,18 @@ fn read_proofs(path: &Path) -> Result<ProofFile> {
         let mut len = [0u8; 4];
         len.copy_from_slice(&rest[32..36]);
         let len = u32::from_le_bytes(len) as usize;
+        if len > MAX_PROOF_RECORD_LEN {
+            return Err(damaged());
+        }
         let Some(record) = rest.get(..36 + len + 8) else {
             break;
         };
         let check = blake3::hash(&record[..36 + len]);
         if record[36 + len..] != check.as_bytes()[..8] {
-            break;
+            if record.len() == rest.len() {
+                break;
+            }
+            return Err(damaged());
         }
         if len == 0 {
             proofs.remove(&address);
@@ -349,22 +392,76 @@ const UNRESUMED_SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_
 /// every [`UNRESUMED_SWEEP_INTERVAL`]. Returns how many checkpoints were
 /// removed.
 pub(crate) fn remove_unresumed(directory: &Path) -> usize {
-    static SWEPT: Mutex<Option<HashMap<PathBuf, std::time::Instant>>> = Mutex::new(None);
-    {
-        let mut swept = SWEPT
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let swept = swept.get_or_insert_with(HashMap::new);
-        let now = std::time::Instant::now();
-        if swept
-            .get(directory)
-            .is_some_and(|at| now.duration_since(*at) < UNRESUMED_SWEEP_INTERVAL)
-        {
-            return 0;
-        }
-        swept.insert(directory.to_path_buf(), now);
+    if !sweep_due(directory) {
+        return 0;
     }
     remove_unresumed_before(directory, SystemTime::now() - UNRESUMED_PROOFS_BACKSTOP)
+}
+
+/// Whether `directory` is due a sweep: not swept by this process in the last
+/// [`UNRESUMED_SWEEP_INTERVAL`]. Marks it swept now if so.
+fn sweep_due(directory: &Path) -> bool {
+    static SWEPT: Mutex<Option<HashMap<PathBuf, std::time::Instant>>> = Mutex::new(None);
+    let mut swept = SWEPT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let swept = swept.get_or_insert_with(HashMap::new);
+    let now = std::time::Instant::now();
+    if swept
+        .get(directory)
+        .is_some_and(|at| now.duration_since(*at) < UNRESUMED_SWEEP_INTERVAL)
+    {
+        return false;
+    }
+    swept.insert(directory.to_path_buf(), now);
+    true
+}
+
+/// Remove the shared waves' files (`payments/waves/<id>.json`) in
+/// `directory` untouched for [`UNRESUMED_PROOFS_BACKSTOP`]. A wave's file
+/// goes once every member has saved its transaction; one whose leader or
+/// member stopped before that, and whose upload is never resumed, would
+/// otherwise stay for good. Any checkpoint that names such a wave is itself
+/// at or past the same backstop by then. A process does this for a
+/// directory at most once every [`UNRESUMED_SWEEP_INTERVAL`]. Returns how
+/// many files were removed.
+pub(crate) fn remove_old_wave_files(directory: &Path) -> usize {
+    if !sweep_due(directory) {
+        return 0;
+    }
+    remove_wave_files_before(directory, SystemTime::now() - UNRESUMED_PROOFS_BACKSTOP)
+}
+
+/// [`remove_old_wave_files`], for files last written before `before`.
+pub(crate) fn remove_wave_files_before(directory: &Path, before: SystemTime) -> usize {
+    let Ok(entries) = std::fs::read_dir(directory) else {
+        return 0;
+    };
+    let mut removed = 0;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let is_wave = path.extension().is_some_and(|e| e == "json")
+            && path.file_stem().is_some_and(|stem| {
+                let stem = stem.to_string_lossy();
+                stem.len() == 64 && stem.bytes().all(|b| b.is_ascii_hexdigit())
+            });
+        let old = std::fs::metadata(&path)
+            .and_then(|metadata| metadata.modified())
+            .is_ok_and(|at| at < before);
+        if !is_wave || !old {
+            continue;
+        }
+        info!(
+            "Removing the shared wave's file {}, untouched for {} days",
+            path.display(),
+            UNRESUMED_PROOFS_BACKSTOP.as_secs() / 86_400
+        );
+        match std::fs::remove_file(&path) {
+            Ok(()) => removed += 1,
+            Err(error) => warn!("Could not remove {}: {error}", path.display()),
+        }
+    }
+    removed
 }
 
 /// [`remove_unresumed`], for checkpoints last written before `before`.
@@ -531,23 +628,100 @@ mod tests {
         assert_eq!(restored.unwrap().proof_addresses(), state.proof_addresses());
     }
 
-    /// A torn last record is left out on reading and cut off before the
-    /// next record is appended.
-    #[test]
-    fn a_torn_last_record_is_left_out_and_cut_off() {
-        let dir = tempfile::tempdir().unwrap();
-        let (files, _) = UploadCheckpointFiles::open(checkpoint_in(dir.path())).unwrap();
-        let mut state = state_with(&[b"one"], None);
+    /// What a crash while a record was appended leaves after `files`'
+    /// whole records: `tail`. Returns the state saved before it.
+    fn with_tail(files: &UploadCheckpointFiles, tail: &[u8]) -> UploadState {
+        let state = state_with(&[b"one"], None);
         files.save(&state).unwrap();
         let mut torn = std::fs::OpenOptions::new()
             .append(true)
             .open(files.proofs_path())
             .unwrap();
-        torn.write_all(&[7; 50]).unwrap();
-        drop(torn);
-        let (files, restored) = UploadCheckpointFiles::open(checkpoint_in(dir.path())).unwrap();
-        assert_eq!(restored.unwrap().proof_addresses(), state.proof_addresses());
+        torn.write_all(tail).unwrap();
+        state
+    }
+
+    /// One whole proof record, as appended.
+    fn a_record() -> Vec<u8> {
+        let mut record = Vec::new();
+        append_record(&mut record, &[9; 32], &[5; 300]);
+        record
+    }
+
+    /// A torn last record is left out on reading and cut off before the
+    /// next record is appended: a part of a record, a whole last record
+    /// that fails its check, or zeros to the end of the file.
+    #[test]
+    fn a_torn_last_record_is_left_out_and_cut_off() {
+        let record = a_record();
+        let mut failing = record.clone();
+        failing[100] ^= 1;
+        for tail in [
+            record[..20].to_vec(),
+            record[..200].to_vec(),
+            failing,
+            vec![0; 400],
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let (files, _) = UploadCheckpointFiles::open(checkpoint_in(dir.path())).unwrap();
+            let mut state = with_tail(&files, &tail);
+            let (files, restored) = UploadCheckpointFiles::open(checkpoint_in(dir.path())).unwrap();
+            assert_eq!(restored.unwrap().proof_addresses(), state.proof_addresses());
+            let p = plan(b"two", now());
+            state.prepare(p.clone());
+            state
+                .confirm(&[p.address], &transactions(&p), now())
+                .unwrap();
+            files.save(&state).unwrap();
+            let (_, restored) = UploadCheckpointFiles::open(checkpoint_in(dir.path())).unwrap();
+            assert_eq!(restored.unwrap().proof_addresses(), state.proof_addresses());
+        }
+    }
+
+    /// A record damaged before the end of the file, by a flipped byte or a
+    /// length past what a proof can be, refuses the file: the proofs after
+    /// it are never silently dropped, and the file is kept.
+    #[test]
+    fn a_record_damaged_before_the_end_refuses_the_file() {
+        // A flipped byte in a whole record with another after it.
+        let dir = tempfile::tempdir().unwrap();
+        let (files, _) = UploadCheckpointFiles::open(checkpoint_in(dir.path())).unwrap();
+        let mut state = state_with(&[b"one"], None);
+        files.save(&state).unwrap();
         let p = plan(b"two", now());
+        state.prepare(p.clone());
+        state
+            .confirm(&[p.address], &transactions(&p), now())
+            .unwrap();
+        files.save(&state).unwrap();
+        let mut bytes = std::fs::read(files.proofs_path()).unwrap();
+        bytes[PROOF_FILE_MAGIC.len() + 40] ^= 1;
+        std::fs::write(files.proofs_path(), &bytes).unwrap();
+        let error = UploadCheckpointFiles::open(checkpoint_in(dir.path())).unwrap_err();
+        assert!(error.to_string().contains("Don't delete it"), "{error}");
+        assert!(files.proofs_path().exists());
+
+        // A length past the longest proof.
+        let dir = tempfile::tempdir().unwrap();
+        let (files, _) = UploadCheckpointFiles::open(checkpoint_in(dir.path())).unwrap();
+        let mut record = a_record();
+        record[32..36].copy_from_slice(&u32::MAX.to_le_bytes());
+        with_tail(&files, &record);
+        assert!(UploadCheckpointFiles::open(checkpoint_in(dir.path())).is_err());
+    }
+
+    /// A proof file shorter than its records as last written is written
+    /// anew from the state at the next save, never extended with a gap of
+    /// zeros before the new records.
+    #[test]
+    fn a_proof_file_found_short_is_written_anew() {
+        let dir = tempfile::tempdir().unwrap();
+        let (files, _) = UploadCheckpointFiles::open(checkpoint_in(dir.path())).unwrap();
+        let mut state = state_with(&[b"one", b"two"], None);
+        files.save(&state).unwrap();
+        let whole = std::fs::read(files.proofs_path()).unwrap();
+        std::fs::write(files.proofs_path(), &whole[..whole.len() / 2]).unwrap();
+        let p = plan(b"three", now());
         state.prepare(p.clone());
         state
             .confirm(&[p.address], &transactions(&p), now())
@@ -660,6 +834,24 @@ mod tests {
         assert!(!old_paid.exists() && !old_paid.with_extension(PROOFS_EXTENSION).exists());
         assert!(old_pending.exists() && old_pending.with_extension(PROOFS_EXTENSION).exists());
         assert!(in_use.exists() && unreadable.exists());
+    }
+
+    /// The backstop removes shared waves' files untouched for 30 days, and
+    /// nothing else in their directory.
+    #[test]
+    fn the_backstop_removes_old_wave_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let wave = dir.path().join(format!("{}.json", "a".repeat(64)));
+        let other = dir.path().join("notes.json");
+        std::fs::write(&wave, b"{}").unwrap();
+        std::fs::write(&other, b"{}").unwrap();
+        // Nothing is old enough yet.
+        assert_eq!(remove_old_wave_files(dir.path()), 0);
+        assert!(wave.exists());
+        let later = SystemTime::now() + Duration::from_secs(60);
+        assert_eq!(remove_wave_files_before(dir.path(), later), 1);
+        assert!(!wave.exists());
+        assert!(other.exists());
     }
 
     /// The files of a checkpoint, as a server removing ended uploads lists

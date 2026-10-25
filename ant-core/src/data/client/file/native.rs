@@ -1340,9 +1340,11 @@ async fn open_upload_checkpoint(
         .map(|r| (r.address, r.size))
         .collect::<Vec<_>>();
     let scope = upload_checkpoint_scope(network, &records, envelope, payer)?;
-    let cache_dir = crate::config::data_dir()
-        .map_err(|e| Error::Config(e.to_string()))?
-        .join("payments/upload");
+    let data_dir = crate::config::data_dir().map_err(|e| Error::Config(e.to_string()))?;
+    super::super::upload_checkpoint::remove_old_wave_files(
+        &data_dir.join(super::super::shared_wave::WAVES),
+    );
+    let cache_dir = data_dir.join("payments/upload");
     std::fs::create_dir_all(&cache_dir)?;
     let cache_dir = long_path_safe(cache_dir);
     let cache_path = cache_dir.join(format!(
