@@ -1,9 +1,11 @@
 //! Census of the places in ant-core and ant-cli that store or pay, choose
 //! how an upload is shown or paid, build a wallet, replace the binary, or
-//! decode a data map, and of the node manager's erasures.
+//! decode a data map, and of the node manager's erasures and of what it
+//! calls outside its own code.
 //!
 //! Each test reads the production source of both crates (`../ant-core/src`
-//! and `src`; the erasure census only the node manager's part of it) and
+//! and `src`; the erasure and boundary censuses only the node manager's part
+//! of it) and
 //! fails when a mention of a name it counts appears anywhere its reviewed
 //! list doesn't name, or when a listed site holds more or fewer mentions than
 //! listed. A change that adds such a path, a merge from upstream among them,
@@ -218,6 +220,20 @@ const DOWNLOAD_LEFTOVERS: &str = "A download's temporary archive and duplicate e
 const DAEMON_FILES: &str = "The daemon's own port and pid files, when it stops or is found gone.";
 const NODE_PID: &str = "A node's pid file (<data dir>/node.pid), once its process has exited; the \
     node's data stays.";
+
+const CORE_ERROR: &str = "ant-core's error and result types (error.rs): values, not actions; \
+    they delete nothing.";
+const CONFIG_DIRS: &str = "ant-core's config module, for the platform's data and config \
+    directories (data_dir, config_dir): paths only, nothing deleted. Any other config function \
+    the manager calls is listed here on its own.";
+const CHANNEL: &str = "channel::version_matches_channel compares a node version with an upgrade \
+    channel; it reads and deletes nothing.";
+const NODE_ADD_PROGRESS: &str = "The darwin CLI's progress bar for `darwin node add`, off \
+    (NODE_MANAGER is false); it draws a bar and deletes nothing.";
+const DEVNET_CLIENT: &str = "LocalDevnet (the devnet feature: tests and local devnets; neither \
+    darwin binary links it) hands back a client of the devnet it started, and its error type. \
+    The client stores and reads records; what it deletes is its own caches, never a node's \
+    folder.";
 
 const NOT_A_MAP: &str = "Decodes a quote, proof, peer record or receipt, not a data map.";
 
@@ -1160,6 +1176,291 @@ const ERASE_SITES: &[Site] = &[
     ),
 ];
 
+/// What the node manager's code names outside its own folders, once a file
+/// (see [`boundary_census`]).
+const BOUNDARY_SITES: &[Site] = &[
+    (
+        "ant-cli/src/commands/node/add.rs",
+        "<file>",
+        "darwin::progress::CliProgress",
+        1,
+        NODE_ADD_PROGRESS,
+    ),
+    (
+        "ant-core/src/node/binary.rs",
+        "<file>",
+        "ant_core::channel::version_matches_channel",
+        1,
+        CHANNEL,
+    ),
+    (
+        "ant-core/src/node/binary.rs",
+        "<file>",
+        "ant_core::config::data_dir",
+        1,
+        CONFIG_DIRS,
+    ),
+    (
+        "ant-core/src/node/binary.rs",
+        "<file>",
+        "ant_core::error::Error",
+        1,
+        CORE_ERROR,
+    ),
+    (
+        "ant-core/src/node/binary.rs",
+        "<file>",
+        "ant_core::error::Result",
+        1,
+        CORE_ERROR,
+    ),
+    (
+        "ant-core/src/node/daemon/client.rs",
+        "<file>",
+        "ant_core::error::Error",
+        1,
+        CORE_ERROR,
+    ),
+    (
+        "ant-core/src/node/daemon/client.rs",
+        "<file>",
+        "ant_core::error::Result",
+        1,
+        CORE_ERROR,
+    ),
+    (
+        "ant-core/src/node/daemon/forward/config.rs",
+        "<file>",
+        "ant_core::config",
+        1,
+        CONFIG_DIRS,
+    ),
+    (
+        "ant-core/src/node/daemon/forward/config.rs",
+        "<file>",
+        "ant_core::config::config_dir",
+        1,
+        CONFIG_DIRS,
+    ),
+    (
+        "ant-core/src/node/daemon/forward/config.rs",
+        "<file>",
+        "ant_core::error::Error",
+        1,
+        CORE_ERROR,
+    ),
+    (
+        "ant-core/src/node/daemon/forward/config.rs",
+        "<file>",
+        "ant_core::error::Result",
+        1,
+        CORE_ERROR,
+    ),
+    (
+        "ant-core/src/node/daemon/forward/es.rs",
+        "<file>",
+        "ant_core::error::Error",
+        1,
+        CORE_ERROR,
+    ),
+    (
+        "ant-core/src/node/daemon/forward/es.rs",
+        "<file>",
+        "ant_core::error::Result",
+        1,
+        CORE_ERROR,
+    ),
+    (
+        "ant-core/src/node/daemon/forward/mod.rs",
+        "<file>",
+        "ant_core::error::Result",
+        1,
+        CORE_ERROR,
+    ),
+    (
+        "ant-core/src/node/daemon/forward/offsets.rs",
+        "<file>",
+        "ant_core::config",
+        1,
+        CONFIG_DIRS,
+    ),
+    (
+        "ant-core/src/node/daemon/forward/offsets.rs",
+        "<file>",
+        "ant_core::config::data_dir",
+        1,
+        CONFIG_DIRS,
+    ),
+    (
+        "ant-core/src/node/daemon/forward/offsets.rs",
+        "<file>",
+        "ant_core::error::Result",
+        1,
+        CORE_ERROR,
+    ),
+    (
+        "ant-core/src/node/daemon/forward/tail.rs",
+        "<file>",
+        "ant_core::error::Result",
+        1,
+        CORE_ERROR,
+    ),
+    (
+        "ant-core/src/node/daemon/server.rs",
+        "<file>",
+        "ant_core::error::Error",
+        1,
+        CORE_ERROR,
+    ),
+    (
+        "ant-core/src/node/daemon/server.rs",
+        "<file>",
+        "ant_core::error::Result",
+        1,
+        CORE_ERROR,
+    ),
+    (
+        "ant-core/src/node/daemon/supervisor.rs",
+        "<file>",
+        "ant_core::error::Error",
+        1,
+        CORE_ERROR,
+    ),
+    (
+        "ant-core/src/node/daemon/supervisor.rs",
+        "<file>",
+        "ant_core::error::Result",
+        1,
+        CORE_ERROR,
+    ),
+    (
+        "ant-core/src/node/devnet.rs",
+        "<file>",
+        "ant_core::data::Client",
+        1,
+        DEVNET_CLIENT,
+    ),
+    (
+        "ant-core/src/node/devnet.rs",
+        "<file>",
+        "ant_core::data::client::ClientConfig",
+        1,
+        DEVNET_CLIENT,
+    ),
+    (
+        "ant-core/src/node/devnet.rs",
+        "<file>",
+        "ant_core::data::error::Error",
+        1,
+        DEVNET_CLIENT,
+    ),
+    (
+        "ant-core/src/node/devnet.rs",
+        "<file>",
+        "ant_core::data::error::Result",
+        1,
+        DEVNET_CLIENT,
+    ),
+    (
+        "ant-core/src/node/mod.rs",
+        "<file>",
+        "ant_core::config",
+        1,
+        CONFIG_DIRS,
+    ),
+    (
+        "ant-core/src/node/mod.rs",
+        "<file>",
+        "ant_core::config::data_dir",
+        1,
+        CONFIG_DIRS,
+    ),
+    (
+        "ant-core/src/node/mod.rs",
+        "<file>",
+        "ant_core::error::Error",
+        1,
+        CORE_ERROR,
+    ),
+    (
+        "ant-core/src/node/mod.rs",
+        "<file>",
+        "ant_core::error::Result",
+        1,
+        CORE_ERROR,
+    ),
+    (
+        "ant-core/src/node/process/detach.rs",
+        "<file>",
+        "ant_core::error::Error",
+        1,
+        CORE_ERROR,
+    ),
+    (
+        "ant-core/src/node/process/detach.rs",
+        "<file>",
+        "ant_core::error::Result",
+        1,
+        CORE_ERROR,
+    ),
+    (
+        "ant-core/src/node/process/spawn.rs",
+        "<file>",
+        "ant_core::error::Error",
+        1,
+        CORE_ERROR,
+    ),
+    (
+        "ant-core/src/node/process/spawn.rs",
+        "<file>",
+        "ant_core::error::Result",
+        1,
+        CORE_ERROR,
+    ),
+    (
+        "ant-core/src/node/registry.rs",
+        "<file>",
+        "ant_core::error::Error",
+        1,
+        CORE_ERROR,
+    ),
+    (
+        "ant-core/src/node/registry.rs",
+        "<file>",
+        "ant_core::error::Result",
+        1,
+        CORE_ERROR,
+    ),
+    (
+        "ant-core/src/node/types.rs",
+        "<file>",
+        "ant_core::config",
+        1,
+        CONFIG_DIRS,
+    ),
+    (
+        "ant-core/src/node/types.rs",
+        "<file>",
+        "ant_core::config::data_dir",
+        1,
+        CONFIG_DIRS,
+    ),
+    (
+        "ant-core/src/node/types.rs",
+        "<file>",
+        "ant_core::error::Error",
+        1,
+        CORE_ERROR,
+    ),
+    (
+        "ant-core/src/node/types.rs",
+        "<file>",
+        "ant_core::error::Result",
+        1,
+        CORE_ERROR,
+    ),
+];
+
 const DECODE_SITES: &[Site] = &[
     (
         "ant-cli/src/commands/data/listings.rs",
@@ -1785,6 +2086,23 @@ struct Walker<'a> {
     /// A label for the next `{` opened at this stack depth.
     pending: Option<(Frame, usize)>,
     scan: FileScan,
+    /// Set when the walk collects the paths out of the node manager's code
+    /// ([`scan_paths`]) rather than names.
+    paths: Option<PathScan>,
+}
+
+/// Where a file of the node manager's code sits, for resolving its paths,
+/// and the aliases its `use` items made so far.
+#[derive(Debug, Default)]
+struct PathScan {
+    /// Its crate: `ant_core`, `darwin` (ant-cli's darwin binary) or
+    /// `darwin_nodes`.
+    krate: String,
+    /// Its module, from its crate's root.
+    module: Vec<String>,
+    /// Names a `use` brought in that start lower case (modules and
+    /// functions), by the crate and path they stand for.
+    aliases: BTreeMap<String, (String, Vec<String>)>,
 }
 
 impl<'a> Walker<'a> {
@@ -1795,6 +2113,7 @@ impl<'a> Walker<'a> {
             stack: Vec::new(),
             pending: None,
             scan: FileScan::default(),
+            paths: None,
         }
     }
 
@@ -1959,6 +2278,12 @@ impl<'a> Walker<'a> {
         if matches!(previous, Some(Tok::Ident(ref word)) if word == "fn") {
             return pos + 1;
         }
+        if self.paths.is_some() {
+            if name == "use" {
+                return self.use_paths(pos);
+            }
+            return self.path_from(pos, previous.as_ref()).unwrap_or(pos + 1);
+        }
         let wanted = self.counting;
         let owner = if matches!(previous, Some(Tok::Joint("::"))) {
             pos.checked_sub(2)
@@ -1971,6 +2296,175 @@ impl<'a> Walker<'a> {
             self.count(&label, line);
         }
         pos + 1
+    }
+
+    /// The paths of the `use` item at `pos`: each recorded if it leaves the
+    /// node manager's code, and each that starts lower case (a module or a
+    /// function) kept as an alias for the paths after it. Returns the
+    /// position after the item.
+    fn use_paths(&mut self, pos: usize) -> usize {
+        let line = self.tokens.get(pos).map_or(0, |token| token.line);
+        let mut start = pos + 1;
+        if matches!(self.tok(start), Some(Tok::Joint("::"))) {
+            start += 1;
+        }
+        let mut leaves = Vec::new();
+        let mut end = self.use_tree(start, Vec::new(), &mut leaves);
+        for (mut path, alias) in leaves {
+            if path.last().is_some_and(|segment| segment == "self") {
+                path.pop();
+            }
+            let name = alias.or_else(|| path.last().cloned());
+            let Some(resolved) = self.resolve(&path) else {
+                continue;
+            };
+            self.record_path(&resolved, line);
+            if let (Some(name), Some(paths)) = (name, self.paths.as_mut()) {
+                if name != "*" && name != "_" && !name.starts_with(char::is_uppercase) {
+                    paths.aliases.insert(name, resolved);
+                }
+            }
+        }
+        while let Some(tok) = self.tok(end) {
+            end += 1;
+            if matches!(tok, Tok::Punct(';')) {
+                break;
+            }
+        }
+        end
+    }
+
+    /// The use tree at `pos`, below `prefix`: each leaf's path, with the
+    /// name it is brought in as when renamed. Returns the position after it.
+    fn use_tree(
+        &self,
+        mut pos: usize,
+        prefix: Vec<String>,
+        leaves: &mut Vec<(Vec<String>, Option<String>)>,
+    ) -> usize {
+        let mut path = prefix;
+        loop {
+            match self.tok(pos) {
+                Some(Tok::Ident(segment)) => {
+                    path.push(segment.clone());
+                    pos += 1;
+                }
+                Some(Tok::Punct('*')) => {
+                    path.push("*".to_string());
+                    leaves.push((path, None));
+                    return pos + 1;
+                }
+                Some(Tok::Punct('{')) => {
+                    pos += 1;
+                    loop {
+                        match self.tok(pos) {
+                            Some(Tok::Punct('}')) => return pos + 1,
+                            Some(Tok::Punct(',')) => pos += 1,
+                            None => return pos,
+                            Some(_) => {
+                                let next = self.use_tree(pos, path.clone(), leaves);
+                                pos = next.max(pos + 1);
+                            }
+                        }
+                    }
+                }
+                _ => return pos,
+            }
+            match self.tok(pos) {
+                Some(Tok::Joint("::")) => pos += 1,
+                Some(Tok::Ident(word)) if word == "as" => {
+                    leaves.push((path, self.ident(pos + 1).map(str::to_string)));
+                    return pos + 2;
+                }
+                _ => {
+                    leaves.push((path, None));
+                    return pos;
+                }
+            }
+        }
+    }
+
+    /// A path from `pos` whose root can lead out of the node manager's code
+    /// (`crate`, `self`, `super`, `ant_core`, or an alias a `use` made),
+    /// recorded if it does. Returns the position after it, or `None` when
+    /// no such path starts here (a later segment of a path, a method, a
+    /// name of another crate's).
+    fn path_from(&mut self, pos: usize, previous: Option<&Tok>) -> Option<usize> {
+        if matches!(previous, Some(Tok::Joint("::") | Tok::Punct('.'))) {
+            return None;
+        }
+        if !matches!(self.tok(pos + 1), Some(Tok::Joint("::"))) {
+            return None;
+        }
+        let root = self.ident(pos)?.to_string();
+        let known = matches!(root.as_str(), "crate" | "self" | "super" | "ant_core")
+            || self
+                .paths
+                .as_ref()
+                .is_some_and(|paths| paths.aliases.contains_key(&root));
+        if !known {
+            return None;
+        }
+        let mut segments = vec![root];
+        let mut end = pos + 1;
+        while matches!(self.tok(end), Some(Tok::Joint("::"))) {
+            let Some(segment) = self.ident(end + 1) else {
+                break;
+            };
+            segments.push(segment.to_string());
+            end += 2;
+        }
+        let line = self.tokens.get(pos).map_or(0, |token| token.line);
+        if let Some(resolved) = self.resolve(&segments) {
+            self.record_path(&resolved, line);
+        }
+        Some(end)
+    }
+
+    /// `segments` from its crate's root: the crate and the path, or `None`
+    /// for a path into another crate, or above its crate's root.
+    fn resolve(&self, segments: &[String]) -> Option<(String, Vec<String>)> {
+        let paths = self.paths.as_ref()?;
+        let (root, rest) = segments.split_first()?;
+        let mut module = paths.module.clone();
+        module.extend(self.inline_modules());
+        let (krate, mut path) = match root.as_str() {
+            "crate" => (paths.krate.clone(), Vec::new()),
+            "self" => (paths.krate.clone(), module),
+            "super" => {
+                let ups = segments.iter().take_while(|s| *s == "super").count();
+                let kept = module.len().checked_sub(ups)?;
+                module.truncate(kept);
+                module.extend(segments[ups..].iter().cloned());
+                return Some((paths.krate.clone(), module));
+            }
+            "ant_core" => ("ant_core".to_string(), Vec::new()),
+            alias => paths.aliases.get(alias)?.clone(),
+        };
+        path.extend(rest.iter().cloned());
+        Some((krate, path))
+    }
+
+    /// Count `resolved` in this file if it leaves the node manager's code,
+    /// by its crate and its path up to and with its first type (a name that
+    /// starts upper case), so a type's variants and associated items count
+    /// as the type.
+    fn record_path(&mut self, (krate, path): &(String, Vec<String>), line: usize) {
+        if inside_node_manager(krate, path) {
+            return;
+        }
+        let mut label = vec![krate.clone()];
+        for segment in path {
+            label.push(segment.clone());
+            if segment.starts_with(char::is_uppercase) {
+                break;
+            }
+        }
+        self.scan
+            .calls
+            .entry(("<file>".to_string(), label.join("::")))
+            .or_default()
+            .push(line);
     }
 
     /// The type an `impl` header starting at `pos` names: after `for` if there
@@ -2128,6 +2622,58 @@ fn scan_counting(source: &str, counting: Counting) -> FileScan {
     let tokens = tokenize(source);
     Walker::new(&tokens, counting).walk()
 }
+
+/// Scan one file of the node manager's code, at `place` (its crate and
+/// module), for the paths that lead out of the node manager's code.
+fn scan_paths(source: &str, (krate, module): (String, Vec<String>)) -> FileScan {
+    let tokens = tokenize(source);
+    let mut walker = Walker::new(&tokens, &[]);
+    walker.paths = Some(PathScan {
+        krate,
+        module,
+        aliases: BTreeMap::new(),
+    });
+    walker.walk()
+}
+
+/// Whether a path, from the root of `krate`, stays in the node manager's
+/// code ([`NODE_MANAGER`]): ant-core's `node` module, the darwin binary's
+/// `commands::node`, or anywhere in `darwin-nodes`, a crate of its own.
+fn inside_node_manager(krate: &str, path: &[String]) -> bool {
+    match krate {
+        "ant_core" => path.first().is_some_and(|segment| segment == "node"),
+        "darwin" => path.len() >= 2 && path[0] == "commands" && path[1] == "node",
+        "darwin_nodes" => true,
+        _ => false,
+    }
+}
+
+/// The crate a file of the workspace belongs to and its module there, for
+/// a file of the node manager's code (`ant-core/src/node/daemon/mod.rs` is
+/// `ant_core`'s `node::daemon`); `None` for any other file.
+fn node_manager_place(file: &str) -> Option<(String, Vec<String>)> {
+    if !NODE_MANAGER.iter().any(|dir| file.starts_with(dir)) {
+        return None;
+    }
+    let (krate, rest) = if let Some(rest) = file.strip_prefix("ant-core/src/") {
+        ("ant_core", rest)
+    } else if let Some(rest) = file.strip_prefix("ant-cli/src/bin/darwin-nodes/") {
+        ("darwin_nodes", rest)
+    } else {
+        ("darwin", file.strip_prefix("ant-cli/src/")?)
+    };
+    let mut module: Vec<String> = rest
+        .trim_end_matches(".rs")
+        .split('/')
+        .map(str::to_string)
+        .collect();
+    if matches!(rest, "main.rs" | "lib.rs") {
+        module.clear();
+    } else if module.last().is_some_and(|name| name == "mod") {
+        module.pop();
+    }
+    Some((krate.to_string(), module))
+}
 // ---------------------------------------------------------------------------
 // The crates
 // ---------------------------------------------------------------------------
@@ -2182,13 +2728,28 @@ fn crate_census(
     root: &Path,
     counting: Counting,
 ) -> BTreeMap<(String, String, String), Vec<usize>> {
+    crate_census_by(crate_name, root, &|_, source| {
+        scan_counting(source, counting)
+    })
+}
+
+/// [`crate_census`], with each file scanned by `scan`, given the file's name
+/// from the workspace root and its source.
+fn crate_census_by(
+    crate_name: &str,
+    root: &Path,
+    scan: &dyn Fn(&str, &str) -> FileScan,
+) -> BTreeMap<(String, String, String), Vec<usize>> {
     let mut files = Vec::new();
     rust_files(root, &root.join("src"), &mut files);
     let scans: BTreeMap<String, FileScan> = files
         .iter()
         .map(|(relative, path)| {
             let source = std::fs::read_to_string(path).unwrap_or_default();
-            (relative.clone(), scan_counting(&source, counting))
+            (
+                relative.clone(),
+                scan(&format!("{crate_name}/{relative}"), &source),
+            )
         })
         .collect();
     let names: BTreeSet<String> = scans.keys().cloned().collect();
@@ -2317,6 +2878,27 @@ fn check_node_manager(counting: Counting, reviewed: &[Site], rule: &str) {
     check_found(&found, reviewed, rule);
 }
 
+/// What the node manager's code ([`NODE_MANAGER`]) names outside its own
+/// folders: every path from `crate`, `self`, `super`, `ant_core`, or a name a
+/// `use` brought in, that resolves outside them, once a file, by crate and
+/// path up to its first type. Test-only code is left out, as everywhere.
+fn boundary_census() -> BTreeMap<(String, String, String), Vec<usize>> {
+    let cli = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let scan = |file: &str, source: &str| match node_manager_place(file) {
+        Some(place) => scan_paths(source, place),
+        None => scan_counting(source, &[]),
+    };
+    let mut found = crate_census_by("ant-core", &cli.join("../ant-core"), &scan);
+    found.extend(crate_census_by("ant-cli", cli, &scan));
+    found
+        .into_iter()
+        .map(|(key, mut lines)| {
+            lines.truncate(1);
+            (key, lines)
+        })
+        .collect()
+}
+
 /// Fail with `rule` and the differences between `found` and `reviewed`, if
 /// there are any.
 fn check_found(
@@ -2405,4 +2987,99 @@ fn the_node_manager_deletes_no_node_data() {
          `node reset` is off. What it deletes is its own process and port files, a node's pid \
          file, and download leftovers.",
     );
+}
+
+/// The erasure census above counts deletions written in the node manager's
+/// folders only. This one lists the doors out of them: every path the
+/// manager's code names in the rest of ant-core or the darwin binary (a
+/// module, a function, a type), once a file. A call from the manager into
+/// code that deletes, in `data/`, `update.rs` or a utility module, then
+/// fails here until it is reviewed, with what it deletes.
+///
+/// Neither census covers other crates: what the manager calls in the
+/// standard library or its dependencies, or ant-node's own pruning of a
+/// node's data, which runs in the node and belongs to darwin-node's census.
+/// Nor does it follow methods called on a value of a listed type, so a
+/// listed type's reason says what its methods delete.
+#[test]
+fn the_node_manager_reaches_outside_its_code_only_where_reviewed() {
+    check_found(
+        &boundary_census(),
+        BOUNDARY_SITES,
+        "The node manager's code reaches the rest of ant-core and of the darwin binary only \
+         through reviewed paths, none of which deletes a node's data folder: error types, the \
+         platform's directories, a version check, a progress bar, and the devnet's client.",
+    );
+}
+
+/// The boundary census resolves what a file names: `use` trees with groups,
+/// renames and `self`, `super` chains from the file's module, aliases a
+/// `use` made, and `crate::` and `ant_core::` paths written in full; and it
+/// leaves out paths that stay in the manager's code, other crates' paths,
+/// methods and test-only code.
+#[test]
+fn the_boundary_census_finds_every_path_out_of_the_node_manager() {
+    let source = r#"
+        use crate::{config, error::{Error, Result}};
+        use crate::node::types::NodeConfig;
+        use super::super::super::data::client::file as files;
+        use super::health;
+        use std::fs;
+
+        pub(crate) fn serve(x: Thing) -> Result<()> {
+            let _ = config::data_dir();
+            files::delete_all();
+            health::check();
+            super::supervisor::run();
+            self::helper();
+            ant_core::update::replace_binary();
+            let _ = crate::error::Error::NodeNotFound;
+            x.self_check();
+            fs::remove_file("x");
+            Ok(())
+        }
+
+        #[cfg(test)]
+        mod tests {
+            use crate::data::Client;
+        }
+    "#;
+    let scan = scan_paths(
+        source,
+        (
+            "ant_core".to_string(),
+            vec!["node".into(), "daemon".into(), "server".into()],
+        ),
+    );
+    let found: Vec<&str> = scan.calls.keys().map(|(_, name)| name.as_str()).collect();
+    assert_eq!(
+        found,
+        vec![
+            "ant_core::config",
+            "ant_core::config::data_dir",
+            "ant_core::data::client::file",
+            "ant_core::data::client::file::delete_all",
+            "ant_core::error::Error",
+            "ant_core::error::Result",
+            "ant_core::update::replace_binary",
+        ]
+    );
+
+    // The manager's files, by crate and module.
+    assert_eq!(
+        node_manager_place("ant-core/src/node/daemon/mod.rs"),
+        Some(("ant_core".into(), vec!["node".into(), "daemon".into()]))
+    );
+    assert_eq!(
+        node_manager_place("ant-cli/src/bin/darwin-nodes/main.rs"),
+        Some(("darwin_nodes".into(), vec![]))
+    );
+    assert_eq!(
+        node_manager_place("ant-cli/src/commands/node/add.rs"),
+        Some((
+            "darwin".into(),
+            vec!["commands".into(), "node".into(), "add".into()]
+        ))
+    );
+    assert_eq!(node_manager_place("ant-core/src/data/client/file.rs"), None);
 }

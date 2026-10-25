@@ -262,6 +262,9 @@ told apart by the commit `darwin --version` prints. Upstream's entries follow.
   marker, reports as `evicted` and is never started again; a pin checks that no level of disk
   pressure stops a node, deletes a file or writes a marker, and a census
   (`the_node_manager_deletes_no_node_data`) lists every deletion in the node manager's code.
+  Another (`the_node_manager_reaches_outside_its_code_only_where_reviewed`) lists every path from
+  that code into the rest of ant-core and of the darwin binary, so a call from the manager into
+  code that deletes elsewhere needs review too.
 - `darwin-nodes`, a second binary of `ant-cli`, is the storage-node image's node manager, in place
   of Autonomi's `ant` 0.3.9, and is built only by darwin-node's image build, from a commit it pins
   (`cargo build --release --locked -p ant-cli --bin darwin-nodes`). It has `ant node`'s commands the
