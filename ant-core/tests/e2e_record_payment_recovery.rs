@@ -12,13 +12,20 @@
 //! client, as a new process would run it, finds the payment on the chain
 //! instead of paying again. Each test counts the transactions the wallet sent
 //! (its nonce, read from Anvil directly).
+//!
+//! Two small files uploaded at once from one wallet share one payment wave,
+//! one transaction for both, and recover it the same way: each file's
+//! records are charged once, in the first run and in a rerun from each
+//! file's journal.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 mod support;
 
 use alloy::providers::Provider;
-use ant_core::data::{compute_address, ml_dsa_65, Client, Error, PointerTarget, PointerTargetKind};
+use ant_core::data::{
+    compute_address, ml_dsa_65, Client, Error, PaymentMode, PointerTarget, PointerTargetKind,
+};
 use ant_protocol::evm::{CustomNetwork, Network as EvmNetwork, Wallet, U256};
 use axum::extract::State;
 use axum::response::{IntoResponse, Response};
@@ -28,6 +35,7 @@ use serial_test::serial;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 use support::{test_client_config, MiniTestnet, DEFAULT_NODE_COUNT};
 
 /// The node the clients are built on.
@@ -195,6 +203,33 @@ fn record_checkpoints() -> usize {
     }
 }
 
+/// The checkpoints of file uploads in the client's data directory.
+fn upload_checkpoints() -> usize {
+    let directory: PathBuf = ant_core::config::data_dir()
+        .unwrap()
+        .join("payments/upload");
+    match std::fs::read_dir(directory) {
+        Ok(entries) => entries
+            .filter(|entry| {
+                entry
+                    .as_ref()
+                    .is_ok_and(|entry| entry.path().extension().is_some_and(|e| e == "msgpack"))
+            })
+            .count(),
+        Err(_) => 0,
+    }
+}
+
+/// A small file of random bytes: a few records, well under a wave.
+fn random_file() -> tempfile::NamedTempFile {
+    use std::io::Write;
+    let mut file = tempfile::NamedTempFile::new().unwrap();
+    let bytes = (0..4096).map(|_| rand::random::<u8>()).collect::<Vec<_>>();
+    file.write_all(&bytes).unwrap();
+    file.flush().unwrap();
+    file
+}
+
 fn random_chunk() -> Bytes {
     Bytes::from((0..1024).map(|_| rand::random::<u8>()).collect::<Vec<_>>())
 }
@@ -334,6 +369,78 @@ async fn a_pointer_write_the_rpc_errored_on_pays_once() {
     assert_eq!((read.counter(), read.target()), (1, second));
     assert_eq!(
         record_checkpoints(),
+        checkpoints,
+        "nothing kept once stored"
+    );
+
+    testnet.teardown().await;
+}
+
+/// Two small files uploaded at once share one payment wave. When the RPC
+/// answers its transaction with an error and then stops answering, both
+/// uploads fail with their journals kept, after one transaction; run again,
+/// each finds the wave's payment from its own journal, with no new one.
+/// Each file's records are charged once: the rerun takes the wave's receipt
+/// only if each file's share is exactly its own quotes' total (the upload
+/// checks it), and each envelope's payment record checks against the chain.
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn files_sharing_a_wave_the_rpc_errored_on_pay_once() {
+    let (testnet, proxy, direct, proxied) = setup().await;
+    let checkpoints = upload_checkpoints();
+    let (first, second) = (random_file(), random_file());
+
+    let before = spent(&direct).await;
+    proxy.fail_next_send_then_go_down();
+    let sharing = client(&testnet, &proxied);
+    // Both uploads join one wave whatever their timing.
+    sharing.set_shared_wave_wait(Duration::from_secs(120));
+    let (a, b) = tokio::join!(
+        sharing.file_upload_with_mode(first.path(), PaymentMode::Single),
+        sharing.file_upload_with_mode(second.path(), PaymentMode::Single),
+    );
+    assert!(a.is_err() && b.is_err(), "the wave's outcome can't be seen");
+    drop(sharing);
+    assert_eq!(
+        spent(&direct).await.0,
+        before.0 + 1,
+        "one transaction for both files"
+    );
+    assert_eq!(proxy.sends(), 1);
+    assert_eq!(
+        upload_checkpoints(),
+        checkpoints + 2,
+        "each file's journal is kept"
+    );
+    proxy.restore();
+
+    for file in [&first, &second] {
+        let result = client(&testnet, &proxied)
+            .file_upload_with_mode(file.path(), PaymentMode::Single)
+            .await
+            .expect("the upload run again finds the wave's payment and stores the file");
+        let envelope = result.envelope.expect("the file's envelope");
+        assert!(envelope.proof_checked, "{:?}", envelope.proof_problem);
+        let output = tempfile::TempDir::new().unwrap();
+        let path = output.path().join("read");
+        client(&testnet, &proxied)
+            .file_download(&result.data_map, &path)
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::read(path).unwrap(),
+            std::fs::read(file.path()).unwrap()
+        );
+    }
+    let after = spent(&direct).await;
+    assert_eq!(
+        after.0,
+        before.0 + 1,
+        "exactly one transaction across both runs"
+    );
+    assert!(after.1 < before.1, "and it paid");
+    assert_eq!(
+        upload_checkpoints(),
         checkpoints,
         "nothing kept once stored"
     );

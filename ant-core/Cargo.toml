@@ -276,3 +276,8 @@ path = "tests/datamap_file.rs"
 name = "e2e_native_payment"
 path = "tests/e2e_native_payment.rs"
 required-features = ["native", "test-utils"]
+
+[[test]]
+name = "e2e_record_payment_recovery"
+path = "tests/e2e_record_payment_recovery.rs"
+required-features = ["native", "test-utils"]
