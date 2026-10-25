@@ -91,6 +91,14 @@ fn write_quorum(peers: usize) -> usize {
     (read_quorum(peers) + 1).min(peers)
 }
 
+/// How many of a pointer's close group must take a write, counted over the
+/// configured close group (`close_group_size`): its write quorum, 5 of 7.
+/// A state is quoted by too few to take it when fewer quote it, and nothing
+/// is paid then ([`Client::get_store_quote_plan_split`]).
+pub(crate) fn pointer_write_quorum(close_group_size: usize) -> usize {
+    write_quorum(quorum_width(0, close_group_size))
+}
+
 /// How many peers must report a state before a read will return it.
 ///
 /// Two, so that no single peer decides what a pointer says. A peer that is in
@@ -3536,6 +3544,15 @@ mod tests {
                 "a read cannot need more backers than answers"
             );
         }
+    }
+
+    /// A pointer's state is paid for only once at least five of a close
+    /// group of seven quoted it: the write quorum, counted over the group
+    /// however small.
+    #[test]
+    fn a_pointer_state_needs_five_of_seven_quoting() {
+        assert_eq!(pointer_write_quorum(7), 5);
+        assert_eq!(pointer_write_quorum(7), write_quorum(quorum_width(3, 7)));
     }
 
     /// The default close group is seven: four answers decide a read, five

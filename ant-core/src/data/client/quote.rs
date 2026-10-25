@@ -1094,6 +1094,19 @@ impl Client {
                 },
             )
             .await?;
+        // A full node quotes no pointer it doesn't hold, so the nodes that
+        // quoted a pointer's state are those that can take its write. Fewer
+        // than its write quorum can't, and nothing is paid then.
+        if data_type == ant_protocol::pointer::DATA_TYPE_POINTER {
+            let wanted = super::pointer::pointer_write_quorum(self.config().close_group_size);
+            if quotes.len() < wanted {
+                return Err(Error::InsufficientPeers(format!(
+                    "only {} of the close group quoted for pointer state {}, and a write needs                      {wanted} to take it; nothing was paid",
+                    quotes.len(),
+                    hex::encode(address)
+                )));
+            }
+        }
         let put_peers = put_peers_with_median_voters_first(
             &quotes,
             &initial_put_peers,
