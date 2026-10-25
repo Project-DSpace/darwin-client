@@ -5534,7 +5534,7 @@ mod tests {
     /// upgrade instruction in the reason.
     #[test]
     fn settlement_refusal_after_paid_waves_carries_spend_and_upgrade_instruction() {
-        let refusal = "your client is too old to pay the current storage rate. Run `ant update`";
+        let refusal = &crate::data::client::quote::update_required_message(1, 2);
         let stored = vec![[1u8; 32], [2u8; 32]];
         let remaining = [[3u8; 32], [4u8; 32], [5u8; 32]];
 

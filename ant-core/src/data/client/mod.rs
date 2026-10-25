@@ -263,6 +263,11 @@ mod settlement_refusal_tests {
         PeerId::from_bytes([seed; 32])
     }
 
+    /// A settlement refusal's wording, as quote collection records it.
+    fn refusal() -> String {
+        super::quote::update_required_message(1, 2)
+    }
+
     /// The question the V2-1109 run could not answer from logs: does one peer
     /// refusing many times count as many? It must not — the quorum is over
     /// DISTINCT peers, and a lone hostile or misconfigured storer repeating
@@ -272,7 +277,7 @@ mod settlement_refusal_tests {
         let refusals = SettlementRefusals::default();
         for _ in 0..50 {
             assert!(
-                refusals.note(peer(7), "run ant update").is_none(),
+                refusals.note(peer(7), &refusal()).is_none(),
                 "a single peer's repeated refusals must stay below the quorum"
             );
         }
@@ -285,8 +290,8 @@ mod settlement_refusal_tests {
     #[test]
     fn corroborating_peers_names_every_distinct_refuser() {
         let refusals = SettlementRefusals::default();
-        assert!(refusals.note(peer(1), "run ant update").is_none());
-        assert!(refusals.note(peer(2), "run ant update").is_some());
+        assert!(refusals.note(peer(1), &refusal()).is_none());
+        assert!(refusals.note(peer(2), &refusal()).is_some());
 
         let ids = refusals.corroborating_peers();
         assert_eq!(ids.len(), 2);

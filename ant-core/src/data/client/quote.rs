@@ -23,9 +23,9 @@ use ant_protocol::payment::commitment::{
 use ant_protocol::payment::verify_quote_signature;
 use ant_protocol::transport::{DHTNode, MultiAddr, PeerId, ResponderView, WitnessedCloseGroup};
 use ant_protocol::{
-    client_update_required_message, ChunkMessage, ChunkMessageBody, ChunkQuoteRequest,
-    ChunkQuoteRequestV2, ChunkQuoteResponse, ProtocolError, CLOSE_GROUP_MAJORITY, CLOSE_GROUP_SIZE,
-    CURRENT_SETTLEMENT_VERSION, DATA_TYPE_CHUNK,
+    ChunkMessage, ChunkMessageBody, ChunkQuoteRequest, ChunkQuoteRequestV2, ChunkQuoteResponse,
+    ProtocolError, CLOSE_GROUP_MAJORITY, CLOSE_GROUP_SIZE, CURRENT_SETTLEMENT_VERSION,
+    DATA_TYPE_CHUNK,
 };
 use futures::stream::{FuturesUnordered, StreamExt};
 use std::collections::{HashMap, HashSet};
@@ -446,10 +446,31 @@ pub(super) fn settlement_refusal_error(
              client is at {CURRENT_SETTLEMENT_VERSION}); ignoring it"
         ));
     }
-    Error::ClientUpdateRequired(client_update_required_message(
+    Error::ClientUpdateRequired(update_required_message(
         client_settlement_version,
         min_settlement_version,
     ))
+}
+
+/// What this client tells its user when storers refuse its settlement
+/// version, in its own words: the vendored `client_update_required_message`
+/// is the storer's wording, which names another client's update command and
+/// download page. A native build says where a newer darwin comes from; a
+/// browser build, whose code the page serves, says to reload the page.
+pub(crate) fn update_required_message(
+    client_settlement_version: u32,
+    min_settlement_version: u32,
+) -> String {
+    #[cfg(feature = "native")]
+    let remedy =
+        "Build a new darwin from https://github.com/Project-DSpace/darwin-client (see its README).";
+    #[cfg(not(feature = "native"))]
+    let remedy = "Reload the page to use a newer one.";
+    format!(
+        "Your darwin client is too old to pay the current storage rate (it settles under \
+         version {client_settlement_version}; the network requires at least \
+         {min_settlement_version}). No quote was issued and nothing was charged. {remedy}"
+    )
 }
 
 /// Did this failure look like a storer that cannot parse a versioned request,
@@ -2940,11 +2961,40 @@ mod tests {
 
         match mapped {
             Some(Err(Error::ClientUpdateRequired(msg))) => {
-                assert!(msg.contains("ant update"), "{msg}");
+                assert_names_darwins_update(&msg);
                 assert!(msg.contains("nothing was charged"), "{msg}");
             }
             other => panic!("expected ClientUpdateRequired, got: {other:?}"),
         }
+    }
+
+    /// The update instruction is darwin's own: it names darwin and where a
+    /// newer one comes from, never another client's update command or
+    /// download page, which the vendored storer wording names.
+    fn assert_names_darwins_update(msg: &str) {
+        assert!(msg.contains("darwin"), "{msg}");
+        assert!(msg.contains("Project-DSpace"), "{msg}");
+        assert!(!msg.contains("ant update"), "{msg}");
+        assert!(!msg.contains("WithAutonomi"), "{msg}");
+    }
+
+    /// The text names both versions and says that nothing was charged, and
+    /// darwin is told how to update, where the vendored text points users of
+    /// another client elsewhere.
+    #[test]
+    fn the_update_message_is_darwins_own() {
+        let msg = update_required_message(1, 2);
+        assert_names_darwins_update(&msg);
+        assert!(msg.contains("version 1"), "{msg}");
+        assert!(msg.contains("at least 2"), "{msg}");
+        assert!(
+            msg.contains("No quote was issued and nothing was charged"),
+            "{msg}"
+        );
+        // The storer's wording, which this replaces for darwin's users.
+        let vendored = ant_protocol::client_update_required_message(1, 2);
+        assert!(vendored.contains("ant update"), "{vendored}");
+        assert_ne!(msg, vendored);
     }
 
     /// Quote collection's error when every storer refused for rate, built
@@ -3078,6 +3128,7 @@ mod tests {
             Some(Err(Error::StorerUpdateRequired(msg))) => {
                 assert!(msg.contains("use a different storer"), "{msg}");
                 assert!(!msg.contains("ant update"), "{msg}");
+                assert!(!msg.contains("Build a new darwin"), "{msg}");
             }
             other => panic!("expected StorerUpdateRequired, got: {other:?}"),
         }
@@ -3101,9 +3152,7 @@ mod tests {
                 record_store_quote_result(
                     PeerId::from_bytes([peer; 32]),
                     Vec::new(),
-                    Err(Error::ClientUpdateRequired(
-                        "too old, run ant update".into(),
-                    )),
+                    Err(Error::ClientUpdateRequired(update_required_message(1, 2))),
                     &mut quotes,
                     &mut already_stored,
                     failures,
@@ -3257,9 +3306,7 @@ mod tests {
             let _ = record_store_quote_result(
                 PeerId::from_bytes([peer; 32]),
                 Vec::new(),
-                Err(Error::ClientUpdateRequired(
-                    "too old, run ant update".into(),
-                )),
+                Err(Error::ClientUpdateRequired(update_required_message(1, 2))),
                 &mut quotes,
                 &mut already_stored,
                 &mut failures,
@@ -3271,7 +3318,7 @@ mod tests {
 
         match refusal_slot {
             Some(Error::ClientUpdateRequired(msg)) => {
-                assert!(msg.contains("ant update"), "{msg}");
+                assert_names_darwins_update(&msg);
             }
             other => panic!("refusal must outlive the collection state, got {other:?}"),
         }
@@ -3383,16 +3430,17 @@ mod tests {
     #[test]
     fn a_second_peer_makes_the_refusal_terminal_and_it_stays_latched() {
         let refusals = SettlementRefusals::default();
-        refusals.note(PeerId::from_bytes([0x62; 32]), "run ant update");
-        let verdict = refusals.note(PeerId::from_bytes([0x63; 32]), "run ant update");
+        let wording = update_required_message(1, 2);
+        refusals.note(PeerId::from_bytes([0x62; 32]), &wording);
+        let verdict = refusals.note(PeerId::from_bytes([0x63; 32]), &wording);
 
-        assert!(verdict.is_some_and(|m| m.contains("ant update")));
+        assert!(verdict.is_some_and(|m| m.contains("Build a new darwin")));
         // Latched: an upload starting later must see it before it spends,
         // which is the whole point of holding it on the client rather than in
         // one collector's local state.
         assert!(refusals
             .corroborated()
-            .is_some_and(|m| m.contains("ant update")));
+            .is_some_and(|m| m.contains("Build a new darwin")));
     }
 
     /// A refusal that does not describe this client is a confused or lying
@@ -3425,7 +3473,7 @@ mod tests {
             CURRENT_SETTLEMENT_VERSION.saturating_add(1),
         );
         match real {
-            Error::ClientUpdateRequired(msg) => assert!(msg.contains("ant update"), "{msg}"),
+            Error::ClientUpdateRequired(msg) => assert_names_darwins_update(&msg),
             other => panic!("expected ClientUpdateRequired, got {other:?}"),
         }
     }

@@ -362,6 +362,13 @@ commit `darwin --version` prints. Upstream's entries follow.
   reader task once its connection ends, where 0.38.1 kept every past connection's reader
   allocated for as long as the endpoint lived. A test (`lock_pins`) holds the lock to one copy, at
   0.38.2 or later.
+- When storers refuse this client's settlement version (`ClientUpdateRequired`), the error is in
+  darwin's own words: the client settles under version X and the network requires at least Y, no
+  quote was issued and nothing was charged, and a new darwin is built from
+  https://github.com/Project-DSpace/darwin-client (see its README); the browser core says to
+  reload the page instead. Before, it repeated the vendored storer wording, which told users to
+  run another client's `ant update`. The vendored ant-protocol is unchanged, and tests that model
+  a storer's own wording keep it.
 
 ## [Unreleased]
 
