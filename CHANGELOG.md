@@ -179,6 +179,13 @@ commit `darwin --version` prints. Upstream's entries follow.
   it is now found only through the nodes nearest the record, which replication copies it to. A
   chunk an upload left farther out, past close-group nodes that failed or were full (up to the
   20th nearest), stays there while the node's disk has room, and is not looked for on a seed.
+  A pointer read asks at least 2 seeds once its lookup answers, the nearest of the rest making
+  up the number when the filter leaves fewer (`MIN_POINTER_READ_SEEDS`), so 2 seeds can still
+  corroborate a state; a chunk read has no floor, its content being checked against its
+  address. The trade-off: a pointer read now asks its seeds after its close-group lookup
+  answers, not beside it, so each pointer read takes one lookup's time before any seed is
+  asked. The close-group part of the read waits for that lookup anyway, and asking the seeds
+  before it would ask the ones the filter leaves out.
   `bootstrap_peers.toml` lists all 16 server nodes on QUIC (both nodes of each server, on 10000
   and 10001) with their peer IDs; the CLI and `Client::connect_multiaddrs` hand the selected
   seeds that carry one to reads (`Client::with_bootstrap_peers` for a client built from a node;

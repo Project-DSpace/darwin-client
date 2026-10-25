@@ -166,42 +166,69 @@ pub fn in_random_order<T>(mut seeds: Vec<T>, rng: &mut impl rand::Rng) -> Vec<T>
 
 /// The bootstrap peers among `seeds` a read of `target` asks once its own
 /// lookup has answered: every one when the lookup found no peer, and otherwise
-/// only those its view leaves among the [`MAX_BOOTSTRAP_READ_PEERS`] nearest
-/// `target`. The view is `found`, the peers the lookup found, together with
-/// the seeds themselves.
+/// those its view leaves among the [`MAX_BOOTSTRAP_READ_PEERS`] nearest
+/// `target`, topped up with the nearest of the rest to at least `floor` seeds
+/// (or every seed, when there are fewer). The view is `found`, the peers the
+/// lookup found, together with the seeds themselves. Seeds keep their order in
+/// `seeds`.
 ///
 /// A seed that many nearer peers pass over is not among the nodes that keep
 /// the record, so asking it costs that seed a request, and a browser a session
 /// with it, with little chance of a copy. While seeds are most of the network
 /// they are most of every view's nearest nodes, and are asked as before; as
-/// other nodes join, each read asks fewer seeds, and none of those farther out.
+/// other nodes join, each read asks fewer seeds, and none of those farther out
+/// beyond the `floor`. Chunk reads, whose content is checked against its
+/// address, pass 0; pointer reads pass [`MIN_POINTER_READ_SEEDS`] so that two
+/// seeds can still corroborate a state.
 pub(crate) fn seeds_for_read<P: Clone>(
     seeds: &[P],
     found: impl IntoIterator<Item = [u8; 32]>,
     target: &[u8; 32],
     key: impl Fn(&P) -> [u8; 32],
+    floor: usize,
 ) -> Vec<P> {
     let found: std::collections::HashSet<[u8; 32]> = found.into_iter().collect();
     if found.is_empty() {
         return seeds.to_vec();
     }
+    let distance = |seed: &P| ant_protocol::transport::xor_distance(&key(seed), target);
     let mut view = found;
     view.extend(seeds.iter().map(&key));
-    seeds
+    let mut keep: Vec<bool> = seeds
         .iter()
-        .filter(|seed| {
+        .map(|seed| {
             let id = key(seed);
-            let distance = ant_protocol::transport::xor_distance(&id, target);
+            let own = distance(seed);
             view.iter()
                 .filter(|peer| {
-                    **peer != id && ant_protocol::transport::xor_distance(peer, target) < distance
+                    **peer != id && ant_protocol::transport::xor_distance(peer, target) < own
                 })
                 .count()
                 < MAX_BOOTSTRAP_READ_PEERS
         })
-        .cloned()
+        .collect();
+    let kept = keep.iter().filter(|&&k| k).count();
+    if kept < floor {
+        let mut rest: Vec<usize> = (0..seeds.len()).filter(|&i| !keep[i]).collect();
+        rest.sort_by_key(|&i| distance(&seeds[i]));
+        for i in rest.into_iter().take(floor - kept) {
+            keep[i] = true;
+        }
+    }
+    seeds
+        .iter()
+        .zip(keep)
+        .filter_map(|(seed, k)| k.then(|| seed.clone()))
         .collect()
 }
+
+/// The fewest bootstrap peers a pointer read asks beside its close group once
+/// its lookup has answered ([`seeds_for_read`]'s `floor`): two, so that two
+/// seeds naming a state can still corroborate it, as the nine-seed set did
+/// before the lookup's filter. A pointer state is owner-signed and checked
+/// against its address, so the floor guards a read's corroboration, not its
+/// authenticity.
+pub(crate) const MIN_POINTER_READ_SEEDS: usize = 2;
 
 /// Bounded, latest-value hints for an immutable read in progress. Hints only
 /// start authenticated GETs; they never establish closeness, absence or payment
@@ -996,9 +1023,13 @@ mod tests {
     #[test]
     fn a_read_asks_the_seeds_its_lookup_leaves_among_the_nine_nearest() {
         let asked = |seeds: &[u8], found: &[u8], target: [u8; 32]| -> Vec<u8> {
-            seeds_for_read(seeds, found.iter().map(|&n| [n; 32]), &target, |&n: &u8| {
-                [n; 32]
-            })
+            seeds_for_read(
+                seeds,
+                found.iter().map(|&n| [n; 32]),
+                &target,
+                |&n: &u8| [n; 32],
+                0,
+            )
         };
         let nine: Vec<u8> = (101..=109).collect();
         // A close group nearer than every seed: the two nearest seeds complete
@@ -1029,6 +1060,34 @@ mod tests {
             ),
             vec![0x81, 0x82]
         );
+    }
+
+    /// A floor tops the seeds the filter leaves up with the nearest of the
+    /// rest, keeping their order, and never asks more seeds than there are.
+    #[test]
+    fn a_read_floor_tops_up_the_seeds_with_the_nearest_of_the_rest() {
+        let asked = |seeds: &[u8], found: &[u8], floor: usize| -> Vec<u8> {
+            seeds_for_read(
+                seeds,
+                found.iter().map(|&n| [n; 32]),
+                &[0; 32],
+                |&n: &u8| [n; 32],
+                floor,
+            )
+        };
+        let nearer: Vec<u8> = (1..=9).collect();
+        // Nine nearer peers leave no seed; a floor of two asks the two nearest.
+        assert!(asked(&[103, 101, 102], &nearer, 0).is_empty());
+        assert_eq!(asked(&[103, 101, 102], &nearer, 2), vec![101, 102]);
+        // Eight nearer leave one; the floor adds the next nearest.
+        assert_eq!(asked(&[103, 101, 102], &nearer[..8], 2), vec![101, 102]);
+        // A floor below what the filter leaves changes nothing.
+        assert_eq!(
+            asked(&[101, 102, 103], &nearer[..2], 2),
+            vec![101, 102, 103]
+        );
+        // One seed in all: one asked.
+        assert_eq!(asked(&[101], &nearer, 2), vec![101]);
     }
 
     /// A client node built from seeds reads from those of them that carry a

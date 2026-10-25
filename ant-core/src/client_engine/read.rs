@@ -294,6 +294,7 @@ where
                     .map(&key),
                 &target,
                 &key,
+                0,
             )
         };
         let peers = read_targets(candidates, &seeds, &target, &key);

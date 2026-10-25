@@ -1079,8 +1079,10 @@ where
 /// The bootstrap peers a pointer read asks beside the close group: of `seeds`,
 /// the nine nearest `address` of those the client knows by peer ID
 /// ([`crate::data::network::bootstrap_read_peers`]), those the close group's
-/// lookup, `group`, leaves among the nine nearest, or every one when the lookup
-/// failed or found nobody ([`crate::data::network::seeds_for_read`]).
+/// lookup, `group`, leaves among the nine nearest, and never fewer than
+/// [`crate::data::network::MIN_POINTER_READ_SEEDS`] (the nearest of the rest
+/// make up the number), or every one when the lookup failed or found nobody
+/// ([`crate::data::network::seeds_for_read`]).
 fn seeds_beside(
     group: Option<&[(PeerId, Vec<MultiAddr>)]>,
     seeds: Vec<(PeerId, Vec<MultiAddr>)>,
@@ -1092,6 +1094,7 @@ fn seeds_beside(
             group.iter().map(|(peer, _)| *peer.as_bytes()),
             address,
             |(peer, _)| *peer.as_bytes(),
+            crate::data::network::MIN_POINTER_READ_SEEDS,
         ),
         None => seeds,
     }
@@ -3324,6 +3327,14 @@ mod tests {
         // Seven peers nearer than every seed: the two nearest seeds complete
         // the nine nearest, and only they are asked.
         assert_eq!(asked(Some(&group)), vec![101, 102]);
+        // Nine peers nearer than every seed: the floor of two still asks the
+        // two nearest seeds, so two can corroborate a state.
+        let nine: Vec<(PeerId, Vec<MultiAddr>)> = (1..=9).map(|n| (id(n), Vec::new())).collect();
+        assert_eq!(asked(Some(&nine)), vec![101, 102]);
+        // Eight nearer: the nearest seed passes the filter and the floor adds
+        // the next one.
+        assert_eq!(asked(Some(&nine[..8])), vec![101, 102]);
+        assert_eq!(crate::data::network::MIN_POINTER_READ_SEEDS, 2);
         // A thin lookup leaves more of them among the nearest.
         assert_eq!(asked(Some(&group[..2])), (101..=107).collect::<Vec<u8>>());
         // No lookup, or an empty one: all nine.
