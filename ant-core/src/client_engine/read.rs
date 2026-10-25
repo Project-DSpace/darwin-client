@@ -28,12 +28,22 @@ pub(crate) fn is_authoritative_not_found(not_found: usize, queried: usize) -> bo
 /// Discovery converges on the target, so a hint with fewer than a close group of
 /// attempted peers nearer the target may still hold the record.
 fn may_hold(attempted: &HashSet<[u8; 32]>, candidate: &[u8; 32], target: &[u8; 32]) -> bool {
+    among_nearest(attempted, candidate, target, ant_protocol::CLOSE_GROUP_SIZE)
+}
+
+/// Whether fewer than `limit` of `peers` are nearer `target` than `candidate`.
+fn among_nearest(
+    peers: &HashSet<[u8; 32]>,
+    candidate: &[u8; 32],
+    target: &[u8; 32],
+    limit: usize,
+) -> bool {
     let distance = ant_protocol::transport::xor_distance(candidate, target);
-    attempted
+    peers
         .iter()
         .filter(|peer| ant_protocol::transport::xor_distance(peer, target) < distance)
         .count()
-        < ant_protocol::CLOSE_GROUP_SIZE
+        < limit
 }
 
 /// Race one already-connected, known candidate against ordinary discovery and
@@ -370,13 +380,25 @@ where
             );
             // A refused peer stays out of discovery and reads, so this round
             // may never have asked it. It cannot hold the record once it, or a
-            // close group of nearer peers, answered NotFound. A refusal that
-            // ended during the round is ready now.
+            // close group of nearer peers, answered NotFound, nor when the
+            // round knows of as many nearer peers as a read asks, whatever
+            // they answered: the record's holders are among those. A refusal
+            // that ended during the round is ready now.
+            let known = final_ids.union(&misses).copied().collect::<HashSet<_>>();
             let refusal = refused_at_start
                 .iter()
                 .map(|(peer, _)| peer)
                 .chain(refused_now.keys())
-                .filter(|peer| !misses.contains(*peer) && may_hold(&misses, peer, &target))
+                .filter(|peer| {
+                    !misses.contains(*peer)
+                        && may_hold(&misses, peer, &target)
+                        && among_nearest(
+                            &known,
+                            peer,
+                            &target,
+                            crate::data::network::MAX_BOOTSTRAP_READ_PEERS,
+                        )
+                })
                 .map(|peer| refused_now.get(peer).copied().unwrap_or_default())
                 .min();
             (absent, refusal)
@@ -1513,6 +1535,39 @@ mod tests {
         assert_eq!(result, Ok(None));
         assert_eq!(rounds, 1);
         assert_eq!(start.elapsed(), Duration::ZERO);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_refused_peer_far_from_the_record_does_not_hold_up_an_inconclusive_read() {
+        let start = tokio::time::Instant::now();
+        let rounds = Cell::new(0);
+        // The nine peers nearest the record time out rather than answer
+        // NotFound, so no close group of misses rules the refused peer out;
+        // they are still nearer than it, as many as a read asks.
+        let result: Result<Option<u8>, ReadError> = retrieve_progressive(
+            peer(0),
+            0,
+            Vec::new(),
+            |_| {
+                rounds.set(rounds.get() + 1);
+                async {
+                    ReadCandidates {
+                        closest: (1..=9).map(peer).collect(),
+                        known: vec![],
+                    }
+                }
+            },
+            |p| *p,
+            |_, _| async { Err(ReadError::Transport) },
+            |_| true,
+            || vec![(peer(200), REFUSAL_COOLDOWN)],
+            || unreachable!("a peer this far from the record is not one of its holders"),
+            tokio::time::sleep,
+        )
+        .await;
+        assert_eq!(result, Ok(None));
+        assert_eq!(rounds.get(), 2, "the one usual retry, and no refusal wait");
+        assert_eq!(start.elapsed(), CLOSE_GROUP_RETRY_DELAY);
     }
 
     /// A read of the record at `holder_after`'s holder, which answers
