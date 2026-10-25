@@ -197,6 +197,10 @@ fn files_under(dir: &Path) -> Vec<(PathBuf, Vec<u8>)> {
 /// The binary carries no Autonomi download repository and no Autonomi log endpoint, and none of
 /// the reset and log-forwarding routes of the darwin CLI's daemon: the code that would use them
 /// isn't in it. The routes it serves are, so the scan reads what the binary holds.
+///
+/// This is the test build. `scripts/check-darwin-nodes.sh` checks the same strings in a release
+/// build, the kind the image ships: build.yml runs it on the one it makes, and darwin-node's image
+/// build can run it on its own. Keep the two lists alike.
 #[test]
 fn the_binary_has_no_autonomi_download_or_log_address_and_no_reset_or_forwarding() {
     let binary = std::fs::read(DARWIN_NODES).expect("the darwin-nodes binary");

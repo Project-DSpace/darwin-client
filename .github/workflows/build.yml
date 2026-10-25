@@ -150,8 +150,16 @@ jobs:
       - name: Vendored ant-protocol
         run: cargo test --locked --manifest-path vendor/ant-protocol/Cargo.toml --target-dir target
 
+      # darwin-nodes, the storage-node image's node manager, is built beside
+      # `darwin` (one more link) and checked as built for release, where the
+      # linker leaves out code it never reaches: ant-cli/tests/darwin_nodes.rs
+      # checks the same strings in the test build. The image ships its own
+      # release build of it, from the darwin-client commit darwin-node pins.
       - name: Build
-        run: cargo build --release --locked -p ant-cli --bin darwin
+        run: cargo build --release --locked -p ant-cli --bin darwin --bin darwin-nodes
+
+      - name: The release darwin-nodes has no Autonomi address, reset or log forwarding
+        run: bash scripts/check-darwin-nodes.sh target/release/darwin-nodes
 
       # Collects, unaltered, the licence, copyright and notice files of every
       # crate the build resolves for this target, including build-time tools
