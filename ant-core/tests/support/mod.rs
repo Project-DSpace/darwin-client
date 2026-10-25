@@ -61,7 +61,53 @@ pub use ant_node::payment::BATCH_PAYMENTS_REFUSED;
 /// client needs 16 peers to ask for a merkle candidate pool; on a network
 /// where it knows fewer it gives up before asking any node, and the nodes'
 /// refusal of the batch is never seen.
+///
+/// Paying many records per chunk on this testnet is limited by the testnet,
+/// not by the client. Its nodes all run in the test process, built without
+/// optimisation, where checking an ML-DSA-65 signature takes 5 to 20 ms
+/// (under 0.1 ms in a release build), and every message is checked, as is
+/// every signed address in a lookup's answer. Every peer is 127.0.0.1, so a
+/// node takes all its inbound messages on one dispatch shard, which drops
+/// what overflows it, and it gives up handling a message after 10 s
+/// (saorsa-core's own limit). A client quotes as many records at once as its
+/// quote limiter allows, each with a witnessed close-group lookup that asks
+/// 21 or more peers for their 20 nearest, and the merkle preflight's checks
+/// grow the limiter (to its ceiling of 128, from 65 records) before
+/// `PaymentMode::Auto` falls back to paying per chunk. A 64-record wave
+/// quoted all at once sends more answers than the client's node can check in
+/// time: lookups come back with no peers, and the upload stops with
+/// `InsufficientPeers` before payment. So a client that pays many records
+/// per chunk here quotes at most [`MERKLE_TESTNET_QUOTE_CONCURRENCY`] at a
+/// time.
+///
+/// For the same reason this testnet's nodes wait for a DHT answer as long as
+/// a user's node does, saorsa-core's default of 25 s, where smaller testnets
+/// wait [`SMALL_TESTNET_DHT_REQUEST_TIMEOUT`] ([`dht_request_timeout`]). On
+/// a loaded machine answers here took longer than 5 s even 8 lookups at a
+/// time, and a request that times out is reported to every lookup waiting on
+/// the same peer, which gives up on that peer too: lookups found no peer
+/// while every node was up.
 pub const MERKLE_TESTNET_NODES: usize = 35;
+
+/// The DHT request timeout (saorsa-core's `connection_timeout`) of the nodes
+/// on testnets smaller than [`MERKLE_TESTNET_NODES`], as this harness has
+/// always set it.
+const SMALL_TESTNET_DHT_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// The DHT request timeout given to the nodes of a `node_count`-node
+/// testnet, or `None` to keep saorsa-core's default (25 s), which a user's
+/// node has. A [`MERKLE_TESTNET_NODES`] testnet keeps the default, for the
+/// reason given there.
+fn dht_request_timeout(node_count: usize) -> Option<Duration> {
+    (node_count < MERKLE_TESTNET_NODES).then_some(SMALL_TESTNET_DHT_REQUEST_TIMEOUT)
+}
+
+/// The most records a client on a [`MERKLE_TESTNET_NODES`] testnet quotes
+/// at once (the quote ceiling in its `AdaptiveConfig::max`), for the reason
+/// given there. Measured on a loaded machine: a 64-record wave quoted 8 at a
+/// time found every lookup's full width of 20 peers; quoted all at once,
+/// none did, and in two runs 28 and 38 of the 64 lookups found no peer.
+pub const MERKLE_TESTNET_QUOTE_CONCURRENCY: usize = 8;
 
 /// What `wallet` has spent, as its chain shows it: the transactions it has
 /// sent (its nonce) and the tokens it holds. Unchanged across a call, nothing
@@ -290,6 +336,7 @@ impl MiniTestnet {
             .expect("create funded wallet");
 
         let bootstrap_count = BOOTSTRAP_COUNT.min(node_count);
+        let request_timeout = dht_request_timeout(node_count);
         let base_port = rand::thread_rng()
             .gen_range(TEST_PORT_RANGE_MIN..TEST_PORT_RANGE_MAX - node_count as u16);
         let mut nodes = Vec::with_capacity(node_count);
@@ -309,6 +356,7 @@ impl MiniTestnet {
                 &evm_network,
                 i,
                 commitment_key_count,
+                request_timeout,
             )
             .await;
 
@@ -337,6 +385,7 @@ impl MiniTestnet {
                 &evm_network,
                 i,
                 commitment_key_count,
+                request_timeout,
             )
             .await;
 
@@ -447,6 +496,7 @@ impl MiniTestnet {
         evm_network: &EvmNetwork,
         node_index: usize,
         commitment_key_count: Option<u32>,
+        dht_request_timeout: Option<Duration>,
     ) -> (
         Arc<P2PNode>,
         Arc<AntProtocol>,
@@ -472,7 +522,9 @@ impl MiniTestnet {
             .iter()
             .map(|addr| MultiAddr::quic(*addr))
             .collect();
-        core_config.connection_timeout = Duration::from_secs(5);
+        if let Some(timeout) = dht_request_timeout {
+            core_config.connection_timeout = timeout;
+        }
         core_config.node_identity = Some(Arc::clone(&identity));
         core_config.diversity_config = Some(IPDiversityConfig::permissive());
 

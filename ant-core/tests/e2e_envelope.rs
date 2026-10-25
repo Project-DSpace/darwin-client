@@ -9,6 +9,7 @@ mod support;
 use ant_core::ant_listings::{
     Envelope, Metadata, PaymentField, ShownFields, DATA_PAYMENT_MADE_TOPIC,
 };
+use ant_core::data::client::adaptive::{AdaptiveConfig, ChannelMax};
 use ant_core::data::client::upload::{
     MerkleUploadPayment, UploadAdapter, UploadPayment, UploadRecord,
 };
@@ -26,7 +27,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use support::{
     assert_batch_refused, test_client_config, wallet_spend, MiniTestnet, DEFAULT_NODE_COUNT,
-    MERKLE_TESTNET_NODES,
+    MERKLE_TESTNET_NODES, MERKLE_TESTNET_QUOTE_CONCURRENCY,
 };
 use tempfile::{NamedTempFile, TempDir};
 
@@ -280,7 +281,10 @@ async fn the_envelope_is_never_sent_when_content_fails_to_store() {
 
 /// A testnet large enough that a client asks its nodes for merkle
 /// candidates, and a client on it, set up as for the batch payments the
-/// tests below attempt.
+/// tests below attempt. The client quotes at most
+/// [`MERKLE_TESTNET_QUOTE_CONCURRENCY`] records at a time, so that it can pay
+/// a 64-record wave per chunk on this testnet ([`MERKLE_TESTNET_NODES`]
+/// says why).
 async fn setup_merkle_sized() -> (Client, MiniTestnet) {
     let testnet = MiniTestnet::start(MERKLE_TESTNET_NODES).await;
     let node = testnet.node(5).expect("Node 5 should exist");
@@ -288,6 +292,13 @@ async fn setup_merkle_sized() -> (Client, MiniTestnet) {
         quote_timeout_secs: 120,
         store_timeout_secs: 120,
         close_group_size: 20,
+        adaptive: AdaptiveConfig {
+            max: ChannelMax {
+                quote: MERKLE_TESTNET_QUOTE_CONCURRENCY,
+                ..ChannelMax::default()
+            },
+            ..AdaptiveConfig::default()
+        },
         ..Default::default()
     };
     let client = Client::from_node(Arc::clone(&node), config).with_wallet(testnet.wallet().clone());
