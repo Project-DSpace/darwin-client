@@ -358,6 +358,14 @@ commit `darwin --version` prints. Upstream's entries follow.
   it. The vendored ant-protocol is 5.0.0, still
   with the price multiplier, darwin-listings is vendored at 0.2.1 to match, and rustls is
   0.23.46, as on upstream's main.
+- `darwin-nodes` caps its own log: `daemon run --log-path PATH` writes `<PATH>.<UTC time>.log`,
+  a new file every 10 MiB or hour and on every start, and after each new file deletes the oldest
+  closed files of the family (the daily files earlier builds wrote included) until it holds at
+  most 50 MiB with the new file full, and closed files older than a month. With 1 GiB free or
+  less on the log's disk (the nodes' full line, and the manager's own low-disk warning level) it
+  deletes its closed files and writes only warnings and errors, counting the lines it leaves
+  out, and writes one line saying how many once space returns. The erasure census lists its two
+  deletions of log files.
 
 ## [Unreleased]
 

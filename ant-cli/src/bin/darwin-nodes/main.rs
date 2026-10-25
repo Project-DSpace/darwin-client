@@ -11,11 +11,15 @@
 //! - it downloads nothing: `add` takes a node binary already on the machine (`--path`);
 //! - it forwards no logs: no `logs forward`, and its daemon serves no log-forwarding API.
 //!
+//! Its own log is capped: 50 MiB in all, giving way when the disk reaches the nodes' full line
+//! (`log_file.rs`).
+//!
 //! `pins.rs` and `ant-cli/tests/darwin_nodes.rs` hold it to that.
 
 mod add;
 mod cli;
 mod daemon;
+mod log_file;
 mod nodes;
 #[cfg(test)]
 mod pins;
