@@ -156,19 +156,20 @@ cargo build --release --locked -p ant-cli --bin darwin
 ```
 
 Or take a release: the Linux x86-64 `darwin`, as `darwin-linux-x64.tar.gz` with its
-`SHA256SUMS.txt`, from this repository's GitHub releases (tags `vX.Y.Z+ds.N`). A release is
-published by the Release workflow (`.github/workflows/release.yml`) only once the tagged commit's
-Test run (the end-to-end and browser tests, with the payment-recovery, batch-refusal and
-occupied-quote pins) and Build run (the unit tests, the targets that need no nodes, the censuses,
-and the build) both succeeded, and once approved in the repository's `release` environment; the
-archive is that Build run's, checked against its sums, and its `darwin --version` names the tag and
-the commit. Next to `darwin`, the archive holds its license files (`LICENSE-MIT`, `LICENSE-APACHE`)
-and the notices for the third-party code in it (`THIRD-PARTY-NOTICES.txt`,
-`RUST-STD-COPYRIGHT.html`). Check it with `sha256sum -c SHA256SUMS.txt`.
+`SHA256SUMS.txt`, from this repository's GitHub releases (tags `vX.Y.Z+ds.N`). None is published
+yet; until then, build from source. A release is published by the Release workflow
+(`.github/workflows/release.yml`) only once the tagged commit's Test run (the end-to-end and
+browser tests, with the payment-recovery, batch-refusal and occupied-quote pins) and Build run
+(the unit tests, the targets that need no nodes, the censuses, and the build) both succeeded, and
+once approved in the repository's `release` environment; the archive is that Build run's, checked
+against its sums, and its `darwin --version` names the tag and the commit. Next to `darwin`, the
+archive holds its license files (`LICENSE-MIT`, `LICENSE-APACHE`) and the notices for the
+third-party code in it (`THIRD-PARTY-NOTICES.txt`, `RUST-STD-COPYRIGHT.html`). Check it with
+`sha256sum -c SHA256SUMS.txt`.
 
 Every push also uploads its build as the `darwin-linux-x64` workflow artifact. That is CI output,
 made whether or not the end-to-end tests pass: for trying a commit, not for deployment. Deploy a
-release.
+release (none is published yet; until then, build from source).
 
 `darwin --version` prints the package version and, on a second line, the git commit the binary
 was built from (`unknown` outside a git checkout of this repository; uncommitted changes don't

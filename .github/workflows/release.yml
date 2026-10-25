@@ -6,6 +6,8 @@
 # Versions are <upstream base>+ds.<build>, as darwin-node's are. Bump
 # ant-cli/Cargo.toml's version (and Cargo.lock's ant-cli entry) to the tag's
 # first, so `darwin --version` names the release; the package job checks it.
+# The first release's commit also takes "none is published yet" out of
+# README.md and CHANGELOG.md.
 #
 # The tag has to come from a person: GitHub won't let GITHUB_TOKEN create a
 # tag on a commit that changes .github/workflows, so this only publishes an
