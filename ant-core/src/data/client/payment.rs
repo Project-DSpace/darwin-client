@@ -16,9 +16,9 @@ use crate::data::client::occupied::{occupied_error, MAX_OCCUPIED_REQUOTES};
 #[cfg(not(feature = "native"))]
 use crate::data::client::quote::median_paid_quote_issuer;
 #[cfg(feature = "native")]
-use crate::data::client::upload::{validate_payment_total, UploadPayment};
+use crate::data::client::upload::{paid_outside_width, validate_payment_total, UploadPayment};
 #[cfg(feature = "native")]
-use crate::data::client::upload_state::{paid_node, reusable_proof, UploadState};
+use crate::data::client::upload_state::{reusable_proof, UploadState};
 use crate::data::client::Client;
 use crate::data::error::{Error, Result};
 #[cfg(not(feature = "native"))]
@@ -336,12 +336,7 @@ impl Client {
                 Vec::new()
             };
             let paid_outside = data_type == ant_protocol::DATA_TYPE_CHUNK
-                && paid_node(&proof).is_some_and(|paid| {
-                    !put_peers
-                        .iter()
-                        .take(crate::quote_policy::PUT_TARGET_WIDTH)
-                        .any(|(peer, _)| *peer.as_bytes() == paid)
-                });
+                && paid_outside_width(&proof, &put_peers);
             if !paid_outside {
                 return Ok((proof, put_peers, true));
             }

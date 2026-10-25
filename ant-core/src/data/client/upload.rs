@@ -1331,20 +1331,10 @@ pub(crate) fn drop_proof_paid_outside(
     plan: &ChunkPaymentPlan,
     paid_now: &HashSet<[u8; 32]>,
 ) -> bool {
-    if paid_now.contains(&plan.address) || plan.quoted_peers.is_empty() {
-        return false;
-    }
-    let Some(paid) = state
-        .proof(&plan.address)
-        .and_then(|bytes| paid_node(bytes))
-    else {
-        return false;
-    };
-    if plan
-        .quoted_peers
-        .iter()
-        .take(crate::quote_policy::PUT_TARGET_WIDTH)
-        .any(|(peer, _)| *peer.as_bytes() == paid)
+    if paid_now.contains(&plan.address)
+        || !state
+            .proof(&plan.address)
+            .is_some_and(|proof| paid_outside_width(proof, &plan.quoted_peers))
     {
         return false;
     }
@@ -1356,6 +1346,29 @@ pub(crate) fn drop_proof_paid_outside(
     );
     state.drop_proof(&plan.address);
     true
+}
+
+/// Whether `peers`, a fresh lookup's PUT targets, put the node `proof` paid
+/// (a single-node proof's) outside the record's
+/// [`PUT_TARGET_WIDTH`](crate::quote_policy::PUT_TARGET_WIDTH) nearest
+/// storers. Only a list that holds the whole width can: a shorter one, as a
+/// lookup that fell back to the close group gives, leaves storers in the
+/// width it doesn't name, which still take the proof, so the storers decide.
+pub(crate) fn paid_outside_width(
+    proof: &[u8],
+    peers: &[(
+        ant_protocol::transport::PeerId,
+        Vec<ant_protocol::transport::MultiAddr>,
+    )],
+) -> bool {
+    let width = crate::quote_policy::PUT_TARGET_WIDTH;
+    peers.len() >= width
+        && paid_node(proof).is_some_and(|paid| {
+            !peers
+                .iter()
+                .take(width)
+                .any(|(peer, _)| *peer.as_bytes() == paid)
+        })
 }
 
 /// Take in the stores of `results` ([`Client::store_planned`]): stored
@@ -1911,6 +1924,28 @@ mod tests {
             &paid_now
         ));
         assert!(state.proof(&paid.address).is_some());
+        // A lookup that fell back to the close group: 7 targets, the paid
+        // node not among them. Storers in places 8 to 20 still take the
+        // proof, so it is kept, here and when a record is paid on its own
+        // (`settle_record` decides by the same check).
+        let mut state = state_paid();
+        let close_group = with_targets(others(7));
+        assert!(!drop_proof_paid_outside(
+            &mut state,
+            &close_group,
+            &HashSet::new()
+        ));
+        assert!(state.proof(&paid.address).is_some());
+        let proof = state.proof(&paid.address).unwrap();
+        assert!(!paid_outside_width(proof, &close_group.quoted_peers));
+        assert!(!paid_outside_width(
+            proof,
+            &with_targets(others(19)).quoted_peers
+        ));
+        assert!(paid_outside_width(
+            proof,
+            &with_targets(others(20)).quoted_peers
+        ));
     }
 
     /// A record whose earlier proof every failing storer refused is paid
