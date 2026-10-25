@@ -20,8 +20,10 @@ from darwin-node's would never show in a build.
 
 With --release, which release.yml runs before a client is published, it also
 checks that the revision is on darwin-node's main (a released node, never an
-unmerged branch commit) and is none of the revisions in TOO_OLD, which a
-client release must not be tested against.
+unmerged branch commit) and has NODE_RELEASE_1A, node release 1a's commit on
+that main, as an ancestor or is that commit. While NODE_RELEASE_1A is unset
+no revision passes: every revision on darwin-node's main is from before node
+release 1a.
 
     darwin-node-pin.py             check that the pins agree
     darwin-node-pin.py --vendored  and that vendor/ant-protocol is darwin-node's
@@ -41,21 +43,17 @@ ROOT = pathlib.Path(__file__).resolve().parent.parent
 NODE_REVISION = ROOT / "ant-core" / "browser-tests" / "node-revision"
 VENDORED = "vendor/ant-protocol"
 
-# Revisions a client release must not be pinned to, with why. Client release
-# 1a's busy handling (a dial refused within REFUSAL_DETECTION_WINDOW, reads
-# waiting on refused peers at most MAX_REFUSAL_WAITS times) needs nodes that
-# refuse a browser session while busy, which node release 1a brings: it has
-# to have run against those nodes before it is released.
-# Node release 1a has no commit on darwin-node main yet, so this is a
-# deny-list of main's head today; once it lands, a lower bound replaces it
-# (the revision must have node release 1a's main commit as an ancestor).
-TOO_OLD = {
-    "94bf3425e31f77e150bc98306d02705fc33b1037": (
-        "darwin-node main from before node release 1a; client release 1a's busy "
-        "handling has never run against a node that refuses a session while busy. "
-        "Move the pin to node release 1a's commit on darwin-node main first"
-    ),
-}
+# The oldest darwin-node revision a client release may be tested against:
+# node release 1a's commit on darwin-node's main. Client release 1a's busy
+# handling (a dial refused within REFUSAL_DETECTION_WINDOW, reads waiting on
+# refused peers at most MAX_REFUSAL_WAITS times) needs nodes that refuse a
+# browser session while busy, which node release 1a brings: it has to have
+# run against those nodes before it is released. Every revision on main
+# before that commit fails, whichever it is, not only main's head of today.
+# Node release 1a has no commit on darwin-node's main yet, so this is None
+# and --release passes no revision. Set it, in the commit that moves the pin
+# to that release, to its 40-character commit.
+NODE_RELEASE_1A = None
 
 
 class Mismatch(Exception):
@@ -156,10 +154,8 @@ def check_vendored(repository, revision):
     raise Mismatch("\n".join(lines))
 
 
-def check_release(repository, revision):
-    """`revision` is on darwin-node's main and is not in TOO_OLD."""
-    if revision in TOO_OLD:
-        raise Mismatch(f"{revision} can't be released against: {TOO_OLD[revision]}")
+def check_release(repository, revision, oldest=NODE_RELEASE_1A):
+    """`revision` is on darwin-node's main and is `oldest` or descends from it."""
     with tempfile.TemporaryDirectory() as scratch:
         git("init", "--quiet", "--bare", scratch, cwd=scratch)
         git(
@@ -174,6 +170,23 @@ def check_release(repository, revision):
             raise Mismatch(
                 f"{revision} is not on darwin-node's main: a client release is "
                 "tested against a released node, never an unmerged branch commit"
+            )
+        if oldest is None:
+            raise Mismatch(
+                f"{revision} can't be released against: node release 1a has no commit "
+                "on darwin-node's main yet, so every revision there is from before it, "
+                "and client release 1a's busy handling has never run against a node "
+                "that refuses a session while busy. Move the pin to node release 1a's "
+                "commit on darwin-node's main and set NODE_RELEASE_1A to it first"
+            )
+        from_it = subprocess.run(
+            ["git", "merge-base", "--is-ancestor", oldest, revision],
+            cwd=scratch, capture_output=True, text=True,
+        )
+        if from_it.returncode != 0:
+            raise Mismatch(
+                f"{revision} can't be released against: it is from before node release "
+                f"1a ({oldest}), which client release 1a's busy handling needs"
             )
 
 

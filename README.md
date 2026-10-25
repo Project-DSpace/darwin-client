@@ -1115,9 +1115,9 @@ chain, so `anvil` (Foundry) must be on PATH. CI runs every test target:
 `scripts/darwin-node-pin.py` checks that the darwin-node revision is pinned
 alike everywhere and that `vendor/ant-protocol` is darwin-node's copy. Before a
 client release is published, its `--release` check also requires the revision to
-be on darwin-node's main and not one listed as too old to release against: the
-darwin-node main of before node release 1a, which client release 1a's busy
-handling has never run against.
+be on darwin-node's main and to be node release 1a's commit there or a later one:
+client release 1a's busy handling has never run against a node from before it.
+Until node release 1a is on darwin-node's main, no revision passes.
 
 ## License
 
