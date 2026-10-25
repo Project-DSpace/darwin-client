@@ -148,7 +148,10 @@ const FINALIZE: &str = "Finishes a prepared file upload with the envelope chosen
     prepared; paid per chunk through the upload coordinator, which reads paid quotes back.";
 const PER_CHUNK: &str = "Per-chunk payment in the network's token through the client's \
     chain-bound wallet; paid quotes are read back from the vault and occupied ones quoted again.";
-const JOURNALED: &str = "Per-chunk payment in the network's token through the client's     chain-bound wallet, signed and journaled before it is sent: a payment of its own, or a     shared wave of one wallet's small payments, each member's journal and payment record     holding only its own quotes and its share.";
+const JOURNALED: &str = "Per-chunk payment in the network's token through the client's \
+    chain-bound wallet, signed and journaled before it is sent: a payment of its own, or a \
+    shared wave of one wallet's small payments, each member's journal and payment record \
+    holding only its own quotes and its share.";
 const RAW_CHUNK_PUT: &str = "raw, by the caller's choice: no envelope. `darwin chunk put` \
     stores one raw chunk; its help names `darwin file upload` as the standard way. Paid per chunk \
     with the read-back.";

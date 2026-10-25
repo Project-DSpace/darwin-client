@@ -1101,7 +1101,8 @@ impl Client {
             let wanted = super::pointer::pointer_write_quorum(self.config().close_group_size);
             if quotes.len() < wanted {
                 return Err(Error::InsufficientPeers(format!(
-                    "only {} of the close group quoted for pointer state {}, and a write needs                      {wanted} to take it; nothing was paid",
+                    "only {} of the close group quoted for pointer state {}, and a write needs \
+                     {wanted} to take it; nothing was paid",
                     quotes.len(),
                     hex::encode(address)
                 )));

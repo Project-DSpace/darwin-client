@@ -1119,7 +1119,8 @@ where
                             other,
                             &nearest,
                             needed,
-                            "not looked up: the listing a quorum of the nearest nodes serve                                  counts"
+                            "not looked up: the listing a quorum of the nearest nodes serve \
+                             counts"
                                 .into(),
                             false,
                         ));
