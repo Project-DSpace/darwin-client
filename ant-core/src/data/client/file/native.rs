@@ -5397,6 +5397,136 @@ mod tests {
         );
     }
 
+    /// A merkle store pass over `count` spilled chunks, `with_proofs` of them
+    /// given a proof, after `already_stored`, on a client whose node was never
+    /// started: so nothing reaches a node.
+    async fn merkle_pass_without_nodes(
+        count: u8,
+        with_proofs: usize,
+        already_stored: &[[u8; 32]],
+    ) -> (Vec<[u8; 32]>, Error) {
+        let network = crate::data::Network::unstarted(&[], true, false)
+            .await
+            .unwrap();
+        let client = Client::from_node(Arc::clone(network.node()), Default::default());
+        let mut spill = ChunkSpill::new().unwrap();
+        for i in 0..count {
+            spill.push(&[i; 1024]).unwrap();
+        }
+        let addresses = spill.addresses.clone();
+        let batch = MerkleBatchPaymentResult {
+            proofs: addresses
+                .iter()
+                .take(with_proofs)
+                .map(|address| (*address, vec![0xcc]))
+                .collect(),
+            chunk_count: with_proofs,
+            storage_cost_atto: "640".into(),
+            gas_cost_wei: 21,
+            merkle_payment_timestamp: 0,
+        };
+        let error = client
+            .upload_merkle_from_spill(&spill, &addresses, &batch, already_stored, None, None)
+            .await
+            .expect_err("a chunk not stored leaves the upload partial");
+        (addresses, error)
+    }
+
+    /// What the end-to-end test of an external signer paying one of two
+    /// merkle sub-batches checked of the accounting, which no node can reach
+    /// now that darwin-node refuses batch payments: the chunks no paid
+    /// sub-batch gave a proof are reported failed, each as missing its proof,
+    /// beside those already stored, the counts cover the file, the spend is
+    /// the batch's, and the reason calls them proofless, not short of
+    /// quorum, with no refusal.
+    #[tokio::test]
+    async fn chunks_with_no_merkle_proof_are_reported_beside_those_stored() {
+        let stored = [[0xaa; 32], [0xbb; 32]];
+        let (proofless, error) = merkle_pass_without_nodes(3, 0, &stored).await;
+        let Error::PartialUpload {
+            stored: stored_now,
+            stored_count,
+            failed,
+            failed_count,
+            total_chunks,
+            spend,
+            reason,
+        } = error
+        else {
+            panic!("expected PartialUpload, got: {error:?}");
+        };
+        assert_eq!(stored_now, stored.to_vec());
+        assert_eq!(stored_count, 2);
+        assert_eq!(failed_count, 3);
+        assert_eq!(total_chunks, 5);
+        let mut failed_addresses: Vec<[u8; 32]> = failed.iter().map(|(a, _)| *a).collect();
+        failed_addresses.sort_unstable();
+        let mut expected = proofless.clone();
+        expected.sort_unstable();
+        assert_eq!(failed_addresses, expected);
+        for (address, message) in &failed {
+            assert_eq!(
+                message,
+                &format!("Missing merkle proof for chunk {}", hex::encode(address))
+            );
+        }
+        assert_eq!(reason, "3 chunk(s) have no merkle proof");
+        assert!(!reason.contains("short of quorum"), "{reason}");
+        assert!(
+            !reason.contains("refused") && !reason.contains("update"),
+            "{reason}"
+        );
+        assert_eq!(spend.storage_cost_atto, "640");
+        assert_eq!(spend.gas_cost_wei, 21);
+    }
+
+    /// With proofs for some chunks only, those are sent: finding no node,
+    /// they are short of quorum through every deferred round (the paused
+    /// clock skips the rounds' waits) and fail with that, while the rest keep
+    /// their own reason. The counts cover the file, nothing is counted stored
+    /// that wasn't, and the reason gives both groups.
+    #[tokio::test(start_paused = true)]
+    async fn chunks_with_and_without_merkle_proofs_are_all_accounted_for() {
+        let stored = [[0xaa; 32]];
+        let (addresses, error) = merkle_pass_without_nodes(4, 2, &stored).await;
+        let Error::PartialUpload {
+            stored: stored_now,
+            stored_count,
+            failed,
+            failed_count,
+            total_chunks,
+            reason,
+            ..
+        } = error
+        else {
+            panic!("expected PartialUpload, got: {error:?}");
+        };
+        assert_eq!(stored_now, stored.to_vec());
+        assert_eq!(stored_count, 1);
+        assert_eq!(failed_count, 4);
+        assert_eq!(failed.len(), failed_count);
+        assert_eq!(stored_count + failed_count, total_chunks);
+        assert_eq!(total_chunks, 5);
+        let messages: HashMap<[u8; 32], String> = failed.into_iter().collect();
+        assert_eq!(messages.len(), 4, "each chunk is reported once");
+        for (i, address) in addresses.iter().enumerate() {
+            let message = &messages[address];
+            let proofless = format!("Missing merkle proof for chunk {}", hex::encode(address));
+            if i < 2 {
+                assert_ne!(message, &proofless, "it had a proof");
+            } else {
+                assert_eq!(message, &proofless);
+            }
+        }
+        assert_eq!(
+            reason,
+            format!(
+                "2 chunk(s) short of quorum after {} attempts; 2 chunk(s) have no merkle proof",
+                1 + DEFERRED_ROUND_DELAYS_SECS.len()
+            )
+        );
+    }
+
     /// A settlement refusal on a later wave must not be reported as if nothing
     /// was charged: the earlier waves paid before storing. The refusal is
     /// reshaped into a `PartialUpload` that carries the real spend, the stored

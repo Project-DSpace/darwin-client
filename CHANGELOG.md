@@ -219,6 +219,13 @@ commit `darwin --version` prints. Upstream's entries follow.
   timeout or a short lookup no longer hides it. `PaymentMode::Auto` and the external signer's
   prepare pay per chunk instead, as for a network too small for a batch; a forced
   `PaymentMode::Merkle` fails with it. It is not a settlement refusal and sets no latch.
+- The end-to-end tests run against darwin-node: each test of a forced batch payment pins its
+  refusal (`BATCH_PAYMENTS_REFUSED` at quote time, the wallet unchanged, nothing stored), and the
+  batch arithmetic is tested with no nodes (`ant-core/tests/merkle_unit.rs`). An external signer
+  paying only some sub-batches is left without an end-to-end test on purpose, since only nodes
+  that accept a batch payment store the paid ones' chunks; the accounting of the chunks no paid
+  sub-batch gave a proof (each failed for its missing proof, beside the chunks stored, the counts
+  covering the file) is unit-tested with no nodes in `ant-core/src/data/client/file/native.rs`.
 - Reads of payments fall back to other RPCs, and uploads recover a payment the RPC errored on.
 - Records paid one at a time recover a payment the RPC errored on, as uploads do:
   `darwin chunk put`, `darwin pointer create`, `update` and `transfer`, and the data maps

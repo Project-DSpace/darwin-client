@@ -13,6 +13,16 @@
 //! paid batches (in the final per-chunk wave, with that remainder, stored
 //! last) is unit-tested beside it, in `src/data/client/upload.rs`
 //! (`PerChunkWaves`): no end-to-end test reaches it on darwin-node.
+//!
+//! An external signer paying only some of the sub-batches is left without an
+//! end-to-end test on purpose: the chunks of the paid ones are stored only by
+//! nodes that accept a batch payment, and darwin-node accepts none. The
+//! accounting of the rest, each chunk no paid sub-batch gave a proof reported
+//! failed for its missing proof, beside the chunks stored, with counts that
+//! cover the file and a reason that calls them proofless, is unit-tested with
+//! no nodes in `src/data/client/file/native.rs`
+//! (`chunks_with_no_merkle_proof_are_reported_beside_those_stored`, and
+//! `chunks_with_and_without_merkle_proofs_are_all_accounted_for`).
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
