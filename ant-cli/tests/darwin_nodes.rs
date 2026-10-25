@@ -479,7 +479,10 @@ fn start_daemon(homes: &Homes) -> Daemon {
 
 /// The daemon the image runs serves the node manager's core, with the shapes the image, stats.sh
 /// and the watchdog read, and no reset, no log forwarding and no download; adding from a
-/// download source is refused; and with the disk in any state, it leaves a node's data as it was.
+/// download source is refused; and across a daemon run on an ordinary disk, it leaves a node's
+/// data as it was. The pin for a low or critical disk is the supervisor's
+/// `the_disk_monitor_deletes_nothing_however_little_space_is_left`
+/// (ant-core/src/node/daemon/supervisor.rs), which runs the disk monitor at or below both levels.
 #[test]
 fn the_daemon_serves_no_reset_forwarding_or_download_and_deletes_nothing() {
     let homes = Homes::new();
