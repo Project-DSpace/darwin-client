@@ -82,7 +82,9 @@ commit `darwin --version` prints. Upstream's entries follow.
   the word of the 30-minute dial-failure cache), and one that left is probed each cycle for a day
   and is back in the census on its first answer; an id that answered no lookup is looked for again
   when a node names it again. `darwin listings refresh-census --state-dir DIR` has the producer's
-  next cycle close every leaf of its census, in place of editing its store by hand.
+  next cycle close every leaf of its census, in place of editing its store by hand. Each request is
+  taken once, by the time it holds, even one whose file the producer can't remove: one made no
+  later than the latest taken, or than the latest refresh began, is answered.
 - Envelopes are darwin's default: `darwin file upload`, `darwin manifest create` and the
   library's file upload shortcuts store each upload in an envelope, with its payment record, a
   listing when listed, and a `.record`. The other ways of using the network remain, with no

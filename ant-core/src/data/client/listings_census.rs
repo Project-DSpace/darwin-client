@@ -36,10 +36,11 @@
 //!   ([`Census::note_peers`]), and before any listing in it is dropped
 //!   ([`Census::witness`]); and every leaf is closed once every
 //!   [`REFRESH_INTERVAL`] ([`Census::refresh`]), and at the next upkeep once
-//!   a refresh is asked for ([`Census::force_refresh`]). The first two queue
-//!   the leaf, kept in the store, and [`Census::maintain`], once a cycle,
-//!   closes what is queued, [`CLOSE_CONCURRENCY`] lookups at a time across
-//!   every range, or every leaf when the refresh is due. What a node names
+//!   a refresh is asked for ([`Census::force_refresh`]), each request taken
+//!   once ([`Census::take_request`]). The first two queue the leaf, kept in
+//!   the store, and [`Census::maintain`], once a cycle, closes what is
+//!   queued, [`CLOSE_CONCURRENCY`] lookups at a time across every range, or
+//!   every leaf when the refresh is due. What a node names
 //!   can cost only so much: an id farther from it than the census's
 //!   [`VIEW_PEERS`] nodes nearest it can't be one of its nearest peers and is
 //!   ignored, and a leaf is closed for what nodes name at most once every
@@ -184,7 +185,8 @@ pub const NODES_DB: &str = "census_nodes";
 /// prefix's 32 bytes and then how many bits it fixes.
 pub const QUEUE_DB: &str = "census_queue";
 
-/// The census's other state: when it was last refreshed.
+/// The census's other state: when it was last refreshed, its size in recent
+/// cycles, and the requests to refresh it that it took.
 pub const META_DB: &str = "census_meta";
 
 /// The re-probe list: the nodes that left, by id ([`Census::reprobing`]).
@@ -196,6 +198,15 @@ const REFRESHED_AT: &str = "refreshed_at";
 /// The key in [`META_DB`] of how many nodes the census held in each of the
 /// latest cycles, the latest last ([`Census::note_cycle`]), as JSON.
 const RECENT_SIZES: &str = "recent_sizes";
+
+/// The key in [`META_DB`] of when the latest request to refresh the census
+/// that it took was made (Unix seconds) ([`Census::take_request`]).
+const REFRESH_ASKED: &str = "refresh_asked";
+
+/// The key in [`META_DB`] of what the latest request to refresh the census
+/// that held no time held, once taken, while its file is there
+/// ([`Census::take_untimed_request`]).
+const UNTIMED_REQUEST: &str = "untimed_request";
 
 /// What a node's user agent starts with: clients' don't.
 const NODE_AGENT: &str = "node/";
@@ -525,6 +536,14 @@ pub struct Census {
     queue_dirty: bool,
     refreshed_at: Option<u64>,
     refreshed_dirty: bool,
+    /// When the latest request to refresh the census that it took was made
+    /// (Unix seconds), if it took one ([`Self::take_request`]).
+    refresh_asked: Option<u64>,
+    /// What the latest request taken that held no time held, while its file
+    /// is there ([`Self::take_untimed_request`]).
+    untimed_request: Option<Vec<u8>>,
+    /// Whether either changed since the last save.
+    requests_dirty: bool,
     /// What changed in the census since [`Self::take_changes`] was last
     /// called.
     changes: CensusChange,
@@ -606,6 +625,12 @@ impl Census {
             .ok()
             .flatten()
             .unwrap_or_default();
+        let refresh_asked = meta_db.get(&txn, REFRESH_ASKED).map_err(store_error)?;
+        let untimed_request = meta_db
+            .remap_data_type::<Bytes>()
+            .get(&txn, UNTIMED_REQUEST)
+            .map_err(store_error)?
+            .map(<[u8]>::to_vec);
         drop(txn);
         Ok(Self {
             store: store.clone(),
@@ -623,6 +648,9 @@ impl Census {
             queue_dirty: false,
             refreshed_at,
             refreshed_dirty: false,
+            refresh_asked,
+            untimed_request,
+            requests_dirty: false,
             changes: CensusChange::default(),
             index: OnceLock::new(),
             named_lacking: BTreeSet::new(),
@@ -1375,6 +1403,66 @@ impl Census {
         self.save()
     }
 
+    /// Take a request to refresh the census made at `asked_at` (Unix
+    /// seconds), unless it is answered: made no later than the latest
+    /// request taken was, or than the latest refresh began
+    /// ([`Self::refreshed_at`]). One taken refreshes the census at the next
+    /// upkeep ([`Self::force_refresh`]) and is kept as the latest taken,
+    /// saved with it, so a request is taken once, however long its file
+    /// stays and however often the producer starts again. Returns whether it
+    /// was taken.
+    ///
+    /// # Errors
+    ///
+    /// If the store can't be written; the request is still taken in this
+    /// process.
+    pub fn take_request(&mut self, asked_at: u64) -> Result<bool> {
+        let answers = |at: Option<u64>| at.is_some_and(|at| asked_at <= at);
+        if answers(self.refresh_asked) || answers(self.refreshed_at) {
+            return Ok(false);
+        }
+        self.refresh_asked = Some(asked_at);
+        self.requests_dirty = true;
+        self.force_refresh()?;
+        Ok(true)
+    }
+
+    /// Take a request to refresh the census that holds no time it could
+    /// have been made at, holding `held`: unless the latest such request
+    /// taken held the same and its file is still there
+    /// ([`Self::request_gone`]), it is taken as [`Self::take_request`]
+    /// takes one, and what it holds is kept, so it too is taken once.
+    /// Returns whether it was taken.
+    ///
+    /// # Errors
+    ///
+    /// If the store can't be written; the request is still taken in this
+    /// process.
+    pub fn take_untimed_request(&mut self, held: &[u8]) -> Result<bool> {
+        if self.untimed_request.as_deref() == Some(held) {
+            return Ok(false);
+        }
+        self.untimed_request = Some(held.to_vec());
+        self.requests_dirty = true;
+        self.force_refresh()?;
+        Ok(true)
+    }
+
+    /// Note that no request's file is there: a request holding no time is
+    /// then taken even if it holds what the latest one taken did
+    /// ([`Self::take_untimed_request`]).
+    ///
+    /// # Errors
+    ///
+    /// If the store can't be written.
+    pub fn request_gone(&mut self) -> Result<()> {
+        if self.untimed_request.take().is_some() {
+            self.requests_dirty = true;
+            self.save()?;
+        }
+        Ok(())
+    }
+
     /// Take `peer` into the census, or update it: a node that has just
     /// answered (a responder of a witnessed lookup, or a request), at `at`
     /// (Unix seconds), reachable at `addresses` (kept as they were if
@@ -1515,6 +1603,7 @@ impl Census {
             && !self.refreshed_dirty
             && !self.queue_dirty
             && !self.recent_dirty
+            && !self.requests_dirty
         {
             return Ok(());
         }
@@ -1572,6 +1661,24 @@ impl Census {
                 .put(&mut txn, RECENT_SIZES, &self.recent_sizes)
                 .map_err(store_error)?;
         }
+        if self.requests_dirty {
+            if let Some(at) = self.refresh_asked {
+                self.meta_db
+                    .put(&mut txn, REFRESH_ASKED, &at)
+                    .map_err(store_error)?;
+            }
+            let untimed = self.meta_db.remap_data_type::<Bytes>();
+            match &self.untimed_request {
+                Some(held) => untimed
+                    .put(&mut txn, UNTIMED_REQUEST, held)
+                    .map_err(store_error)?,
+                None => {
+                    untimed
+                        .delete(&mut txn, UNTIMED_REQUEST)
+                        .map_err(store_error)?;
+                }
+            }
+        }
         txn.commit().map_err(store_error)?;
         self.dirty.clear();
         self.removed.clear();
@@ -1580,6 +1687,7 @@ impl Census {
         self.refreshed_dirty = false;
         self.queue_dirty = false;
         self.recent_dirty = false;
+        self.requests_dirty = false;
         Ok(())
     }
 
@@ -4317,6 +4425,61 @@ mod tests {
         assert_eq!(ids(&census), sim.live());
         census.save().unwrap();
         assert_eq!(Census::open(&store).unwrap().refreshed_at(), Some(220));
+    }
+
+    /// A request to refresh the census is taken once: one made no later
+    /// than the latest taken, or than the latest refresh began, is
+    /// answered, in this process and after a restart. One that holds no
+    /// time is taken once by what it holds, until its file is gone.
+    #[test]
+    fn a_request_to_refresh_is_taken_once_after_a_restart_too() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ListingsStore::open_with_map_size(dir.path(), TEST_MAP).unwrap();
+        let mut census = Census::open(&store).unwrap();
+        census.set_refreshed_at(100);
+        census.save().unwrap();
+
+        // Made before the latest refresh began, or as it began: answered.
+        assert!(!census.take_request(50).unwrap());
+        assert!(!census.take_request(100).unwrap());
+        assert!(!census.refresh_due(101));
+        // Made after: taken, and the refresh is due.
+        assert!(census.take_request(150).unwrap());
+        assert!(census.refresh_due(151));
+        assert!(!census.take_request(150).unwrap(), "taken once");
+        assert!(!census.take_request(120).unwrap());
+        // Kept: started again before the refresh, it is answered still.
+        drop(census);
+        let mut census = Census::open(&store).unwrap();
+        assert!(census.refresh_due(152));
+        assert!(!census.take_request(150).unwrap());
+        // The refresh it asked for, then a daily one, answer it too; a
+        // request made after them is taken.
+        census.set_refreshed_at(160);
+        census.set_refreshed_at(200);
+        census.save().unwrap();
+        assert!(!census.take_request(150).unwrap());
+        assert!(!census.take_request(200).unwrap());
+        assert!(census.take_request(201).unwrap());
+
+        // Untimed: taken once by what it holds, after a restart too.
+        census.set_refreshed_at(300);
+        census.save().unwrap();
+        assert!(census.take_untimed_request(b"").unwrap());
+        assert!(!census.take_untimed_request(b"").unwrap());
+        drop(census);
+        let mut census = Census::open(&store).unwrap();
+        assert!(!census.take_untimed_request(b"").unwrap());
+        // Holding something else, it is a new request.
+        assert!(census.take_untimed_request(b"soon").unwrap());
+        assert!(!census.take_untimed_request(b"soon").unwrap());
+        // Once its file is gone, the same is a new request again.
+        census.request_gone().unwrap();
+        drop(census);
+        let mut census = Census::open(&store).unwrap();
+        assert!(census.take_untimed_request(b"soon").unwrap());
+        // A time taken stays answered, untimed requests or not.
+        assert!(!census.take_request(201).unwrap());
     }
 
     #[test]

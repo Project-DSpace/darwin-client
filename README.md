@@ -471,7 +471,7 @@ It decides what `darwin listings --state --carry` decides, with the same rules a
 $ darwin listings refresh-census --state-dir /var/lib/listings
 ```
 
-Asks the producer keeping its state in that directory to refresh its census of nodes in its next cycle, or, if it isn't running, in its first cycle after it starts: every leaf is closed again with witnessed lookups, as the daily closing does, and every node that left the census is probed before any other. The request is the file `census-refresh` in the state directory, which the producer removes once it has taken it, so run the command as a user that can write there (the producer's own, or root). A directory without the producer's `listings.mdb` is refused. It needs no network, wallet or chain.
+Asks the producer keeping its state in that directory to refresh its census of nodes in its next cycle, or, if it isn't running, in its first cycle after it starts: every leaf is closed again with witnessed lookups, as the daily closing does, and every node that left the census is probed before any other. The request is the file `census-refresh` in the state directory, which the producer removes once it has taken it, so run the command as a user that can write there (the producer's own, or root). Each request is taken once, by the time it holds: one made no later than the latest taken, or than the latest refresh began, is already answered, and is removed too; one the producer can't remove is left where it is, and isn't taken again, after a restart either. A directory without the producer's `listings.mdb` is refused. It needs no network, wallet or chain.
 
 ### `darwin listing <ADDRESS>` — One Listing
 

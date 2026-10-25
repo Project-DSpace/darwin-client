@@ -297,12 +297,14 @@ pub const STORE_DIR: &str = "listings.mdb";
 /// census ([`Producer::request_census_refresh`]): its next cycle closes
 /// every leaf again, as the daily refresh does, and probes every node that
 /// left first ([`Census::force_refresh`]), and then removes the file. It
-/// holds when it was asked for, in Unix seconds.
+/// holds when it was asked for, in Unix seconds. A request is taken once
+/// ([`Census::take_request`]): one made no later than the latest taken, or
+/// than the latest refresh began, is answered, so one whose file can't be
+/// removed isn't taken again, after a restart either.
 pub const CENSUS_REFRESH_FILE: &str = "census-refresh";
 
 /// The most of a request to refresh the census that is read: its time, and
-/// room to spare. A request is told apart from the last one taken by what
-/// it holds.
+/// room to spare.
 const CENSUS_REFRESH_BYTES: u64 = 64;
 
 /// Since when each address has been deferred, or listed below full
@@ -826,9 +828,6 @@ pub struct Producer {
     /// Where a request to refresh the census is left
     /// ([`CENSUS_REFRESH_FILE`] in the state directory).
     refresh_request: PathBuf,
-    /// What the latest request taken held, while its file couldn't be
-    /// removed: it isn't taken again until it changes.
-    refresh_taken: Option<Vec<u8>>,
 }
 
 impl Producer {
@@ -901,7 +900,6 @@ impl Producer {
             totals: Totals::default(),
             traffic_counted,
             refresh_request: state_dir.join(CENSUS_REFRESH_FILE),
-            refresh_taken: None,
         })
     }
 
@@ -938,8 +936,14 @@ impl Producer {
     /// Take a request to refresh the census, if one is waiting
     /// ([`Self::request_census_refresh`]): the census is refreshed at its
     /// next upkeep ([`Census::force_refresh`]), and the request's file is
-    /// removed. One whose file can't be removed isn't taken again until it
-    /// holds something else. Returns whether one was taken.
+    /// removed. A request is taken once, by the time it holds
+    /// ([`Census::take_request`]): one made no later than the latest taken,
+    /// or than the latest refresh began, is answered. One that holds no
+    /// time it could have been made at ([`request_time`]) is taken once by
+    /// what it holds ([`Census::take_untimed_request`]). The file of a
+    /// request answered is removed too; one that can't be removed is left,
+    /// and isn't taken again, after a restart either. Returns whether one
+    /// was taken.
     ///
     /// # Errors
     ///
@@ -953,7 +957,7 @@ impl Producer {
         match read {
             Ok(_) => {}
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                self.refresh_taken = None;
+                self.census.request_gone()?;
                 return Ok(false);
             }
             Err(e) => {
@@ -964,26 +968,30 @@ impl Producer {
                 return Ok(false);
             }
         }
-        if self.refresh_taken.as_ref() == Some(&held) {
-            return Ok(false);
+        let taken = match request_time(&held, unix_now()) {
+            Some(asked_at) => self.census.take_request(asked_at)?,
+            None => self.census.take_untimed_request(&held)?,
+        };
+        if taken {
+            info!(
+                "Census: a refresh was asked for ({}): every leaf is closed again this cycle",
+                path.display()
+            );
         }
-        self.census.force_refresh()?;
-        info!(
-            "Census: a refresh was asked for ({}): every leaf is closed again this cycle",
-            path.display()
-        );
         match std::fs::remove_file(path) {
-            Ok(()) => self.refresh_taken = None,
-            Err(e) => {
-                warn!(
-                    "Could not remove the census refresh request {}: {e}; it is taken again only \
-                     once it changes",
-                    path.display()
-                );
-                self.refresh_taken = Some(held);
-            }
+            Ok(()) => self.census.request_gone()?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => self.census.request_gone()?,
+            Err(e) if taken => warn!(
+                "Could not remove the census refresh request {}: {e}; it is left, and not taken \
+                 again",
+                path.display()
+            ),
+            Err(e) => debug!(
+                "Could not remove the census refresh request {}, answered already: {e}",
+                path.display()
+            ),
         }
-        Ok(true)
+        Ok(taken)
     }
 
     /// On a first start, while the store holds no index yet, take the
@@ -3509,6 +3517,19 @@ impl Iterator for WantedIter<'_> {
             }
         }
     }
+}
+
+/// When a request to refresh the census holding `held` was made: the Unix
+/// seconds it holds ([`Producer::request_census_refresh`]), if that is no
+/// later than `now`. One holding anything else, or a later time (as after
+/// the clock was set back), holds no time it could have been made at.
+fn request_time(held: &[u8], now: u64) -> Option<u64> {
+    std::str::from_utf8(held)
+        .ok()?
+        .trim()
+        .parse::<u64>()
+        .ok()
+        .filter(|at| *at <= now)
 }
 
 /// Each of `copies` of an address, digest entries, as the full listing its
@@ -6071,7 +6092,8 @@ mod tests {
         let state = dir.path().join("state");
         assert!(!producer.take_refresh_request().unwrap(), "none asked for");
         let now = unix_now();
-        producer.census.set_refreshed_at(now);
+        // The latest refresh began before the request is made.
+        producer.census.set_refreshed_at(now - 60);
         assert!(!producer.census.refresh_due(now));
         let file = Producer::request_census_refresh(&state).unwrap();
         assert_eq!(file, state.join(CENSUS_REFRESH_FILE));
@@ -6090,6 +6112,143 @@ mod tests {
         let elsewhere = tempfile::tempdir().unwrap();
         assert!(Producer::request_census_refresh(elsewhere.path()).is_err());
         assert!(!elsewhere.path().join(CENSUS_REFRESH_FILE).exists());
+    }
+
+    /// While it lives, a request's file can't be removed, as one left where
+    /// the producer may not delete: its directory is read-only on Unix, and
+    /// on Windows the file is held open without sharing its deletion.
+    #[cfg(any(unix, windows))]
+    struct Unremovable {
+        #[cfg(unix)]
+        dir: PathBuf,
+        #[cfg(windows)]
+        _held: std::fs::File,
+    }
+
+    #[cfg(unix)]
+    impl Unremovable {
+        /// `None` where this user may remove it all the same, as root may
+        /// from a read-only directory.
+        fn hold(file: &Path) -> Option<Self> {
+            use std::os::unix::fs::PermissionsExt as _;
+            let dir = file.parent().unwrap().to_path_buf();
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+            let held = Self { dir };
+            let probe = held.dir.join("probe");
+            if std::fs::write(&probe, b"").is_ok() {
+                std::fs::remove_file(&probe).unwrap();
+                return None;
+            }
+            Some(held)
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for Unremovable {
+        fn drop(&mut self) {
+            use std::os::unix::fs::PermissionsExt as _;
+            let _ = std::fs::set_permissions(&self.dir, std::fs::Permissions::from_mode(0o755));
+        }
+    }
+
+    #[cfg(windows)]
+    impl Unremovable {
+        /// Never `None`: no user deletes a file another handle doesn't share
+        /// the deletion of.
+        fn hold(file: &Path) -> Option<Self> {
+            use std::os::windows::fs::OpenOptionsExt as _;
+            // FILE_SHARE_READ: others may read it, not write or delete it.
+            const SHARE_READ: u32 = 1;
+            let held = std::fs::OpenOptions::new()
+                .read(true)
+                .share_mode(SHARE_READ)
+                .open(file)
+                .unwrap();
+            Some(Self { _held: held })
+        }
+    }
+
+    /// A request whose file the producer can't remove (left by a user that
+    /// may write in the state directory where the producer may not delete)
+    /// is taken once: not again in the cycles after, nor after the producer
+    /// starts again, before or after the refresh it asked for. Once its file
+    /// can be removed, an answered request is removed, and a later one is
+    /// taken. One that holds no time is taken once by what it holds.
+    #[cfg(any(unix, windows))]
+    #[tokio::test]
+    async fn a_census_refresh_request_left_in_place_is_taken_once_across_restarts() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("state").join(CENSUS_REFRESH_FILE);
+        let (mut producer, mut node) = offline_producer(dir.path()).await;
+        let base = unix_now() - 1_000;
+        producer.census.set_refreshed_at(base);
+        producer.census.save().unwrap();
+
+        std::fs::write(&file, format!("{}\n", base + 100)).unwrap();
+        let Some(held) = Unremovable::hold(&file) else {
+            eprintln!("skipped: this user may remove files from a read-only directory");
+            return;
+        };
+        assert!(producer.take_refresh_request().unwrap());
+        assert!(file.exists(), "it couldn't be removed");
+        assert!(producer.census.refresh_due(base + 101));
+        assert!(!producer.take_refresh_request().unwrap(), "not taken again");
+
+        // Started again before the refresh it asked for: not taken again.
+        drop(producer);
+        drop(node);
+        (producer, node) = offline_producer(dir.path()).await;
+        assert!(!producer.take_refresh_request().unwrap());
+        assert!(producer.census.refresh_due(base + 101), "still due");
+        // Started again after it: not taken again either.
+        producer.census.set_refreshed_at(base + 200);
+        producer.census.save().unwrap();
+        drop(producer);
+        drop(node);
+        (producer, node) = offline_producer(dir.path()).await;
+        assert!(!producer.take_refresh_request().unwrap());
+        assert!(!producer.census.refresh_due(base + 201));
+        assert!(file.exists());
+
+        // Removable again: the answered request is removed, not taken.
+        drop(held);
+        assert!(!producer.take_refresh_request().unwrap());
+        assert!(!file.exists(), "an answered request is removed");
+        // A request made after the latest refresh began is taken; one made
+        // before the latest taken, as a file put back would be, isn't.
+        std::fs::write(&file, format!("{}\n", base + 300)).unwrap();
+        assert!(producer.take_refresh_request().unwrap());
+        assert!(!file.exists());
+        producer.census.set_refreshed_at(base + 400);
+        std::fs::write(&file, format!("{}\n", base + 300)).unwrap();
+        assert!(!producer.take_refresh_request().unwrap());
+        assert!(!file.exists());
+
+        // No time, or a time to come: taken once by what it holds, after a
+        // restart too, and taken again once its file was gone.
+        for untimed in [
+            String::new(),
+            "soon".into(),
+            format!("{}", unix_now() + 3_600),
+        ] {
+            std::fs::write(&file, &untimed).unwrap();
+            let held = Unremovable::hold(&file).unwrap();
+            assert!(producer.take_refresh_request().unwrap(), "{untimed:?}");
+            assert!(!producer.take_refresh_request().unwrap(), "{untimed:?}");
+            producer.census.set_refreshed_at(unix_now());
+            producer.census.save().unwrap();
+            drop(producer);
+            drop(node);
+            (producer, node) = offline_producer(dir.path()).await;
+            assert!(!producer.take_refresh_request().unwrap(), "{untimed:?}");
+            drop(held);
+            assert!(!producer.take_refresh_request().unwrap(), "{untimed:?}");
+            assert!(!file.exists(), "{untimed:?}");
+            std::fs::write(&file, &untimed).unwrap();
+            assert!(producer.take_refresh_request().unwrap(), "{untimed:?}");
+            assert!(!file.exists(), "{untimed:?}");
+        }
+        drop(node);
     }
 
     #[tokio::test]
