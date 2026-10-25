@@ -54,7 +54,10 @@ async fn a_data_upload_too_small_to_encrypt_fails() {
     );
 }
 
-/// An upload of a file that does not exist fails.
+/// An upload of a file that does not exist fails reading it, before anything
+/// else. The control: the same walletless client given a file that exists
+/// gets past the read and fails on the missing wallet instead, so the first
+/// assertion holds only because the path is missing.
 #[tokio::test]
 async fn a_file_upload_of_a_missing_path_fails() {
     let client = offline_client().await;
@@ -62,8 +65,18 @@ async fn a_file_upload_of_a_missing_path_fails() {
     let missing = work_dir.path().join("missing.bin");
     let result = client.file_upload(&missing).await;
     assert!(
-        result.is_err(),
-        "file_upload on non-existent path should fail"
+        matches!(&result, Err(Error::Io(e)) if e.kind() == std::io::ErrorKind::NotFound),
+        "file_upload on a non-existent path should fail with a not-found read, got {:?}",
+        result.err()
+    );
+
+    let present = work_dir.path().join("present.bin");
+    std::fs::write(&present, vec![0x42u8; 4096]).expect("write present file");
+    let result = client.file_upload(&present).await;
+    assert!(
+        matches!(&result, Err(Error::Payment(m)) if m.contains("Wallet not configured")),
+        "file_upload of an existing file on a walletless client should fail on the wallet, got {:?}",
+        result.err()
     );
 }
 
