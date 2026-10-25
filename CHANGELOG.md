@@ -369,6 +369,14 @@ commit `darwin --version` prints. Upstream's entries follow.
   reload the page instead. Before, it repeated the vendored storer wording, which told users to
   run another client's `ant update`. The vendored ant-protocol is unchanged, and tests that model
   a storer's own wording keep it.
+- `darwin-nodes` caps its own log: `daemon run --log-path PATH` writes `<PATH>.<UTC time>.log`,
+  a new file every 10 MiB or hour and on every start, and after each new file deletes the oldest
+  closed files of the family (the daily files earlier builds wrote included) until it holds at
+  most 50 MiB with the new file full, and closed files older than a month. With 1 GiB free or
+  less on the log's disk (the nodes' full line, and the manager's own low-disk warning level) it
+  deletes its closed files and writes only warnings and errors, counting the lines it leaves
+  out, and writes one line saying how many once space returns. The erasure census lists its two
+  deletions of log files.
 
 ## [Unreleased]
 

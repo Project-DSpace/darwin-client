@@ -447,16 +447,24 @@ fn request(port: u16, method: &str, path: &str, body: Option<&str>) -> (u16, Str
 }
 
 fn start_daemon(homes: &Homes) -> Daemon {
+    start_daemon_with(homes, &[])
+}
+
+/// [`start_daemon`], with `extra` arguments after the image's.
+fn start_daemon_with(homes: &Homes, extra: &[&str]) -> Daemon {
     let port = free_port();
+    let port_arg = port.to_string();
+    let mut args = vec![
+        "daemon",
+        "run",
+        "--listen-addr",
+        "127.0.0.1",
+        "--port",
+        port_arg.as_str(),
+    ];
+    args.extend_from_slice(extra);
     let child = homes
-        .command(&[
-            "daemon",
-            "run",
-            "--listen-addr",
-            "127.0.0.1",
-            "--port",
-            &port.to_string(),
-        ])
+        .command(&args)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
@@ -565,5 +573,51 @@ fn the_daemon_serves_no_reset_forwarding_or_download_and_deletes_nothing() {
         files_under(&data_dir),
         before,
         "the node's data is as it was"
+    );
+}
+
+/// The daemon's own log, where the image writes it (`--log-path $LOGS/manager`): a new file of the
+/// family on every start, holding the start line, and a daily file of an earlier build gone once
+/// it is older than the family keeps. A node's logs beside it are left as they were.
+#[test]
+fn the_daemon_starts_a_capped_log_file_and_leaves_the_nodes_logs_alone() {
+    let homes = Homes::new();
+    let logs = homes.path("logs");
+    let node_logs = logs.join("node-1").join("logs");
+    std::fs::create_dir_all(&node_logs).unwrap();
+    std::fs::write(node_logs.join("ant-node.log"), b"a node's log line\n").unwrap();
+    let stale = logs.join("manager.2026-01-01.log");
+    std::fs::write(&stale, b"an old daily line\n").unwrap();
+    std::fs::File::options()
+        .write(true)
+        .open(&stale)
+        .unwrap()
+        .set_modified(std::time::SystemTime::now() - Duration::from_secs(40 * 24 * 60 * 60))
+        .unwrap();
+    let recent = logs.join("manager.2026-10-24.log");
+    std::fs::write(&recent, b"yesterday's daily line\n").unwrap();
+
+    let manager = logs.join("manager");
+    let daemon = start_daemon_with(&homes, &["--log-path", manager.to_str().unwrap()]);
+    drop(daemon);
+
+    let mut files: Vec<String> = std::fs::read_dir(&logs)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+        .filter(|name| name.ends_with(".log"))
+        .collect();
+    files.sort();
+    assert!(!stale.exists(), "{files:?}");
+    assert!(recent.exists(), "{files:?}");
+    let started: Vec<&String> = files
+        .iter()
+        .filter(|name| name.starts_with("manager.") && name.contains('T'))
+        .collect();
+    assert_eq!(started.len(), 1, "{files:?}");
+    let text = std::fs::read_to_string(logs.join(started[0])).unwrap();
+    assert!(text.contains("darwin-nodes daemon starting"), "{text}");
+    assert_eq!(
+        std::fs::read(node_logs.join("ant-node.log")).unwrap(),
+        b"a node's log line\n"
     );
 }

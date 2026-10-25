@@ -705,6 +705,13 @@ and identities. It leaves out what would delete or send anything:
   machine, and its daemon refuses an add naming any other source;
 - it forwards no logs: no `logs forward`, and its daemon serves no log-forwarding routes.
 
+Its own log (`daemon run --log-path PATH`, which the image passes) is capped, since it shares the
+disk with the nodes: a new file, `<PATH>.<UTC time>.log`, every 10 MiB or hour and on every start,
+at most 50 MiB in all, the daily files of earlier builds included, and none kept past a month.
+With 1 GiB free or less on its disk, the nodes' full line and its own warning level, it deletes
+its closed files and writes only warnings and errors, then one line saying how many others it
+left out once space returns.
+
 Its commands are `add`, `daemon` (`start`, `stop`, `status`, `info`, and the hidden `run` the
 image runs), `dismiss`, `start`, `status` and `stop`. A node an earlier manager evicted keeps its
 marker until dismissed, reports as `evicted`, and never starts again under its old identity.
