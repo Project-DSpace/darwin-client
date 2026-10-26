@@ -23,8 +23,18 @@ export async function closesSettled() {
 // responses use the shared Rust wire contract and real session encryption.
 // ICE gathering completes `gatheringMs` after setLocalDescription; Infinity
 // never completes.
+// How soon a refusing node's transport fails a dial, as a STUN error response
+// to the browser's first answered connectivity check would.
+const REFUSAL_MS = 20;
+// How late a node that never connects fails a dial's ICE checks: past the
+// client's 3 s REFUSAL_DETECTION_WINDOW, with a second of margin, and well
+// inside its 10 s channel-open deadline.
+const SLOW_ICE_FAIL_MS = 4_000;
+
 export function mockWebRtc(nodes = [{}], { gatheringMs = 0 } = {}) {
   const connections = [];
+  // Dials each node has received, for nodes that refuse their first few.
+  const dials = nodes.map(() => 0);
   const requests = [];
   // When each connection started and completed ICE gathering.
   const gathering = [];
@@ -72,6 +82,12 @@ export function mockWebRtc(nodes = [{}], { gatheringMs = 0 } = {}) {
         quoteHash: this.server.last_put_quote_hash(),
       } : {}), ...(address ? { address } : {}) });
       if (this.options.respond?.(this, method, response) === false) return;
+      // A full node's application closes an authenticated-to-be association
+      // instead of answering its handshake (ADR-0015).
+      if (method === "handshake" && this.connection.dial <= (this.options.closeHandshakes ?? 0)) {
+        this.close();
+        return;
+      }
       setTimeout(() => {
         if (this.options.multiplex && method !== "handshake") response = this.server.seal_response(response);
         this.options.delivered?.(this, method);
@@ -110,6 +126,7 @@ export function mockWebRtc(nodes = [{}], { gatheringMs = 0 } = {}) {
 
   globalThis.RTCPeerConnection = class {
     connectionState = "new";
+    iceConnectionState = "new";
     iceGatheringState = "new";
     constructor() {
       connections.push(this);
@@ -151,6 +168,37 @@ export function mockWebRtc(nodes = [{}], { gatheringMs = 0 } = {}) {
     }
     async setRemoteDescription(remote) {
       this.remoteSeed = Number(remote.sdp.match(/m=application (\d+)/)[1]) - 24_000;
+      this.dial = ++dials[this.remoteSeed - 1];
+      // A node at transport capacity answers the check with a STUN error, and
+      // the browser fails the association without connecting (ant-node ADR-0023).
+      if (this.dial <= (nodes[this.remoteSeed - 1].refuseDials ?? 0)) {
+        setTimeout(() => {
+          this.iceConnectionState = "failed";
+          this.connectionState = "failed";
+          this.onconnectionstatechange?.(new Event("connectionstatechange"));
+        }, REFUSAL_MS);
+        return;
+      }
+      // ICE checks fail late without ever connecting, as when no node answers
+      // and the browser gives up on its own: an ordinary failure, not a refusal.
+      if (this.dial <= (nodes[this.remoteSeed - 1].slowIceFailDials ?? 0)) {
+        setTimeout(() => {
+          this.iceConnectionState = "failed";
+          this.connectionState = "failed";
+          this.onconnectionstatechange?.(new Event("connectionstatechange"));
+        }, SLOW_ICE_FAIL_MS);
+        return;
+      }
+      // A different node at the endpoint answers ICE, but fails the DTLS
+      // certificate check, so the association fails after ICE connected.
+      if (this.dial <= (nodes[this.remoteSeed - 1].failDtlsDials ?? 0)) {
+        setTimeout(() => {
+          this.iceConnectionState = "connected";
+          this.connectionState = "failed";
+          this.onconnectionstatechange?.(new Event("connectionstatechange"));
+        }, REFUSAL_MS);
+        return;
+      }
       await this.prepareChannel(this.channel);
     }
     async prepareChannel(channel) {
@@ -183,6 +231,7 @@ export function mockWebRtc(nodes = [{}], { gatheringMs = 0 } = {}) {
       }
       if (channel.options.connectDelay) await new Promise(resolve => setTimeout(resolve, channel.options.connectDelay));
       if (this.connectionState === "new") this.connectionState = "connected";
+      this.iceConnectionState = "connected";
       setTimeout(() => channel.onopen?.({}), 0);
     }
     close() {

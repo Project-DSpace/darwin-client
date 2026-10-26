@@ -18,6 +18,7 @@ pub mod data;
 pub mod diagnostics;
 pub mod envelope;
 pub mod file;
+pub(crate) mod holders;
 #[cfg(feature = "native")]
 pub mod listings;
 #[cfg(feature = "native")]
@@ -267,6 +268,11 @@ mod settlement_refusal_tests {
         PeerId::from_bytes([seed; 32])
     }
 
+    /// A settlement refusal's wording, as quote collection records it.
+    fn refusal() -> String {
+        super::quote::update_required_message(1, 2)
+    }
+
     /// The question the V2-1109 run could not answer from logs: does one peer
     /// refusing many times count as many? It must not — the quorum is over
     /// DISTINCT peers, and a lone hostile or misconfigured storer repeating
@@ -276,7 +282,7 @@ mod settlement_refusal_tests {
         let refusals = SettlementRefusals::default();
         for _ in 0..50 {
             assert!(
-                refusals.note(peer(7), "run ant update").is_none(),
+                refusals.note(peer(7), &refusal()).is_none(),
                 "a single peer's repeated refusals must stay below the quorum"
             );
         }
@@ -289,8 +295,8 @@ mod settlement_refusal_tests {
     #[test]
     fn corroborating_peers_names_every_distinct_refuser() {
         let refusals = SettlementRefusals::default();
-        assert!(refusals.note(peer(1), "run ant update").is_none());
-        assert!(refusals.note(peer(2), "run ant update").is_some());
+        assert!(refusals.note(peer(1), &refusal()).is_none());
+        assert!(refusals.note(peer(2), &refusal()).is_some());
 
         let ids = refusals.corroborating_peers();
         assert_eq!(ids.len(), 2);
@@ -687,6 +693,9 @@ pub struct Client {
     wallet: Option<Arc<Wallet>>,
     evm_network: Option<ant_protocol::evm::Network>,
     chunk_cache: ChunkCache,
+    /// The nodes that served chunks read recently, which a read of one again
+    /// asks first.
+    holders: holders::HolderCache,
     /// Chunk GETs in flight, by address and peer count, so concurrent reads
     /// of one chunk share a single network GET.
     chunk_gets: SingleFlight<(XorName, usize), Result<Option<ant_protocol::DataChunk>>>,
@@ -776,6 +785,7 @@ impl Client {
             wallet: None,
             evm_network: None,
             chunk_cache: ChunkCache::default(),
+            holders: holders::HolderCache::default(),
             chunk_gets: SingleFlight::default(),
             next_request_id: AtomicU64::new(1),
             controller,
@@ -825,6 +835,7 @@ impl Client {
             wallet: None,
             evm_network: None,
             chunk_cache: ChunkCache::default(),
+            holders: holders::HolderCache::default(),
             chunk_gets: SingleFlight::default(),
             next_request_id: AtomicU64::new(1),
             unversioned_quote_peers: Arc::new(Mutex::new(HashSet::new())),
@@ -884,6 +895,7 @@ impl Client {
             wallet: None,
             evm_network: None,
             chunk_cache: ChunkCache::default(),
+            holders: holders::HolderCache::default(),
             chunk_gets: SingleFlight::default(),
             next_request_id: AtomicU64::new(1),
             unversioned_quote_peers: Arc::new(Mutex::new(HashSet::new())),
@@ -1017,6 +1029,11 @@ impl Client {
     #[must_use]
     pub fn chunk_cache(&self) -> &ChunkCache {
         &self.chunk_cache
+    }
+
+    /// The nodes that served chunks read recently.
+    pub(crate) fn holders(&self) -> &holders::HolderCache {
+        &self.holders
     }
 
     /// Adaptive concurrency controller. Hot loops read

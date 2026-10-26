@@ -8,7 +8,9 @@
 # must pass, and once for each change below, where it must fail with that
 # change's problem alone. Each change would let a release skip something it
 # relies on. Then the filter release.yml's checks job picks the tagged
-# commit's Test run with runs on sample lists of runs.
+# commit's Test run with runs on sample lists of runs. Last, the check
+# in scripts/test-targets.py that every case file of the e2e target is built:
+# it needs cargo, for `cargo metadata --no-deps`.
 
 set -euo pipefail
 
@@ -130,6 +132,10 @@ edit "${RELEASE}" 'if [[ ",$rules," != *",required_reviewers,"* ]]; then' 'if fa
 expect "the release environment's approval not checked" "no longer makes sure the release environment asks for approval"
 
 fresh
+edit "${RELEASE}" 'run: python3 scripts/darwin-node-pin.py --release' 'run: python3 scripts/darwin-node-pin.py'
+expect "the darwin-node revision not checked for release" "no longer checks the darwin-node revision may be released against"
+
+fresh
 edit "${RELEASE}" 'actions/workflows/test.yml/runs' 'actions/workflows/build.yml/runs'
 expect "no Test run looked for" "missing: actions/workflows/test.yml/runs"
 
@@ -220,7 +226,7 @@ edit "${TEST}" $'    timeout-minutes: 120\n' $'    timeout-minutes: 120\n    con
 expect "end-to-end failures let through" "test.yml must not continue on error"
 
 fresh
-edit "${TEST}" 'target: ${{ fromJSON(needs.targets.outputs.e2e) }}' 'target: [e2e_merkle, e2e_envelope]'
+edit "${TEST}" 'target: ${{ fromJSON(needs.targets.outputs.e2e) }}' 'target: [e2e]'
 expect "the end-to-end targets listed by hand" "e2e job no longer runs each listed end-to-end target"
 
 fresh
@@ -310,8 +316,42 @@ takes "a push to another branch is not taken" 14 "${push}"$'\n'"${elsewhere}"
 takes "only a pull request run" "" "${pull}"
 takes "no run" "" ""
 
+# scripts/test-targets.py: a case file in ant-core/tests/e2e that tests/e2e.rs
+# doesn't declare is never compiled, so its check must fail on one. Cargo
+# finds the files itself, so the stray file goes in this checkout, and is
+# removed again on exit.
+STRAY=ant-core/tests/e2e/stray_case_for_the_check.rs
+targets() {
+    local name=$1 want=$2 out rc=0
+    out=$(python3 scripts/test-targets.py check 2>&1) || rc=$?
+    if [[ "${want}" == pass ]]; then
+        if ((rc != 0)); then
+            fail "test-targets.py, ${name}: the check failed: ${out}"
+            return
+        fi
+    elif ((rc == 0)); then
+        fail "test-targets.py, ${name}: the check passed; it must fail with: ${want}"
+        return
+    elif [[ $(grep -c '^test-targets: ' <<<"${out}") -ne 1 ]] || ! grep -qF -- "${want}" <<<"${out}"; then
+        fail "test-targets.py, ${name}: the check must fail with this problem alone: ${want}; it said: ${out}"
+        return
+    fi
+    PASSED=$((PASSED + 1))
+}
+
+if [[ -e "${STRAY}" ]]; then
+    fail "test-targets.py: ${STRAY} already exists; this case would remove it"
+else
+    targets "the test files as they are" pass
+    trap 'rm -rf "${WORK}" "${STRAY}"' EXIT
+    printf '// Not declared in tests/e2e.rs.
+' > "${STRAY}"
+    targets "an e2e case file tests/e2e.rs doesn't declare"         "ant-core/tests/e2e/stray_case_for_the_check.rs is not declared in tests/e2e.rs"
+    rm -f "${STRAY}"
+fi
+
 if ((FAILED > 0)); then
     echo "${FAILED} of $((PASSED + FAILED)) cases failed" >&2
     exit 1
 fi
-echo "scripts/check-workflows.sh: ${PASSED} cases pass. It passes on the workflows as they are and fails on each change that would let a release skip a check, and release.yml's filter takes the tagged commit's own Test run."
+echo "scripts/check-workflows.sh: ${PASSED} cases pass. It passes on the workflows as they are and fails on each change that would let a release skip a check, release.yml's filter takes the tagged commit's own Test run, and scripts/test-targets.py fails on an e2e case file that isn't built."

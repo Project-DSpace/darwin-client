@@ -24,10 +24,8 @@
 //! from the journal, and never while the vault's record of its payment
 //! can't be read.
 
-#![allow(clippy::unwrap_used, clippy::expect_used)]
-
-mod support;
-
+use crate::support::runner::Case;
+use crate::support::{test_client_config, MiniTestnet, CLIENT_NODE};
 use alloy::providers::Provider;
 use ant_core::data::{
     compute_address, ml_dsa_65, Client, Error, PaymentMode, PointerTarget, PointerTargetKind,
@@ -37,15 +35,43 @@ use axum::extract::State;
 use axum::response::{IntoResponse, Response};
 use bytes::Bytes;
 use serde_json::{json, Value};
-use serial_test::serial;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
-use support::{test_client_config, MiniTestnet, DEFAULT_NODE_COUNT};
 
-/// The node the clients are built on.
-const CLIENT_NODE: usize = 3;
+pub fn cases() -> Vec<Case> {
+    vec![
+        Case::on_network(
+            "payment_recovery::a_chunk_put_the_rpc_errored_on_pays_once",
+            a_chunk_put_the_rpc_errored_on_pays_once,
+        ),
+        Case::on_network(
+            "payment_recovery::a_pointer_write_the_rpc_errored_on_pays_once",
+            a_pointer_write_the_rpc_errored_on_pays_once,
+        ),
+        Case::on_network(
+            "payment_recovery::files_sharing_a_wave_the_rpc_errored_on_pay_once",
+            files_sharing_a_wave_the_rpc_errored_on_pay_once,
+        ),
+        Case::on_network(
+            "payment_recovery::a_payment_settled_from_the_journal_is_not_paid_again_when_refused",
+            a_payment_settled_from_the_journal_is_not_paid_again_when_refused,
+        ),
+        Case::on_network(
+            "payment_recovery::refusals_on_every_run_pay_again_at_most_once",
+            refusals_on_every_run_pay_again_at_most_once,
+        ),
+        Case::on_network(
+            "payment_recovery::a_failed_payment_after_a_refusal_never_pays_a_third_time",
+            a_failed_payment_after_a_refusal_never_pays_a_third_time,
+        ),
+        Case::on_network(
+            "payment_recovery::a_refused_proof_whose_payment_cant_be_read_is_kept",
+            a_refused_proof_whose_payment_cant_be_read_is_kept,
+        ),
+    ]
+}
 
 /// What the proxy in front of Anvil does.
 #[derive(Default)]
@@ -150,10 +176,9 @@ async fn relay(State(proxy): State<Arc<Proxy>>, body: axum::body::Bytes) -> Resp
         .into_response()
 }
 
-/// A testnet on the DARWIN vault's code; the proxy in front of its Anvil;
-/// and a funded wallet, as Anvil sees it directly and as the proxy shows it.
-async fn setup() -> (MiniTestnet, Arc<Proxy>, Wallet, Wallet) {
-    let testnet = MiniTestnet::start_with_darwin_vault(DEFAULT_NODE_COUNT).await;
+/// The proxy in front of the testnet's Anvil (the DARWIN vault's code), and
+/// a funded wallet, as Anvil sees it directly and as the proxy shows it.
+async fn setup(testnet: &MiniTestnet) -> (Arc<Proxy>, Wallet, Wallet) {
     let anvil = testnet.evm_network().clone();
 
     let proxy = Arc::new(Proxy {
@@ -190,7 +215,7 @@ async fn setup() -> (MiniTestnet, Arc<Proxy>, Wallet, Wallet) {
         .await
         .unwrap();
     let proxied = Wallet::new_from_private_key(proxied, &key).unwrap();
-    (testnet, proxy, direct, proxied)
+    (proxy, direct, proxied)
 }
 
 /// A client paying through the proxy. Each attempt below takes a new one,
@@ -283,10 +308,8 @@ async fn sent(wallet: &Wallet) -> u64 {
 /// `chunk_put` whose payment the RPC answered with an error pays once: in
 /// one run when the chain shows the payment 10 seconds later, and across two
 /// when it doesn't, the second run finding the journaled payment.
-#[tokio::test(flavor = "multi_thread")]
-#[serial]
-async fn a_chunk_put_the_rpc_errored_on_pays_once() {
-    let (testnet, proxy, direct, proxied) = setup().await;
+async fn a_chunk_put_the_rpc_errored_on_pays_once(testnet: Arc<MiniTestnet>) {
+    let (proxy, direct, proxied) = setup(&testnet).await;
     let checkpoints = record_checkpoints();
 
     let content = random_chunk();
@@ -347,17 +370,13 @@ async fn a_chunk_put_the_rpc_errored_on_pays_once() {
         checkpoints,
         "nothing kept once stored"
     );
-
-    testnet.teardown().await;
 }
 
 /// A pointer write whose payment the RPC answered with an error pays once,
 /// as a chunk put does: a create recovered in one run, and an update across
 /// two, the second signing the same state and finding its payment.
-#[tokio::test(flavor = "multi_thread")]
-#[serial]
-async fn a_pointer_write_the_rpc_errored_on_pays_once() {
-    let (testnet, proxy, direct, proxied) = setup().await;
+async fn a_pointer_write_the_rpc_errored_on_pays_once(testnet: Arc<MiniTestnet>) {
+    let (proxy, direct, proxied) = setup(&testnet).await;
     let checkpoints = record_checkpoints();
     let (owner, secret) = ml_dsa_65().generate_keypair().unwrap();
     let first = PointerTarget::new(PointerTargetKind::Chunk, [1; 32]);
@@ -418,8 +437,6 @@ async fn a_pointer_write_the_rpc_errored_on_pays_once() {
         checkpoints,
         "nothing kept once stored"
     );
-
-    testnet.teardown().await;
 }
 
 /// Two small files uploaded at once share one payment wave. When the RPC
@@ -429,10 +446,8 @@ async fn a_pointer_write_the_rpc_errored_on_pays_once() {
 /// Each file's records are charged once: the rerun takes the wave's receipt
 /// only if each file's share is exactly its own quotes' total (the upload
 /// checks it), and each envelope's payment record checks against the chain.
-#[tokio::test(flavor = "multi_thread")]
-#[serial]
-async fn files_sharing_a_wave_the_rpc_errored_on_pay_once() {
-    let (testnet, proxy, direct, proxied) = setup().await;
+async fn files_sharing_a_wave_the_rpc_errored_on_pay_once(testnet: Arc<MiniTestnet>) {
+    let (proxy, direct, proxied) = setup(&testnet).await;
     let checkpoints = upload_checkpoints();
     let (first, second) = (random_file(), random_file());
 
@@ -490,18 +505,16 @@ async fn files_sharing_a_wave_the_rpc_errored_on_pay_once() {
         checkpoints,
         "nothing kept once stored"
     );
-
-    testnet.teardown().await;
 }
 
 /// A payment a run left journaled, settled by the next run, whose storers
 /// all refuse its proof in that run, is not paid for again: the refusal is
 /// a failure, the proof kept, and a later run stores the record with it.
 /// For a chunk put and for a file upload.
-#[tokio::test(flavor = "multi_thread")]
-#[serial]
-async fn a_payment_settled_from_the_journal_is_not_paid_again_when_refused() {
-    let (testnet, proxy, direct, proxied) = setup().await;
+async fn a_payment_settled_from_the_journal_is_not_paid_again_when_refused(
+    testnet: Arc<MiniTestnet>,
+) {
+    let (proxy, direct, proxied) = setup(&testnet).await;
     let checkpoints = (record_checkpoints(), upload_checkpoints());
 
     let content = random_chunk();
@@ -560,8 +573,6 @@ async fn a_payment_settled_from_the_journal_is_not_paid_again_when_refused() {
         checkpoints,
         "nothing kept once stored"
     );
-
-    testnet.teardown().await;
 }
 
 /// Storers that refuse every proof on every run, as when the nodes can't
@@ -569,10 +580,8 @@ async fn a_payment_settled_from_the_journal_is_not_paid_again_when_refused() {
 /// first run pays; the second, offered the first's proof and refused, pays
 /// again once; the third pays nothing. For a chunk put and for a file
 /// upload, each stored afterwards.
-#[tokio::test(flavor = "multi_thread")]
-#[serial]
-async fn refusals_on_every_run_pay_again_at_most_once() {
-    let (testnet, _proxy, direct, proxied) = setup().await;
+async fn refusals_on_every_run_pay_again_at_most_once(testnet: Arc<MiniTestnet>) {
+    let (_proxy, direct, proxied) = setup(&testnet).await;
     let checkpoints = (record_checkpoints(), upload_checkpoints());
 
     let content = random_chunk();
@@ -623,18 +632,14 @@ async fn refusals_on_every_run_pay_again_at_most_once() {
         checkpoints,
         "nothing kept once stored"
     );
-
-    testnet.teardown().await;
 }
 
 /// A chunk paid again because every storer refused its kept proof, whose
 /// new payment then fails before anything is sent, keeps the mark: its
 /// checkpoint stays, and the runs after it, refused again, pay once more
 /// in all, never a third time.
-#[tokio::test(flavor = "multi_thread")]
-#[serial]
-async fn a_failed_payment_after_a_refusal_never_pays_a_third_time() {
-    let (testnet, proxy, direct, proxied) = setup().await;
+async fn a_failed_payment_after_a_refusal_never_pays_a_third_time(testnet: Arc<MiniTestnet>) {
+    let (proxy, direct, proxied) = setup(&testnet).await;
     let checkpoints = record_checkpoints();
 
     let content = random_chunk();
@@ -682,8 +687,6 @@ async fn a_failed_payment_after_a_refusal_never_pays_a_third_time() {
         checkpoints,
         "nothing kept once stored"
     );
-
-    testnet.teardown().await;
 }
 
 /// A kept proof every storer refuses while the vault's record of its
@@ -691,10 +694,8 @@ async fn a_failed_payment_after_a_refusal_never_pays_a_third_time() {
 /// alike) is kept, and nothing is paid; once the chain answers and storers
 /// take it, the record is stored with it. For a chunk put and for a file
 /// upload.
-#[tokio::test(flavor = "multi_thread")]
-#[serial]
-async fn a_refused_proof_whose_payment_cant_be_read_is_kept() {
-    let (testnet, proxy, direct, proxied) = setup().await;
+async fn a_refused_proof_whose_payment_cant_be_read_is_kept(testnet: Arc<MiniTestnet>) {
+    let (proxy, direct, proxied) = setup(&testnet).await;
     let checkpoints = (record_checkpoints(), upload_checkpoints());
 
     let content = random_chunk();
@@ -736,6 +737,4 @@ async fn a_refused_proof_whose_payment_cant_be_read_is_kept() {
         checkpoints,
         "nothing kept once stored"
     );
-
-    testnet.teardown().await;
 }

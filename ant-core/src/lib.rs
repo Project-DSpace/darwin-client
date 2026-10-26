@@ -11,6 +11,8 @@ mod record;
 mod transfer_policy;
 
 mod client_engine;
+#[cfg(test)]
+mod lock_pins;
 
 #[cfg(feature = "native")]
 pub mod config;

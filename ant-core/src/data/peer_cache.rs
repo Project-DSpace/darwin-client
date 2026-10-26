@@ -134,14 +134,20 @@ pub fn cached_bootstrap_peers_with_filter(
 /// Select startup bootstrap peers.
 ///
 /// Cached peers are ordered first and configured bootstrap peers are appended
-/// behind them. saorsa-core stops client bootstrap after the client bootstrap
-/// target is reached, so configured peers are only reached when the cached
-/// candidates do not produce enough successful connections.
+/// behind them, in a random order ([`crate::data::network::in_random_order`]).
+/// saorsa-core stops client bootstrap after the client bootstrap target is
+/// reached, so configured peers are only reached when the cached candidates do
+/// not produce enough successful connections, and then not always the same
+/// first few.
 #[must_use]
 pub fn select_bootstrap_peers(
     cached: impl IntoIterator<Item = MultiAddr>,
     configured: impl IntoIterator<Item = MultiAddr>,
 ) -> Vec<MultiAddr> {
+    let configured = crate::data::network::in_random_order(
+        configured.into_iter().collect(),
+        &mut rand::thread_rng(),
+    );
     dedupe_bootstrap_peers(cached.into_iter().chain(configured))
 }
 
@@ -896,6 +902,29 @@ mod tests {
         );
 
         assert_eq!(selected, vec![first_cached, second_cached, configured]);
+    }
+
+    #[test]
+    fn select_bootstrap_peers_tries_the_configured_seeds_in_a_random_order() {
+        let cached = MultiAddr::quic(SocketAddr::new(v4(203, 0, 113, 20), FIRST_PORT))
+            .with_peer_id(peer_id(1));
+        let configured: Vec<MultiAddr> = (0..16u8)
+            .map(|n| MultiAddr::quic(SocketAddr::new(v4(203, 0, 113, 100 + n), FIRST_PORT)))
+            .collect();
+        let mut firsts = HashSet::new();
+        for _ in 0..200 {
+            let selected = select_bootstrap_peers(vec![cached.clone()], configured.clone());
+            // The cached peer still goes first, and every seed is there once.
+            assert_eq!(selected[0], cached);
+            let mut seeds = selected[1..].to_vec();
+            seeds.sort_by_key(ToString::to_string);
+            let mut expected = configured.clone();
+            expected.sort_by_key(ToString::to_string);
+            assert_eq!(seeds, expected);
+            firsts.insert(selected[1].to_string());
+        }
+        // Not the same seed first every time.
+        assert!(firsts.len() > 1, "{firsts:?}");
     }
 
     #[test]

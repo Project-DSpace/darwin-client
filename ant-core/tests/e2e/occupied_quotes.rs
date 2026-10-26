@@ -1,4 +1,5 @@
-//! E2E tests for occupied quotes, against the DARWIN vault's code on Anvil.
+//! Occupied quotes, against the DARWIN vault's code on Anvil, which the
+//! shared network runs.
 //!
 //! The DARWIN vault keeps a quote hash's first non-zero payment and skips
 //! later ones without reverting. Someone who knows a quote hash before it is
@@ -8,16 +9,13 @@
 //! before the upload pays it, or, for a payer outside the client, just before
 //! that payer pays.
 
-#![allow(clippy::unwrap_used, clippy::expect_used)]
-
-mod support;
-
+use crate::support::runner::Case;
+use crate::support::MiniTestnet;
 use ant_core::data::client::upload::{UploadAdapter, UploadPayment, UploadRecord};
 use ant_core::data::client::upload_state::UploadState;
 use ant_core::data::{
-    compute_address, ml_dsa_65, ChunkPaymentPlan, Client, Error, ExternalPaymentInfo,
-    FinalizeOutcome, FinalizeResume, PaymentMode, Pointer, PointerTarget, PointerTargetKind,
-    SingleNodeQuotePayment, MAX_OCCUPIED_REQUOTES, QUOTES_OCCUPIED,
+    compute_address, ChunkPaymentPlan, Error, ExternalPaymentInfo, FinalizeOutcome, FinalizeResume,
+    PaymentMode, SingleNodeQuotePayment, MAX_OCCUPIED_REQUOTES, QUOTES_OCCUPIED,
 };
 use ant_protocol::evm::contract::payment_vault::interface::IPaymentVault;
 use ant_protocol::evm::utils::http_provider;
@@ -25,21 +23,28 @@ use ant_protocol::evm::{
     Amount, EncodedPeerId, PaymentQuote, QuoteHash, RewardsAddress, TxHash, Wallet,
 };
 use bytes::Bytes;
-use serial_test::serial;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-use support::{test_client_config, MiniTestnet, DEFAULT_NODE_COUNT};
+
+pub fn cases() -> Vec<Case> {
+    vec![
+        Case::on_network(
+            "occupied::an_occupied_quote_is_quoted_and_paid_again",
+            an_occupied_quote_is_quoted_and_paid_again,
+        ),
+        Case::on_network(
+            "occupied::a_chunk_whose_quotes_keep_being_occupied_names_the_node",
+            a_chunk_whose_quotes_keep_being_occupied_names_the_node,
+        ),
+        Case::on_network(
+            "occupied::an_outside_payers_occupied_quote_is_set_aside_at_finalize",
+            an_outside_payers_occupied_quote_is_set_aside_at_finalize,
+        ),
+    ]
+}
 
 /// Where the occupier sends its dust.
 const STRANGER: [u8; 20] = [0xee; 20];
-
-async fn setup() -> (Client, MiniTestnet) {
-    let testnet = MiniTestnet::start_with_darwin_vault(DEFAULT_NODE_COUNT).await;
-    let node = testnet.node(3).expect("Node 3 should exist");
-    let client = Client::from_node(Arc::clone(&node), test_client_config())
-        .with_wallet(testnet.wallet().clone());
-    (client, testnet)
-}
 
 /// One payment the upload asked for: the quotes it paid, and the one the
 /// occupier recorded first with the node that issued it, if any.
@@ -149,10 +154,8 @@ async fn record(testnet: &MiniTestnet, hash: QuoteHash) -> ([u8; 16], u128) {
     (record.rewardsAddress.0, record.amount)
 }
 
-#[tokio::test(flavor = "multi_thread")]
-#[serial]
-async fn an_occupied_quote_is_quoted_and_paid_again() {
-    let (client, testnet) = setup().await;
+async fn an_occupied_quote_is_quoted_and_paid_again(testnet: Arc<MiniTestnet>) {
+    let client = testnet.client();
     let staged = Occupier::new(3, testnet.wallet(), 1);
     let before = testnet.wallet().balance_of_tokens().await.unwrap();
 
@@ -204,15 +207,10 @@ async fn an_occupied_quote_is_quoted_and_paid_again() {
     // reports, plus the occupier's 1 atto (it is the same wallet here).
     let after = testnet.wallet().balance_of_tokens().await.unwrap();
     assert_eq!(before - after, outcome.amount + Amount::from(1u64));
-
-    drop(client);
-    testnet.teardown().await;
 }
 
-#[tokio::test(flavor = "multi_thread")]
-#[serial]
-async fn a_chunk_whose_quotes_keep_being_occupied_names_the_node() {
-    let (client, testnet) = setup().await;
+async fn a_chunk_whose_quotes_keep_being_occupied_names_the_node(testnet: Arc<MiniTestnet>) {
+    let client = testnet.client();
     let staged = Occupier::new(3, testnet.wallet(), usize::MAX);
 
     let error = client
@@ -244,9 +242,6 @@ async fn a_chunk_whose_quotes_keep_being_occupied_names_the_node() {
         reason.contains(&format!("node {}", hex::encode(issuer.as_bytes()))),
         "{reason}"
     );
-
-    drop(client);
-    testnet.teardown().await;
 }
 
 /// Record `hash`'s payment first, with 1 atto to the stranger, as the node
@@ -277,16 +272,6 @@ fn paid_quote(
     (paid.quote_hash, issuer, paid.amount)
 }
 
-/// The non-zero payments of `payment`.
-fn payments_of(payment: &SingleNodeQuotePayment) -> Vec<(QuoteHash, RewardsAddress, Amount)> {
-    payment
-        .quotes
-        .iter()
-        .filter(|quote| !quote.amount.is_zero())
-        .map(|quote| (quote.quote_hash, quote.rewards_address, quote.amount))
-        .collect()
-}
-
 /// Pay `payments` as a payer outside the client does, returning the
 /// transaction of each quote.
 async fn pay_outside(
@@ -304,10 +289,8 @@ async fn pay_outside(
 /// are stored, the envelope is held back, and the cost leaves the skipped
 /// payment out. The resume handle leaves the chunk out, so a resume never
 /// completes the upload.
-#[tokio::test(flavor = "multi_thread")]
-#[serial]
-async fn an_outside_payers_occupied_quote_is_set_aside_at_finalize() {
-    let (client, testnet) = setup().await;
+async fn an_outside_payers_occupied_quote_is_set_aside_at_finalize(testnet: Arc<MiniTestnet>) {
+    let client = testnet.client();
     for resumable in [false, true] {
         let content: Vec<u8> = (0..20_000).map(|_| rand::random::<u8>()).collect();
         let prepared = client
@@ -406,134 +389,4 @@ async fn an_outside_payers_occupied_quote_is_set_aside_at_finalize() {
             (STRANGER[..16].try_into().unwrap(), 1)
         );
     }
-
-    drop(client);
-    testnet.teardown().await;
-}
-
-/// `finalize_chunk`, and `pointer_put_paid` after `prepare_pointer_payment`,
-/// refuse a quote occupied before the outside payer paid it, naming the node,
-/// and send nothing; a fresh quote paid honestly is stored.
-#[tokio::test(flavor = "multi_thread")]
-#[serial]
-async fn finalize_chunk_and_pointer_put_paid_refuse_an_occupied_quote() {
-    let (client, testnet) = setup().await;
-    let wallet = testnet.wallet();
-
-    let content = Bytes::from((0..2_000).map(|_| rand::random::<u8>()).collect::<Vec<_>>());
-    let address = compute_address(&content);
-    let prepared = client
-        .prepare_chunk_payment(content.clone())
-        .await
-        .expect("quote")
-        .expect("not stored yet");
-    let (hash, issuer, _) = paid_quote(&prepared.payment, &prepared.peer_quotes);
-    occupy(wallet, hash).await;
-    let transactions = pay_outside(wallet, payments_of(&prepared.payment)).await;
-    let refused = client
-        .finalize_chunk(prepared, &transactions)
-        .await
-        .expect_err("occupied");
-    let text = refused.to_string();
-    assert!(text.contains(QUOTES_OCCUPIED), "{text}");
-    assert!(
-        text.contains(&format!("node {}", hex::encode(issuer.as_bytes()))),
-        "{text}"
-    );
-    assert!(client.chunk_get(&address).await.expect("fetch").is_none());
-    let prepared = client
-        .prepare_chunk_payment(content.clone())
-        .await
-        .expect("quote again")
-        .expect("still not stored");
-    let transactions = pay_outside(wallet, payments_of(&prepared.payment)).await;
-    assert_eq!(
-        client
-            .finalize_chunk(prepared, &transactions)
-            .await
-            .expect("an honest payment is stored"),
-        address
-    );
-    assert_eq!(
-        client
-            .chunk_get(&address)
-            .await
-            .expect("fetch")
-            .expect("stored")
-            .content,
-        content
-    );
-
-    let (owner, secret) = ml_dsa_65().generate_keypair().expect("owner key");
-    let record = Pointer::create(
-        &secret,
-        &owner,
-        PointerTarget::new(PointerTargetKind::Chunk, address),
-    )
-    .expect("sign");
-    let plan = client
-        .prepare_pointer_payment(&record)
-        .await
-        .expect("quote the state");
-    let (hash, issuer, _) = paid_quote(&plan.payment, &plan.peer_quotes);
-    occupy(wallet, hash).await;
-    let transactions = pay_outside(wallet, payments_of(&plan.payment)).await;
-    let refused = client
-        .pointer_put_paid(&record, plan.proof(&transactions).expect("proof"))
-        .await
-        .expect_err("occupied");
-    let text = refused.to_string();
-    assert!(text.contains(QUOTES_OCCUPIED), "{text}");
-    assert!(text.contains("pointer state"), "{text}");
-    assert!(
-        text.contains(&format!("node {}", hex::encode(issuer.as_bytes()))),
-        "{text}"
-    );
-    assert!(client
-        .pointer_get(&record.address())
-        .await
-        .expect("read")
-        .is_none());
-    let plan = client
-        .prepare_pointer_payment(&record)
-        .await
-        .expect("quote the state again");
-    let transactions = pay_outside(wallet, payments_of(&plan.payment)).await;
-    client
-        .pointer_put_paid(&record, plan.proof(&transactions).expect("proof"))
-        .await
-        .expect("an honest payment is stored");
-    assert_eq!(
-        client
-            .pointer_get(&record.address())
-            .await
-            .expect("read")
-            .expect("present")
-            .state_id(),
-        record.state_id()
-    );
-
-    drop(client);
-    testnet.teardown().await;
-}
-
-/// The fixture is the deployed DARWIN vault's creation code: with the DARWIN
-/// token and batch limit 512 as arguments, it hashes to the recorded
-/// deployment's creation code (payment-vault's deployment.json).
-#[test]
-fn the_vault_fixture_is_the_deployed_vaults_code() {
-    use alloy::primitives::{address, keccak256, U256};
-    use alloy::sol_types::SolValue;
-    let mut code = hex::decode(support::DARWIN_VAULT_CREATION_CODE.trim()).unwrap();
-    code.extend(
-        (
-            address!("511f76A3De41F000EC11EA4fD212fb3587c6cef3"),
-            U256::from(512u64),
-        )
-            .abi_encode_params(),
-    );
-    assert_eq!(
-        hex::encode(keccak256(&code)),
-        "ee232ab3534f8cab41744a6bf26f862d6e72dc28529f218db5e94c386f8dcac1"
-    );
 }

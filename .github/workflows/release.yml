@@ -24,7 +24,9 @@
 # SHA256SUMS.txt, and checks that it reports this tag's version and the
 # tagged commit. The release environment's approval is asked for only after
 # that, and the checks job first makes sure that environment exists and
-# asks for one.
+# asks for one, and that the darwin-node revision the tests ran against is on
+# darwin-node's main and may be released against (darwin-node-pin.py
+# --release).
 #
 # scripts/check-workflows.sh, which the Build and Test workflows run, fails
 # if this file loses that order.
@@ -55,6 +57,7 @@ jobs:
     runs-on: ubuntu-24.04
     permissions:
       actions: read
+      contents: read
     outputs:
       build_run: ${{ steps.build_run.outputs.run }}
     env:
@@ -79,6 +82,16 @@ jobs:
             echo "::error::the release environment must exist and ask for approval (required reviewers; it has: '${rules:-no such environment, or no rules}'): set it up in the repository's settings, then re-run this job"
             exit 1
           fi
+
+      # The darwin-node revision the tagged commit's tests ran against must
+      # be on darwin-node's main and be node release 1a's commit there or
+      # descend from it (scripts/darwin-node-pin.py's NODE_RELEASE_1A): client
+      # release 1a's busy handling waits for node release 1a.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - name: Check the darwin-node revision may be released against
+        run: python3 scripts/darwin-node-pin.py --release
 
       # The newest run of the suite on this commit: from its push to main,
       # or one run by hand. A pull request's run tests a merge, not this

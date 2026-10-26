@@ -388,7 +388,7 @@ Download complete!
 
 A private file's envelope address can't be downloaded from: its envelope stores only a salted hash of the data map, and the download says so. Use `--datamap`, or `--proof` with a proof that reveals it.
 
-Every chunk read is checked against its address. A node that serves bytes that don't match is passed over for the next nearest node (and named in the `-v` log); a read fails on bad bytes only when no node serves the chunk intact. The same holds in the browser build. Reads also ask the bootstrap peers nearest the chunk, from the start; see [Bootstrap multiaddresses and browser defaults](#bootstrap-multiaddresses-and-browser-defaults).
+Every chunk read is checked against its address. A node that serves bytes that don't match is passed over for the next nearest node (and named in the `-v` log); a read fails on bad bytes only when no node serves the chunk intact. The same holds in the browser build. Reads may also ask the bootstrap peers nearest the chunk, once their lookup answers; see [Bootstrap multiaddresses and browser defaults](#bootstrap-multiaddresses-and-browser-defaults).
 
 #### `darwin file prove <RECORD>`
 
@@ -613,8 +613,8 @@ Ask every peer of the close group whether a pointer is final, and on what.
 it reports a pointer open with no state only when neither holds one. While
 the close group shows no final state, the pointer is read as
 `darwin pointer get` reads it, from the close group and the bootstrap peers
-nearest it (nine at most), and a `seeds:` line says how many of those were
-asked and answered and what they hold. Final, unconfirmed, settling and
+nearest it that its lookup leaves among the nine nearest, and a `seeds:` line
+says how many of those were asked and answered and what they hold. Final, unconfirmed, settling and
 forked are otherwise the close group's to decide.
 
 - `open` — no peer of the close group that answered holds a final state, and
@@ -704,6 +704,13 @@ and identities. It leaves out what would delete or send anything:
 - it downloads nothing: `darwin-nodes add` requires `--path`, a node binary already on the
   machine, and its daemon refuses an add naming any other source;
 - it forwards no logs: no `logs forward`, and its daemon serves no log-forwarding routes.
+
+Its own log (`daemon run --log-path PATH`, which the image passes) is capped, since it shares the
+disk with the nodes: a new file, `<PATH>.<UTC time>.log`, every 10 MiB or hour and on every start,
+at most 50 MiB in all, the daily files of earlier builds included, and none kept past a month.
+With 1 GiB free or less on its disk, the nodes' full line and its own warning level, it deletes
+its closed files and writes only warnings and errors, then one line saying how many others it
+left out once space returns.
 
 Its commands are `add`, `daemon` (`start`, `stop`, `status`, `info`, and the hidden `run` the
 image runs), `dismiss`, `start`, `status` and `stop`. A node an earlier manager evicted keeps its
@@ -944,6 +951,17 @@ cache.put(address, content);
 if let Some(data) = cache.get(&address) { /* ... */ }
 ```
 
+The default cache holds at most 1,024 chunks and an eighth of the memory free for use when the
+client is built, at least one full chunk (4 MiB) and at most 256 MiB, where it used to hold up
+to 1,024 full chunks (4 GiB) whatever the memory. A larger one is a client's own choice:
+`Client::with_chunk_cache(ChunkCache::with_byte_budget(chunks, bytes))`, or `ChunkCache::new`
+for a cache bounded by chunks alone.
+
+The client also keeps which node served each chunk it read in the last 15 minutes (1,024 chunks
+at most). A read of a chunk the cache has let go asks that node first, and looks the chunk up
+only once the node answers without it, or hasn't answered within a second; a node that no
+longer serves it is forgotten. Reading a chunk again soon after costs no lookup.
+
 ### Node Management (Programmatic)
 
 `ant-core` keeps upstream's node manager, which `darwin node` used before it was turned off. It
@@ -1090,12 +1108,19 @@ cargo run --bin darwin -- --help
 cargo run --bin darwin -- file upload photo.jpg --public --devnet-manifest ~/.local/share/ant/devnet-manifest.json --allow-loopback --evm-network local
 ```
 
-ant-core's end-to-end tests (`ant-core/tests/e2e_*.rs`) start in-process
-darwin-node nodes, at the revision `ant-core/Cargo.toml` pins, and a local Anvil
-chain, so `anvil` (Foundry) must be on PATH. CI runs every test target:
+ant-core's end-to-end tests (the `e2e` target: `ant-core/tests/e2e.rs` and its
+cases in `ant-core/tests/e2e/`) start in-process darwin-node nodes, at the
+revision `ant-core/Cargo.toml` pins, and a local Anvil chain, so `anvil`
+(Foundry) must be on PATH. The target starts one network and runs every case on
+it; `cargo test -p ant-core --features test-utils --test e2e -- refusals` runs
+one group (`storage`, `envelopes`, `refusals`, `pointers`, `committed`). CI runs every test target:
 `scripts/test-targets.py` lists where each one runs, or why it is skipped, and
 `scripts/darwin-node-pin.py` checks that the darwin-node revision is pinned
-alike everywhere and that `vendor/ant-protocol` is darwin-node's copy.
+alike everywhere and that `vendor/ant-protocol` is darwin-node's copy. Before a
+client release is published, its `--release` check also requires the revision to
+be on darwin-node's main and to be node release 1a's commit there or a later one:
+client release 1a's busy handling has never run against a node from before it.
+Until node release 1a is on darwin-node's main, no revision passes.
 
 ## License
 
@@ -1128,44 +1153,56 @@ the config directory, which takes precedence over the bundled seeds. Only QUIC s
 are selected for native dialing. `darwin -v` logs "using N bundled bootstrap
 seed(s)" when it falls back to the bundled ones.
 
-Chunk and pointer reads also ask the bootstrap peers whose peer IDs the client
-knows (the selected QUIC seeds that carry `/p2p/<peer-id>`, or a browser
-client's seeds): the nine nearest the address read, or all of them when there
-are fewer. The nodes that were nearest to a record when it was stored may still
-hold it after the nodes nearest to it have changed. Nine is the nodes' storage
-retention width, the close group of seven plus a margin of two: a node is
-responsible for a record, and replication stores it there, while the node is
-among the nine nodes nearest the record by its own routing table. A bootstrap
-peer that is among the nine nodes nearest an address out of the whole network is
-also among the nine nearest out of the bootstrap peers, so the nine bootstrap
-peers nearest the address include every bootstrap peer responsible for the
-record. An upload can also leave a chunk farther out: it moves past close-group
-nodes that fail or are full to the next nearest, up to the twentieth, and nodes
-keep what they hold while their disk has room. A copy left that way on a
-bootstrap peer past the ninth is not looked for there.
+Chunk and pointer reads may also ask the bootstrap peers whose peer IDs the
+client knows (the selected QUIC seeds that carry `/p2p/<peer-id>`, or a browser
+client's seeds): of the nine nearest the address read, those the read's own
+lookup leaves among the nine nearest of what it knows, the seeds and the peers
+the lookup found, or all nine when the lookup finds no peer. Nine is the nodes'
+storage retention width, the close group of seven plus a margin of two: a node
+is responsible for a record, and replication stores it there, while the node is
+among the nine nodes nearest the record by its own routing table. A seed that
+nine nearer peers pass over is not responsible for the record, so asking it
+costs that seed a request, and a browser a session with it, with little chance
+of a copy. While the seeds are most of the network they are most of every
+read's nearest nodes and are asked as before; as other nodes join, each read
+asks fewer seeds, and none of those farther out. A copy a seed keeps after it
+stops being among a record's nearest nodes is then found only through the nodes
+now nearest, which replication copies it to. An upload can also leave a chunk
+farther out: it moves past close-group nodes that fail or are full to the next
+nearest, up to the twentieth, and nodes keep what they hold while their disk has
+room; such a copy is not looked for on a seed.
 
-A chunk read asks them from the start of each round, nearest to the chunk first
-and one at a time, in one of its two GET slots; discovery's hints, then the
-close group, keep the other, so a slow or silent bootstrap peer holds up only
-the next one. It reports a chunk missing only once each of them has answered.
-A pointer read asks them from the start and the close group once it is found,
+A chunk read asks no seed before its lookup answers, except as it reads any
+connected peer early. Then it asks the seeds the lookup leaves among the
+nearest, nearest to the chunk first and one at a time, in one of its two GET
+slots, while the close group keeps the other, so a slow or silent seed holds up
+only the next one, and it reports a chunk missing only once each of them has
+answered. A pointer read looks its close group up, then asks it and those seeds,
 each set on its own quorum and corroboration (a peer in both is asked once; of
 nine bootstrap peers, five must answer and two name the state), and returns the
 newer of the two states: a state the bootstrap peers agree on is returned even
 when the close group holds none or does not answer. When the close group has a
 state, the read waits for a quorum of the bootstrap peers; when it has none, for
 all of them, so it takes as long as the slower set, up to the GET timeout when a
-bootstrap peer doesn't answer. Bootstrap addresses without a peer ID are only
-dialled, as before.
+bootstrap peer doesn't answer. `darwin pointer finality` uses the same lookup
+for its census and that read. Bootstrap addresses without a peer ID are only
+dialled, as before. A chunk read can still reach other seeds the way it reaches
+any node: as discovery's hints, or among the known peers (20 at most) a round
+falls back to before it reports a chunk missing.
 
-So every read reaches the bootstrap peers: a chunk read sends its first GET to
-the one nearest the chunk, connected or not, and one to each of them in a round
-that finds nothing; a pointer read sends one to each of them that is not in the
-close group, all at once, dialling any it is not yet connected to. With the 16
-bundled seeds, a read asks nine of them as bootstrap peers, not all 16. A chunk
-read can still reach other seeds the way it reaches any node: as discovery's
-hints, or among the known peers (20 at most) a round falls back to before it
-reports a chunk missing.
+A client dials its seeds in a random order: a native client after the peers it
+cached, so client starts spread over every seed instead of landing on the first
+few listed. A browser client keeps sessions with three of its seeds, not all of
+them, and takes three more only when lookups through those fall short: lookups
+find every other node through them, and a seed's session stays
+open until the node closes it for idleness, so a seed that holds a record is read
+on its open session. A seed that declines a session because it is busy (its
+transport refuses the connection check within 3 seconds, or it closes the
+session right after the handshake) is held off for 15 seconds, not the 30
+minutes a seed whose dial fails is, and the next seed in the random order is
+dialled in its place. A read whose possible holders declined waits for the
+first of them to come back, up to three times, and then reports the holders
+busy, to try again shortly, rather than the chunk missing.
 
 The config directory is `ant`'s: `~/.config/ant` on Linux,
 `~/Library/Application Support/ant` on macOS, `%APPDATA%\ant` on Windows.

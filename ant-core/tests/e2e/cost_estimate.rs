@@ -1,25 +1,63 @@
-//! E2E tests for file upload cost estimation.
+//! Upload cost estimates against what is actually paid: multiple file
+//! sizes, the payment mode, and the partial and full already-stored samples
+//! (#114). Plus the refusal pin of a padded merkle estimate, whose upload is
+//! refused.
 //!
-//! Compares `estimate_upload_cost()` against actual upload costs to verify
-//! the estimate is accurate. Tests multiple file sizes covering single-wave
-//! and multi-chunk scenarios.
-//!
-//! Run with: cargo test --test e2e_cost_estimate -- --nocapture
+//! Every node of the shared network quotes the baseline `(0, None)` price
+//! whatever it stores, so prices stay uniform however many cases ran before.
 
-#![allow(clippy::unwrap_used, clippy::expect_used)]
-
-mod support;
-
+use crate::support::runner::Case;
+use crate::support::{assert_batch_refused, wallet_spend, MiniTestnet, CLIENT_NODE};
 use ant_core::data::client::merkle::{merkle_billable_leaves, PaymentMode};
 use ant_core::data::{
     forget_upload_record, Client, ClientConfig, CostEstimateConfidence, Visibility,
 };
-use serial_test::serial;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use support::{assert_batch_refused, wallet_spend, MiniTestnet};
 use tempfile::TempDir;
+
+pub fn cases() -> Vec<Case> {
+    vec![
+        Case::on_network(
+            "cost_estimate::matches_actual_cost",
+            test_estimate_matches_actual_cost,
+        ),
+        Case::on_network(
+            "cost_estimate::payment_mode_without_a_wallet",
+            test_estimate_payment_mode,
+        ),
+        Case::on_network(
+            "cost_estimate::all_stored_partial_sample_is_incomplete",
+            test_estimate_all_stored_partial_sample_is_incomplete,
+        ),
+        Case::on_network(
+            "cost_estimate::all_stored_full_sample_is_verified",
+            test_estimate_all_stored_full_sample_is_verified,
+        ),
+    ]
+}
+
+/// The refusal pin: a merkle estimate bills the padded tree, and the upload
+/// it estimates is refused.
+pub fn refusals() -> Vec<Case> {
+    vec![Case::on_network(
+        "cost_estimate::merkle_estimate_pads_and_the_upload_is_refused",
+        test_merkle_estimate_pads_to_the_billed_tree_and_the_upload_is_refused,
+    )]
+}
+
+/// A client on the shared network's client node, with the default
+/// configuration, paying from the funded wallet if `wallet`.
+fn client(testnet: &MiniTestnet, wallet: bool) -> Client {
+    let node = testnet.node(CLIENT_NODE).expect("client node");
+    let client = Client::from_node(node, ClientConfig::default());
+    if wallet {
+        client.with_wallet(testnet.wallet().clone())
+    } else {
+        client
+    }
+}
 
 /// Simple xorshift64 PRNG for deterministic, incompressible test data.
 struct Xorshift64(u64);
@@ -119,13 +157,8 @@ async fn compare_estimate_vs_actual(
 ///    (prices are uniform on a healthy local network, so this is generous)
 /// 3. Estimate does not require a wallet (no payment made)
 /// 4. Estimate returns correct payment mode
-#[tokio::test(flavor = "multi_thread")]
-#[serial]
-async fn test_estimate_matches_actual_cost() {
-    let testnet = MiniTestnet::start(10).await;
-    let node = testnet.node(3).expect("Node 3 should exist");
-    let client = Client::from_node(Arc::clone(&node), ClientConfig::default())
-        .with_wallet(testnet.wallet().clone());
+async fn test_estimate_matches_actual_cost(testnet: Arc<MiniTestnet>) {
+    let client = client(&testnet, true);
 
     let work_dir = TempDir::new().expect("create work dir");
 
@@ -190,42 +223,10 @@ async fn test_estimate_matches_actual_cost() {
     eprintln!();
 }
 
-/// Test that estimate works without a wallet.
-///
-/// Creates a client WITHOUT a wallet and verifies that
-/// `estimate_upload_cost` still returns a valid estimate.
-#[tokio::test(flavor = "multi_thread")]
-#[serial]
-async fn test_estimate_works_without_wallet() {
-    // Use 10 nodes (> CLOSE_GROUP_SIZE=7) for quote reliability
-    let testnet = MiniTestnet::start(10).await;
-    let node = testnet.node(3).expect("Node 3 should exist");
-
-    // Client WITHOUT wallet — no .with_wallet() call
-    let client = Client::from_node(Arc::clone(&node), ClientConfig::default());
-
-    let work_dir = TempDir::new().expect("create work dir");
-    let path = create_test_file(work_dir.path(), 4096, "no_wallet.bin", 0xBBBB_0001);
-
-    let estimate = client
-        .estimate_upload_cost(&path, PaymentMode::Auto, None)
-        .await
-        .expect("estimate should work without wallet");
-
-    assert!(
-        estimate.chunk_count >= 3,
-        "self-encryption produces at least 3 chunks"
-    );
-    assert!(estimate.file_size == 4096);
-}
-
-/// Test that estimate returns correct payment mode.
-#[tokio::test(flavor = "multi_thread")]
-#[serial]
-async fn test_estimate_payment_mode() {
-    let testnet = MiniTestnet::start(10).await;
-    let node = testnet.node(3).expect("Node 3 should exist");
-    let client = Client::from_node(Arc::clone(&node), ClientConfig::default());
+/// The estimate needs no wallet, and returns the payment mode.
+async fn test_estimate_payment_mode(testnet: Arc<MiniTestnet>) {
+    // WITHOUT a wallet: estimates make no payment.
+    let client = client(&testnet, false);
 
     let work_dir = TempDir::new().expect("create work dir");
 
@@ -234,7 +235,12 @@ async fn test_estimate_payment_mode() {
     let small_est = client
         .estimate_upload_cost(&small_path, PaymentMode::Auto, None)
         .await
-        .expect("estimate should succeed");
+        .expect("estimate should work without wallet");
+    assert!(
+        small_est.chunk_count >= 3,
+        "self-encryption produces at least 3 chunks"
+    );
+    assert_eq!(small_est.file_size, 4096);
     assert_eq!(
         small_est.payment_mode,
         PaymentMode::Single,
@@ -264,39 +270,14 @@ async fn test_estimate_payment_mode() {
     );
 }
 
-/// Test that estimate rejects files too small for self-encryption.
-#[tokio::test(flavor = "multi_thread")]
-#[serial]
-async fn test_estimate_rejects_tiny_files() {
-    let testnet = MiniTestnet::start(10).await;
-    let node = testnet.node(3).expect("Node 3 should exist");
-    let client = Client::from_node(Arc::clone(&node), ClientConfig::default());
-
-    let work_dir = TempDir::new().expect("create work dir");
-
-    // 2-byte file — below self-encryption minimum of 3 bytes
-    let tiny_path = work_dir.path().join("tiny.bin");
-    std::fs::write(&tiny_path, b"ab").expect("write tiny file");
-
-    let result = client
-        .estimate_upload_cost(&tiny_path, PaymentMode::Auto, None)
-        .await;
-    assert!(result.is_err(), "Estimate should fail for files < 3 bytes");
-}
-
 /// Regression for the partial-sample case (issue #114): re-estimating a
 /// fully-stored file with more chunks than the sample cap must return `Ok`
 /// flagged `AllSamplesAlreadyStoredIncomplete`, not `CostEstimationInconclusive`.
 ///
 /// Every sampled chunk is already stored, but the sample cannot cover the whole
 /// file, so the old code errored and left consumers (the GUI) with no estimate.
-#[tokio::test(flavor = "multi_thread")]
-#[serial]
-async fn test_estimate_all_stored_partial_sample_is_incomplete() {
-    let testnet = MiniTestnet::start(10).await;
-    let node = testnet.node(3).expect("Node 3 should exist");
-    let client = Client::from_node(Arc::clone(&node), ClientConfig::default())
-        .with_wallet(testnet.wallet().clone());
+async fn test_estimate_all_stored_partial_sample_is_incomplete(testnet: Arc<MiniTestnet>) {
+    let client = client(&testnet, true);
 
     let work_dir = TempDir::new().expect("create work dir");
     // ~30 MB -> ~8 chunks at MAX_CHUNK_SIZE (4,190,208 B), comfortably above the
@@ -351,13 +332,8 @@ async fn test_estimate_all_stored_partial_sample_is_incomplete() {
 
 /// A fully-stored file small enough to be sampled in full returns the exact
 /// zero-cost estimate tagged `VerifiedAllAlreadyStored` (the provably-free case).
-#[tokio::test(flavor = "multi_thread")]
-#[serial]
-async fn test_estimate_all_stored_full_sample_is_verified() {
-    let testnet = MiniTestnet::start(10).await;
-    let node = testnet.node(3).expect("Node 3 should exist");
-    let client = Client::from_node(Arc::clone(&node), ClientConfig::default())
-        .with_wallet(testnet.wallet().clone());
+async fn test_estimate_all_stored_full_sample_is_verified(testnet: Arc<MiniTestnet>) {
+    let client = client(&testnet, true);
 
     let work_dir = TempDir::new().expect("create work dir");
     // ~4 KB -> 3 chunks, within the sample cap so every chunk is sampled.
@@ -416,14 +392,11 @@ async fn test_estimate_all_stored_full_sample_is_verified() {
 /// vault bills for the trees the upload engine builds, at the 9-chunk case,
 /// the 65- and 257-chunk batch boundaries and every count between, is pinned
 /// without nodes in `merkle_unit.rs`.
-#[tokio::test(flavor = "multi_thread")]
-#[serial]
-async fn test_merkle_estimate_pads_to_the_billed_tree_and_the_upload_is_refused() {
+async fn test_merkle_estimate_pads_to_the_billed_tree_and_the_upload_is_refused(
+    testnet: Arc<MiniTestnet>,
+) {
     // More than 16 nodes, so the client asks them for merkle candidates.
-    let testnet = MiniTestnet::start(20).await;
-    let node = testnet.node(3).expect("Node 3 should exist");
-    let client = Client::from_node(Arc::clone(&node), ClientConfig::default())
-        .with_wallet(testnet.wallet().clone());
+    let client = client(&testnet, true);
 
     let work_dir = TempDir::new().expect("create work dir");
     let file_size = 6 * self_encryption::MAX_CHUNK_SIZE as u64;

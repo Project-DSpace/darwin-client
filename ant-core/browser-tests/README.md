@@ -54,10 +54,9 @@ uses Chromium's real WebRTC implementation. [`node-revision`](node-revision)
 pins the node: darwin-node's repository, then the revision. It is the revision
 `ant-core/Cargo.toml` pins for the tests and the devnet, so the browser and the
 native suites run the same nodes; `scripts/darwin-node-pin.py`, which CI runs,
-checks that the pins agree. It is currently `aa45ab9b`: darwin-node main at
-`9757a72` (the ds.15 release the network runs, with the build plan's
-groundwork) and node release 1a's first commit, the unused pricing by record
-size in its vendored ant-protocol, which this repository's copy matches.
+checks that the pins agree. It is currently `ef5c5d0`: the head of
+darwin-node's `node-1a` branch, the node release this client release is built
+against, ahead of the ds.15 release the network runs.
 
 The devnet runs from a sibling `darwin-node` checkout (beside this repository's
 checkout), or from the one `ANT_NODE_DIR` names. Without `ANT_NODE_DIR`, it

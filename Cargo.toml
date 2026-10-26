@@ -7,6 +7,15 @@ default-members = ["ant-core", "ant-cli"]
 exclude = ["vendor/ant-protocol"]
 resolver = "2"
 
+# Dependencies are optimised in dev and test builds, while the workspace's own
+# crates (ant-core, ant-cli, ant-listings) stay unoptimised for debugging. "*"
+# covers darwin-node (ant-node) and vendor/ant-protocol too, which are not
+# members here: the e2e tests' in-process testnets run their code. Debug builds
+# of saorsa-pqc's ML-DSA checks are about 200 times slower than release ones,
+# and they dominate those testnets. `cargo test` inherits this profile.
+[profile.dev.package."*"]
+opt-level = 2
+
 
 [patch.crates-io]
 # Autonomi's protocol crate with our price multiplier; see vendor/ant-protocol/VENDORED.md.
@@ -16,4 +25,4 @@ ant-protocol = { path = "vendor/ant-protocol" }
 # revision ant-core's tests and devnet run, so the in-process nodes are built
 # as darwin-node builds them. Only builds that link darwin-node (the tests and
 # the `devnet` feature) use webrtc; the `darwin` binary doesn't.
-webrtc = { git = "https://github.com/Project-DSpace/darwin-node.git", rev = "aa45ab9b3db1aacd70ff89fceafa0eceda4ba000" }
+webrtc = { git = "https://github.com/Project-DSpace/darwin-node.git", rev = "ef5c5d0ac8463dc3bcfe4de00dbf06d7c6c854b3" }

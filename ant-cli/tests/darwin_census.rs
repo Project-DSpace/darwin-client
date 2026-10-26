@@ -223,6 +223,9 @@ const DOWNLOAD_LEFTOVERS: &str = "A download's temporary archive and duplicate e
     in the download cache (<data dir>/bin), never a node's folder; reached only from `darwin node \
     add` with a download source (off). darwin-nodes downloads nothing.";
 const DAEMON_FILES: &str = "The daemon's own port and pid files, when it stops or is found gone.";
+const MANAGER_LOG: &str = "darwin-nodes' own log files (<prefix>.*.log in its --log-path folder), \
+    never a node's: closed files past the family's 50 MiB cap or a month old, and every closed one \
+    at the disk's full line, so its log never fills the disk the nodes share.";
 const NODE_PID: &str = "A node's pid file (<data dir>/node.pid), once its process has exited; the \
     node's data stays.";
 
@@ -1150,6 +1153,20 @@ const ERASE_SITES: &[Site] = &[
         "node::reset",
         1,
         RESET_COMMAND,
+    ),
+    (
+        "ant-cli/src/bin/darwin-nodes/log_file.rs",
+        "Family::delete_closed_files",
+        "remove_file",
+        1,
+        MANAGER_LOG,
+    ),
+    (
+        "ant-cli/src/bin/darwin-nodes/log_file.rs",
+        "Family::prune",
+        "remove_file",
+        1,
+        MANAGER_LOG,
     ),
     (
         "ant-core/src/node/binary.rs",

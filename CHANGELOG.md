@@ -175,34 +175,43 @@ commit `darwin --version` prints. Upstream's entries follow.
   price of the 1,000,000 records a commitment may count, 31,250 DARWIN, so 93,750 DARWIN for one
   chunk. A payment planned before the ceiling and saved by an interrupted upload is resumed as
   saved, never made twice.
-- Chunk and pointer reads also ask the bootstrap peers whose peer IDs the client knows, from the
-  start, nearest to the address first: the nodes that were nearest to a record when it was
-  stored may still hold it after the nodes nearest to it have changed. A read asks the 9
-  nearest the address, or all of them when fewer are configured: 9 is the nodes' storage
-  retention width, the close group (7) plus the storage admission margin (2). A node is
-  responsible for a record, and replication stores it there, while the node is among the 9
-  nodes nearest the record by its own routing table, and a bootstrap peer among the 9 nearest
-  out of the whole network is also among the 9 nearest out of the bootstrap peers, so these 9
-  include every bootstrap peer responsible for the record. A chunk an upload left farther out,
-  past close-group nodes that failed or were full (up to the 20th nearest), stays there while
-  the node's disk has room, and is not looked for on a bootstrap peer past the 9th.
+- Chunk and pointer reads may also ask the bootstrap peers whose peer IDs the client knows,
+  nearest to the address first: of the 9 nearest the address (all of them when fewer are
+  configured), those the read's own lookup leaves among the 9 nearest of what it knows (the
+  seeds and the peers the lookup found), or all 9 when the lookup finds no peer
+  (`seeds_for_read`). 9 is the nodes' storage retention width, the close group (7) plus the
+  storage admission margin (2): a node is responsible for a record, and replication stores it
+  there, while the node is among the 9 nodes nearest the record by its own routing table. A
+  seed that 9 nearer peers pass over is not responsible for the record, so it isn't asked:
+  while the seeds are most of the network they are most of every read's nearest nodes, and as
+  other nodes join, each read asks fewer of them, and none of those farther out. Before, every
+  read asked the 9 seeds nearest the address from the start, whatever the network's size, so a
+  copy a seed kept after it stopped being among a record's nearest nodes was looked for there;
+  it is now found only through the nodes nearest the record, which replication copies it to. A
+  chunk an upload left farther out, past close-group nodes that failed or were full (up to the
+  20th nearest), stays there while the node's disk has room, and is not looked for on a seed.
+  A pointer read asks at least 2 seeds once its lookup answers, the nearest of the rest making
+  up the number when the filter leaves fewer (`MIN_POINTER_READ_SEEDS`), so 2 seeds can still
+  corroborate a state; a chunk read has no floor, its content being checked against its
+  address. The trade-off: a pointer read now asks its seeds after its close-group lookup
+  answers, not beside it, so each pointer read takes one lookup's time before any seed is
+  asked. The close-group part of the read waits for that lookup anyway, and asking the seeds
+  before it would ask the ones the filter leaves out.
   `bootstrap_peers.toml` lists all 16 server nodes on QUIC (both nodes of each server, on 10000
-  and 10001, every server's 10000 node first) with their peer IDs; the CLI and
-  `Client::connect_multiaddrs` hand the selected seeds that carry one to reads
-  (`Client::with_bootstrap_peers` for a client built from a node; `Network::bootstrap_peers`
-  lists them), and a browser client asks its seeds. Bootstrap addresses without a peer ID add
-  nothing.
-- A chunk read asks those bootstrap peers one after another in one of its two GET slots, from
-  the start of each round until each has been asked; discovery's hints, then the close group,
-  keep the other. A slow or silent bootstrap peer holds up only the next one, and a stalled hint
-  is raced only once the bootstrap peers have all been asked. Every chunk read sends its first
-  GET to the bootstrap peer nearest the chunk, connected or not, and a chunk is reported missing
-  only once all of them have answered. A missing chunk therefore costs up to 9 more GETs in
-  each round, and a bootstrap peer that doesn't answer makes the read take its second round,
-  which asks them again, as an unanswering close-group node does.
-- A pointer read asks those bootstrap peers from the start and the close group once it is found,
-  each set on its own quorum and corroboration (of 9 bootstrap peers, 5 must answer and 2 name
-  the state), a peer in both once, and returns the newer of the two states. A state the
+  and 10001) with their peer IDs; the CLI and `Client::connect_multiaddrs` hand the selected
+  seeds that carry one to reads (`Client::with_bootstrap_peers` for a client built from a node;
+  `Network::bootstrap_peers` lists them), and a browser client asks its seeds. Bootstrap
+  addresses without a peer ID add nothing.
+- A chunk read asks no bootstrap peer before its lookup answers, except as it reads any
+  connected peer early. Then it asks those the lookup leaves among the nearest one after
+  another in one of its two GET slots, while the close group keeps the other, so a slow or
+  silent one holds up only the next, and a chunk is reported missing only once each of them has
+  answered. A bootstrap peer that doesn't answer makes the read take its second round, which
+  asks it again, as an unanswering close-group node does.
+- A pointer read looks its close group up, then asks it and the bootstrap peers that lookup
+  leaves among the nearest (all 9 nearest when the lookup fails), each set on its own quorum
+  and corroboration (of 9 bootstrap peers, 5 must answer and 2 name the state), a peer in both
+  once, and returns the newer of the two states. A state the
   bootstrap peers agree on is returned even when the close group holds none or does not answer.
   When too few of a set answer, the state those that did agree on still holds the read back: it
   fails with that shortfall rather than return an older state, or none. The close group is read
@@ -214,8 +223,7 @@ commit `darwin --version` prints. Upstream's entries follow.
   only then. So when two bootstrap peers agree on a state, the read does not wait for a newer one
   that a single bootstrap peer names. A read takes as long as the slower set, up to the GET
   timeout when bootstrap peers don't answer, and sends one GET to each bootstrap peer it asks
-  that is outside the close group (9 at most, of the 16 bundled seeds; a pointer is at most
-  5.3 KB). In either set, a final state a majority of it holds is its answer, and two final
+  that is outside the close group (9 at most; a pointer is at most 5.3 KB). In either set, a final state a majority of it holds is its answer, and two final
   states that no majority holds are a fork, which fails the read unless only the bootstrap peers
   report it and the close group holds a final state. Creating, updating and transferring a
   pointer read it this way first, so they wait the same way; the check an update or a transfer
@@ -338,7 +346,8 @@ commit `darwin --version` prints. Upstream's entries follow.
   `.datamap` and `.record`, or in the manifest file written.
   Here `darwin pointer finality` (`Client::pointer_finality`, the browser's `pointerFinality`,
   and the check `pointer transfer` reports) asks the close group and the bootstrap peers nearest
-  the address: while the close group shows no final state, the pointer is read as
+  the address its lookup leaves among the nearest, the census and the read sharing one lookup:
+  while the close group shows no final state, the pointer is read as
   `darwin pointer get` reads it, so it is reported open at the counter of the state that read
   returns, settling on a final state only the bootstrap peers hold, and open with no state only
   when neither set holds one, once every bootstrap peer asked has answered;
@@ -369,6 +378,55 @@ commit `darwin --version` prints. Upstream's entries follow.
   it. The vendored ant-protocol is 5.0.0, still
   with the price multiplier, darwin-listings is vendored at 0.2.1 to match, and rustls is
   0.23.46, as on upstream's main.
+- saorsa-transport is 0.38.2 at least, in ant-core's requirement and in the lock: it reaps a QUIC
+  reader task once its connection ends, where 0.38.1 kept every past connection's reader
+  allocated for as long as the endpoint lived. A test (`lock_pins`) holds the lock to one copy, at
+  0.38.2 or later.
+- When storers refuse this client's settlement version (`ClientUpdateRequired`), the error is in
+  darwin's own words: the client settles under version X and the network requires at least Y, no
+  quote was issued and nothing was charged, and a new darwin is built from
+  https://github.com/Project-DSpace/darwin-client (see its README); the browser core says to
+  reload the page instead. Before, it repeated the vendored storer wording, which told users to
+  run another client's `ant update`. The vendored ant-protocol is unchanged, and tests that model
+  a storer's own wording keep it.
+- A client dials its seeds in a random order (`in_random_order`): the `darwin` CLI after the
+  peers it cached, and a library client built from seeds, so client starts spread over every
+  seed instead of landing on the first few listed.
+- A browser client keeps sessions with 3 of its seeds, not all of them: `connect()` dials 3 in
+  a random order, leaving out those it holds off, replaces each that fails or declines with the
+  next, and takes 3 more only when lookups through those fall short. Lookups find every other
+  node through them, and a seed's session stays open until the node closes it for idleness, so
+  a seed that holds a record is read on its open session.
+  A seed that declines a session because it is busy is held off for 15 seconds, not the 30
+  minutes of a failed dial (ported from upstream ant-client #225): the browser counts a dial as
+  declined when the association fails within 3 seconds of its ICE checks starting, before ICE
+  connected (a full node's transport answers the check with an error), or when the node closes
+  it right after DTLS or the handshake. A DTLS failure after ICE connected (another node at the
+  address) and every other failure keep the 30 minutes. `BrowserNetwork::refused_peers` lists
+  the peers held off, with the time left; a read whose possible holders declined waits for the
+  first of them to come back, up to 3 times, and then fails with "the nodes that may hold chunk
+  ... are busy; try again shortly", not as a missing chunk. A pointer read too few of whose close
+  group answered, some of the rest held off, fails at once with "the nodes that may hold pointer
+  ... are busy; try again shortly" in place of a shortfall; it does not wait for them to come
+  back. With every seed held off, `connect()` says how many are busy.
+- The library's default chunk cache (`ChunkCache::default`, every client's) holds at most 1,024
+  chunks and an eighth of the memory free for use when the client is built, at least 4 MiB and
+  at most 256 MiB (`default_cache_bytes`); before, up to 1,024 full chunks, 4 GiB, whatever
+  the memory. `ChunkCache::with_byte_budget` builds one with other bounds, and `ChunkCache::new`
+  one bounded by chunks alone, as before.
+- A client keeps which node served each chunk it read in the last 15 minutes (1,024 chunks at
+  most). A read of a chunk no longer in the chunk cache asks that node first, and looks the
+  chunk up only once the node answers without it or hasn't answered within the 1-second hedge
+  delay of early reads (`read_from_holder`); a node that no longer serves it is forgotten, and
+  what it answers never makes a chunk missing.
+- `darwin-nodes` caps its own log: `daemon run --log-path PATH` writes `<PATH>.<UTC time>.log`,
+  a new file every 10 MiB or hour and on every start, and after each new file deletes the oldest
+  closed files of the family (the daily files earlier builds wrote included) until it holds at
+  most 50 MiB with the new file full, and closed files older than a month. With 1 GiB free or
+  less on the log's disk (the nodes' full line, and the manager's own low-disk warning level) it
+  deletes its closed files and writes only warnings and errors, counting the lines it leaves
+  out, and writes one line saying how many once space returns. The erasure census lists its two
+  deletions of log files.
 
 ## [Unreleased]
 
