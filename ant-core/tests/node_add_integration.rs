@@ -16,6 +16,19 @@ fn create_fake_binary(dir: &std::path::Path) -> PathBuf {
         std::fs::write(&binary_path, "#!/bin/sh\necho \"antnode 0.1.0-test\"\n").unwrap();
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&binary_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // Another test thread forking at the same moment can briefly hold a copy of
+        // the write descriptor, which makes executing the file fail with ETXTBSY
+        // ("Text file busy"). Wait until the file can be run before handing it out.
+        let mut attempts = 0;
+        loop {
+            match std::process::Command::new(&binary_path).arg("--version").output() {
+                Err(e) if e.raw_os_error() == Some(26) && attempts < 500 => {
+                    attempts += 1;
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                _ => break,
+            }
+        }
         binary_path
     }
     #[cfg(windows)]
