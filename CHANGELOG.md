@@ -40,12 +40,14 @@ commit `darwin --version` prints. Upstream's entries follow.
   the single-node and merkle paths, is gone: a node asked without a version quotes as for version 1
   and would refuse the weighted payment made on that quote. A node that can't decode a versioned
   request is a peer that didn't quote.
-- The browser core sends quote requests (`quote_chunk`, and `chunk_protocol` frames carrying a
-  quote request) at `BROWSER_QUOTE_PROTOCOL_VERSION`, one above `BROWSER_PROTOCOL_VERSION`; hello,
-  lookups, reads and PUTs stay at `BROWSER_PROTOCOL_VERSION`. A node that predates size pricing
-  can't parse such a frame and gives no quote, so it's never paid an amount it would refuse. Every
-  quote the core pays on comes from such a request. JavaScript passes `chunk_length` to
-  `verifyStorageQuote` only for a quote obtained at that version.
+- The browser core's quote requests are `chunk_protocol` frames at `BROWSER_PROTOCOL_VERSION`
+  whose `QuoteRequestV2` declares settlement version 2, so a node that prices by size quotes them
+  by weight and a node that predates it answers `StorerUpdateRequired`, which the core skips.
+  `BROWSER_QUOTE_PROTOCOL_VERSION`, one above `BROWSER_PROTOCOL_VERSION`, is for a `quote_chunk`
+  with no content alone, sent only to a node that advertises `size_priced_quote` in hello
+  (`SIZE_PRICED_QUOTE_CAPABILITY`): a node that doesn't can't parse such a frame and closes the
+  channel, dropping any requests in flight on it. JavaScript passes `chunk_length` to
+  `verifyStorageQuote` only for a quote obtained by such a `quote_chunk`.
 - `pay_for_storage` and `pay_for_storage_split` quote and plan a pointer at its wire length,
   whatever size is declared, so an interrupted payment's journal restores.
 - Upload checkpoints have a format of their own (`DSCK` and a version byte, then msgpack). The

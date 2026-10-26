@@ -377,7 +377,7 @@ impl BrowserNetwork for SharedNetworkAdapter {
                     exclusive,
                     crate::browser::protocol::request_version(
                         &BrowserRequestBody::ChunkProtocol,
-                        crate::browser::protocol::is_quote_request(&request.body),
+                        false,
                     ),
                 )
                 .await

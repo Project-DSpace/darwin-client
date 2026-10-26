@@ -707,10 +707,13 @@ mod wasm {
     /// `amount` is a full chunk's, three times its price, unless
     /// `chunk_length` is given: then it is the weighted amount for a chunk
     /// of that many bytes, by its size class. Pass `chunk_length` only for a
-    /// quote obtained by a request at the next browser protocol version
-    /// (`BROWSER_QUOTE_PROTOCOL_VERSION`), as this core's own quotes are: a
-    /// node quoting a request at the current version expects the full
-    /// amount, which every node accepts.
+    /// quote obtained by a `quote_chunk` at the next browser protocol version
+    /// (`BROWSER_QUOTE_PROTOCOL_VERSION`), sent only to a node that advertises
+    /// `size_priced_quote` in hello: a node that doesn't closes the channel on
+    /// such a frame, and a node quoting a `quote_chunk` at the current version
+    /// expects the full amount, which every node accepts. (This core's own
+    /// quotes are `chunk_protocol` requests declaring settlement version 2,
+    /// which every node parses at the current version.)
     #[wasm_bindgen(js_name = verifyStorageQuote)]
     pub fn verify_storage_quote_wasm(
         quote: JsValue,

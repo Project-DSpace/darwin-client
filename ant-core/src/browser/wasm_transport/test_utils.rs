@@ -470,9 +470,26 @@ impl BrowserTestNode {
             return encode_pq_frame(&accept).unwrap();
         }
         let plaintext = self.session.as_mut().unwrap().open(&payload).unwrap();
-        // As a storer that prices by size: quotes come at the next version.
-        let (request, _version) =
-            crate::browser::protocol::parse_request_frame_versioned(&plaintext).unwrap();
+        // As a storer that prices by size: the next version for an empty
+        // quote_chunk alone. Any other frame at it, a chunk_protocol quote
+        // among them, is refused as darwin-node refuses it.
+        let request = match crate::browser::protocol::parse_request_frame_versioned(&plaintext) {
+            Ok((request, _version)) => request,
+            Err(error) => {
+                self.last_method = "invalid_request".into();
+                let request_id = serde_json::Deserializer::from_slice(&plaintext)
+                    .into_iter::<serde_json::Value>()
+                    .next()
+                    .and_then(Result::ok)
+                    .and_then(|header| header.get("request_id")?.as_u64())
+                    .unwrap_or(0);
+                let response =
+                    BrowserResponse::error(request_id, "invalid_request", error.to_string());
+                let plaintext = encode_response_frame(&response, &[]).unwrap();
+                let encrypted = self.session.as_mut().unwrap().seal(&plaintext).unwrap();
+                return encode_pq_frame(&encrypted).unwrap();
+            }
+        };
         if !self.hello_received && !matches!(&request.request.body, BrowserRequestBody::Hello) {
             let response = BrowserResponse::error(
                 request.request.request_id,
@@ -510,7 +527,11 @@ impl BrowserTestNode {
                             capabilities.push(multiplex::CAPABILITY.into());
                         }
                         if self.uploads_enabled {
-                            capabilities.extend(["quote_chunk".into(), "put_chunk".into()]);
+                            capabilities.extend([
+                                "quote_chunk".into(),
+                                "put_chunk".into(),
+                                crate::browser::protocol::SIZE_PRICED_QUOTE_CAPABILITY.into(),
+                            ]);
                         }
                         if self.address_v2 {
                             capabilities

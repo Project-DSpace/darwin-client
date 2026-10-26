@@ -1269,7 +1269,14 @@ impl LockedBrowserClient<'_> {
         response_timeout: Duration,
     ) -> Result<BrowserResponseFrame, RpcError> {
         let exclusive = matches!(&body, BrowserRequestBody::PutChunk { .. });
-        let version = super::protocol::request_version(&body, false);
+        // A size-priced quote_chunk goes only to a storer that advertises
+        // it: one that predates size pricing closes the channel on it.
+        let size_priced = self
+            .hello
+            .borrow()
+            .as_ref()
+            .is_some_and(super::protocol::quotes_by_size);
+        let version = super::protocol::request_version(&body, size_priced);
         self.request_reserved(body, content, response_timeout, None, exclusive, version)
             .await
             .map(|(response, _)| response)
@@ -1315,8 +1322,8 @@ impl LockedBrowserClient<'_> {
         let request_id = self.next_request_id.get();
         self.next_request_id.set(request_id.wrapping_add(1).max(1));
         let request = BrowserRequest::new(request_id, body, content.len());
-        // A quote goes at the next protocol version, so only a storer that
-        // quotes by size answers it (`BROWSER_QUOTE_PROTOCOL_VERSION`).
+        // At the next protocol version only for a quote_chunk to a storer
+        // that advertises size-priced quotes (`request_version`).
         let plaintext = encode_request_frame_at(&request, content, version)
             .map_err(|error| error.to_string())?;
         let slot = self.slot.borrow_mut().take();
