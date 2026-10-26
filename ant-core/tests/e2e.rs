@@ -18,8 +18,12 @@
 //!
 //! - `storage`: the raw chunk path, DARWIN payments per chunk, payment
 //!   verification of tampered proofs, data and file uploads, cost estimates,
-//!   occupied quotes, and payment recovery (a native payment's journal, and a
-//!   record paid on its own whose payment the RPC answered with an error).
+//!   occupied quotes, and payment recovery: a native payment's journal, a
+//!   record paid on its own whose payment the RPC answered with an error,
+//!   two files sharing one payment wave recovered from their journals, and
+//!   kept proofs that every storer refuses, paid again at most once, never
+//!   when the payment was settled from the journal, and never while the
+//!   vault's record of the payment can't be read.
 //! - `envelopes`: envelopes as the default of our own tools, and manifests (ADR-0006).
 //! - `refusals`: merkle refusal, darwin-node refusing batch payments at quote
 //!   time with nothing paid (`BATCH_PAYMENTS_REFUSED`).
