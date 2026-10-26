@@ -152,14 +152,19 @@ test("nodes serving corrupt content are passed over for one that serves the reco
   const corrupt = ordered.slice(0, 3);
   for (const i of corrupt) nodes[i].chunk = new Uint8Array([1, 2, 3]);
   nodes[ordered[3]].chunk = datamap.content;
-  const client = new BrowserNetworkClient(rtc.endpoints);
+  // A read asks the connected seeds before discovery answers, and a browser
+  // connects to three seeds at random. With every node a seed, the holder can
+  // be among them and the corrupt nodes not, and then it is rightly asked
+  // first. The corrupt nodes are the only seeds here, so a corrupt node is
+  // asked first and the holder is reached through discovery.
+  const client = new BrowserNetworkClient(corrupt.map(i => rtc.endpoints[i]));
   let reader;
   try {
     reader = await client.openPublicFile(datamap.address);
     assert.equal(reader.size, content.length);
     const gets = rtc.requests.filter(request => request.method === "get_chunk");
-    assert.ok(gets.some(request => corrupt.includes(request.node)), "a corrupt node was asked first");
-    assert.ok(gets.some(request => request.node === ordered[3]));
+    assert.ok(corrupt.includes(gets[0]?.node), "a corrupt node was asked first");
+    assert.ok(gets.some(request => request.node === ordered[3]), "the holder served the record");
   } finally { reader?.close(); client.close(); }
 });
 
