@@ -43,6 +43,41 @@ fn the_lock_keeps_saorsa_transport_with_its_reader_task_fix() {
     );
 }
 
+/// One ant-protocol, the vendored copy with this network's price multiplier:
+/// `[patch.crates-io]` puts vendor/ant-protocol in place of crates.io's, so the
+/// lock holds it as a path package, without a `source`. ant-core requires
+/// exactly that copy's version, so a fresh resolve, here or in a project that
+/// takes ant-core by git and repeats the patch, can't pass it for a newer
+/// crates.io release.
+#[test]
+fn the_lock_has_one_ant_protocol_the_vendored_copy() {
+    let lock = include_str!("../../Cargo.lock");
+    let entries: Vec<&str> = lock
+        .split("[[package]]")
+        .skip(1)
+        .filter(|entry| entry.lines().any(|line| line == "name = \"ant-protocol\""))
+        .collect();
+    assert_eq!(entries.len(), 1, "one ant-protocol: {entries:?}");
+    assert!(
+        !entries[0].lines().any(|line| line.starts_with("source = ")),
+        "ant-protocol is not the vendored copy: {}",
+        entries[0]
+    );
+
+    let vendored = include_str!("../../vendor/ant-protocol/Cargo.toml")
+        .lines()
+        .find_map(|line| line.strip_prefix("version = \"")?.strip_suffix('"'))
+        .expect("vendor/ant-protocol/Cargo.toml has a version");
+    assert_eq!(locked_versions("ant-protocol"), [vendored]);
+    let requirement = format!("ant-protocol = {{ version = \"={vendored}\",");
+    assert!(
+        include_str!("../Cargo.toml")
+            .lines()
+            .any(|line| line.starts_with(&requirement)),
+        "ant-core/Cargo.toml doesn't require exactly ant-protocol {vendored}"
+    );
+}
+
 #[test]
 fn versions_compare_by_number() {
     assert!(numbers("0.38.10") > numbers("0.38.2"));

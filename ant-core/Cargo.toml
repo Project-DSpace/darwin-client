@@ -67,7 +67,14 @@ tower-http = { version = "0.6.8", features = ["cors"], optional = true }
 # under `ant_protocol::{evm, transport, pqc}`. This is the ONE pin for
 # those three deps — do not add direct evmlib/saorsa-core/saorsa-pqc
 # deps here or the version can skew between ant-client and ant-node.
-ant-protocol = { version = "5.0.0", default-features = false, features = ["rpc"] }
+# Exactly 5.0.0: the version of vendor/ant-protocol, the copy with this
+# network's price multiplier, which `[patch.crates-io]` puts in place of the
+# crates.io release. A patch applies only to a requirement it can meet before
+# a newer release, so "5.0.0" would let a fresh resolve take crates.io's 5.0.1
+# instead. A project that takes ant-core by git repeats the patch (README,
+# "Rust Library API"); without it, `src/lib.rs`'s check of the vendored copy
+# fails the build.
+ant-protocol = { version = "=5.0.0", default-features = false, features = ["rpc"] }
 # Listed files: envelope format, listings, payment checks, the listings protocol.
 # A copy of darwin-listings v0.3.1 (84787fe); see vendor/ant-listings/VENDORED.md.
 ant-listings = { path = "../vendor/ant-listings" }

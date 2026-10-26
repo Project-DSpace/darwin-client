@@ -755,6 +755,41 @@ The `ant-core` crate exposes the full API programmatically. Add it as a dependen
 ant-core = { path = "ant-core" }
 ```
 
+From another project, take `ant-core` by a release tag, and repeat this repository's
+`[patch.crates-io]` entry for `ant-protocol` from the same tag:
+
+```toml
+[dependencies]
+ant-core = { git = "https://github.com/Project-DSpace/darwin-client", tag = "<tag>" }
+
+[patch.crates-io]
+ant-protocol = { git = "https://github.com/Project-DSpace/darwin-client", tag = "<tag>" }
+```
+
+`<tag>` is a release's tag, such as `v0.3.11+ds.1`, the same in both lines. The patch puts
+`vendor/ant-protocol`, Autonomi's protocol crate with this network's price multiplier, in place
+of the crates.io release. Cargo applies a `[patch]` only in the top-level workspace, so taking
+`ant-core` alone isn't enough, and `ant-core` doesn't compile without it. `ant-core` requires
+exactly `ant-protocol` 5.0.0, the vendored copy's version, so a later crates.io release can't
+take the patch's place, for `ant-core` or for any other crate in your build that uses
+`ant-protocol`.
+
+A project that enables `ant-core`'s `devnet` feature also repeats the other entry of this
+repository's `[patch.crates-io]`, `webrtc` from darwin-node, with the `rev` from the same tag's
+`Cargo.toml`:
+
+```toml
+[patch.crates-io]
+webrtc = { git = "https://github.com/Project-DSpace/darwin-node.git", rev = "<rev>" }
+```
+
+`devnet` runs darwin-node in process, and darwin-node accepts browser sessions over WebRTC with
+its own patched copy of the `webrtc` crate (closing a browser session cancels a DTLS handshake
+still in progress). Without this entry, a `devnet` build compiles darwin-node against crates.io's
+`webrtc` 0.14.0 instead. A build without `devnet` doesn't need it: it doesn't link `webrtc` at all.
+`ant-core` uses only `saorsa-transport`'s browser protocol types, and the `webrtc` crate comes in
+through `saorsa-transport`'s `webrtc-direct` feature, which only darwin-node turns on.
+
 ### Connecting to the Network
 
 ```rust
