@@ -21,7 +21,10 @@ fn create_fake_binary(dir: &std::path::Path) -> PathBuf {
         // ("Text file busy"). Wait until the file can be run before handing it out.
         let mut attempts = 0;
         loop {
-            match std::process::Command::new(&binary_path).arg("--version").output() {
+            match std::process::Command::new(&binary_path)
+                .arg("--version")
+                .output()
+            {
                 Err(e) if e.raw_os_error() == Some(26) && attempts < 500 => {
                     attempts += 1;
                     std::thread::sleep(std::time::Duration::from_millis(10));
