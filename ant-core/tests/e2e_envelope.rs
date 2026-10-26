@@ -146,6 +146,7 @@ impl UploadAdapter for StagedRecords<'_> {
             transactions: transactions.into_iter().collect(),
             amount,
             gas: gas.gas_cost_wei,
+            root: None,
         })
     }
 
@@ -206,6 +207,7 @@ impl UploadPayer for AccountPayer<'_> {
             transactions: transactions.into_iter().collect(),
             amount,
             gas: gas.gas_cost_wei,
+            root: None,
         })
     }
 

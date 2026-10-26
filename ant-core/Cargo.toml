@@ -67,7 +67,7 @@ tower-http = { version = "0.6.8", features = ["cors"], optional = true }
 # deps here or the version can skew between ant-client and ant-node.
 ant-protocol = { version = "5.0.0", default-features = false, features = ["rpc"] }
 # Listed files: envelope format, listings, payment checks, the listings protocol.
-# A copy of darwin-listings v0.3.1 (84787fe); see vendor/ant-listings/VENDORED.md.
+# A copy of darwin-listings v0.4.0 (7e709e0); see vendor/ant-listings/VENDORED.md.
 ant-listings = { path = "../vendor/ant-listings" }
 # The payment wallet's signer, bound to the payment chain (config::wallet).
 # Features evmlib already enables, so this adds no crates.

@@ -63,7 +63,8 @@ pub use chunk::{
     PointerGetResponse, PointerPutRequest, PointerPutResponse, ProtocolError,
     SettlementCompatibility, XorName, CHUNK_PROTOCOL_ID, CLOSE_GROUP_MAJORITY, CLOSE_GROUP_SIZE,
     CURRENT_SETTLEMENT_VERSION, DATA_TYPE_CHUNK, MAX_CHUNK_SIZE, MAX_WIRE_MESSAGE_SIZE,
-    MIN_SUPPORTED_SETTLEMENT_VERSION, PROOF_TAG_MERKLE, PROOF_TAG_SINGLE_NODE, PROTOCOL_VERSION,
+    MIN_SUPPORTED_SETTLEMENT_VERSION, PROOF_TAG_MERKLE, PROOF_TAG_ROOT, PROOF_TAG_SINGLE_NODE,
+    PROTOCOL_VERSION,
     XORNAME_LEN,
 };
 #[cfg(feature = "native")]
@@ -75,9 +76,10 @@ pub use data_types::{compute_address, peer_id_to_xor_name, xor_distance, ChunkSt
 pub use devnet_manifest::{DevnetEvmInfo, DevnetManifest};
 pub use error::{Error, Result};
 pub use payment::{
-    deserialize_merkle_proof, deserialize_proof, detect_proof_type, serialize_merkle_proof,
-    serialize_single_node_proof, verify_merkle_candidate_signature, verify_quote_content,
-    verify_quote_signature, PaymentProof, ProofType, QuotePaymentInfo, SingleNodePayment,
+    deserialize_merkle_proof, deserialize_proof, deserialize_root_proof, detect_proof_type,
+    serialize_merkle_proof, serialize_root_proof, serialize_single_node_proof,
+    verify_merkle_candidate_signature, verify_quote_content, verify_quote_signature, PaymentProof,
+    ProofType, QuotePaymentInfo, RootPaymentProof, SingleNodePayment,
 };
 pub use pointer::{
     pointer_address, state_id_for_body, ParsedPointer, Pointer, PointerError, PointerState,

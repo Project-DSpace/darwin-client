@@ -1,0 +1,88 @@
+{
+ "leafVectors": [
+  {
+   "quoteHash": "0x0617238273552b69df8841d38a45cd4966396d27490dd2aae1d8377be5e2b725",
+   "payee": "0x2c0f6fc4ff4286d1cec2e811fc5d1ce5707a15af",
+   "amount": "0x53444835ec58000",
+   "leaf": "0x840991fc44de05ab275f041e2108dd49d91db386aa2388438706a2c01f36c7da"
+  },
+  {
+   "quoteHash": "0x478a9f05f553dbab9e22fd96c84c5004cb7ab778ae64eadc1c5de770ea24b24f",
+   "payee": "0x52c6e46a3ab4f8235b4f82028f4e48f3f6fcbd73",
+   "amount": "0x1",
+   "leaf": "0x8225605908c3878d8253041d9f09daafb218278a1003f333ca62cef5a0e68e29"
+  },
+  {
+   "quoteHash": "0x0000000000000000000000000000000000000000000000000000000000000001",
+   "payee": "0x0000000000000000000000000000000000000001",
+   "amount": "0x1",
+   "leaf": "0x94cd1175289751c8a6db8e0c551cf29d850a926dfd54bfcb0aa81842bc61abc2"
+  },
+  {
+   "quoteHash": "0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+   "payee": "0xffffffffffffffffffffffffffffffffffffffff",
+   "amount": "0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+   "leaf": "0xd93df4bd07ada28ec0785f794f055a009b461d5edb8020ecc9495f55e4727703"
+  },
+  {
+   "quoteHash": "0x8000000000000000000000000000000000000000000000000000000000000000",
+   "payee": "0x8000000000000000000000000000000000000000",
+   "amount": "0x8000000000000000000000000000000000000000000000000000000000000000",
+   "leaf": "0x44c9a356dfd9bf260298a354f94bf74c599ce7ae7f769f6f09bd111d50666820"
+  }
+ ],
+ "pairVectors": [
+  {
+   "left": "0x34cd620fad7e78781d69fdf227dd4013ed00139c6954a1ed6d74a7e032e0ea2a",
+   "right": "0x74c1a9bbd0d8cefcd36c34f3e2f9050f9cac29ae7830ea56d0bf77c9e76eda5d",
+   "pair": "0xbf2eae37eddc33e3e99048a4c0e5e1bfe534e9d1540e4d19dfbfef40b8ba369f"
+  },
+  {
+   "left": "0x74c1a9bbd0d8cefcd36c34f3e2f9050f9cac29ae7830ea56d0bf77c9e76eda5d",
+   "right": "0x34cd620fad7e78781d69fdf227dd4013ed00139c6954a1ed6d74a7e032e0ea2a",
+   "pair": "0xa1a7890cfd8237ad33c31eca8d4d2db2cbbbeef085cec89e855cb2f22afaa97a"
+  },
+  {
+   "left": "0x0000000000000000000000000000000000000000000000000000000000000000",
+   "right": "0x0000000000000000000000000000000000000000000000000000000000000000",
+   "pair": "0xc07a1e8b7e0057673fdc2affe190d8a960c5fe615663f27b7ce84f3d93ef92a6"
+  },
+  {
+   "left": "0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+   "right": "0x0000000000000000000000000000000000000000000000000000000000000000",
+   "pair": "0x3097fb5f04149d31f861eea0d1c6fa52f4a877356bfa8d5f71ec2207eda2be29"
+  }
+ ],
+ "keyVectors": [
+  {
+   "vault": "0xd6d757e8e685d1ac7d1a9684c8a0bf783635088a",
+   "root": "0xd6c66cad06fe14fdb6ce9297d80d32f24d7428996d0045cbf90cc345c677ba16",
+   "leafCount": "0x1",
+   "key": "0x75063dd76dc711d34831f173e028bef55b5c0604eed4681b4c13cc1f75afbfd7"
+  },
+  {
+   "vault": "0xd6d757e8e685d1ac7d1a9684c8a0bf783635088a",
+   "root": "0xd6c66cad06fe14fdb6ce9297d80d32f24d7428996d0045cbf90cc345c677ba16",
+   "leafCount": "0x2",
+   "key": "0xceb8ec47c8bd009b19b72b11b8a09a9c20e2868c23c2aec342f0509d8656b34e"
+  },
+  {
+   "vault": "0xd6d757e8e685d1ac7d1a9684c8a0bf783635088a",
+   "root": "0xd6c66cad06fe14fdb6ce9297d80d32f24d7428996d0045cbf90cc345c677ba16",
+   "leafCount": "0x200",
+   "key": "0xb6cd141b21ed9cf27421b8ed501d0092637736e2bb2084fe4b2a5b86af0ee5d5"
+  },
+  {
+   "vault": "0xffffffffffffffffffffffffffffffffffffffff",
+   "root": "0xd6c66cad06fe14fdb6ce9297d80d32f24d7428996d0045cbf90cc345c677ba16",
+   "leafCount": "0x200",
+   "key": "0xa59bff089e6053613a5ff25cb4a8d16687740f0880a502975b696f9118b518be"
+  },
+  {
+   "vault": "0xd6d757e8e685d1ac7d1a9684c8a0bf783635088a",
+   "root": "0x0000000000000000000000000000000000000000000000000000000000000000",
+   "leafCount": "0xffffffff",
+   "key": "0x2f0c6ac0685b906955fe1a4817992565935fcbbaa6439590d35abee662ec5e6c"
+  }
+ ]
+}

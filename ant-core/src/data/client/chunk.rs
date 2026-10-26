@@ -398,7 +398,7 @@ fn timed_out_chunk_peer_get_result(
 fn store_response_timeout_for_proof(proof: &[u8], merkle_timeout_secs: u64) -> Duration {
     match detect_proof_type(proof) {
         Some(ProofType::Merkle) => Duration::from_secs(merkle_timeout_secs),
-        _ => STORE_RESPONSE_TIMEOUT,
+        Some(ProofType::SingleNode | ProofType::Root) | None => STORE_RESPONSE_TIMEOUT,
     }
 }
 
@@ -1410,7 +1410,7 @@ impl Client {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ant_protocol::{PROOF_TAG_MERKLE, PROOF_TAG_SINGLE_NODE};
+    use ant_protocol::{PROOF_TAG_MERKLE, PROOF_TAG_ROOT, PROOF_TAG_SINGLE_NODE};
 
     #[cfg(feature = "native")]
     #[test]
@@ -1999,7 +1999,7 @@ mod tests {
     #[test]
     fn non_merkle_put_ignores_merkle_timeout_value() {
         let absurd_merkle_timeout = 9_999;
-        for tag in [PROOF_TAG_SINGLE_NODE, UNKNOWN_PROOF_TAG] {
+        for tag in [PROOF_TAG_SINGLE_NODE, PROOF_TAG_ROOT, UNKNOWN_PROOF_TAG] {
             let timeout = store_response_timeout_for_proof(&[tag], absurd_merkle_timeout);
             assert_eq!(
                 timeout, STORE_RESPONSE_TIMEOUT,

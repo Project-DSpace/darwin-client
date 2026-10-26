@@ -31,8 +31,8 @@ listings from the nodes and check each one against the chain as far as its
 shown fields allow. A listing can't exist without a stored, paid envelope.
 
 This crate holds what nodes and clients share: the envelope format, the listing
-record, the payment checks, upload proofs and the protocol messages. It does no
-I/O.
+record, the payment checks, upload proofs, the tree root payments are recorded
+under, and the protocol messages. It does no I/O.
 
 ## Envelope format (version 2)
 
@@ -107,8 +107,9 @@ data map.
 
 A listing holds the envelope's address, its flags and metadata, the file size
 when the data map gives it directly, and the shown payment fields: transaction
-hash, block number, block timestamp, the log index of the payment vault's
-`DataPaymentMade` event, and the paid quote. Hidden fields are never recorded.
+hash, block number, block timestamp, the log index of the `DataPaymentMade`
+event of the vault that was paid, and the paid quote. Hidden fields are never
+recorded.
 
 A listing in the index that hides the block timestamp also has `first_seen`:
 when the node first stored it, in Unix seconds rounded down to the hour, or the
@@ -156,11 +157,15 @@ What can be checked against the chain depends on the payment fields shown:
 
 | Shown | Fetched from the chain | Checked | Level |
 |---|---|---|---|
-| the quote (any others) | the tx receipt, by tx hash or through the quote's hash in the vault event | the quote names the address and is signed; the tx succeeded and paid it to the vault; every shown field matches | verified |
+| the quote (any others) | the tx receipt, by tx hash or through the quote's hash in a vault's event | the quote names the address and is signed; the tx succeeded and paid it to a vault; every shown field matches | verified |
 | tx hash, no quote | the tx receipt | the tx succeeded and has a vault payment, at the shown log index if shown; shown block and time match | reported |
-| block and log index, no tx hash or quote | the receipt of the tx with that vault log | that log is a vault payment; the shown time matches | reported |
+| block and log index, no tx hash or quote | the receipt of the tx with a vault's log there | that log is a vault payment; the shown time matches | reported |
 | block, no log index, tx hash or quote | the block | the block exists; the shown time matches | reported |
 | none of the above | nothing | nothing about the payment | reported |
+
+A vault here is one of the vaults the reader takes payments from, and a root
+vault's payment counts only where the receipt shows its wave whole (see
+Payment vaults).
 
 The paid quote is carried with its timestamp in whole seconds, which is all its
 signature and hash cover, so each quote has exactly one encoding.
@@ -185,10 +190,11 @@ serve (`choose_verified`). The payment made first only breaks a tie between
 copies that both have that many, or, marked as such, stands in when none has:
 a fallback a quoting node could have front-run.
 
-A quote can also be paid more than once, which the vault allows. Found through
-its hash, each payment is checked, and the earliest that checks out counts
-(`verify_listing_receipts`), so a later payment of the same quote never moves
-the listing.
+A quote can also be paid more than once, which the vaults allow: the per-quote
+vault takes a quote again, and a root vault records it again in another wave.
+Found through its hash, each payment is checked, and the earliest that checks
+out counts (`verify_listing_receipts`), so a later payment of the same quote
+never moves the listing.
 
 Only the quote ties a payment to the file, since it names the envelope's
 address. Without it, a listing rests on the nodes that recorded it at upload,
@@ -242,6 +248,77 @@ before the uploader saves the record rather than when it is needed.
 A proof travels as text: the lowercase hex of `01` (the format version)
 followed by the postcard-encoded record. A proof file holds that text, and a
 JSON field carries it as a string.
+
+## Payment vaults
+
+A reader takes payments from a set of vaults (`VaultSet`), each by its own
+address: the per-quote vault (upstream's `PaymentVaultV2`), which records each
+paid quote on its own, and, where the network has one, a root vault, which
+records each wave of payments under one key. Both log each paid quote as the
+same `DataPaymentMade` event, so neither the listing nor the proof names the
+vault: the log's emitter does, and both formats are unchanged. To find a
+payment by its quote's hash, or by its block and log index, search the logs of
+every vault in the set in one `eth_getLogs`. Of the logs in a receipt that
+would be the payment, the earliest that counts is the payment.
+
+A log of that shape from a contract outside the set is never a payment, since
+any contract can emit one. It is refused with an error of its own, "a payment
+log from a contract this version doesn't recognise as a vault; if a newer vault
+exists, update this tool", not as unpaid.
+
+### Root payments
+
+A root vault pays a wave of 1 to 512 payments in one call and keeps one record
+for the whole wave, under the wave's key:
+
+| Hash | Bytes |
+|---|---|
+| leaf | `keccak256(00 ‖ quote hash ‖ payee ‖ amount)` |
+| pair | `keccak256(01 ‖ left ‖ right)` |
+| key | `keccak256(02 ‖ vault address ‖ root ‖ leaf count)` |
+
+- Numbers are 32-byte big-endian words, and addresses their 20 bytes.
+- The payments are in strictly ascending quote-hash order, each with an amount
+  above zero and a payee other than the zero address, and the amounts add up
+  to less than 2^256 (`root::Wave::new`, which refuses as the vault does).
+- Each level of the tree pairs its nodes in order, and an unpaired last node
+  is carried up to the next level unchanged. The last node left is the root,
+  so a wave of one payment has its leaf as its root.
+- A payment's path holds its siblings from the leaf up, one for each level
+  where it has one, and nothing more: at most 9 hashes.
+- A storer rebuilds the leaf from the paid quote and hashes it up with the
+  path, the payment's place and the leaf count telling left from right and
+  which levels carry it up unpaired, then reads the vault's record under the
+  key (`root::leaf_key`). A leaf count of 0 or above 512, a place outside the
+  wave or a path of the wrong length is refused before anything is read.
+- `src/root/vectors/` holds the vault's own test vectors, and the module is
+  checked against every one of them.
+
+A wave the vault records logs, in this order: each payment's
+`DataPaymentMade`; then `RootPaid(bytes32 indexed key, address payer, uint256
+leafCount, uint256 total)`; then one token `Transfer` from the payer to each
+distinct payee, of the sum of its payments, in the order the payees first
+appear. A wave sent again moves nothing and logs nothing.
+`src/root/vectors/receipt.json` holds the logs of one such wave, as the
+vault's code wrote them on a local chain, and the reader is checked against
+them.
+
+A root vault's `DataPaymentMade` log counts as a payment only where the
+receipt shows its wave whole (`root::recorded_wave`):
+
+1. that log and the vault's payment logs after it run on to the vault's
+   `RootPaid` log, and the leaf count `RootPaid` names of logs right before it
+   are the wave, that log among them;
+2. those payments are a wave the vault takes, and `RootPaid` names its key and
+   its total;
+3. after `RootPaid`, the token's next transfers, with nothing between them but
+   the token's own other logs, are one from the payer `RootPaid` names to each
+   of the wave's payees, of the sum of its payments, in any order.
+
+A receipt that doesn't show all of that reads as unpaid, with an error naming
+which part it lacks. A storer reads the vault's record instead (above); this
+check holds whoever reads payments from receipts, such as an indexer, to the
+token transfers that back them.
 
 ## Protocol
 

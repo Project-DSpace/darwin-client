@@ -642,6 +642,9 @@ pub enum MerkleCandidateQuoteResponse {
 pub const PROOF_TAG_SINGLE_NODE: u8 = 0x01;
 /// Version byte prefix for merkle payment proofs.
 pub const PROOF_TAG_MERKLE: u8 = 0x02;
+/// Version byte prefix for root payment proofs: a payment recorded in a root
+/// vault's wave, proven by the paid quote's place in the wave's tree.
+pub const PROOF_TAG_ROOT: u8 = 0x03;
 
 // =============================================================================
 // Protocol Errors
@@ -964,6 +967,9 @@ mod tests {
         assert_ne!(PROOF_TAG_MERKLE, 0x00);
         assert_eq!(PROOF_TAG_SINGLE_NODE, 0x01);
         assert_eq!(PROOF_TAG_MERKLE, 0x02);
+        assert_eq!(PROOF_TAG_ROOT, 0x03);
+        assert_ne!(PROOF_TAG_ROOT, PROOF_TAG_SINGLE_NODE);
+        assert_ne!(PROOF_TAG_ROOT, PROOF_TAG_MERKLE);
     }
 
     #[test]

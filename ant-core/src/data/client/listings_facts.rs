@@ -582,6 +582,7 @@ fn decode_receipt(tx_hash: [u8; 32], vault: &[u8; 20], bytes: &[u8]) -> Option<P
         logs.push(PaymentLog {
             address: *vault,
             topics,
+            data: Vec::new(),
             log_index,
         });
     }
@@ -679,11 +680,13 @@ mod tests {
                 PaymentLog {
                     address: VAULT,
                     topics: vec![DATA_PAYMENT_MADE_TOPIC, [1; 32], [2; 32], [3; 32]],
+                    data: Vec::new(),
                     log_index: 4,
                 },
                 PaymentLog {
                     address: VAULT,
                     topics: Vec::new(),
+                    data: Vec::new(),
                     log_index: 9,
                 },
             ],
@@ -698,6 +701,7 @@ mod tests {
             PaymentLog {
                 address: [0x11; 20],
                 topics: vec![[5; 32]],
+                data: Vec::new(),
                 log_index: 1,
             },
         );

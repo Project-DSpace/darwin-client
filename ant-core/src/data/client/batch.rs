@@ -11,6 +11,7 @@ use crate::data::client::payment::peer_id_to_encoded;
 #[cfg(test)]
 use crate::data::client::payment::SINGLE_NODE_PAYMENT_MULTIPLIER;
 use crate::data::client::quote::StoreQuotePlan;
+use crate::data::client::root_payment::PaymentVault;
 use crate::data::client::Client;
 use crate::data::error::{Error, Result};
 use ant_protocol::evm::{
@@ -175,6 +176,12 @@ pub struct ChunkPaymentPlan {
     pub peer_quotes: Vec<(EncodedPeerId, PaymentQuote)>,
     /// Verified commitment evidence carried to storers.
     pub commitment_sidecars: Vec<Vec<u8>>,
+    /// The vault this plan pays, recorded with it: a kept plan is paid,
+    /// and its payment reconciled, through this vault only. Left out of a
+    /// checkpoint for the per-quote vault, as plans saved before the field
+    /// existed were, so those read as paying it.
+    #[serde(default, skip_serializing_if = "PaymentVault::is_v2")]
+    pub vault: PaymentVault,
 }
 
 impl ChunkPaymentPlan {
@@ -400,6 +407,7 @@ fn payment_plan_from_quotes(
     data_size: u64,
     quote_plan: StoreQuotePlan,
     ceiling: Option<Amount>,
+    vault: PaymentVault,
 ) -> Result<ChunkPaymentPlan> {
     let quotes_with_peers = quote_plan.quotes;
 
@@ -434,6 +442,7 @@ fn payment_plan_from_quotes(
         payment,
         peer_quotes,
         commitment_sidecars,
+        vault,
     })
 }
 
@@ -510,6 +519,7 @@ impl Client {
             data_size,
             quote_plan,
             self.config().max_chunk_price,
+            self.payment_vault(),
         )
         .map(Some)
     }
@@ -537,6 +547,7 @@ impl Client {
             data_size,
             quote_plan,
             self.config().max_chunk_price,
+            self.payment_vault(),
         )
     }
 
@@ -593,6 +604,8 @@ impl Client {
             all_payments.len()
         );
 
+        // One transaction in flight per signing key, whichever vault.
+        let _signing = self.lock_signing().await?;
         let (tx_hash_map, gas_info) =
             wallet
                 .pay_for_quotes(all_payments)
@@ -967,7 +980,9 @@ fn readable_cached_proofs(
     let mut kept: HashMap<XorName, Vec<u8>> = HashMap::with_capacity(proofs.len());
     let mut unreadable: Vec<([u8; 32], Vec<u8>)> = Vec::new();
     for (addr, bytes) in proofs {
-        if deserialize_proof(&bytes).is_ok() {
+        if deserialize_proof(&bytes).is_ok()
+            || ant_protocol::payment::deserialize_root_proof(&bytes).is_ok()
+        {
             kept.insert(addr, bytes);
         } else {
             unreadable.push((addr, bytes));

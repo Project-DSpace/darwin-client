@@ -36,6 +36,10 @@ pub struct UploadPayment {
     pub amount: Amount,
     /// Gas spend, when the adapter can report it.
     pub gas: u128,
+    /// The wave a root payment paid, for its records' root proofs; `None`
+    /// for a payment to the per-quote vault, whose proofs name the
+    /// transaction of each paid quote in `transactions`.
+    pub root: Option<super::root_payment::RootWavePayment>,
 }
 
 /// Confirmed Merkle settlement; Rust constructs all record proofs.
@@ -772,11 +776,7 @@ impl Client {
                     .copied()
                     .filter(|address| !released.contains(address))
                     .collect::<Vec<_>>();
-                state.confirm(
-                    &confirmed,
-                    &payment.transactions,
-                    crate::runtime::system_time(),
-                )?;
+                state.confirm_payment(&confirmed, &payment, crate::runtime::system_time())?;
             }
             // Recovered receipts are previous spend, not new payments by this invocation.
             adapter.checkpoint(state, None).await?;
@@ -834,7 +834,47 @@ impl Client {
     /// payments, which moved no tokens), the records found already stored when
     /// quoted again, and the records left unpaid because their quotes were
     /// occupied every time, with why (their plans in `plans` become `None`).
+    ///
+    /// Each plan is paid through the vault it records: a wave holding plans
+    /// for both, as when a plan kept from an earlier run pays the other
+    /// vault, pays each vault's plans in a payment of their own, the
+    /// per-quote vault's first, one after the other.
     async fn pay_wave<A: UploadAdapter>(
+        &self,
+        payable: Vec<ChunkPaymentPlan>,
+        plans: &mut [(UploadRecord, Option<ChunkPaymentPlan>)],
+        state: &mut UploadState,
+        adapter: &A,
+        envelope: bool,
+        total: usize,
+    ) -> Result<(UploadPayment, Vec<[u8; 32]>, Vec<([u8; 32], String)>)> {
+        let (v2, root): (Vec<_>, Vec<_>) = payable.into_iter().partition(|plan| plan.vault.is_v2());
+        if v2.is_empty() || root.is_empty() {
+            let payable = if v2.is_empty() { root } else { v2 };
+            return self
+                .pay_wave_to_one_vault(payable, plans, state, adapter, envelope, total)
+                .await;
+        }
+        let (mut spent, mut found_stored, mut unpaid) = self
+            .pay_wave_to_one_vault(v2, plans, state, adapter, envelope, total)
+            .await?;
+        let (more, stored, left) = self
+            .pay_wave_to_one_vault(root, plans, state, adapter, envelope, total)
+            .await?;
+        spent.amount = spent
+            .amount
+            .checked_add(more.amount)
+            .ok_or_else(|| Error::Payment("payment total overflow".into()))?;
+        spent.gas = spent.gas.saturating_add(more.gas);
+        spent.transactions.extend(more.transactions);
+        spent.root = more.root;
+        found_stored.extend(stored);
+        unpaid.extend(left);
+        Ok((spent, found_stored, unpaid))
+    }
+
+    /// [`Self::pay_wave`] for `payable` plans that all pay one vault.
+    async fn pay_wave_to_one_vault<A: UploadAdapter>(
         &self,
         mut payable: Vec<ChunkPaymentPlan>,
         plans: &mut [(UploadRecord, Option<ChunkPaymentPlan>)],
@@ -868,13 +908,13 @@ impl Client {
             validate_payment_total(&payable, &payment)?;
             let occupied = self.occupied_quotes(&payable).await;
             let released = state.release_occupied(&occupied);
-            state.confirm(
+            state.confirm_payment(
                 &payable
                     .iter()
                     .map(|plan| plan.address)
                     .filter(|address| !released.contains(address))
                     .collect::<Vec<_>>(),
-                &payment.transactions,
+                &payment,
                 crate::runtime::system_time(),
             )?;
             let paid = UploadPayment {
@@ -884,6 +924,7 @@ impl Client {
                     .ok_or_else(|| Error::Payment("payment total underflow".into()))?,
                 gas: payment.gas,
                 transactions: payment.transactions,
+                root: payment.root,
             };
             adapter.checkpoint(state, Some(&paid)).await?;
             spent.amount = spent
@@ -892,6 +933,7 @@ impl Client {
                 .ok_or_else(|| Error::Payment("payment total overflow".into()))?;
             spent.gas = spent.gas.saturating_add(paid.gas);
             spent.transactions.extend(paid.transactions);
+            spent.root = paid.root;
             if occupied.is_empty() {
                 break;
             }
@@ -976,6 +1018,7 @@ impl Client {
                         payment: super::batch::SingleNodeQuotePayment { quotes: Vec::new() },
                         peer_quotes: Vec::new(),
                         commitment_sidecars: Vec::new(),
+                        vault: crate::data::client::root_payment::PaymentVault::V2,
                     })
                 } else {
                     match recovery.retained_plan(
@@ -1631,6 +1674,8 @@ impl UploadAdapter for MemoryUploadAdapter<'_> {
                     .map(|q| (q.quote_hash, q.rewards_address, q.amount))
             })
             .collect::<Vec<_>>();
+        // One transaction in flight per signing key, whichever vault.
+        let _signing = self.client.lock_signing().await?;
         let (transactions, gas) = wallet.pay_for_quotes(payments).await.map_err(
             |ant_protocol::evm::PayForQuotesError(error, _)| Error::Payment(error.to_string()),
         )?;
@@ -1642,6 +1687,7 @@ impl UploadAdapter for MemoryUploadAdapter<'_> {
             transactions: transactions.into_iter().collect(),
             amount,
             gas: gas.gas_cost_wei,
+            root: None,
         })
     }
     async fn pay_merkle(
@@ -1765,6 +1811,7 @@ mod tests {
             },
             peer_quotes: Vec::new(),
             commitment_sidecars: Vec::new(),
+            vault: crate::data::client::root_payment::PaymentVault::V2,
         }
     }
 

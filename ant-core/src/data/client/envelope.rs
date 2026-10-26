@@ -471,9 +471,34 @@ struct ProvenPayment {
 }
 
 /// Read the paid quote and its transaction from the payment proof sent with
-/// an envelope's PUT.
+/// an envelope's PUT: a single-node proof's median quote, or the quote a
+/// root proof's leaf pays.
 #[cfg(feature = "native")]
 fn paid_quote(proof_bytes: &[u8]) -> Result<ProvenPayment, String> {
+    use ant_protocol::payment::{detect_proof_type, ProofType};
+    match detect_proof_type(proof_bytes) {
+        Some(ProofType::SingleNode) => {}
+        Some(ProofType::Root) => {
+            let proof = ant_protocol::payment::deserialize_root_proof(proof_bytes)?;
+            let quote = super::root_payment::proof_paid_quote(&proof)
+                .map(|(_, quote)| quote.clone())
+                .ok_or("the paid quote is not in the proof")?;
+            return Ok(ProvenPayment {
+                quotes: proof
+                    .payment
+                    .proof_of_payment
+                    .peer_quotes
+                    .into_iter()
+                    .map(|(_, quote)| quote)
+                    .collect(),
+                tx_hashes: proof.payment.tx_hashes.into_iter().map(|tx| tx.0).collect(),
+                paid: quote,
+            });
+        }
+        Some(ProofType::Merkle) | None => {
+            return Err("the envelope's proof is not a single-node or root payment proof".into());
+        }
+    }
     let (proof, tx_hashes) = ant_protocol::payment::deserialize_proof(proof_bytes)?;
     let quotes: Vec<_> = proof
         .peer_quotes
@@ -646,7 +671,7 @@ pub(crate) async fn complete_upload_envelope(
             }
         };
         let checked =
-            ant_listings::find_payment(&address, &quotes, &receipt, timestamp, chain.vault())
+            ant_listings::find_payment(&address, &quotes, &receipt, timestamp, chain.vaults())
                 .map_err(|e| e.to_string())
                 .and_then(|payment| {
                     EnvelopeProof::from_payment(&envelope.envelope, &payment)
@@ -654,7 +679,7 @@ pub(crate) async fn complete_upload_envelope(
                 })
                 .and_then(reveal)
                 .and_then(|record| {
-                    ant_listings::check_proof(&record, &receipt, timestamp, chain.vault())
+                    ant_listings::check_proof(&record, &receipt, timestamp, chain.vaults())
                         .map(|_| record)
                         .map_err(|e| e.to_string())
                 });
@@ -1246,7 +1271,7 @@ mod tests {
             &record,
             &receipt,
             1_800_000_240,
-            &super::super::listings::test_chain::VAULT,
+            &ant_listings::VaultSet::v2_only(super::super::listings::test_chain::VAULT),
         )
         .unwrap();
         assert_eq!(proven.payment.log_index, 1);

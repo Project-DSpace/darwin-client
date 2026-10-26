@@ -45,6 +45,7 @@ pub mod occupied;
 pub mod payment;
 pub mod pointer;
 pub mod quote;
+pub mod root_payment;
 #[cfg(feature = "native")]
 pub(crate) mod shared_wave;
 pub mod upload;
@@ -685,6 +686,10 @@ pub struct Client {
     config: ClientConfig,
     network: Network,
     wallet: Option<Arc<Wallet>>,
+    /// The wallet root payments go through: the same key as `wallet`,
+    /// paying the root vault ([`Client::with_root_payments`]). Set, every
+    /// payment this client makes pays the root vault.
+    root_wallet: Option<Arc<Wallet>>,
     evm_network: Option<ant_protocol::evm::Network>,
     chunk_cache: ChunkCache,
     /// Chunk GETs in flight, by address and peer count, so concurrent reads
@@ -774,6 +779,7 @@ impl Client {
             config,
             network,
             wallet: None,
+            root_wallet: None,
             evm_network: None,
             chunk_cache: ChunkCache::default(),
             chunk_gets: SingleFlight::default(),
@@ -823,6 +829,7 @@ impl Client {
             config,
             network,
             wallet: None,
+            root_wallet: None,
             evm_network: None,
             chunk_cache: ChunkCache::default(),
             chunk_gets: SingleFlight::default(),
@@ -882,6 +889,7 @@ impl Client {
             config,
             network,
             wallet: None,
+            root_wallet: None,
             evm_network: None,
             chunk_cache: ChunkCache::default(),
             chunk_gets: SingleFlight::default(),
@@ -929,6 +937,88 @@ impl Client {
         self.evm_network = Some(wallet.network().clone());
         self.wallet = Some(Arc::new(wallet));
         self
+    }
+
+    /// Pay through the root vault: every payment this client makes, of
+    /// uploads, single records and pointers alike, pays the root vault in
+    /// waves through `root_wallet`, a wallet of the same key as
+    /// [`Self::with_wallet`]'s, paying the root vault on the same RPC and
+    /// token (`crate::config::root_wallet`). The client's network, and so
+    /// the names of its checkpoints, stay the per-quote vault's.
+    ///
+    /// # Errors
+    ///
+    /// If the client has no wallet, or `root_wallet` signs with another key,
+    /// pays another token, or pays the client's own payment vault.
+    pub fn with_root_payments(mut self, root_wallet: Wallet) -> Result<Self> {
+        let wallet = self.require_wallet()?;
+        let (network, root) = (wallet.network(), root_wallet.network());
+        if root_wallet.address() != wallet.address() {
+            return Err(Error::Payment(
+                "the root vault's wallet signs with another key than the client's wallet".into(),
+            ));
+        }
+        if root.payment_token_address() != network.payment_token_address()
+            || root.rpc_url() != network.rpc_url()
+            || root.payment_vault_address() == network.payment_vault_address()
+        {
+            return Err(Error::Payment(
+                "the root vault's wallet must pay the client's token, on its RPC, to a vault \
+                 other than the client's payment vault"
+                    .into(),
+            ));
+        }
+        self.root_wallet = Some(Arc::new(root_wallet));
+        Ok(self)
+    }
+
+    /// The wallet root payments go through, if this client pays the root
+    /// vault ([`Self::with_root_payments`]).
+    #[must_use]
+    pub fn root_wallet(&self) -> Option<&Arc<Wallet>> {
+        self.root_wallet.as_ref()
+    }
+
+    /// The vault this client's payments go to: the root vault once
+    /// [`Self::with_root_payments`] set its wallet, else the per-quote vault.
+    #[must_use]
+    pub fn payment_vault(&self) -> root_payment::PaymentVault {
+        if self.root_wallet.is_some() {
+            root_payment::PaymentVault::Root
+        } else {
+            root_payment::PaymentVault::V2
+        }
+    }
+
+    /// The wallet that pays `vault`.
+    ///
+    /// # Errors
+    ///
+    /// If the client has no wallet for it.
+    #[cfg(feature = "native")]
+    pub(crate) fn wallet_paying(&self, vault: root_payment::PaymentVault) -> Result<&Arc<Wallet>> {
+        match vault {
+            root_payment::PaymentVault::V2 => self.require_wallet(),
+            root_payment::PaymentVault::Root => self.root_wallet.as_ref().ok_or_else(|| {
+                Error::Payment(
+                    "this payment is to the root vault, and the client has no wallet for it: \
+                     build the client with with_root_payments to pay or reconcile it"
+                        .into(),
+                )
+            }),
+        }
+    }
+
+    /// Hold the lock of the client's signing key
+    /// ([`root_payment::signing_lock`]): every transaction the key sends,
+    /// through either vault's wallet, is signed and sent under it.
+    ///
+    /// # Errors
+    ///
+    /// If the client has no wallet.
+    pub(crate) async fn lock_signing(&self) -> Result<tokio::sync::OwnedMutexGuard<()>> {
+        let address = self.require_wallet()?.address();
+        Ok(root_payment::signing_lock(address).lock_owned().await)
     }
 
     /// Set the EVM network without requiring a wallet.

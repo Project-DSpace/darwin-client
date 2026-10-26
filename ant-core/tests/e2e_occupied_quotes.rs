@@ -129,6 +129,7 @@ impl UploadAdapter for Occupier<'_> {
             transactions: transactions.into_iter().collect(),
             amount,
             gas: gas.gas_cost_wei,
+            root: None,
         })
     }
 }

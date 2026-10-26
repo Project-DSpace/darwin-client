@@ -66,6 +66,7 @@ const STORES: Counting = &[
     (None, "pay_for_record*"),
     (None, "batch_pay"),
     (None, "prepare_payment"),
+    (None, "pay_root"),
     (None, "batch_upload_chunks*"),
     (None, "upload_records"),
     (None, "upload_records_then"),
@@ -152,6 +153,7 @@ const JOURNALED: &str = "Per-chunk payment in the network's token through the cl
     chain-bound wallet, signed and journaled before it is sent: a payment of its own, or a \
     shared wave of one wallet's small payments, each member's journal and payment record \
     holding only its own quotes and its share.";
+const ROOT_JOURNALED: &str = "Per-chunk payment in the network's token to the root vault,     through the client's chain-bound wallet built for it: the payment's records as one wave, their     paid quotes as leaves in ascending quote-hash order, signed and journaled before it is sent,     never shared with another payment; each record's proof names its leaf, its place and its     path. Every transaction from the key is sent under the key's one lock.";
 const RAW_CHUNK_PUT: &str = "raw, by the caller's choice: no envelope. `darwin chunk put` \
     stores one raw chunk; its help names `darwin file upload` as the standard way. Paid per chunk \
     with the read-back.";
@@ -676,6 +678,13 @@ const STORE_SITES: &[Site] = &[
         "prepare_payment",
         1,
         JOURNALED,
+    ),
+    (
+        "ant-core/src/data/client/native_payment.rs",
+        "pay_with",
+        "pay_root",
+        1,
+        ROOT_JOURNALED,
     ),
     (
         "ant-core/src/data/client/payment.rs",

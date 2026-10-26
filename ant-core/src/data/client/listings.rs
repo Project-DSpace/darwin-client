@@ -58,9 +58,9 @@ use ant_listings::{
     push_request_id, quorum_needed, verify_listing_receipts, AddressWalk, ChangesResponse,
     CheckLevel, Envelope, EnvelopeProof, IndexWalk, Listing, ListingCheck, ListingKey,
     ListingPayment, ListingsBody, ListingsMessage, Lookup, MergedListing, NodeReport, PaidAt,
-    PaymentError, PaymentLog, PaymentReceipt, ProvenUpload, WalkOutcome, WalkResult, CLOCK_MARGIN,
-    DATA_PAYMENT_MADE_TOPIC, FIRST_SEEN_ROUNDING, MAX_LIST_LIMIT, QUORUM_THRESHOLD, TOPIC,
-    WALK_FREE_LISTINGS, WATCH_LEASE,
+    PaymentError, PaymentLog, PaymentReceipt, ProvenUpload, VaultSet, WalkOutcome, WalkResult,
+    CLOCK_MARGIN, DATA_PAYMENT_MADE_TOPIC, FIRST_SEEN_ROUNDING, MAX_LIST_LIMIT, QUORUM_THRESHOLD,
+    TOPIC, WALK_FREE_LISTINGS, WATCH_LEASE,
 };
 use ant_protocol::evm::{Amount, Network as EvmNetwork, QuoteHash};
 use ant_protocol::transport::{MultiAddr, P2PEvent, P2PNode, PeerId};
@@ -2197,7 +2197,7 @@ pub(crate) async fn check_quorum_group(
     let listing = listing_to_check(group, nearest, needed).ok_or_else(|| {
         GroupProblem::Invalid("none of the nodes nearest its address gives it a first_seen".into())
     })?;
-    check_offline(&listing, envelope, chain.vault())
+    check_offline(&listing, envelope, chain.vaults())
         .map_err(|e| GroupProblem::Invalid(e.to_string()))?;
     check_vault_deployment(group, nearest, needed, chain).map_err(GroupProblem::Invalid)?;
     let lookup = payment_lookup(&listing).map_err(|e| GroupProblem::Invalid(e.to_string()))?;
@@ -2206,7 +2206,7 @@ pub(crate) async fn check_quorum_group(
         .await
         .map_err(|e| GroupProblem::Again(CheckProblem::ChainUnread(e).to_string()))?;
     check_copies(group, nearest, needed, |listing| {
-        verify_listing_receipts(listing, envelope, &fetched, chain.vault(), now)
+        verify_listing_receipts(listing, envelope, &fetched, chain.vaults(), now)
     })
     .map_err(|e| match e {
         PaymentError::NotFound => {
@@ -2318,7 +2318,7 @@ pub(crate) async fn check_group<P: PartialEq>(
         CheckProblem::Invalid("none of the nodes nearest its address gives it a first_seen".into())
     })?;
     // A copy that can't check out is never looked up.
-    check_offline(&listing, envelope, chain.vault())?;
+    check_offline(&listing, envelope, chain.vaults())?;
     check_vault_deployment(group, nearest, needed, chain).map_err(CheckProblem::Invalid)?;
     let lookup = payment_lookup(&listing)?;
     let fetched = chain
@@ -2326,7 +2326,7 @@ pub(crate) async fn check_group<P: PartialEq>(
         .await
         .map_err(CheckProblem::ChainUnread)?;
     Ok(check_copies(group, nearest, needed, |listing| {
-        verify_listing_receipts(listing, envelope, &fetched, chain.vault(), now)
+        verify_listing_receipts(listing, envelope, &fetched, chain.vaults(), now)
     })?)
 }
 
@@ -2428,6 +2428,47 @@ fn check_vault_deployment<P: PartialEq>(
 /// through their own RPC alone.
 pub const RPC_URLS_ENV: &str = "RPC_URLS";
 
+/// `records(bytes32)`: the root vault's view of the record under a wave's
+/// key.
+const ROOT_RECORDS_SELECTOR: [u8; 4] = [0x01, 0xe6, 0x47, 0x25];
+
+/// A root vault's record of a wave ([`ListingChain::root_record`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RootRecord {
+    /// The block time it was recorded at, in Unix seconds.
+    pub time: u64,
+    /// How many payments the wave holds.
+    pub leaf_count: u32,
+    /// The account that paid it.
+    pub payer: [u8; 20],
+}
+
+impl RootRecord {
+    /// The record `records(bytes32)` answers with: three words, the time,
+    /// the leaf count and the payer; `None` if all are zero.
+    fn from_words(bytes: &[u8]) -> std::result::Result<Option<Self>, String> {
+        let malformed = || "the root vault's record is not three words".to_string();
+        let [time, leaf_count, payer]: [&[u8]; 3] = [
+            bytes.get(..32).ok_or_else(malformed)?,
+            bytes.get(32..64).ok_or_else(malformed)?,
+            bytes.get(64..96).ok_or_else(malformed)?,
+        ];
+        if bytes.len() != 96
+            || time[..24].iter().any(|b| *b != 0)
+            || leaf_count[..28].iter().any(|b| *b != 0)
+            || payer[..12].iter().any(|b| *b != 0)
+        {
+            return Err(malformed());
+        }
+        let record = Self {
+            time: u64::from_be_bytes(time[24..].try_into().map_err(|_| malformed())?),
+            leaf_count: u32::from_be_bytes(leaf_count[28..].try_into().map_err(|_| malformed())?),
+            payer: payer[12..].try_into().map_err(|_| malformed())?,
+        };
+        Ok((record != Self::default()).then_some(record))
+    }
+}
+
 /// The most block timestamps kept to narrow later searches for the block at
 /// a time. When full, every other one is dropped. darwin-node's number for
 /// the same search.
@@ -2449,6 +2490,9 @@ const MAX_KNOWN_BLOCKS: usize = 4_096;
 pub struct ListingChain {
     rpc: Rpc,
     vault: [u8; 20],
+    /// The vaults whose payments this reader reads: `vault` alone, until
+    /// the readers read a root vault's payments too.
+    vaults: VaultSet,
     /// The block the vault was deployed in, where known.
     vault_deployment_block: Option<u64>,
     /// That block's timestamp (Unix seconds), where known.
@@ -2631,6 +2675,7 @@ impl ListingChain {
         Ok(Self {
             rpc,
             vault,
+            vaults: VaultSet::v2_only(vault),
             vault_deployment_block: None,
             vault_deployment_time: None,
             vault_first_payment_time: None,
@@ -2769,6 +2814,12 @@ impl ListingChain {
         &self.vault
     }
 
+    /// The vaults whose payments this reader reads.
+    #[must_use]
+    pub fn vaults(&self) -> &VaultSet {
+        &self.vaults
+    }
+
     /// The block the payment vault was deployed in, where known.
     #[must_use]
     pub fn vault_deployment_block(&self) -> Option<u64> {
@@ -2828,7 +2879,7 @@ impl ListingChain {
             .transaction(&proof.tx_hash)
             .await?
             .ok_or("the payment transaction is not on chain")?;
-        ant_listings::check_proof(proof, &receipt, timestamp, &self.vault)
+        ant_listings::check_proof(proof, &receipt, timestamp, &self.vaults)
             .map_err(|e| e.to_string())
     }
 
@@ -2874,6 +2925,42 @@ impl ListingChain {
             rewards_prefix: record.rewardsAddress.0,
             amount: Amount::from(record.amount),
         })
+    }
+
+    /// The root vault `vault`'s record under the wave key `key`
+    /// (`records(bytes32)`): the block time it was recorded at, its leaf
+    /// count and its payer, or `None` for a key never recorded, which the
+    /// vault answers with zeros.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the call fails or the answer is not three words.
+    pub async fn root_record(
+        &self,
+        vault: &[u8; 20],
+        key: &[u8; 32],
+    ) -> std::result::Result<Option<RootRecord>, String> {
+        let mut data = ROOT_RECORDS_SELECTOR.to_vec();
+        data.extend_from_slice(key);
+        let answer = self
+            .rpc
+            .call(
+                "eth_call",
+                json!([
+                    {
+                        "to": format!("0x{}", hex::encode(vault)),
+                        "data": format!("0x{}", hex::encode(data)),
+                    },
+                    "latest",
+                ]),
+            )
+            .await?
+            .value;
+        let bytes = answer
+            .as_str()
+            .and_then(|hex| hex::decode(hex.trim_start_matches("0x")).ok())
+            .ok_or("payment chain eth_call: the answer is not hex")?;
+        RootRecord::from_words(&bytes)
     }
 
     /// The receipt of `tx_hash` (as little of it as a check reads: whether
@@ -3894,6 +3981,13 @@ fn parse_log(log: &Value) -> Option<PaymentLog> {
             .iter()
             .map(|topic| topic.as_str().and_then(parse_bytes))
             .collect::<Option<Vec<[u8; 32]>>>()?,
+        data: hex::decode(
+            log["data"]
+                .as_str()
+                .unwrap_or("0x")
+                .trim_start_matches("0x"),
+        )
+        .ok()?,
         log_index: parse_u64(log["logIndex"].as_str()?)?,
     })
 }
@@ -3934,6 +4028,9 @@ pub(crate) mod test_chain {
 
     /// The vault the tests pay into.
     pub(crate) const VAULT: [u8; 20] = [0x69; 20];
+
+    /// The vaults the tests read: the per-quote vault alone.
+    pub(crate) const VAULTS: VaultSet = VaultSet::v2_only(VAULT);
 
     /// Receipts (each with the block it is in), and block timestamps.
     #[derive(Default)]
@@ -4225,6 +4322,7 @@ pub(crate) mod test_chain {
         PaymentLog {
             address: VAULT,
             topics: vec![DATA_PAYMENT_MADE_TOPIC, rewards, amount, quote.hash().0],
+            data: Vec::new(),
             log_index,
         }
     }
@@ -4259,8 +4357,32 @@ pub(crate) mod test_chain {
 
 #[cfg(test)]
 mod tests {
-    use super::test_chain::{paying_log, reader, serve, signed_quote, MockChain, VAULT};
+    use super::test_chain::{paying_log, reader, serve, signed_quote, MockChain, VAULT, VAULTS};
     use super::*;
+
+    /// A root vault's record reads as its three words; all zeros, a key
+    /// never recorded, as none; anything but three clean words as an error.
+    #[test]
+    fn a_root_record_is_three_words() {
+        let mut words = [0u8; 96];
+        assert_eq!(RootRecord::from_words(&words), Ok(None));
+        words[24..32].copy_from_slice(&1_800_000_000u64.to_be_bytes());
+        words[60..64].copy_from_slice(&64u32.to_be_bytes());
+        words[76..96].copy_from_slice(&[0x9a; 20]);
+        assert_eq!(
+            RootRecord::from_words(&words),
+            Ok(Some(RootRecord {
+                time: 1_800_000_000,
+                leaf_count: 64,
+                payer: [0x9a; 20],
+            }))
+        );
+        assert!(RootRecord::from_words(&words[..64]).is_err());
+        let mut dirty = words;
+        dirty[64] = 1;
+        assert!(RootRecord::from_words(&dirty).is_err());
+        assert!(RootRecord::from_words(&[words.as_slice(), &[0; 32]].concat()).is_err());
+    }
     use ant_listings::{
         first_seen_at, Flags, ListingError, Metadata, Payment, PaymentField, ShownFields,
     };
@@ -4819,7 +4941,7 @@ mod tests {
         let h = FIRST_SEEN_ROUNDING;
         let now = hour + 3 * h;
         let check =
-            |listing: &Listing| verify_listing_receipts(listing, &envelope, &[], &VAULT, now);
+            |listing: &Listing| verify_listing_receipts(listing, &envelope, &[], &VAULTS, now);
         let dated_by = |dates: &[u64]| {
             let (chosen, _) = decide(dated_copies(&listing, &NEAREST, dates), check);
             chosen.map(|(listing, ..)| listing.first_seen.expect("dated"))
@@ -4860,7 +4982,7 @@ mod tests {
         let listing = Listing::new(&envelope, &upload_payment(&envelope), BLOCK_TIME);
         let hour = first_seen_at(BLOCK_TIME);
         let check =
-            |listing: &Listing| verify_listing_receipts(listing, &envelope, &[], &VAULT, hour);
+            |listing: &Listing| verify_listing_receipts(listing, &envelope, &[], &VAULTS, hour);
         // Four of the nearest date it at `hour`; ten other nodes dating it
         // in 1970 neither count nor move it.
         let mut copies = dated_copies(&listing, &NEAREST[..4], &[hour; 4]);

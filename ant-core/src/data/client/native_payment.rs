@@ -5,6 +5,8 @@
 use super::{
     batch::{ChunkPaymentPlan, PAYMENT_WAVE_SIZE},
     merkle::PreparedMerkleBatch,
+    occupied::KeptPayment,
+    root_payment::{self, PaymentVault, RootWavePayment},
     shared_wave::{Member, QuoteTuple, Step, WaveEnd, WaveSigned},
     upload::{MerkleUploadPayment, UploadAdapter, UploadPayment, UploadRecord},
     upload_state::{PaymentAttempt, UploadState},
@@ -225,6 +227,12 @@ async fn pay_with<A: UploadAdapter>(
     state: &mut UploadState,
     share: bool,
 ) -> Result<UploadPayment> {
+    match root_payment::vault_of(plans)? {
+        PaymentVault::V2 => {}
+        // A root wave is paid on its own: its leaves, and so every
+        // record's path, are fixed before anything is signed.
+        PaymentVault::Root => return pay_root(client, adapter, plans, state).await,
+    }
     let quotes = quotes_of(plans);
     let fresh = |state: &UploadState| {
         plans.iter().all(|p| {
@@ -251,7 +259,9 @@ async fn pay_with<A: UploadAdapter>(
             }
             _ => {
                 let request = PaymentRequest::Quotes(quotes.clone());
-                let receipt = execute(client, adapter, &request, state, fresh).await?;
+                let wallet = client.require_wallet()?;
+                let receipt =
+                    execute(client, wallet, adapter, &request, state, fresh, None).await?;
                 (receipt, quotes.len())
             }
         },
@@ -264,8 +274,93 @@ async fn pay_with<A: UploadAdapter>(
             .collect(),
         amount: share.amount,
         gas: share.gas,
+        root: None,
     })
 }
+
+/// Pay for `plans`, each of which pays the root vault, as one wave through
+/// the client's root wallet, journaled in `state` as any payment is: the
+/// wave's leaves in ascending quote-hash order, sent as one `payForQuotes`
+/// call, the same calldata the per-quote vault takes. A journaled attempt is
+/// reconciled through the root wallet, never sent to the other vault.
+///
+/// Once the payment is confirmed, the vault's record under the wave's key
+/// is read back, again while it reads empty, as the occupied-quote
+/// read-back reads; an empty read never pays again, since an RPC can lag
+/// the chain. The key binds every leaf's payee and amount, so that one read
+/// stands for the read-back of every paid quote.
+async fn pay_root<A: UploadAdapter>(
+    client: &Client,
+    adapter: &A,
+    plans: &[ChunkPaymentPlan],
+    state: &mut UploadState,
+) -> Result<UploadPayment> {
+    let wave = root_payment::wave_of(plans)?;
+    let quotes = root_payment::wave_quotes(&wave);
+    let wallet = client.wallet_paying(PaymentVault::Root)?;
+    let vault: [u8; 20] = wallet.network().payment_vault_address().0 .0;
+    let key = wave.key(&vault);
+    if let Journal::Wave(_) | Journal::WaveSigned(_) = journal_of(state)? {
+        return Err(Error::Payment(
+            "the checkpoint journals a shared wave for plans that pay the root vault, which is \
+             never paid in a shared wave; its journal is kept. Don't delete the upload's \
+             checkpoint"
+                .into(),
+        ));
+    }
+    let fresh = |state: &UploadState| {
+        plans.iter().all(|p| {
+            state
+                .retained_plan(&p.address, p.data_size, crate::runtime::system_time())
+                .is_some()
+        })
+    };
+    let request = PaymentRequest::Quotes(quotes.clone());
+    let receipt = execute(
+        client,
+        wallet,
+        adapter,
+        &request,
+        state,
+        fresh,
+        Some((vault, key)),
+    )
+    .await?;
+    match client
+        .root_wave_recorded(&vault, &key, ROOT_READS_AFTER_PAYMENT)
+        .await
+    {
+        KeptPayment::Recorded => {}
+        read => tracing::warn!(
+            "the root vault's record of the wave {} read {read:?} after its payment was \
+             confirmed; storing its records as paid, and the nodes decide",
+            hex::encode(key)
+        ),
+    }
+    let share = super::shared_wave::share_of(&receipt, &quotes, quotes.len())?;
+    Ok(UploadPayment {
+        transactions: quotes
+            .iter()
+            .map(|q| (q.0, receipt.transaction_hash))
+            .collect(),
+        amount: share.amount,
+        gas: share.gas,
+        root: Some(RootWavePayment {
+            transaction: receipt.transaction_hash,
+            wave,
+        }),
+    })
+}
+
+/// How many times the root vault's record of a wave is read after its
+/// payment was confirmed, 2 seconds apart, while it reads empty: as many
+/// as the occupied-quote read-back reads each paid quote.
+const ROOT_READS_AFTER_PAYMENT: usize = 5;
+
+/// How many times the root vault's record of a wave is read, 2 seconds
+/// apart, before a root payment whose transaction reverted or was replaced
+/// is taken to have paid nothing: a read and a re-read.
+const ROOT_READS_BEFORE_PAYING_AGAIN: usize = 2;
 
 /// Pay `quotes` in the shared wave of the client's wallet
 /// ([`super::shared_wave`]): join it, save its id in `state`'s journal, and
@@ -338,9 +433,11 @@ async fn save_wave_journal<A: UploadAdapter>(
 /// every member's quotes, write the wave's file, have every member save it,
 /// send it, and tell the members how it ended.
 async fn lead(client: &Client, wallet: &Wallet, member: &Member) {
-    // One transaction in flight per wallet: the wave stays open for others
-    // to join while an earlier one is in flight.
-    let _wallet_lock = wallet.lock().await;
+    // One transaction in flight per signing key: the wave stays open for
+    // others to join while an earlier one is in flight.
+    let _signing = root_payment::signing_lock(wallet.address())
+        .lock_owned()
+        .await;
     let quotes = member.close(client.shared_waves()).await;
     if quotes.is_empty() {
         member.end(WaveEnd::NotSent(Error::Payment(
@@ -438,7 +535,7 @@ async fn reconcile_wave<A: UploadAdapter, F: Fn(&UploadState) -> bool + Send + S
     fresh: &F,
 ) -> Result<Option<(PaymentReceipt, usize)>> {
     let wallet = client.require_wallet()?;
-    let _wallet_lock = wallet.lock().await;
+    let _signing = client.lock_signing().await?;
     let file = super::shared_wave::read_wave_file(wave)?;
     let file_gone = file.is_none();
     let Some(signed) = super::shared_wave::wave_payment(file, own, quotes)? else {
@@ -508,7 +605,8 @@ pub(super) async fn pay_merkle<A: UploadAdapter>(
             crate::runtime::system_time(),
         )
     };
-    let receipt = execute(client, adapter, &request, state, fresh).await?;
+    let wallet = client.require_wallet()?;
+    let receipt = execute(client, wallet, adapter, &request, state, fresh, None).await?;
     Ok(MerkleUploadPayment {
         winner_pool: receipt
             .winner_pool
@@ -528,20 +626,29 @@ fn is_stale_nonce(message: &str) -> bool {
     message.to_ascii_lowercase().contains("nonce too low")
 }
 
+/// A root wave's vault and key, for a payment through the root vault.
+type RootKey = ([u8; 20], [u8; 32]);
+
+/// Pay `request` through `wallet`, journaled in `state`. For a root wave
+/// (`root`: its vault and key), a transaction that reverted or was replaced
+/// ends the attempt only once the vault shows no record under the wave's
+/// key ([`root_wave_unpaid`]).
 async fn execute<A: UploadAdapter, F: Fn(&UploadState) -> bool + Send + Sync>(
     client: &Client,
+    wallet: &Wallet,
     adapter: &A,
     request: &PaymentRequest,
     state: &mut UploadState,
     fresh: F,
+    root: Option<RootKey>,
 ) -> Result<PaymentReceipt> {
     // A nonce is read from a public endpoint whose replicas lag each other, so
     // a freshly signed payment can carry a nonce the chain already consumed
     // (measured 1 in 150 reads on Arbitrum Sepolia, DEV-03 run 589). Such bytes
     // can never be mined and were never sent, so one re-preparation is the fix.
-    match execute_once(client, adapter, request, state, &fresh).await {
+    match execute_once(client, wallet, adapter, request, state, &fresh, root).await {
         Err(Error::Payment(message)) if message == STALE_UNSENT_NONCE => {
-            execute_once(client, adapter, request, state, &fresh).await
+            execute_once(client, wallet, adapter, request, state, &fresh, root).await
         }
         outcome => outcome,
     }
@@ -549,14 +656,18 @@ async fn execute<A: UploadAdapter, F: Fn(&UploadState) -> bool + Send + Sync>(
 
 async fn execute_once<A: UploadAdapter, F: Fn(&UploadState) -> bool + Send + Sync>(
     client: &Client,
+    wallet: &Wallet,
     adapter: &A,
     request: &PaymentRequest,
     state: &mut UploadState,
     fresh: &F,
+    root: Option<RootKey>,
 ) -> Result<PaymentReceipt> {
     let journal = journal_of(state)?;
-    let wallet = client.require_wallet()?;
-    let _wallet_lock = wallet.lock().await;
+    // One transaction in flight per signing key, whichever vault it pays.
+    let _signing = root_payment::signing_lock(wallet.address())
+        .lock_owned()
+        .await;
     // True only for bytes signed below, in this call: they have never been
     // broadcast, so there is nothing on chain to observe before sending them.
     let (signed, unsent) = match journal {
@@ -594,7 +705,41 @@ async fn execute_once<A: UploadAdapter, F: Fn(&UploadState) -> bool + Send + Syn
         }
     };
     let settled = settle(client, wallet, &signed, request, unsent, || fresh(state)).await;
+    if let (Some((vault, key)), Settled::Reverted | Settled::Replaced(_)) = (root, &settled) {
+        root_wave_unpaid(client, &vault, &key).await?;
+    }
     finish(adapter, state, settled).await
+}
+
+/// Check, before a root payment whose transaction reverted or was replaced
+/// ends and its records can be paid again, that the root vault records no
+/// wave under its `key`: the same leaves, sent by any wallet in any block,
+/// are recorded under the same key, and a recorded key counts as paid.
+///
+/// # Errors
+///
+/// If the key is recorded, or its record can't be read: the journal is
+/// kept, and nothing is paid again.
+async fn root_wave_unpaid(client: &Client, vault: &[u8; 20], key: &[u8; 32]) -> Result<()> {
+    match client
+        .root_wave_recorded(vault, key, ROOT_READS_BEFORE_PAYING_AGAIN)
+        .await
+    {
+        KeptPayment::NotRecorded => Ok(()),
+        KeptPayment::Recorded => Err(Error::Payment(format!(
+            "the root wave's own transaction didn't pay it, and the root vault records the wave \
+             under its key {} as paid, by another transaction: its journal is kept, and nothing \
+             is paid again. Don't delete the upload's checkpoint: it holds a payment that was \
+             made",
+            hex::encode(key)
+        ))),
+        KeptPayment::Unreadable | KeptPayment::NotChecked => Err(Error::Payment(format!(
+            "the root wave's own transaction didn't pay it, and the root vault's record under its \
+             key {} couldn't be read; its journal is kept, and a retry reads it again rather \
+             than pay twice. Don't delete the upload's checkpoint",
+            hex::encode(key)
+        ))),
+    }
 }
 
 /// How a signed payment ended, as [`settle`] saw it.
@@ -754,7 +899,16 @@ impl Client {
             initialize(state.pending_payment.as_mut().expect("just initialized"));
             adapter.checkpoint(state, None).await?;
         }
-        execute(self, adapter, request, state, |_| fresh).await
+        execute(
+            self,
+            self.require_wallet()?,
+            adapter,
+            request,
+            state,
+            |_| fresh,
+            None,
+        )
+        .await
     }
 }
 
@@ -804,6 +958,7 @@ pub(super) mod test_plans {
                 quote,
             )],
             commitment_sidecars: Vec::new(),
+            vault: crate::data::client::root_payment::PaymentVault::V2,
         }
     }
 

@@ -591,6 +591,7 @@ impl Client {
             payment,
             peer_quotes,
             commitment_sidecars: Vec::new(),
+            vault: crate::data::client::root_payment::PaymentVault::V2,
         };
         Ok((proof_bytes, quoted_peers, plan))
     }
@@ -603,9 +604,13 @@ impl Client {
     /// # Errors
     ///
     /// Returns an error if the wallet is not set or the approval transaction fails.
+    /// A client paying the root vault ([`Client::with_root_payments`])
+    /// approves the root vault too. Each approval is sent under the signing
+    /// key's lock, as every transaction from the key is.
     pub async fn approve_token_spend(&self) -> Result<()> {
         let wallet = self.require_wallet()?;
         let evm_network = self.require_evm_network()?;
+        let _signing = self.lock_signing().await?;
 
         let vault_address = evm_network.payment_vault_address();
         wallet
@@ -613,6 +618,16 @@ impl Client {
             .await
             .map_err(|e| Error::Payment(format!("Token approval failed: {e}")))?;
         info!("Token spend approved for payment vault contract");
+
+        if let Some(root) = self.root_wallet() {
+            root.approve_to_spend_tokens(
+                *root.network().payment_vault_address(),
+                ant_protocol::evm::U256::MAX,
+            )
+            .await
+            .map_err(|e| Error::Payment(format!("Token approval of the root vault failed: {e}")))?;
+            info!("Token spend approved for the root vault contract");
+        }
 
         Ok(())
     }
@@ -632,11 +647,7 @@ fn confirm_record(
 ) -> Result<Option<Vec<u8>>> {
     let released = state.release_occupied(occupied);
     let proof = if released.is_empty() {
-        state.confirm(
-            &[plan.address],
-            &payment.transactions,
-            crate::runtime::system_time(),
-        )?;
+        state.confirm_payment(&[plan.address], payment, crate::runtime::system_time())?;
         state.proof(&plan.address).cloned()
     } else {
         None
