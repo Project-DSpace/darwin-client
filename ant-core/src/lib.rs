@@ -14,6 +14,14 @@ mod client_engine;
 #[cfg(test)]
 mod lock_pins;
 
+// This network's price multiplier is in vendor/ant-protocol, which
+// `[patch.crates-io]` puts in place of crates.io's ant-protocol 5.0.0. Built
+// against crates.io's copy (a project that takes ant-core by git without
+// repeating the patch; README, "Rust Library API"), ant-core would check and
+// pay quotes at Autonomi's prices. It fails to compile here instead:
+// `FULL_RECORD_BYTES` is in the vendored copy only (its VENDORED.md).
+const _: u64 = ant_protocol::payment::pricing::FULL_RECORD_BYTES;
+
 #[cfg(feature = "native")]
 pub mod config;
 pub mod data;

@@ -19,6 +19,8 @@ opt-level = 2
 
 [patch.crates-io]
 # Autonomi's protocol crate with our price multiplier; see vendor/ant-protocol/VENDORED.md.
+# A project that takes ant-core by git repeats this entry, from the same tag
+# (README, "Rust Library API"): a [patch] applies only in the top-level workspace.
 ant-protocol = { path = "vendor/ant-protocol" }
 # darwin-node's patched webrtc (its vendor/webrtc/VENDORED.md: closing a browser
 # session cancels a DTLS handshake still in progress), from the darwin-node

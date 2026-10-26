@@ -24,6 +24,9 @@ commit `darwin --version` prints. Upstream's entries follow.
   RPCs bundled in `ant-core/resources/`.
 - Payments in DARWIN (`0x511f76A3…`, vault `0xE0f62798…`), priced like Autonomi with a price
   multiplier of 32 in the vendored ant-protocol. Builds before `0995cba` pay the retired test token.
+  `ant-core` requires exactly `ant-protocol` 5.0.0, the vendored copy's version, and doesn't compile
+  against crates.io's copy; a project that takes `ant-core` by git repeats the `[patch.crates-io]`
+  entry from the same tag (README, "Rust Library API").
 - Listings v2: envelopes on every visibility, optional payment fields, upload records and proofs
   (`darwin file prove`, `darwin file verify`), and the listings index (`darwin listings`,
   `darwin listing`) read with quorum checks.

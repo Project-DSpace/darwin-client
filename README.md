@@ -755,6 +755,25 @@ The `ant-core` crate exposes the full API programmatically. Add it as a dependen
 ant-core = { path = "ant-core" }
 ```
 
+From another project, take `ant-core` by a release tag, and repeat this repository's
+`[patch.crates-io]` entry for `ant-protocol` from the same tag:
+
+```toml
+[dependencies]
+ant-core = { git = "https://github.com/Project-DSpace/darwin-client", tag = "<tag>" }
+
+[patch.crates-io]
+ant-protocol = { git = "https://github.com/Project-DSpace/darwin-client", tag = "<tag>" }
+```
+
+`<tag>` is a release's tag, such as `v0.3.11+ds.1`, the same in both lines. The patch puts
+`vendor/ant-protocol`, Autonomi's protocol crate with this network's price multiplier, in place
+of the crates.io release. Cargo applies a `[patch]` only in the top-level workspace, so taking
+`ant-core` alone isn't enough, and `ant-core` doesn't compile without it. `ant-core` requires
+exactly `ant-protocol` 5.0.0, the vendored copy's version, so a later crates.io release can't
+take the patch's place, for `ant-core` or for any other crate in your build that uses
+`ant-protocol`.
+
 ### Connecting to the Network
 
 ```rust
