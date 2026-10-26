@@ -2067,9 +2067,25 @@ impl ChunkSource<'_> {
 /// a root wave, so a payment of root plans could never be confirmed, and
 /// each retry would pay again. Uploads through a payer are quoted for the
 /// per-quote vault ([`super::super::upload::UploadAdapter::pays_root_waves`]).
-fn payer_pays_per_quote(plans: &[crate::data::client::batch::ChunkPaymentPlan]) -> Result<()> {
+///
+/// When `reconciling`, the plans are an earlier run's journaled payment,
+/// which may have signed and sent its root transaction with the client's
+/// own wallet: the refusal says so, and that the checkpoint holding its
+/// journal must be kept, never that nothing was paid.
+fn payer_pays_per_quote(
+    plans: &[crate::data::client::batch::ChunkPaymentPlan],
+    reconciling: bool,
+) -> Result<()> {
     if plans.iter().all(|plan| plan.vault.is_v2()) {
         Ok(())
+    } else if reconciling {
+        Err(Error::Payment(
+            "a root payment of these plans is journaled and may have been sent; an external \
+             payer doesn't pay the root vault, so its journal is kept, and nothing is paid \
+             again. Reconcile it with the client's own wallet (with_root_payments). Don't \
+             delete the upload's checkpoint"
+                .into(),
+        ))
     } else {
         Err(Error::Payment(
             "these plans pay the root vault, which an external payer doesn't pay: nothing was \
@@ -2109,7 +2125,7 @@ impl super::super::upload::UploadAdapter for SpillUploadAdapter<'_> {
     ) -> Result<super::super::upload::UploadPayment> {
         match self.payer {
             Some(payer) => {
-                payer_pays_per_quote(plans)?;
+                payer_pays_per_quote(plans, false)?;
                 payer.pay_quotes(plans).await
             }
             None => super::super::native_payment::pay_shared(self.client, self, plans, state).await,
@@ -2123,7 +2139,7 @@ impl super::super::upload::UploadAdapter for SpillUploadAdapter<'_> {
     ) -> Result<super::super::upload::UploadPayment> {
         match self.payer {
             Some(payer) => {
-                payer_pays_per_quote(plans)?;
+                payer_pays_per_quote(plans, true)?;
                 payer.pay_quotes(plans).await
             }
             None => super::super::native_payment::pay_shared(self.client, self, plans, state).await,
@@ -6501,13 +6517,28 @@ mod payer_tests {
         plans[1].vault = PaymentVault::Root;
         let mut state = crate::data::client::upload_state::UploadState::default();
         for paying in [&plans[..], &plans[1..]] {
-            for error in [
-                through_payer.submit_payment(paying, &mut state).await,
-                through_payer.reconcile_payment(paying, &mut state).await,
-            ] {
-                let message = error.unwrap_err().to_string();
-                assert!(message.contains("nothing was paid"), "{message}");
-            }
+            // Before anything is signed, nothing was paid.
+            let message = through_payer
+                .submit_payment(paying, &mut state)
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(message.contains("nothing was paid"), "{message}");
+            // An earlier run's journaled root payment may have been sent:
+            // the refusal never says nothing was paid, and keeps the
+            // checkpoint for the client's own wallet to reconcile.
+            let message = through_payer
+                .reconcile_payment(paying, &mut state)
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(!message.contains("nothing was paid"), "{message}");
+            assert!(message.contains("may have been sent"), "{message}");
+            assert!(message.contains("with_root_payments"), "{message}");
+            assert!(
+                message.contains("Don't delete the upload's checkpoint"),
+                "{message}"
+            );
         }
         assert_eq!(payer.0.load(std::sync::atomic::Ordering::SeqCst), 0);
         // Plans that pay the per-quote vault go to the payer.
