@@ -227,7 +227,13 @@ async fn pay_with<A: UploadAdapter>(
     state: &mut UploadState,
     share: bool,
 ) -> Result<UploadPayment> {
-    match root_payment::vault_of(plans)? {
+    // A transaction the attempt journaled is reconciled through the wallet
+    // of the vault its `to` names, never sent to the other.
+    let vault = match journal_of(state)? {
+        Journal::Signed(signed) => journaled_vault(client, &signed, plans)?,
+        _ => root_payment::vault_of(plans)?,
+    };
+    match vault {
         PaymentVault::V2 => {}
         // A root wave is paid on its own: its leaves, and so every
         // record's path, are fixed before anything is signed.
@@ -350,6 +356,85 @@ async fn pay_root<A: UploadAdapter>(
             wave,
         }),
     })
+}
+
+/// The `to` of a journaled transaction: the address it pays.
+///
+/// # Errors
+///
+/// If the journaled bytes aren't a transaction with a recipient.
+fn journaled_to(signed: &SignedPayment) -> Result<ant_protocol::evm::Address> {
+    use alloy::consensus::{Transaction as _, TxEnvelope};
+    use alloy::eips::eip2718::Decodable2718 as _;
+    let unreadable = || {
+        Error::Payment(
+            "the journaled transaction can't be read; its journal is kept, and nothing is paid \
+             again. Don't delete the upload's checkpoint"
+                .into(),
+        )
+    };
+    let raw: Vec<u8> = serde_json::to_value(signed)
+        .ok()
+        .and_then(|value| serde_json::from_value(value.get("raw")?.clone()).ok())
+        .ok_or_else(unreadable)?;
+    let mut bytes = raw.as_slice();
+    let tx = TxEnvelope::decode_2718(&mut bytes).map_err(|_| unreadable())?;
+    tx.to().ok_or_else(unreadable)
+}
+
+/// Which of this client's vaults `to` is: the per-quote vault its wallet
+/// pays, or the root vault, as its root wallet pays it or, without one, as
+/// the client's network bundles it.
+fn vault_named(client: &Client, to: &ant_protocol::evm::Address) -> Option<PaymentVault> {
+    let v2 = client
+        .wallet_paying(PaymentVault::V2)
+        .ok()
+        .map(|wallet| *wallet.network().payment_vault_address());
+    let root = client
+        .root_wallet()
+        .map(|wallet| *wallet.network().payment_vault_address())
+        .or_else(|| {
+            client
+                .require_evm_network()
+                .ok()
+                .and_then(crate::config::root_vault_address)
+        });
+    if Some(*to) == root {
+        Some(PaymentVault::Root)
+    } else if Some(*to) == v2 {
+        Some(PaymentVault::V2)
+    } else {
+        None
+    }
+}
+
+/// The vault a journaled transaction is reconciled through: the one its
+/// `to` names, which must be the vault its `plans` recorded.
+///
+/// # Errors
+///
+/// If its `to` is neither vault, or names the other vault than its plans
+/// recorded: its journal is kept, and nothing is paid again.
+fn journaled_vault(
+    client: &Client,
+    signed: &SignedPayment,
+    plans: &[ChunkPaymentPlan],
+) -> Result<PaymentVault> {
+    let to = journaled_to(signed)?;
+    let recorded = root_payment::vault_of(plans)?;
+    match vault_named(client, &to) {
+        Some(named) if named == recorded => Ok(named),
+        Some(named) => Err(Error::Payment(format!(
+            "the journaled transaction pays the {named:?} vault, but its plans record the \
+             {recorded:?} vault; its journal is kept, and nothing is paid again. Don't delete the \
+             upload's checkpoint"
+        ))),
+        None => Err(Error::Payment(format!(
+            "the journaled transaction pays {to}, which is neither vault this client pays; its \
+             journal is kept, and nothing is paid again. A client paying the root vault \
+             reconciles a root payment (with_root_payments). Don't delete the upload's checkpoint"
+        ))),
+    }
 }
 
 /// How many times the root vault's record of a wave is read after its
@@ -997,6 +1082,75 @@ mod tests {
     use super::test_plans::{checkpoints, network, signed_plan, transactions};
     use super::*;
     use std::time::Duration;
+
+    /// A signed transaction paying `to`, journaled as a wallet journals it.
+    fn journaled_paying(to: ant_protocol::evm::Address) -> SignedPayment {
+        use alloy::consensus::{SignableTransaction as _, TxEip1559, TxEnvelope};
+        use alloy::eips::eip2718::Encodable2718 as _;
+        let tx = TxEip1559 {
+            chain_id: 1,
+            to: alloy::primitives::TxKind::Call(to),
+            ..TxEip1559::default()
+        };
+        let one = alloy::primitives::U256::from(1u8);
+        let signed = tx.into_signed(alloy::primitives::Signature::new(one, one, false));
+        let raw = TxEnvelope::from(signed).encoded_2718();
+        serde_json::from_value(serde_json::json!({ "raw": raw })).unwrap()
+    }
+
+    /// A journaled transaction is reconciled through the wallet of the vault
+    /// its `to` names, which must be the vault its plans recorded: one
+    /// naming the other vault, or neither, keeps its journal and pays
+    /// nothing again, and a root payment needs a client that pays the root
+    /// vault to be reconciled.
+    #[tokio::test]
+    async fn a_journaled_transaction_is_reconciled_through_the_vault_it_pays() {
+        const KEY: &str = "0x4c0883a69102937d6231471b5dbb6204fe5129617082792ae468d01a3f362318";
+        let (v2, root, other) = (
+            ant_protocol::evm::Address::from([0x22; 20]),
+            ant_protocol::evm::Address::from([0x33; 20]),
+            ant_protocol::evm::Address::from([0x44; 20]),
+        );
+        let net = network(1);
+        let node = crate::data::Network::unstarted(&[], true, false)
+            .await
+            .unwrap();
+        let client = Client::from_node(std::sync::Arc::clone(node.node()), Default::default())
+            .with_wallet(Wallet::new_from_private_key(net.clone(), KEY).unwrap());
+        let root_wallet =
+            Wallet::new_from_private_key(crate::config::network_paying(&net, root), KEY).unwrap();
+        let rooted = Client::from_node(std::sync::Arc::clone(node.node()), Default::default())
+            .with_wallet(Wallet::new_from_private_key(net, KEY).unwrap())
+            .with_root_payments(root_wallet)
+            .unwrap();
+        let now = crate::runtime::system_time();
+        let v2_plans = vec![signed_plan([1; 32], 1024, now)];
+        let mut root_plans = vec![signed_plan([2; 32], 1024, now)];
+        root_plans[0].vault = PaymentVault::Root;
+
+        assert_eq!(journaled_to(&journaled_paying(root)).unwrap(), root);
+        let vault = |client: &Client, to, plans: &[ChunkPaymentPlan]| {
+            journaled_vault(client, &journaled_paying(to), plans)
+        };
+        assert_eq!(
+            vault(&rooted, root, &root_plans).unwrap(),
+            PaymentVault::Root
+        );
+        assert_eq!(vault(&rooted, v2, &v2_plans).unwrap(), PaymentVault::V2);
+        assert_eq!(vault(&client, v2, &v2_plans).unwrap(), PaymentVault::V2);
+        for error in [
+            vault(&rooted, v2, &root_plans),
+            vault(&rooted, root, &v2_plans),
+            vault(&rooted, other, &v2_plans),
+            vault(&client, root, &root_plans),
+        ] {
+            let message = error.unwrap_err().to_string();
+            assert!(message.contains("journal is kept"), "{message}");
+            assert!(message.contains("nothing is paid again"), "{message}");
+        }
+        let unrooted = vault(&client, root, &root_plans).unwrap_err().to_string();
+        assert!(unrooted.contains("with_root_payments"), "{unrooted}");
+    }
 
     #[test]
     fn only_a_sent_payment_without_an_outcome_is_rechecked() {

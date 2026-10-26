@@ -764,6 +764,15 @@ pub struct Client {
     /// agree, which a genuine incompatibility reaches immediately (every
     /// upgraded peer refuses) and a lone attacker cannot reach at all.
     settlement_refusals: SettlementRefusals,
+    /// Peers that answered `StorerUpdateRequired` to a quote request at
+    /// the root vault's settlement version
+    /// ([`root_payment::ROOT_SETTLEMENT_VERSION`]): their build can't check
+    /// a root proof. A record whose close group holds one is quoted for the
+    /// per-quote vault at once, without asking again, for as long as this
+    /// client lives: one more transaction's gas, never a refused payment.
+    /// No agreement among peers is needed, since paying the per-quote vault
+    /// is always accepted.
+    root_refusing_peers: Arc<Mutex<HashSet<PeerId>>>,
     /// The shared payment waves of this client's wallet
     /// ([`shared_wave`]).
     #[cfg(feature = "native")]
@@ -792,6 +801,7 @@ impl Client {
             unversioned_quote_peers: Arc::new(Mutex::new(HashSet::new())),
             versioned_capable_peers: Arc::new(Mutex::new(HashSet::new())),
             settlement_refusals: SettlementRefusals::default(),
+            root_refusing_peers: Arc::new(Mutex::new(HashSet::new())),
             #[cfg(feature = "native")]
             shared_waves: Arc::default(),
         }
@@ -804,6 +814,7 @@ impl Client {
         self.unversioned_quote_peers = Arc::clone(&session.unversioned_quote_peers);
         self.versioned_capable_peers = Arc::clone(&session.versioned_capable_peers);
         self.settlement_refusals = session.settlement_refusals.clone();
+        self.root_refusing_peers = Arc::clone(&session.root_refusing_peers);
         self
     }
 
@@ -837,6 +848,7 @@ impl Client {
             unversioned_quote_peers: Arc::new(Mutex::new(HashSet::new())),
             versioned_capable_peers: Arc::new(Mutex::new(HashSet::new())),
             settlement_refusals: SettlementRefusals::default(),
+            root_refusing_peers: Arc::new(Mutex::new(HashSet::new())),
             shared_waves: Arc::default(),
             controller,
             persist_path,
@@ -897,6 +909,7 @@ impl Client {
             unversioned_quote_peers: Arc::new(Mutex::new(HashSet::new())),
             versioned_capable_peers: Arc::new(Mutex::new(HashSet::new())),
             settlement_refusals: SettlementRefusals::default(),
+            root_refusing_peers: Arc::new(Mutex::new(HashSet::new())),
             shared_waves: Arc::default(),
             controller,
             persist_path,
@@ -1156,6 +1169,12 @@ impl Client {
     /// declaration.
     pub(crate) fn unversioned_quote_peers(&self) -> Arc<Mutex<HashSet<PeerId>>> {
         Arc::clone(&self.unversioned_quote_peers)
+    }
+
+    /// Handle to the peers that refused a quote request at the root vault's
+    /// settlement version (the field's comment says how it is used).
+    pub(crate) fn root_refusing_peers(&self) -> Arc<Mutex<HashSet<PeerId>>> {
+        Arc::clone(&self.root_refusing_peers)
     }
 
     /// Handle to the set of peers already seen answering a versioned request.

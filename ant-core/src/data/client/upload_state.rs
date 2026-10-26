@@ -1413,6 +1413,31 @@ mod tests {
         }
     }
 
+    /// A kept root proof has no age test: the root vault's record of its
+    /// wave never expires, so the proof is reused, not paid for again,
+    /// however old its quotes are, as long as it is its record's.
+    #[test]
+    fn a_kept_root_proof_is_reused_whatever_its_age() {
+        let quoted = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+        let mut plans = (0u8..3)
+            .map(|n| plan_priced(&[n, 0x0e], quoted, &[10, 20, 30]))
+            .collect::<Vec<_>>();
+        let payment = paid_root_wave(&mut plans);
+        let mut state = UploadState::default();
+        for plan in &plans {
+            state.prepare(plan.clone());
+        }
+        let addresses = plans.iter().map(|p| p.address).collect::<Vec<_>>();
+        state.start_payment(false, addresses.clone()).unwrap();
+        state.confirm_payment(&addresses, &payment, quoted).unwrap();
+        let later = quoted + std::time::Duration::from_secs(10 * 365 * 86_400);
+        for plan in &plans {
+            let bytes = state.proof(&plan.address).unwrap();
+            assert!(reusable_proof(&plan.address, bytes, later));
+            assert!(state.is_paid(&plan.address, later));
+        }
+    }
+
     /// A root plan confirmed by a payment that names no root wave gets no
     /// proof, and its plan is kept.
     #[test]

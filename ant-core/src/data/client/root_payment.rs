@@ -66,6 +66,134 @@ impl PaymentVault {
     }
 }
 
+/// The settlement version a quote for a record paid through the root vault
+/// asks: "root proofs accepted". A storer whose build doesn't know it
+/// answers `StorerUpdateRequired` before quoting, so a record is never paid
+/// through the root vault to a quoter that can't check the payment.
+pub const ROOT_SETTLEMENT_VERSION: u32 = 3;
+
+/// The newest settlement version whose payments go through the per-quote
+/// vault: a record paid there is quoted at this version, or at this build's
+/// own if that is older.
+pub const V2_SETTLEMENT_VERSION: u32 = 2;
+
+impl PaymentVault {
+    /// The settlement version a quote for a record paying this vault asks.
+    ///
+    /// # Errors
+    ///
+    /// If this build can't ask it: above its `CURRENT_SETTLEMENT_VERSION`,
+    /// as root payments are until the protocol it builds against reaches
+    /// [`ROOT_SETTLEMENT_VERSION`], or below its minimum.
+    pub fn settlement_version(self) -> Result<u32> {
+        let version = match self {
+            Self::V2 => ant_protocol::CURRENT_SETTLEMENT_VERSION.min(V2_SETTLEMENT_VERSION),
+            Self::Root => ROOT_SETTLEMENT_VERSION,
+        };
+        askable_settlement_version(version)
+    }
+}
+
+/// `version`, if this build may ask quotes at it: no newer than its
+/// `CURRENT_SETTLEMENT_VERSION` and no older than its minimum.
+///
+/// # Errors
+///
+/// If it is outside those bounds.
+pub(crate) fn askable_settlement_version(version: u32) -> Result<u32> {
+    let (min, current) = (
+        ant_protocol::MIN_SUPPORTED_SETTLEMENT_VERSION,
+        ant_protocol::CURRENT_SETTLEMENT_VERSION,
+    );
+    if version > current || version < min {
+        return Err(Error::Config(format!(
+            "quotes at settlement version {version} can't be asked by this build, which              settles under versions {min} to {current}; root payments need a build whose              protocol settles under version {ROOT_SETTLEMENT_VERSION}"
+        )));
+    }
+    Ok(version)
+}
+
+/// The fewest records a payment pays through the root vault when some of
+/// its records pay the per-quote vault: below it, all of them pay the
+/// per-quote vault. From the gas model: the gas a root wave saves per
+/// record outweighs a second transaction's base gas from 3 records on;
+/// where approvals are exact ([`ROOT_SPLIT_MIN_RECORDS_EXACT_APPROVALS`]) a
+/// second approval has to be outweighed too.
+pub const ROOT_SPLIT_MIN_RECORDS: usize = 3;
+
+/// [`ROOT_SPLIT_MIN_RECORDS`] for a payer whose approvals are exact, so a
+/// split also costs a second approval.
+pub const ROOT_SPLIT_MIN_RECORDS_EXACT_APPROVALS: usize = 5;
+
+/// Decide which of a payment's `plans` pay which vault, before any of them
+/// is kept or signed. Every plan comes quoted for the vault it can pay: a
+/// root plan's quoters all accept root proofs, and a per-quote plan is one
+/// whose close group holds a quoter that doesn't. A root plan's quotes are
+/// the same as a per-quote plan's, so one can pay the per-quote vault, never
+/// the reverse. Plans `fixed` says were kept from an earlier attempt never
+/// move: they pay the vault they recorded.
+///
+/// - **When a split costs more than it saves.** A payment uses both vaults
+///   only when at least [`ROOT_SPLIT_MIN_RECORDS`] of its records pay root
+///   ([`ROOT_SPLIT_MIN_RECORDS_EXACT_APPROVALS`] with `exact_approvals`);
+///   otherwise its root plans move to the per-quote vault.
+/// - **The envelope never pays alone.** When the per-quote vault's payment
+///   would hold the `envelope` alone, one root content record joins it if
+///   the root payment still meets the threshold without it; otherwise the
+///   payment's root plans all move.
+///
+/// Returns how many plans moved.
+pub(crate) fn split_vaults<'a>(
+    plans: impl IntoIterator<Item = &'a mut ChunkPaymentPlan>,
+    fixed: impl Fn(&ChunkPaymentPlan) -> bool,
+    envelope: Option<&[u8; 32]>,
+    exact_approvals: bool,
+) -> usize {
+    let threshold = if exact_approvals {
+        ROOT_SPLIT_MIN_RECORDS_EXACT_APPROVALS
+    } else {
+        ROOT_SPLIT_MIN_RECORDS
+    };
+    let mut plans = plans.into_iter().collect::<Vec<_>>();
+    let roots = plans
+        .iter()
+        .filter(|plan| plan.vault == PaymentVault::Root)
+        .count();
+    let v2 = plans.len() - roots;
+    if roots == 0 || v2 == 0 {
+        return 0;
+    }
+    let mut move_all = roots < threshold;
+    let mut join_envelope = false;
+    if !move_all {
+        let envelope_alone = v2 == 1
+            && plans
+                .iter()
+                .any(|plan| plan.vault == PaymentVault::V2 && Some(&plan.address) == envelope);
+        if envelope_alone {
+            let movable = plans
+                .iter()
+                .any(|plan| plan.vault == PaymentVault::Root && !fixed(plan));
+            if movable && roots > threshold {
+                join_envelope = true;
+            } else {
+                move_all = true;
+            }
+        }
+    }
+    let mut moved = 0;
+    for plan in &mut plans {
+        if plan.vault != PaymentVault::Root || fixed(plan) {
+            continue;
+        }
+        if move_all || (join_envelope && moved == 0) {
+            plan.vault = PaymentVault::V2;
+            moved += 1;
+        }
+    }
+    moved
+}
+
 /// The vault every one of `plans` pays.
 ///
 /// # Errors
@@ -378,5 +506,92 @@ mod tests {
         assert!(vault_of(&plans).is_err());
         plans[0].vault = PaymentVault::Root;
         assert_eq!(vault_of(&plans).unwrap(), PaymentVault::Root);
+    }
+
+    /// `roots` plans for the root vault and `v2` for the per-quote vault.
+    fn mixed(roots: u8, v2: u8) -> Vec<ChunkPaymentPlan> {
+        let mut all = plans(roots + v2);
+        for plan in &mut all[..usize::from(roots)] {
+            plan.vault = PaymentVault::Root;
+        }
+        all
+    }
+
+    fn root_count(plans: &[ChunkPaymentPlan]) -> usize {
+        plans
+            .iter()
+            .filter(|plan| plan.vault == PaymentVault::Root)
+            .count()
+    }
+
+    /// A payment uses both vaults only when at least 3 of its records pay
+    /// root, or 5 where approvals are exact; below that, its root plans
+    /// move to the per-quote vault. A payment to one vault never changes.
+    #[test]
+    fn a_split_pays_both_vaults_only_when_it_saves_gas() {
+        for (roots, v2, exact, moved) in [
+            (2, 1, false, 2),
+            (3, 1, false, 0),
+            (4, 1, true, 4),
+            (5, 1, true, 0),
+            (1, 0, false, 0),
+            (0, 4, false, 0),
+        ] {
+            let mut all = mixed(roots, v2);
+            assert_eq!(
+                split_vaults(all.iter_mut(), |_| false, None, exact),
+                moved,
+                "{roots} root, {v2} per-quote, exact {exact}"
+            );
+            assert_eq!(root_count(&all), usize::from(roots) - moved);
+        }
+        assert_eq!(ROOT_SPLIT_MIN_RECORDS, 3);
+        assert_eq!(ROOT_SPLIT_MIN_RECORDS_EXACT_APPROVALS, 5);
+    }
+
+    /// The envelope never pays alone: when it alone pays the per-quote
+    /// vault, one root content record joins it if the root payment still
+    /// meets the threshold, and otherwise the whole payment pays the
+    /// per-quote vault.
+    #[test]
+    fn a_split_never_leaves_the_envelope_alone() {
+        let mut all = mixed(4, 1);
+        let envelope = all[4].address;
+        assert_eq!(
+            split_vaults(all.iter_mut(), |_| false, Some(&envelope), false),
+            1
+        );
+        assert_eq!(root_count(&all), 3);
+        assert_eq!(all[4].vault, PaymentVault::V2, "the envelope stays");
+
+        let mut all = mixed(3, 1);
+        let envelope = all[3].address;
+        assert_eq!(
+            split_vaults(all.iter_mut(), |_| false, Some(&envelope), false),
+            3
+        );
+        assert_eq!(root_count(&all), 0);
+
+        // With content beside it, nothing moves.
+        let mut all = mixed(3, 2);
+        let envelope = all[4].address;
+        assert_eq!(
+            split_vaults(all.iter_mut(), |_| false, Some(&envelope), false),
+            0
+        );
+    }
+
+    /// A plan kept from an earlier attempt pays the vault it recorded,
+    /// whatever the split decides for the others.
+    #[test]
+    fn a_kept_plan_never_changes_vault() {
+        let mut all = mixed(2, 1);
+        let kept = all[0].address;
+        assert_eq!(
+            split_vaults(all.iter_mut(), |plan| plan.address == kept, None, false),
+            1
+        );
+        assert_eq!(all[0].vault, PaymentVault::Root);
+        assert_eq!(all[1].vault, PaymentVault::V2);
     }
 }

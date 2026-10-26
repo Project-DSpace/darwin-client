@@ -359,9 +359,15 @@ impl Client {
             // network holds already needs nothing more. A pointer's write
             // looks up its own close group.
             let put_peers = if data_type == ant_protocol::DATA_TYPE_CHUNK {
-                self.get_store_quote_plan_split(routing, content, data_size, data_type)
-                    .await?
-                    .put_peers
+                self.get_store_quote_plan_split(
+                    routing,
+                    content,
+                    data_size,
+                    data_type,
+                    super::root_payment::PaymentVault::V2,
+                )
+                .await?
+                .put_peers
             } else {
                 Vec::new()
             };
@@ -512,7 +518,13 @@ impl Client {
 
         // 1. Collect at least one witnessed quote from the network
         let quote_plan = self
-            .get_store_quote_plan_split(routing, content, data_size, data_type)
+            .get_store_quote_plan_split(
+                routing,
+                content,
+                data_size,
+                data_type,
+                super::root_payment::PaymentVault::V2,
+            )
             .await?;
         let quotes_with_peers = quote_plan.quotes;
         let median_quote_issuer =

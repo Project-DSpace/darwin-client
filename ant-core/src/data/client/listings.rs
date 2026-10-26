@@ -58,9 +58,9 @@ use ant_listings::{
     push_request_id, quorum_needed, verify_listing_receipts, AddressWalk, ChangesResponse,
     CheckLevel, Envelope, EnvelopeProof, IndexWalk, Listing, ListingCheck, ListingKey,
     ListingPayment, ListingsBody, ListingsMessage, Lookup, MergedListing, NodeReport, PaidAt,
-    PaymentError, PaymentLog, PaymentReceipt, ProvenUpload, VaultSet, WalkOutcome, WalkResult,
-    CLOCK_MARGIN, DATA_PAYMENT_MADE_TOPIC, FIRST_SEEN_ROUNDING, MAX_LIST_LIMIT, QUORUM_THRESHOLD,
-    TOPIC, WALK_FREE_LISTINGS, WATCH_LEASE,
+    PaymentError, PaymentLog, PaymentReceipt, ProvenUpload, RootVault, VaultSet, WalkOutcome,
+    WalkResult, CLOCK_MARGIN, DATA_PAYMENT_MADE_TOPIC, FIRST_SEEN_ROUNDING, MAX_LIST_LIMIT,
+    QUORUM_THRESHOLD, TOPIC, WALK_FREE_LISTINGS, WATCH_LEASE,
 };
 use ant_protocol::evm::{Amount, Network as EvmNetwork, QuoteHash};
 use ant_protocol::transport::{MultiAddr, P2PEvent, P2PNode, PeerId};
@@ -2490,8 +2490,8 @@ const MAX_KNOWN_BLOCKS: usize = 4_096;
 pub struct ListingChain {
     rpc: Rpc,
     vault: [u8; 20],
-    /// The vaults whose payments this reader reads: `vault` alone, until
-    /// the readers read a root vault's payments too.
+    /// The vaults whose payments this reader reads: `vault`, and the root
+    /// vault where the reader knows one ([`Self::with_root_vault`]).
     vaults: VaultSet,
     /// The block the vault was deployed in, where known.
     vault_deployment_block: Option<u64>,
@@ -2619,6 +2619,12 @@ impl ListingChain {
         let mut vault = [0u8; 20];
         vault.copy_from_slice(network.payment_vault_address().as_slice());
         let mut reader = Self::with_rpc_setup(urls, logs_order, chain_id, vault)?;
+        if let Some(root) = crate::config::root_vault_address(network) {
+            reader = reader.with_root_vault(RootVault {
+                address: root.into_array(),
+                token: network.payment_token_address().into_array(),
+            });
+        }
         if let Some(block) = crate::config::vault_deployment_block(network) {
             reader = reader.with_vault_deployment_block(block);
         }
@@ -2774,6 +2780,17 @@ impl ListingChain {
     #[must_use]
     pub fn with_vault_deployment_block(mut self, block: u64) -> Self {
         self.vault_deployment_block = Some(block);
+        self
+    }
+
+    /// This reader, reading the payments of the root vault `root` beside
+    /// the per-quote vault's: each log query asks both addresses in one
+    /// `eth_getLogs`, and a payment is checked by the vault whose log it is
+    /// (`ant_listings::VaultSet`). Payments to the root vault are recorded
+    /// a wave at a time; its token's transfers show what each payee got.
+    #[must_use]
+    pub fn with_root_vault(mut self, root: RootVault) -> Self {
+        self.vaults = VaultSet::with_root(self.vault, root);
         self
     }
 
@@ -3813,8 +3830,17 @@ impl ListingChain {
                 None => Value::Null,
             })
             .collect();
+        // Both vaults' logs in one query where the reader knows a root
+        // vault; one address, as before, where it doesn't.
+        let address = match self.vaults.root {
+            Some(root) => json!([
+                format!("0x{}", hex::encode(self.vault)),
+                format!("0x{}", hex::encode(root.address)),
+            ]),
+            None => json!(format!("0x{}", hex::encode(self.vault))),
+        };
         let filter = json!({
-            "address": format!("0x{}", hex::encode(self.vault)),
+            "address": address,
             "fromBlock": quantity(from),
             "toBlock": quantity(to),
             "topics": topics,
@@ -4131,8 +4157,17 @@ pub(crate) mod test_chain {
                         .and_then(parse_u64)
                         .unwrap_or(0);
                     let to = filter["toBlock"].as_str().and_then(parse_u64).unwrap_or(0);
-                    // Only the contract asked about, as a chain answers.
-                    let address = filter["address"].as_str().and_then(parse_bytes::<20>);
+                    // Only the contracts asked about, as a chain answers: one
+                    // address, or a list of them.
+                    let address: Option<Vec<[u8; 20]>> = match &filter["address"] {
+                        Value::String(one) => parse_bytes::<20>(one).map(|one| vec![one]),
+                        Value::Array(many) => Some(
+                            many.iter()
+                                .filter_map(|one| one.as_str().and_then(parse_bytes::<20>))
+                                .collect(),
+                        ),
+                        _ => None,
+                    };
                     let topics: Vec<Option<[u8; 32]>> = filter["topics"]
                         .as_array()
                         .map(|topics| {
@@ -4148,7 +4183,9 @@ pub(crate) mod test_chain {
                             continue;
                         }
                         for log in &receipt.logs {
-                            let matches = address.is_none_or(|address| log.address == address)
+                            let matches = address
+                                .as_ref()
+                                .is_none_or(|addresses| addresses.contains(&log.address))
                                 && topics.iter().enumerate().all(|(i, topic)| {
                                     topic.is_none_or(|topic| log.topics.get(i) == Some(&topic))
                                 });
@@ -4382,6 +4419,71 @@ mod tests {
         dirty[64] = 1;
         assert!(RootRecord::from_words(&dirty).is_err());
         assert!(RootRecord::from_words(&[words.as_slice(), &[0; 32]].concat()).is_err());
+    }
+
+    /// A reader that knows a root vault asks both vaults' logs in one
+    /// `eth_getLogs`, and finds a payment the root vault's log records,
+    /// which a reader of the per-quote vault alone doesn't see. Its vault
+    /// set names both, so each payment is checked by the vault that
+    /// emitted its log.
+    #[tokio::test]
+    async fn a_reader_with_a_root_vault_reads_both_vaults_logs_in_one_query() {
+        const ROOT: [u8; 20] = [0x7a; 20];
+        let quote = signed_quote([0x31; 32], 30);
+        let mut log = paying_log(&quote, 4);
+        log.address = ROOT;
+        let mut chain = MockChain::with_blocks(10, 1_700_000_000);
+        chain.add_receipt(PaymentReceipt {
+            tx_hash: [0x41; 32],
+            success: true,
+            block_number: 5,
+            logs: vec![log],
+        });
+        let mock = Arc::new(Mutex::new(chain));
+        let url = serve(Arc::clone(&mock)).await;
+        let topics = [
+            Some(DATA_PAYMENT_MADE_TOPIC),
+            None,
+            None,
+            Some(quote.hash().0),
+        ];
+
+        let v2_only = reader(url.clone());
+        assert!(v2_only.vault_logs(&topics, 0, 9).await.unwrap().is_empty());
+        assert_eq!(v2_only.vaults(), &VAULTS);
+
+        let root = RootVault {
+            address: ROOT,
+            token: [0x11; 20],
+        };
+        let both = reader(url).with_root_vault(root);
+        let before = mock.lock().unwrap().calls_to("eth_getLogs");
+        let found = both.vault_logs(&topics, 0, 9).await.unwrap();
+        assert_eq!(mock.lock().unwrap().calls_to("eth_getLogs"), before + 1);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].tx_hash, [0x41; 32]);
+        assert_eq!(both.vaults(), &VaultSet::with_root(VAULT, root));
+        assert_eq!(
+            both.vault(),
+            &VAULT,
+            "the per-quote vault stays the reader's own"
+        );
+    }
+
+    /// The bundled network's reader reads the root vault the network
+    /// config names, paying the network's token.
+    #[test]
+    fn the_bundled_networks_reader_reads_its_root_vault() {
+        let bundled = crate::config::bundled_payment_network().unwrap();
+        let chain = ListingChain::new(&bundled).unwrap();
+        let root = crate::config::root_vault_address(&bundled).unwrap();
+        assert_eq!(
+            chain.vaults().root,
+            Some(RootVault {
+                address: root.into_array(),
+                token: bundled.payment_token_address().into_array(),
+            })
+        );
     }
     use ant_listings::{
         first_seen_at, Flags, ListingError, Metadata, Payment, PaymentField, ShownFields,

@@ -407,8 +407,10 @@ fn payment_plan_from_quotes(
     data_size: u64,
     quote_plan: StoreQuotePlan,
     ceiling: Option<Amount>,
-    vault: PaymentVault,
 ) -> Result<ChunkPaymentPlan> {
+    // The vault the quotes were asked for, which may be the per-quote vault
+    // for a client paying the root vault (`StoreQuotePlan::vault`).
+    let vault = quote_plan.vault;
     let quotes_with_peers = quote_plan.quotes;
 
     // Capture the ordered PUT target set for replication. This can be
@@ -498,13 +500,26 @@ impl Client {
         address: XorName,
         data_size: u64,
     ) -> Result<Option<ChunkPaymentPlan>> {
+        self.prepare_chunk_payment_plan_in(address, data_size, self.payment_vault())
+            .await
+    }
+
+    /// [`Self::prepare_chunk_payment_plan`] for `vault`: the plan pays it,
+    /// or the per-quote vault where the record's close group can't check a
+    /// root payment.
+    pub(crate) async fn prepare_chunk_payment_plan_in(
+        &self,
+        address: XorName,
+        data_size: u64,
+        vault: PaymentVault,
+    ) -> Result<Option<ChunkPaymentPlan>> {
         if data_size > ant_protocol::MAX_CHUNK_SIZE as u64 {
             return Err(Error::InvalidData(
                 "chunk exceeds the protocol size limit".into(),
             ));
         }
         let quote_plan = match self
-            .get_store_quote_plan(&address, data_size, DATA_TYPE_CHUNK)
+            .get_store_quote_plan(&address, data_size, DATA_TYPE_CHUNK, vault)
             .await
         {
             Ok(plan) => plan,
@@ -519,7 +534,6 @@ impl Client {
             data_size,
             quote_plan,
             self.config().max_chunk_price,
-            self.payment_vault(),
         )
         .map(Some)
     }
@@ -540,14 +554,19 @@ impl Client {
             return Err(Error::ClientUpdateRequired(refusal));
         }
         let quote_plan = self
-            .get_store_quote_plan_split(routing, content, data_size, data_type)
+            .get_store_quote_plan_split(
+                routing,
+                content,
+                data_size,
+                data_type,
+                self.payment_vault(),
+            )
             .await?;
         payment_plan_from_quotes(
             *content,
             data_size,
             quote_plan,
             self.config().max_chunk_price,
-            self.payment_vault(),
         )
     }
 
