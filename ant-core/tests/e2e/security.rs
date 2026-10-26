@@ -19,8 +19,10 @@ use crate::support::runner::Case;
 use crate::support::MiniTestnet;
 use ant_core::data::{compute_address, Client, RecordWeight, SingleNodeQuotePayment};
 use ant_protocol::evm::{Amount, EncodedPeerId, ProofOfPayment, RewardsAddress, TxHash};
+use ant_protocol::payment::pricing::record_weight;
 use ant_protocol::payment::{serialize_single_node_proof, PaymentProof};
 use ant_protocol::transport::PeerId;
+use ant_protocol::DATA_TYPE_CHUNK;
 use bytes::Bytes;
 use std::sync::Arc;
 
@@ -383,7 +385,10 @@ async fn test_attack_underpayment_single_node(testnet: Arc<MiniTestnet>) {
         }
     }
 
-    let mut payment = SingleNodeQuotePayment::from_quotes(quotes_for_payment, RecordWeight::FULL)
+    // At the chunk's own size class, the amount a storer requires of it: a
+    // full chunk's amount is several times that for a chunk this small.
+    let weight = record_weight(DATA_TYPE_CHUNK, content.len());
+    let mut payment = SingleNodeQuotePayment::from_quotes(quotes_for_payment, weight)
         .expect("payment creation should succeed");
 
     // Target the median peer specifically — it's the only one that receives
@@ -471,10 +476,14 @@ async fn test_attack_underpayment_half_price(testnet: Arc<MiniTestnet>) {
         }
     }
 
-    let mut payment = SingleNodeQuotePayment::from_quotes(quotes_for_payment, RecordWeight::FULL)
+    // At the chunk's own size class, the amount a storer requires of it:
+    // half a full chunk's amount is more than that for a chunk this small,
+    // and a storer that prices by size rightly takes it.
+    let weight = record_weight(DATA_TYPE_CHUNK, content.len());
+    let mut payment = SingleNodeQuotePayment::from_quotes(quotes_for_payment, weight)
         .expect("payment creation should succeed");
 
-    // Halve the median payment (3× → ~1.5×).
+    // Halve the median payment (3× → ~1.5×, of the chunk's weighted price).
     // Target the median peer — only it verifies the amount it received.
     let median_quote_index = payment.quotes.len() / 2;
     let original_amount = payment.quotes[median_quote_index].amount;

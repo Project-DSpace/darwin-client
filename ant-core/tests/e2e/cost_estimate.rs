@@ -435,10 +435,15 @@ async fn test_merkle_estimate_pads_to_the_billed_tree_and_the_upload_is_refused(
         "9 chunks must be billed as a padded 16-leaf tree"
     );
     assert!(single_atto > 0, "a per-chunk estimate prices every chunk");
-    assert_eq!(
-        merkle_atto * 9,
-        single_atto * 16,
-        "the merkle estimate bills 16 leaves where the per-chunk one bills 9 chunks"
+    // A merkle leaf pays a full chunk's amount whatever its size, so the
+    // merkle estimate is 16 full chunks. Paid per chunk, the 6 full data
+    // chunks pay a full chunk's amount each and the 3 shrunk DataMap chunks
+    // pay by their smaller size class: more than 6 full chunks, less than 9.
+    assert_eq!(merkle_atto % 16, 0, "16 leaves at one amount each");
+    let full_chunk = merkle_atto / 16;
+    assert!(
+        single_atto > 6 * full_chunk && single_atto < 9 * full_chunk,
+        "per-chunk estimate {single_atto}: 6 full chunks of {full_chunk} and 3 smaller ones"
     );
 
     let before = wallet_spend(testnet.wallet()).await;
