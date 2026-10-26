@@ -945,8 +945,21 @@ impl Client {
     ///
     /// Also populates the EVM network from the wallet so that
     /// token approvals work without a separate `with_evm_network` call.
+    ///
+    /// A root vault's wallet set earlier ([`Self::with_root_payments`]) is
+    /// kept only while it still passes that function's checks against
+    /// `wallet`; one of another key, token, RPC or vault is dropped, and the
+    /// client pays the per-quote vault until `with_root_payments` is called
+    /// again. Root waves are never signed by another key than the wallet's.
     #[must_use]
     pub fn with_wallet(mut self, wallet: Wallet) -> Self {
+        if self
+            .root_wallet
+            .as_ref()
+            .is_some_and(|root| root_wallet_mismatch(&wallet, root).is_some())
+        {
+            self.root_wallet = None;
+        }
         self.evm_network = Some(wallet.network().clone());
         self.wallet = Some(Arc::new(wallet));
         self
@@ -959,27 +972,22 @@ impl Client {
     /// token (`crate::config::root_wallet`). The client's network, and so
     /// the names of its checkpoints, stay the per-quote vault's.
     ///
+    /// On the bundled network the root vault is the one the client's
+    /// configuration names (`crate::config::root_vault_address`), and no
+    /// other is accepted. On any other network the vault `root_wallet` pays
+    /// is taken as given: it must be that network's root vault, the vault
+    /// its storers read root payments from, since the client approves it to
+    /// spend the wallet's tokens and every payment goes to it.
+    ///
     /// # Errors
     ///
     /// If the client has no wallet, or `root_wallet` signs with another key,
-    /// pays another token, or pays the client's own payment vault.
+    /// pays another token, pays the client's own payment vault, or, on the
+    /// bundled network, pays a vault other than its root vault.
     pub fn with_root_payments(mut self, root_wallet: Wallet) -> Result<Self> {
         let wallet = self.require_wallet()?;
-        let (network, root) = (wallet.network(), root_wallet.network());
-        if root_wallet.address() != wallet.address() {
-            return Err(Error::Payment(
-                "the root vault's wallet signs with another key than the client's wallet".into(),
-            ));
-        }
-        if root.payment_token_address() != network.payment_token_address()
-            || root.rpc_url() != network.rpc_url()
-            || root.payment_vault_address() == network.payment_vault_address()
-        {
-            return Err(Error::Payment(
-                "the root vault's wallet must pay the client's token, on its RPC, to a vault \
-                 other than the client's payment vault"
-                    .into(),
-            ));
+        if let Some(mismatch) = root_wallet_mismatch(wallet, &root_wallet) {
+            return Err(Error::Payment(mismatch.into()));
         }
         self.root_wallet = Some(Arc::new(root_wallet));
         Ok(self)
@@ -1012,13 +1020,19 @@ impl Client {
     pub(crate) fn wallet_paying(&self, vault: root_payment::PaymentVault) -> Result<&Arc<Wallet>> {
         match vault {
             root_payment::PaymentVault::V2 => self.require_wallet(),
-            root_payment::PaymentVault::Root => self.root_wallet.as_ref().ok_or_else(|| {
-                Error::Payment(
-                    "this payment is to the root vault, and the client has no wallet for it: \
-                     build the client with with_root_payments to pay or reconcile it"
-                        .into(),
-                )
-            }),
+            root_payment::PaymentVault::Root => {
+                let root = self.root_wallet.as_ref().ok_or_else(|| {
+                    Error::Payment(
+                        "this payment is to the root vault, and the client has no wallet for it: \
+                         build the client with with_root_payments to pay or reconcile it"
+                            .into(),
+                    )
+                })?;
+                if let Some(mismatch) = root_wallet_mismatch(self.require_wallet()?, root) {
+                    return Err(Error::Payment(mismatch.into()));
+                }
+                Ok(root)
+            }
         }
     }
 
@@ -1269,6 +1283,35 @@ impl Drop for Client {
         let snap = self.controller.snapshot();
         adaptive::save_snapshot_with_timeout(path, snap, DROP_SAVE_TIMEOUT);
     }
+}
+
+/// Why `root_wallet` cannot pay the root vault for a client paying through
+/// `wallet` ([`Client::with_root_payments`]), or none if it can: it must sign
+/// with `wallet`'s key and pay `wallet`'s token on its RPC, to a vault other
+/// than `wallet`'s, and on the bundled network to its root vault.
+fn root_wallet_mismatch(wallet: &Wallet, root_wallet: &Wallet) -> Option<&'static str> {
+    let (network, root) = (wallet.network(), root_wallet.network());
+    if root_wallet.address() != wallet.address() {
+        return Some("the root vault's wallet signs with another key than the client's wallet");
+    }
+    if root.payment_token_address() != network.payment_token_address()
+        || root.rpc_url() != network.rpc_url()
+        || root.payment_vault_address() == network.payment_vault_address()
+    {
+        return Some(
+            "the root vault's wallet must pay the client's token, on its RPC, to a vault \
+             other than the client's payment vault",
+        );
+    }
+    #[cfg(feature = "native")]
+    if crate::config::root_vault_address(network)
+        .is_some_and(|vault| &vault != root.payment_vault_address())
+    {
+        return Some(
+            "the root vault's wallet pays another vault than the bundled network's root vault",
+        );
+    }
+    None
 }
 
 #[cfg(test)]

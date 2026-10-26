@@ -61,6 +61,12 @@ pub(crate) const FINALIZED_REFRESH: Duration = Duration::from_secs(60);
 /// The version of the encoding of every chain fact kept, its first byte.
 const FORMAT: u8 = 1;
 
+/// The length of a receipt's or a quote's key kept by a reader of the
+/// per-quote vault alone ([`Facts::key`]): the vault (20 bytes) and the
+/// transaction or quote hash (32). A reader with a root vault keys them
+/// longer, its address and token after the vault ([`Facts::logs_key`]).
+const UNROOTED_KEY_LEN: usize = 20 + 32;
+
 /// The version of the encoding of a receipt kept, its first byte: each log
 /// with its own address and data ([`encode_receipt`]). Receipts of
 /// [`FORMAT`] held the per-quote vault's logs alone, with no address or
@@ -168,7 +174,7 @@ impl Facts {
     ///
     /// If the databases can't be opened.
     pub(crate) fn open(store: &ListingsStore, vaults: VaultSet) -> Result<Self> {
-        Ok(Self {
+        let facts = Self {
             vaults,
             store: store.clone(),
             envelopes: store.database(ENVELOPES_DB)?,
@@ -178,7 +184,9 @@ impl Facts {
             block_logs: store.database(BLOCK_LOGS_DB)?,
             held: Mutex::default(),
             finalized: tokio::sync::Mutex::default(),
-        })
+        };
+        facts.drop_unrooted();
+        Ok(facts)
     }
 
     /// Read `vaults` from now on: the receipts and quotes' payments held of
@@ -187,9 +195,55 @@ impl Facts {
     pub(crate) fn set_vaults(&mut self, vaults: VaultSet) {
         if vaults != self.vaults {
             self.vaults = vaults;
-            let mut held = self.held();
-            held.receipts.clear();
-            held.quotes.clear();
+            {
+                let mut held = self.held();
+                held.receipts.clear();
+                held.quotes.clear();
+            }
+            self.drop_unrooted();
+        }
+    }
+
+    /// For a reader with a root vault, drop the receipts and quotes'
+    /// payments kept for its per-quote vault alone ([`Self::key`] rather
+    /// than [`Self::logs_key`]), as a reader of that vault kept them before
+    /// it read a root vault. It never reads them ([`Self::logs_key`]), and
+    /// they can't be carried over: a receipt kept so lacks its logs' data
+    /// and the root vault's logs, and a quote's payments lack the root
+    /// vault's. The facts are read again as listings need them. Blocks and
+    /// block logs are keyed under the per-quote vault alone for every
+    /// reader, and stay. A failure is logged: the entries are left, unread.
+    fn drop_unrooted(&self) {
+        if self.vaults.root.is_none() {
+            return;
+        }
+        let drop = || -> heed::Result<usize> {
+            let mut txn = self.store.env().write_txn()?;
+            let mut dropped = 0;
+            for database in [&self.receipts, &self.quotes] {
+                let unrooted = database
+                    .prefix_iter(&txn, &self.vaults.v2[..])?
+                    .filter_map(|entry| {
+                        entry
+                            .map(|(key, _)| (key.len() == UNROOTED_KEY_LEN).then(|| key.to_vec()))
+                            .transpose()
+                    })
+                    .collect::<heed::Result<Vec<_>>>()?;
+                for key in &unrooted {
+                    database.delete(&mut txn, key)?;
+                }
+                dropped += unrooted.len();
+            }
+            txn.commit()?;
+            Ok(dropped)
+        };
+        match drop() {
+            Ok(0) => {}
+            Ok(dropped) => debug!(
+                "Dropped {dropped} receipt(s) and quote payment(s) kept for the per-quote vault \
+                 alone; they are read again with the root vault's logs"
+            ),
+            Err(e) => debug!("Could not drop the facts kept for the per-quote vault alone: {e}"),
         }
     }
 
@@ -884,6 +938,82 @@ mod tests {
         v2_only.set_vaults(with_root);
         assert_eq!(v2_only.kept_receipt(&[0xcc; 32]), Some(expected));
         assert!(v2_only.receipt(&[0xaa; 32]).is_none());
+    }
+
+    /// Opening the store with a root vault drops the receipts and quotes'
+    /// payments a reader of the per-quote vault alone kept, which it never
+    /// reads, and keeps its own, the blocks and the block logs.
+    #[test]
+    fn a_root_reader_drops_the_facts_kept_for_the_per_quote_vault_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let with_root = VaultSet::with_root(VAULT, ROOT);
+        let payments = vec![VaultLog {
+            tx_hash: [0xaa; 32],
+            block_number: 81_942_857,
+            log_index: 4,
+        }];
+        let store = store(dir.path());
+        {
+            let v2_only = Facts::open(&store, VAULTS).unwrap();
+            assert!(v2_only.keep(&Keep {
+                receipts: vec![receipt()],
+                blocks: vec![(81_942_857, 1_791_321_603)],
+                quotes: vec![([3; 32], payments)],
+                block_logs: vec![((81_942_857, 4), [0xaa; 32])],
+            }));
+            // A first-format receipt, as a reader kept it before receipts
+            // held their logs' addresses and data.
+            let mut txn = store.env().write_txn().unwrap();
+            v2_only
+                .receipts
+                .put(
+                    &mut txn,
+                    &v2_only.key(&[0xbb; 32]),
+                    &first_format(&receipt()),
+                )
+                .unwrap();
+            txn.commit().unwrap();
+        }
+        // Another vault's facts are not this reader's to drop.
+        let other = Facts::open(&store, VaultSet::v2_only([0x70; 20])).unwrap();
+        assert!(other.keep(&Keep {
+            receipts: vec![receipt()],
+            ..Keep::default()
+        }));
+        let unrooted = |facts: &Facts| {
+            let txn = store.env().read_txn().unwrap();
+            [&facts.receipts, &facts.quotes]
+                .into_iter()
+                .map(|database| {
+                    database
+                        .prefix_iter(&txn, &VAULT[..])
+                        .unwrap()
+                        .filter(|entry| entry.as_ref().unwrap().0.len() == UNROOTED_KEY_LEN)
+                        .count()
+                })
+                .sum::<usize>()
+        };
+        let rooted = Facts::open(&store, with_root).unwrap();
+        assert_eq!(unrooted(&rooted), 0);
+        assert!(rooted.keep(&Keep {
+            receipts: vec![root_receipt()],
+            ..Keep::default()
+        }));
+        assert!(rooted.kept_receipt(&[0xcc; 32]).is_some());
+        assert_eq!(rooted.kept_blocks(), vec![(81_942_857, 1_791_321_603)]);
+        assert_eq!(rooted.kept_block_log(81_942_857, 4), Some([0xaa; 32]));
+        assert!(other.kept_receipt(&[0xaa; 32]).is_some());
+        // A reader moved to the root vault drops them the same way, and
+        // keeps the root vault's.
+        let mut moved = Facts::open(&store, VAULTS).unwrap();
+        assert!(moved.keep(&Keep {
+            receipts: vec![receipt()],
+            ..Keep::default()
+        }));
+        assert_eq!(unrooted(&moved), 1);
+        moved.set_vaults(with_root);
+        assert_eq!(unrooted(&moved), 0);
+        assert!(moved.kept_receipt(&[0xcc; 32]).is_some());
     }
 
     #[test]
