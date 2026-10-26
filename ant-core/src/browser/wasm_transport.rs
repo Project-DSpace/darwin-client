@@ -112,6 +112,11 @@ const ENDPOINT_REFUSAL_COOLDOWN: Duration = Duration::from_secs(15);
 const REFUSAL_DETECTION_WINDOW: Duration = Duration::from_secs(3);
 const MAX_BROWSER_ROUTING_ENTRIES: usize = 256;
 const MAX_BROWSER_ENDPOINT_FAILURES: usize = 256;
+/// The peers the browser's lookups left out that it remembers, so an upload
+/// can tell whether a lookup's PUT targets are the nearest storers
+/// ([`BrowserClientPool::left_out_since`]). Past it, an upload can't tell,
+/// and leaves the judgment to the storers.
+const MAX_BROWSER_LEFT_OUT_PEERS: usize = 4096;
 const DEFAULT_BROWSER_QUOTE_CONCURRENCY: usize = 4;
 // Reserve encrypted input, decrypted frame and decoded content for every
 // physical GET, including speculative reads. This bounds transient response
@@ -200,6 +205,8 @@ struct BrowserClientPool {
     read_budget: std::sync::Arc<crate::client_engine::read_budget::ReadBudget>,
     fetch_limiter: RefCell<Option<crate::data::client::adaptive::Limiter>>,
     dial_failures: DialFailures,
+    /// The peers lookups left out ([`Self::record_left_out`]).
+    left_out: RefCell<crate::client_engine::LeftOutPeers>,
     max_clients: usize,
     clients: RefCell<HashMap<String, PoolEntry>>,
     clock: Cell<u64>,
@@ -346,6 +353,10 @@ impl BrowserClientPool {
                     ENDPOINT_REFUSAL_COOLDOWN,
                     MAX_BROWSER_ENDPOINT_FAILURES,
                 ),
+            )),
+            left_out: RefCell::new(crate::client_engine::LeftOutPeers::new(
+                std::num::NonZeroUsize::new(MAX_BROWSER_LEFT_OUT_PEERS)
+                    .expect("a non-zero capacity"),
             )),
             max_clients,
             clients: RefCell::new(HashMap::new()),
@@ -510,6 +521,33 @@ impl BrowserClientPool {
             .dial_failures
             .borrow_mut()
             .is_suppressed(&peer.to_string(), &endpoint.multiaddr)
+    }
+
+    /// A lookup, or an upload's PUT targets, left `peer` out: one the
+    /// browser holds off or can't reach, so its absence says nothing about
+    /// where it is in the network.
+    fn record_left_out(&self, peer: LookupKey) {
+        self.left_out.borrow_mut().record(peer);
+    }
+
+    /// A mark from which [`Self::left_out_since`] reads.
+    fn left_out_mark(&self) -> u64 {
+        self.left_out.borrow().mark()
+    }
+
+    /// The peers lookups or PUT targets left out since `mark`
+    /// ([`Self::left_out_mark`]), with those held off now: a dial failed
+    /// or was declined within its cooldown. `None` when some left out since
+    /// may have been forgotten.
+    fn left_out_since(&self, mark: u64) -> Option<Vec<LookupKey>> {
+        let mut peers = self.left_out.borrow().since(mark)?;
+        peers.extend(
+            self.dial_failures
+                .borrow()
+                .held_off()
+                .filter_map(|peer| parse_lookup_key(peer, "peer ID").ok()),
+        );
+        Some(peers)
     }
 
     /// Whether the browser holds `endpoint` off now: its dial failed, or it
@@ -1983,12 +2021,21 @@ impl LookupQuery<BrowserLookupCandidate> for BrowserNetworkLookupQuery {
         &mut self,
         candidate: &BrowserLookupCandidate,
     ) -> Result<bool, Self::Error> {
-        let Some(endpoint) = candidate.wire.webrtc_direct.as_ref() else {
-            return Ok(false);
-        };
-        Ok(self
-            .pool
-            .is_lookup_eligible(&candidate.wire.peer_id, endpoint))
+        let eligible = candidate
+            .wire
+            .webrtc_direct
+            .as_ref()
+            .is_some_and(|endpoint| {
+                self.pool
+                    .is_lookup_eligible(&candidate.wire.peer_id, endpoint)
+            });
+        if !eligible {
+            // Left out of this lookup's result, though it may be among the
+            // nearest: an upload must not take its absence from the PUT
+            // targets for its place in the network.
+            self.pool.record_left_out(candidate.peer_id);
+        }
+        Ok(eligible)
     }
 
     async fn query_batch(
@@ -2075,6 +2122,9 @@ impl LookupQuery<BrowserLookupCandidate> for BrowserNetworkLookupQuery {
                         Err(error) => {
                             routing.borrow_mut().remove(&responder);
                             contacted.borrow_mut().remove(&responder);
+                            // Not in the result, though it may be among the
+                            // nearest.
+                            pool.record_left_out(responder);
                             progress.report(&format!("Query {peer_id} failed: {error}"));
                             failures.borrow_mut().push(BrowserLookupFailure {
                                 peer_id,
@@ -2101,6 +2151,9 @@ impl LookupQuery<BrowserLookupCandidate> for BrowserNetworkLookupQuery {
                 // A grace-cancelled RPC says nothing about whether dialing
                 // this endpoint works. Native does not poison its dial cache
                 // here; only Connection::open failures populate that cache.
+                // Nor is the peer in the result, though it may be among the
+                // nearest.
+                self.pool.record_left_out(peer);
                 let peer_id = hex::encode(peer);
                 let message = "did not respond before the lookup grace period".to_string();
                 self.progress

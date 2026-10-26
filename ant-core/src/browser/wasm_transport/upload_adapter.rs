@@ -243,6 +243,13 @@ impl UploadAdapter for BrowserUploadAdapter<'_> {
         .into_iter()
         .flatten()
         .collect::<Vec<_>>();
+        // A PUT target the browser can't use is left out of the record's
+        // targets, as a lookup leaves out one it can't reach.
+        for (peer, _) in &plan.quoted_peers {
+            if !eligible.iter().any(|(kept, _)| kept == peer) {
+                self.network.inner.pool.record_left_out(*peer.as_bytes());
+            }
+        }
         let required = crate::quote_policy::witness_quorum(0);
         if eligible.len() < required {
             return Err(Error::InsufficientPeers(format!(
@@ -368,6 +375,12 @@ impl UploadAdapter for BrowserUploadAdapter<'_> {
             .save(self.scope, state)
             .await
             .map_err(Error::Payment)
+    }
+    fn lookup_mark(&self) -> u64 {
+        self.network.inner.pool.left_out_mark()
+    }
+    fn left_out_since(&self, mark: u64) -> Option<Vec<[u8; 32]>> {
+        self.network.inner.pool.left_out_since(mark)
     }
     fn quote_limit(&self) -> usize {
         DEFAULT_BROWSER_QUOTE_CONCURRENCY

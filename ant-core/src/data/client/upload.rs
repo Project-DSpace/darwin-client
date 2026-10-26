@@ -170,6 +170,20 @@ pub trait UploadAdapter: AdapterBounds {
     async fn checkpoint_paid_again(&self, state: &UploadState) -> Result<()> {
         self.checkpoint(state, None).await
     }
+    /// A mark from which [`Self::left_out_since`] reads, taken before a
+    /// wave's lookups.
+    fn lookup_mark(&self) -> u64 {
+        0
+    }
+    /// The peers this client left out of its lookups, or of a record's PUT
+    /// targets, since `mark` ([`Self::lookup_mark`]), and those it holds off
+    /// now: storers whose absence from a lookup's PUT targets says nothing
+    /// about where they are in the network. `None` when it can't tell. A
+    /// client that leaves no peer out on its own account, as a native one,
+    /// names none.
+    fn left_out_since(&self, _mark: u64) -> Option<Vec<[u8; 32]>> {
+        Some(Vec::new())
+    }
     /// Adapter resource ceiling; the adaptive controller still controls scheduling.
     fn quote_limit(&self) -> usize {
         usize::MAX
@@ -471,17 +485,37 @@ impl Client {
         let mut failed = Vec::new();
         let mut held = None;
         for (wave_index, wave) in waves.iter().enumerate() {
-            let mut plans = match prefetched.take() {
-                Some(plans) => plans?,
+            let (mark, mut plans) = match prefetched.take() {
+                Some((mark, plans)) => (mark, plans?),
                 None => {
-                    self.prepare_upload_wave(wave, state, adapter, total)
-                        .await?
+                    let mark = adapter.lookup_mark();
+                    let plans = self
+                        .prepare_upload_wave(wave, state, adapter, total)
+                        .await?;
+                    (mark, plans)
                 }
             };
+            let left_out = adapter.left_out_since(mark);
+            let outside = plans
+                .iter()
+                .filter_map(|(_, plan)| plan.as_ref())
+                .filter(|plan| proof_paid_outside(state, plan, left_out.as_deref()))
+                .map(|plan| plan.address)
+                .collect::<Vec<_>>();
+            if !outside.is_empty() {
+                for address in &outside {
+                    tracing::info!(
+                        "the node an earlier run paid for {} is no longer among its {} nearest \
+                         storers; paying for it again, once",
+                        hex::encode(address),
+                        crate::quote_policy::PUT_TARGET_WIDTH
+                    );
+                }
+                drop_to_pay_again(state, adapter, &outside).await?;
+            }
             let mut payable = Vec::new();
             for (record, plan) in &plans {
                 if let Some(plan) = plan {
-                    drop_proof_paid_outside(state, plan);
                     if !state.is_paid(&plan.address, crate::runtime::system_time()) {
                         state.prepare(plan.clone());
                         payable.push(plan.clone());
@@ -520,7 +554,11 @@ impl Client {
                 async {
                     match waves.get(wave_index + 1) {
                         Some(next) => {
-                            Some(self.prepare_upload_wave(next, state, adapter, total).await)
+                            let mark = adapter.lookup_mark();
+                            Some((
+                                mark,
+                                self.prepare_upload_wave(next, state, adapter, total).await,
+                            ))
                         }
                         None => None,
                     }
@@ -690,17 +728,12 @@ impl Client {
                  paid for it; paying for it again, once",
                 hex::encode(record.address)
             );
-            state.mark_paid_again(record.address);
         }
-        // The marks are saved first, the refused proofs still kept, so a
-        // crash before the proofs are dropped leaves them marked, never
-        // dropped unmarked; a mark that can't be saved stops the payment.
-        adapter.checkpoint_paid_again(state).await?;
-        for record in records {
-            state.drop_proof(&record.address);
-        }
-        // Saved before anything is paid, so no later run pays again.
-        adapter.checkpoint(state, None).await?;
+        let addresses = records
+            .iter()
+            .map(|record| record.address)
+            .collect::<Vec<_>>();
+        drop_to_pay_again(state, adapter, &addresses).await?;
         let mut plans = self
             .prepare_upload_wave(records, state, adapter, total)
             .await?;
@@ -1388,29 +1421,82 @@ impl PerChunkWaves {
     }
 }
 
-/// Drop the proof `state` holds for `plan`'s record if an earlier run paid
-/// it and `plan`, a fresh lookup's, puts the paid node outside the record's
-/// [`PUT_TARGET_WIDTH`](crate::quote_policy::PUT_TARGET_WIDTH) nearest
-/// storers, the width within which storers take a proof: the record is then
-/// paid again with `plan`. A proof this run paid
-/// ([`UploadState::paid_this_run`]) or a Merkle one is kept. Returns whether
-/// it dropped one.
-pub(crate) fn drop_proof_paid_outside(state: &mut UploadState, plan: &ChunkPaymentPlan) -> bool {
-    if state.paid_this_run().contains(&plan.address)
-        || !state
-            .proof(&plan.address)
-            .is_some_and(|proof| paid_outside_width(proof, &plan.quoted_peers))
-    {
-        return false;
+/// Mark `addresses` paid again ([`UploadState::mark_paid_again`]) and drop
+/// the proofs `state` keeps for them, so they are paid again, once. The
+/// marks are saved first ([`UploadAdapter::checkpoint_paid_again`]), the
+/// proofs still kept, so a crash before the proofs are dropped leaves them
+/// marked, never dropped unmarked; a mark that can't be saved stops the
+/// payment. The dropped proofs are saved before anything is paid, so no
+/// later run pays again.
+async fn drop_to_pay_again<A: UploadAdapter>(
+    state: &mut UploadState,
+    adapter: &A,
+    addresses: &[[u8; 32]],
+) -> Result<()> {
+    for address in addresses {
+        state.mark_paid_again(*address);
     }
-    tracing::info!(
-        "the node an earlier run paid for {} is no longer among its {} nearest storers; \
-         paying for it again",
-        hex::encode(plan.address),
-        crate::quote_policy::PUT_TARGET_WIDTH
-    );
-    state.drop_proof(&plan.address);
-    true
+    adapter.checkpoint_paid_again(state).await?;
+    for address in addresses {
+        state.drop_proof(address);
+    }
+    adapter.checkpoint(state, None).await
+}
+
+/// Whether the proof `state` keeps for `plan`'s record is to be dropped and
+/// the record paid again with `plan`, a fresh lookup's: an earlier run paid
+/// it, and `plan` puts the paid node outside the record's
+/// [`PUT_TARGET_WIDTH`](crate::quote_policy::PUT_TARGET_WIDTH) nearest
+/// storers ([`paid_outside_width`]), the width within which storers take a
+/// proof. Only when the client left out none of the storers that could be
+/// within the width (`left_out`, [`UploadAdapter::left_out_since`]): not the
+/// paid node, nor any peer nearer the record than the width's last PUT
+/// target. A lookup that left one out names a farther peer in its place,
+/// and the paid node may be within the width on the network. With
+/// `left_out` `None`, the client can't tell. A proof this run paid
+/// ([`UploadState::paid_this_run`]), a Merkle one, or one for a record paid
+/// again once already ([`UploadState::was_paid_again`]) is kept: the storers
+/// decide, and a refusal is paid for at most once ([`absorb_stores`]).
+pub(crate) fn proof_paid_outside(
+    state: &UploadState,
+    plan: &ChunkPaymentPlan,
+    left_out: Option<&[[u8; 32]]>,
+) -> bool {
+    let Some(left_out) = left_out else {
+        return false;
+    };
+    !state.paid_this_run().contains(&plan.address)
+        && !state.was_paid_again(&plan.address)
+        && state.proof(&plan.address).is_some_and(|proof| {
+            paid_outside_width(proof, &plan.quoted_peers)
+                && paid_node(proof).is_some_and(|paid| {
+                    !left_out_within_width(&plan.address, &paid, &plan.quoted_peers, left_out)
+                })
+        })
+}
+
+/// Whether `left_out`, peers the client left out of its lookups, holds a
+/// storer that could be within `address`'s width but missing from `peers`,
+/// its PUT targets, nearest first: the paid node `paid`, or a peer nearer
+/// `address` than the width's last of `peers`. A list shorter than the
+/// width can't show who is outside it, so it answers `true`.
+pub(crate) fn left_out_within_width(
+    address: &[u8; 32],
+    paid: &[u8; 32],
+    peers: &[(
+        ant_protocol::transport::PeerId,
+        Vec<ant_protocol::transport::MultiAddr>,
+    )],
+    left_out: &[[u8; 32]],
+) -> bool {
+    let distance = |peer: &[u8; 32]| -> [u8; 32] { std::array::from_fn(|i| peer[i] ^ address[i]) };
+    let Some((last, _)) = peers.get(crate::quote_policy::PUT_TARGET_WIDTH - 1) else {
+        return true;
+    };
+    let bound = distance(last.as_bytes());
+    left_out
+        .iter()
+        .any(|peer| peer == paid || distance(peer) < bound)
 }
 
 /// Whether `peers`, a fresh lookup's PUT targets, put the node `proof` paid
@@ -1992,7 +2078,8 @@ mod tests {
 
     /// An earlier run's paid proof is kept while its paid node is among
     /// the storers' width in a fresh lookup, and dropped, to be paid again,
-    /// once it isn't; a proof this run paid is never dropped so.
+    /// once it isn't; a proof this run paid, or one for a record paid again
+    /// once already, is never dropped so.
     #[test]
     fn a_proof_is_paid_again_only_once_its_paid_node_is_outside_the_width() {
         use crate::data::client::upload_state::test_state::{plan_priced, transactions};
@@ -2023,33 +2110,36 @@ mod tests {
                 .unwrap();
             state
         };
+        let none_left_out: Option<&[[u8; 32]]> = Some(&[]);
         // Among the 20 nearest, last of them: kept.
         let mut inside = others(19);
         inside.push(median);
-        let mut state = state_paid();
-        assert!(!drop_proof_paid_outside(&mut state, &with_targets(inside)));
-        assert!(state.proof(&paid.address).is_some());
+        let state = state_paid();
+        assert!(!proof_paid_outside(
+            &state,
+            &with_targets(inside),
+            none_left_out
+        ));
         // The 21st: dropped.
         let mut outside = others(20);
         outside.push(median);
-        assert!(drop_proof_paid_outside(
-            &mut state,
-            &with_targets(outside.clone())
-        ));
-        assert!(state.proof(&paid.address).is_none());
+        let outside = with_targets(outside);
+        assert!(proof_paid_outside(&state, &outside, none_left_out));
         // Paid by this run: kept.
-        let mut state = state_paid();
-        state.add_paid_this_run([paid.address]);
-        assert!(!drop_proof_paid_outside(&mut state, &with_targets(outside)));
-        assert!(state.proof(&paid.address).is_some());
+        let mut this_run = state_paid();
+        this_run.add_paid_this_run([paid.address]);
+        assert!(!proof_paid_outside(&this_run, &outside, none_left_out));
+        // Paid again once already, by this rule or the storers' refusal:
+        // kept, so the record is paid again at most once.
+        let mut marked = state_paid();
+        marked.mark_paid_again(paid.address);
+        assert!(!proof_paid_outside(&marked, &outside, none_left_out));
         // A lookup that fell back to the close group: 7 targets, the paid
         // node not among them. Storers in places 8 to 20 still take the
         // proof, so it is kept, here and when a record is paid on its own
         // (`settle_record` decides by the same check).
-        let mut state = state_paid();
         let close_group = with_targets(others(7));
-        assert!(!drop_proof_paid_outside(&mut state, &close_group));
-        assert!(state.proof(&paid.address).is_some());
+        assert!(!proof_paid_outside(&state, &close_group, none_left_out));
         let proof = state.proof(&paid.address).unwrap();
         assert!(!paid_outside_width(proof, &close_group.quoted_peers));
         assert!(!paid_outside_width(
@@ -2059,6 +2149,64 @@ mod tests {
         assert!(paid_outside_width(
             proof,
             &with_targets(others(20)).quoted_peers
+        ));
+    }
+
+    /// A paid node missing from a fresh lookup's PUT targets only because
+    /// the client left it out (a browser holds it off after a failed or
+    /// declined dial, or its lookup skipped it) is not taken to be outside
+    /// the width: the proof is kept and the storers decide. So is one whose
+    /// lookup left out any peer nearer the record than the width's last
+    /// target, and one whose client can't tell what it left out. A peer
+    /// left out farther than the width's last changes nothing.
+    #[test]
+    fn a_paid_node_the_client_left_out_does_not_drop_the_proof() {
+        use crate::data::client::upload_state::test_state::{plan_priced, transactions};
+        use ant_protocol::transport::PeerId;
+        let now = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000);
+        let paid = plan_priced(b"paid earlier", now, &[30, 10, 20]);
+        let median = paid
+            .peer_quotes
+            .iter()
+            .find(|(_, quote)| quote.price == ant_protocol::evm::Amount::from(20u64))
+            .map(|(peer, _)| *peer.as_bytes())
+            .unwrap();
+        let mut state = UploadState::default();
+        state.prepare(paid.clone());
+        state
+            .confirm(&[paid.address], &transactions(&paid), now)
+            .unwrap();
+        // The 20 eligible peers a lookup found, the paid node not among them.
+        let mut fresh = paid.clone();
+        fresh.quoted_peers = (0..crate::quote_policy::PUT_TARGET_WIDTH)
+            .map(|i| {
+                let byte = u8::try_from(i + 100).unwrap();
+                (PeerId::from_bytes([byte; 32]), Vec::new())
+            })
+            .collect();
+        let mut nearest = paid.address;
+        nearest[31] ^= 1;
+        let farthest = paid.address.map(|byte| !byte);
+        assert!(proof_paid_outside(&state, &fresh, Some(&[])));
+        // Held off: kept.
+        assert!(!proof_paid_outside(&state, &fresh, Some(&[median])));
+        // A nearer peer left out: kept.
+        assert!(!proof_paid_outside(&state, &fresh, Some(&[nearest])));
+        // Can't tell: kept.
+        assert!(!proof_paid_outside(&state, &fresh, None));
+        // Only a farther peer left out: dropped.
+        assert!(proof_paid_outside(&state, &fresh, Some(&[farthest])));
+        assert!(!left_out_within_width(
+            &paid.address,
+            &median,
+            &fresh.quoted_peers,
+            &[farthest]
+        ));
+        assert!(left_out_within_width(
+            &paid.address,
+            &median,
+            &fresh.quoted_peers,
+            &[farthest, median]
         ));
     }
 
@@ -2190,8 +2338,7 @@ mod tests {
                 )
             })
             .collect();
-        assert!(!drop_proof_paid_outside(&mut state, &outside));
-        assert!(state.proof(&address).is_some());
+        assert!(!proof_paid_outside(&state, &outside, Some(&[])));
 
         // A new process: the proof is an earlier run's.
         let mut state = UploadState::parse(&state.checkpoint().unwrap())
@@ -2206,7 +2353,10 @@ mod tests {
             &mut false,
         );
         assert!(again.contains_key(&address), "paid again, once");
-        assert!(drop_proof_paid_outside(&mut state, &outside));
+        assert!(proof_paid_outside(&state, &outside, Some(&[])));
+        // Once paid again, by either rule, neither pays a third time.
+        state.mark_paid_again(address);
+        assert!(!proof_paid_outside(&state, &outside, Some(&[])));
     }
 
     /// A kept proof every storer refused is paid again only when the vault's

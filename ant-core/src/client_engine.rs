@@ -298,6 +298,72 @@ where
     pub(crate) fn record_success(&mut self, peer: &K) {
         self.entries.remove(peer);
     }
+
+    /// The peers held off now: each one's failure or refusal is within its
+    /// cooldown, whatever endpoint it failed at.
+    pub(crate) fn held_off(&self) -> impl Iterator<Item = &K> + '_ {
+        self.entries
+            .iter()
+            .filter(|(_, record)| !self.remaining(record).is_zero())
+            .map(|(peer, _)| peer)
+    }
+}
+
+/// The peers a client's lookups left out, numbered in the order they were
+/// left out, so a caller can read back those left out since a mark it took
+/// ([`Self::mark`]). Each peer keeps its latest number. At capacity the
+/// least recently left out is forgotten, and a read from a mark older than
+/// a forgotten number answers `None`: the caller can't tell what was left
+/// out since.
+#[cfg(any(all(target_arch = "wasm32", feature = "browser-wasm"), test))]
+#[derive(Debug)]
+pub(crate) struct LeftOutPeers {
+    /// How many times a peer was left out, so far: the latest number.
+    count: u64,
+    /// The newest number forgotten at capacity.
+    forgotten: u64,
+    peers: lru::LruCache<[u8; 32], u64>,
+}
+
+#[cfg(any(all(target_arch = "wasm32", feature = "browser-wasm"), test))]
+impl LeftOutPeers {
+    pub(crate) fn new(capacity: std::num::NonZeroUsize) -> Self {
+        Self {
+            count: 0,
+            forgotten: 0,
+            peers: lru::LruCache::new(capacity),
+        }
+    }
+
+    /// A mark from which [`Self::since`] reads.
+    pub(crate) fn mark(&self) -> u64 {
+        self.count
+    }
+
+    /// `peer` was left out of a lookup.
+    pub(crate) fn record(&mut self, peer: [u8; 32]) {
+        self.count += 1;
+        if let Some((evicted, number)) = self.peers.push(peer, self.count) {
+            if evicted != peer {
+                self.forgotten = self.forgotten.max(number);
+            }
+        }
+    }
+
+    /// The peers left out since `mark`, or `None` if some of them may have
+    /// been forgotten.
+    pub(crate) fn since(&self, mark: u64) -> Option<Vec<[u8; 32]>> {
+        if self.forgotten > mark {
+            return None;
+        }
+        Some(
+            self.peers
+                .iter()
+                .filter(|(_, number)| **number > mark)
+                .map(|(peer, _)| *peer)
+                .collect(),
+        )
+    }
 }
 
 #[cfg(test)]
@@ -356,6 +422,35 @@ mod tests {
         cache.record_failure(7_u8, "endpoint".to_string());
         cache.record_success(&7);
         assert!(!cache.is_suppressed(&7, "endpoint"));
+    }
+
+    #[test]
+    fn held_off_names_only_peers_within_their_cooldown() {
+        let mut cache =
+            EndpointFailureCache::new(Duration::from_secs(60), Duration::from_millis(1), 8);
+        cache.record_failure(7_u8, "failed".to_string());
+        cache.record_refusal(8_u8, "busy".to_string());
+        std::thread::sleep(Duration::from_millis(5));
+        assert_eq!(cache.held_off().copied().collect::<Vec<_>>(), vec![7]);
+    }
+
+    #[test]
+    fn left_out_peers_since_a_mark_and_none_once_forgotten() {
+        let mut left_out = LeftOutPeers::new(std::num::NonZeroUsize::new(2).unwrap());
+        left_out.record([1; 32]);
+        let mark = left_out.mark();
+        assert_eq!(left_out.since(mark), Some(Vec::new()));
+        left_out.record([2; 32]);
+        // Left out again: a newer number, nothing forgotten.
+        left_out.record([1; 32]);
+        let mut since = left_out.since(mark).unwrap();
+        since.sort_unstable();
+        assert_eq!(since, vec![[1; 32], [2; 32]]);
+        // A third peer forgets [2; 32], left out after the mark: from that
+        // mark, what was left out can no longer be told.
+        left_out.record([3; 32]);
+        assert_eq!(left_out.since(mark), None);
+        assert!(left_out.since(left_out.mark()).is_some());
     }
 
     #[test]
