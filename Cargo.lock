@@ -935,7 +935,7 @@ dependencies = [
 [[package]]
 name = "ant-listings"
 version = "0.3.1"
-source = "git+https://github.com/Project-DSpace/darwin-node.git?rev=aa45ab9b3db1aacd70ff89fceafa0eceda4ba000#aa45ab9b3db1aacd70ff89fceafa0eceda4ba000"
+source = "git+https://github.com/Project-DSpace/darwin-node.git?rev=19d38d58fd3f760fedf1c83729108529ed48d232#19d38d58fd3f760fedf1c83729108529ed48d232"
 dependencies = [
  "ant-protocol",
  "postcard",
@@ -957,9 +957,9 @@ dependencies = [
 [[package]]
 name = "ant-node"
 version = "0.23.0+ds.15"
-source = "git+https://github.com/Project-DSpace/darwin-node.git?rev=aa45ab9b3db1aacd70ff89fceafa0eceda4ba000#aa45ab9b3db1aacd70ff89fceafa0eceda4ba000"
+source = "git+https://github.com/Project-DSpace/darwin-node.git?rev=19d38d58fd3f760fedf1c83729108529ed48d232#19d38d58fd3f760fedf1c83729108529ed48d232"
 dependencies = [
- "ant-listings 0.3.1 (git+https://github.com/Project-DSpace/darwin-node.git?rev=aa45ab9b3db1aacd70ff89fceafa0eceda4ba000)",
+ "ant-listings 0.3.1 (git+https://github.com/Project-DSpace/darwin-node.git?rev=19d38d58fd3f760fedf1c83729108529ed48d232)",
  "ant-protocol",
  "bao",
  "blake3",
@@ -5681,9 +5681,9 @@ dependencies = [
 
 [[package]]
 name = "saorsa-transport"
-version = "0.38.1"
+version = "0.38.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7debc3e4627e16065ae43ac24ce329de65f71a7ee1cc86943073de3d43f5d004"
+checksum = "cd334b3d02ba2d0bcac8a30d07c3e79004fc504a193813aaa7bf89c11f0f44d0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -7347,7 +7347,7 @@ dependencies = [
 [[package]]
 name = "webrtc"
 version = "0.14.0"
-source = "git+https://github.com/Project-DSpace/darwin-node.git?rev=aa45ab9b3db1aacd70ff89fceafa0eceda4ba000#aa45ab9b3db1aacd70ff89fceafa0eceda4ba000"
+source = "git+https://github.com/Project-DSpace/darwin-node.git?rev=19d38d58fd3f760fedf1c83729108529ed48d232#19d38d58fd3f760fedf1c83729108529ed48d232"
 dependencies = [
  "arc-swap",
  "async-trait",

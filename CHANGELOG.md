@@ -34,6 +34,18 @@ commit `darwin --version` prints. Upstream's entries follow.
   `calculate_price` of the smallest weight's share of its committed key count to
   `calculate_price` of the count, in place of the exact price, in native, merkle and browser quote
   checks alike.
+- Settlement version 2 (`CURRENT_SETTLEMENT_VERSION`, with `MIN_SUPPORTED_SETTLEMENT_VERSION`
+  still 1): the client declares it on every quote request, and nodes at version 1 answer
+  `StorerUpdateRequired` and are skipped before anything is paid. The unversioned quote retry, on
+  the single-node and merkle paths, is gone: a node asked without a version quotes as for version 1
+  and would refuse the weighted payment made on that quote. A node that can't decode a versioned
+  request is a peer that didn't quote.
+- The browser core sends quote requests (`quote_chunk`, and `chunk_protocol` frames carrying a
+  quote request) at `BROWSER_QUOTE_PROTOCOL_VERSION`, one above `BROWSER_PROTOCOL_VERSION`; hello,
+  lookups, reads and PUTs stay at `BROWSER_PROTOCOL_VERSION`. A node that predates size pricing
+  can't parse such a frame and gives no quote, so it's never paid an amount it would refuse. Every
+  quote the core pays on comes from such a request. JavaScript passes `chunk_length` to
+  `verifyStorageQuote` only for a quote obtained at that version.
 - Upload checkpoints have a format of their own (`DSCK` and a version byte, then msgpack). The
   browser core still hands `on_checkpoint` a string, now the checkpoint's bytes as base64: store
   it as text, as it is, and pass it back to resume. It also takes the bytes as a `Uint8Array` or

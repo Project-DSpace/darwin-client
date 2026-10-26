@@ -99,7 +99,7 @@ pub fn calculate_price(close_records_stored: usize) -> Amount {
 }
 
 // =============================================================================
-// Pricing by record size: not used by any quote or payment path yet
+// Pricing by record size
 // =============================================================================
 //
 // A record pays a fixed share φ of a full chunk's price, plus the rest of that
@@ -214,6 +214,43 @@ pub fn weight_total<I: IntoIterator<Item = RecordWeight>>(weights: I) -> u64 {
         sum.saturating_add(u128::from(weight.numerator()))
     });
     u64::try_from(sum.div_ceil(u128::from(WEIGHT_DENOMINATOR))).unwrap_or(u64::MAX)
+}
+
+/// The smallest weight total a node committing to `key_count` records can
+/// have: every record in the smallest size class, `floor(w_min × key_count)`,
+/// with `w_min` the smallest class's weight (259/1,024 at φ = 1/4).
+///
+/// An honest node's weight total is always at or above it, since its exact
+/// weight sum is at least `w_min × key_count` and it rounds up.
+#[must_use]
+pub fn band_bottom_count(key_count: u64) -> u64 {
+    let smallest = record_weight(crate::chunk::DATA_TYPE_CHUNK, 0).numerator();
+    let bottom = u128::from(key_count) * u128::from(smallest) / u128::from(WEIGHT_DENOMINATOR);
+    u64::try_from(bottom).unwrap_or(u64::MAX)
+}
+
+/// The prices a quote committing to `key_count` records may carry, both ends
+/// included: from `calculate_price(band_bottom_count(key_count))`, every
+/// record in the smallest class, to `calculate_price(key_count)`, every
+/// record a full chunk.
+///
+/// Both ends are computed forward through [`calculate_price`]; the price is
+/// never inverted to a count. With no records the band is the one price
+/// `calculate_price(0)`.
+#[must_use]
+pub fn price_band(key_count: u64) -> (Amount, Amount) {
+    let to_usize = |count: u64| usize::try_from(count).unwrap_or(usize::MAX);
+    (
+        calculate_price(to_usize(band_bottom_count(key_count))),
+        calculate_price(to_usize(key_count)),
+    )
+}
+
+/// Whether `price` is in [`price_band`]`(key_count)`.
+#[must_use]
+pub fn price_in_band(price: &Amount, key_count: u64) -> bool {
+    let (bottom, top) = price_band(key_count);
+    bottom <= *price && *price <= top
 }
 
 #[cfg(test)]

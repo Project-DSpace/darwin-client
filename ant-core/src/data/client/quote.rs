@@ -7,7 +7,6 @@ use crate::data::client::peer_xor_distance;
 use crate::data::client::Client;
 use crate::data::client::SettlementRefusals;
 use crate::data::client::PUT_TARGET_WIDTH;
-use crate::data::client::VERSIONED_QUOTE_PROBE_CEILING;
 use crate::data::error::{Error, Result};
 use crate::data::network::send_and_await_chunk_response;
 #[cfg(test)]
@@ -23,13 +22,12 @@ use ant_protocol::payment::commitment::{
 use ant_protocol::payment::verify_quote_signature;
 use ant_protocol::transport::{DHTNode, MultiAddr, PeerId, ResponderView, WitnessedCloseGroup};
 use ant_protocol::{
-    client_update_required_message, ChunkMessage, ChunkMessageBody, ChunkQuoteRequest,
-    ChunkQuoteRequestV2, ChunkQuoteResponse, ProtocolError, CLOSE_GROUP_MAJORITY, CLOSE_GROUP_SIZE,
+    client_update_required_message, ChunkMessage, ChunkMessageBody, ChunkQuoteRequestV2,
+    ChunkQuoteResponse, ProtocolError, CLOSE_GROUP_MAJORITY, CLOSE_GROUP_SIZE,
     CURRENT_SETTLEMENT_VERSION, DATA_TYPE_CHUNK,
 };
 use futures::stream::{FuturesUnordered, StreamExt};
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tracing::{debug, info, warn};
 
@@ -233,6 +231,22 @@ fn drop_quotes_with_bad_bindings(quotes: &mut Vec<QuotedPeer>) -> usize {
     before - quotes.len()
 }
 
+/// The quote request for a record: always the versioned shape, declaring
+/// [`CURRENT_SETTLEMENT_VERSION`].
+fn store_quote_message(
+    request_id: u64,
+    address: [u8; 32],
+    data_size: u64,
+    data_type: u32,
+) -> ChunkMessage {
+    let mut request = ChunkQuoteRequestV2::new(address, data_size);
+    request.data_type = data_type;
+    ChunkMessage {
+        request_id,
+        body: ChunkMessageBody::QuoteRequestV2(request),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn request_store_quote_from_peer(
     node: crate::data::network::Network,
@@ -243,42 +257,15 @@ async fn request_store_quote_from_peer(
     data_size: u64,
     data_type: u32,
     per_peer_timeout: Duration,
-    unversioned_peers: Arc<Mutex<HashSet<PeerId>>>,
-    versioned_capable: Arc<Mutex<HashSet<PeerId>>>,
 ) -> StoreQuoteRequestResult {
-    let legacy_request = ChunkQuoteRequest {
-        address,
-        data_size,
-        data_type,
-    };
-
-    // A peer that already failed to answer a versioned request is asked in the
-    // legacy shape directly. Re-probing costs a full per-peer timeout every
-    // time, and against a fleet that predates the versioned requests that is
-    // paid on every quote: measured on the merkle E2E suite it took the run
-    // from ~24 minutes to past the 60-minute cap.
-    // The capable set wins. The two sets are updated under separate locks, so
-    // a slow probe can insert into the legacy set after a concurrent request
-    // has already proved the peer capable; letting capability win makes that
-    // interleaving harmless instead of permanently preferring the legacy shape.
-    let known_legacy = !versioned_capable
-        .lock()
-        .is_ok_and(|peers| peers.contains(&peer_id))
-        && unversioned_peers
-            .lock()
-            .is_ok_and(|peers| peers.contains(&peer_id));
-
     // Declare the settlement version so a storer can turn us away before we
-    // pay. See `merkle.rs` for why the legacy retry below exists and when it
-    // can be deleted.
-    let body = if known_legacy {
-        ChunkMessageBody::QuoteRequest(legacy_request.clone())
-    } else {
-        let mut versioned_request = ChunkQuoteRequestV2::new(address, data_size);
-        versioned_request.data_type = data_type;
-        ChunkMessageBody::QuoteRequestV2(versioned_request)
-    };
-    let message = ChunkMessage { request_id, body };
+    // pay, and so it quotes the record by its weight. There is no unversioned
+    // retry: a storer asked without a version quotes as for settlement
+    // version 1, and one that can't honour this client's version would take
+    // the payment made on that quote and then refuse the record. A storer
+    // that can't decode this request stays silent, and is one more peer that
+    // didn't quote.
+    let message = store_quote_message(request_id, address, data_size, data_type);
 
     let message_bytes = match message.encode() {
         Ok(bytes) => bytes,
@@ -293,21 +280,12 @@ async fn request_store_quote_from_peer(
         }
     };
 
-    // A first-contact probe waits only long enough to learn whether the peer
-    // can parse the shape; a peer already known to be legacy is asked with the
-    // caller's full patience because that request is the real one.
-    let attempt_timeout = if known_legacy {
-        per_peer_timeout
-    } else {
-        per_peer_timeout.min(VERSIONED_QUOTE_PROBE_CEILING)
-    };
-
     let result = send_and_await_chunk_response(
         &node,
         &peer_id,
         message_bytes,
         request_id,
-        attempt_timeout,
+        per_peer_timeout,
         &peer_addrs,
         |body| map_quote_response(&peer_id, &address, body),
         |e| Error::Network(format!("Failed to send quote request to {peer_id}: {e}")),
@@ -315,76 +293,11 @@ async fn request_store_quote_from_peer(
     )
     .await;
 
-    // Any recognised answer proves the peer parsed the versioned shape,
-    // including a structured error. Only silence and send failures leave the
-    // question open.
-    let answered = match &result {
-        Ok(_) => true,
-        Err(e) => !is_version_unaware(e),
-    };
-    if !known_legacy && answered {
-        if let Ok(mut peers) = versioned_capable.lock() {
-            peers.insert(peer_id);
-        }
-    }
-
-    // Only a storer that could not decode the versioned request is asked
-    // again in the legacy shape. One that answered has understood us, and a
-    // refusal must stay a refusal.
-    let result = match result {
-        Err(ref e) if is_version_unaware(e) && !known_legacy => {
-            // Remember it, so the next request to this peer skips the probe.
-            // Only silence counts as evidence: a send failure means the
-            // request never arrived, which says nothing about whether the peer
-            // could have parsed it, and caching that would strand a peer in
-            // the legacy shape for the rest of the session over one flaky send.
-            // A peer that has answered a versioned request before is never
-            // demoted: one lost response would otherwise pin an upgraded peer
-            // to the legacy shape for the rest of the session.
-            let ever_answered = versioned_capable
-                .lock()
-                .is_ok_and(|peers| peers.contains(&peer_id));
-            if matches!(e, Error::Timeout(_)) && !ever_answered {
-                if let Ok(mut peers) = unversioned_peers.lock() {
-                    peers.insert(peer_id);
-                }
-            }
-            let legacy = ChunkMessage {
-                request_id,
-                body: ChunkMessageBody::QuoteRequest(legacy_request),
-            };
-            match legacy.encode() {
-                Ok(legacy_bytes) => {
-                    send_and_await_chunk_response(
-                        &node,
-                        &peer_id,
-                        legacy_bytes,
-                        request_id,
-                        per_peer_timeout,
-                        &peer_addrs,
-                        |body| map_quote_response(&peer_id, &address, body),
-                        |e| {
-                            Error::Network(format!(
-                                "Failed to send quote request to {peer_id}: {e}"
-                            ))
-                        },
-                        || Error::Timeout(format!("Timeout waiting for quote from {peer_id}")),
-                    )
-                    .await
-                }
-                Err(e) => Err(Error::Protocol(format!(
-                    "Failed to encode quote request for {peer_id}: {e}"
-                ))),
-            }
-        }
-        other => other,
-    };
-
     (peer_id, peer_addrs, result)
 }
 
 /// Turn a quote response into the quote it carries, or the error explaining
-/// why there is none. Shared by the versioned request and its legacy retry.
+/// why there is none.
 ///
 /// `ClientUpdateRequired` is separated from the generic protocol error because
 /// it is terminal: it must reach the user with its own wording rather than
@@ -452,20 +365,6 @@ pub(super) fn settlement_refusal_error(
         client_settlement_version,
         min_settlement_version,
     ))
-}
-
-/// Did this failure look like a storer that cannot parse a versioned request,
-/// as opposed to one that parsed it and refused? See the merkle path for the
-/// full reasoning.
-///
-/// This is the single-node fallback, independent of the merkle one, so it
-/// carries its own reference to the shared cutover guard. Without it, deleting
-/// the merkle fallback would take the only build-time check with it and leave
-/// this downgrade path live.
-const _: () = crate::data::client::UNVERSIONED_RETRY_REQUIRES_MIN_V1;
-
-const fn is_version_unaware(error: &Error) -> bool {
-    matches!(error, Error::Network(_) | Error::Timeout(_))
 }
 
 /// How a storer's refusal for rate reads in a quote failure. No released
@@ -1322,8 +1221,6 @@ impl Client {
                                 data_size,
                                 data_type,
                                 per_peer_timeout,
-                                self.unversioned_quote_peers(),
-                                self.versioned_quote_capable_handle(),
                             ));
                         }
 
@@ -1382,8 +1279,6 @@ impl Client {
                     data_size,
                     data_type,
                     per_peer_timeout,
-                    self.unversioned_quote_peers(),
-                    self.versioned_quote_capable_handle(),
                 ));
             }
 
@@ -1754,6 +1649,27 @@ mod tests {
             return false;
         }
         compute_address(&quote.pub_key) == *peer_id.as_bytes()
+    }
+
+    /// Settlement version 2 pays a record by its size class, and every quote
+    /// request declares it: no unversioned request is ever sent, since a
+    /// storer asked without a version quotes as for version 1 and would
+    /// refuse the weighted payment made on it.
+    #[test]
+    fn every_quote_request_declares_settlement_version_2() {
+        assert_eq!(CURRENT_SETTLEMENT_VERSION, 2);
+        assert_eq!(ant_protocol::MIN_SUPPORTED_SETTLEMENT_VERSION, 1);
+        let message = store_quote_message(7, [3; 32], 16 * 1024, DATA_TYPE_CHUNK);
+        assert_eq!(message.request_id, 7);
+        match message.body {
+            ChunkMessageBody::QuoteRequestV2(request) => {
+                assert_eq!(request.settlement_version, CURRENT_SETTLEMENT_VERSION);
+                assert_eq!(request.address, [3; 32]);
+                assert_eq!(request.data_size, 16 * 1024);
+                assert_eq!(request.data_type, DATA_TYPE_CHUNK);
+            }
+            other => panic!("expected a versioned quote request, got {other:?}"),
+        }
     }
 
     // ============================================================
@@ -3060,30 +2976,6 @@ mod tests {
         assert_eq!(started.elapsed(), Duration::ZERO);
     }
 
-    /// The legacy retry exists for storers that cannot parse a versioned
-    /// request, which are silent. A storer that answered has understood us, so
-    /// retrying its refusal without the version would talk it into quoting a
-    /// client that cannot pay. That is the exact failure this change removes,
-    /// so the predicate deciding it is pinned.
-    #[test]
-    fn only_silence_triggers_the_legacy_retry() {
-        assert!(is_version_unaware(&Error::Timeout("no answer".into())));
-        assert!(is_version_unaware(&Error::Network("send failed".into())));
-
-        assert!(!is_version_unaware(&Error::ClientUpdateRequired(
-            "too old".into()
-        )));
-        // A storer that says it is the old side has understood the request.
-        // Retrying it unversioned would obtain a quote from a peer that cannot
-        // verify the resulting payment, which is a burn.
-        assert!(!is_version_unaware(&Error::StorerUpdateRequired(
-            "node behind".into()
-        )));
-        assert!(!is_version_unaware(&Error::Protocol(
-            "quote error from peer".into()
-        )));
-    }
-
     /// A storer declaring itself the old side is an ordinary skippable peer,
     /// not a client fault. Surfacing it as `ClientUpdateRequired` would tell an
     /// up-to-date user to upgrade, and during a client-first rollout it would
@@ -3325,62 +3217,6 @@ mod tests {
         // In-flight peers count against the budget, so draining them does not
         // pull in replacements.
         assert_eq!(witnessed_quote_launch_budget(0, CLOSE_GROUP_SIZE, 32), 0);
-    }
-
-    /// The probe must be paid per peer, not per request.
-    ///
-    /// A storer that predates the versioned request never answers it, so the
-    /// client eats the probe wait before falling back. Without remembering the
-    /// answer that cost lands on every quote, and a merkle pool asks sixteen
-    /// candidates. Measured on the merkle E2E suite against a fleet on
-    /// published ant-node, re-probing took the run from ~24 minutes to past
-    /// the 60-minute CI cap.
-    ///
-    /// The cache is consulted, not enforced: concurrent first contacts are not
-    /// single-flighted, so the same peer can be probed by a few in-flight
-    /// requests before any of them records the answer. What the cache
-    /// guarantees is that later rounds do not re-probe.
-    #[test]
-    fn a_peer_that_cannot_answer_a_versioned_quote_is_only_probed_once() {
-        let peers: Arc<Mutex<HashSet<PeerId>>> = Arc::new(Mutex::new(HashSet::new()));
-        let legacy_peer = PeerId::from_bytes([0x51; 32]);
-        let fresh_peer = PeerId::from_bytes([0x52; 32]);
-
-        let known = |p: &PeerId| peers.lock().expect("cache lock").contains(p);
-
-        // First contact: nothing known, so the versioned request is sent.
-        assert!(!known(&legacy_peer));
-
-        // Silence records the peer.
-        peers.lock().expect("cache lock").insert(legacy_peer);
-
-        // Second contact skips the probe entirely.
-        assert!(known(&legacy_peer));
-        // and does not tar every other peer with the same brush.
-        assert!(!known(&fresh_peer));
-    }
-
-    /// Only silence is evidence that a peer cannot parse the versioned shape.
-    ///
-    /// Both a timeout and a send failure trigger the legacy retry, but they
-    /// mean different things: a send failure says the request never arrived,
-    /// so it teaches nothing about the peer's capabilities. Caching it would
-    /// strand that peer in the legacy shape for the rest of the session over
-    /// one flaky send.
-    #[test]
-    fn only_silence_is_evidence_worth_caching() {
-        assert!(matches!(
-            Error::Timeout("no answer".into()),
-            Error::Timeout(_)
-        ));
-        assert!(!matches!(
-            Error::Network("send failed".into()),
-            Error::Timeout(_)
-        ));
-        // Both still take the fallback, so a send failure is retried rather
-        // than left to fail outright.
-        assert!(is_version_unaware(&Error::Network("send failed".into())));
-        assert!(is_version_unaware(&Error::Timeout("no answer".into())));
     }
 
     /// One peer cannot condemn the client.

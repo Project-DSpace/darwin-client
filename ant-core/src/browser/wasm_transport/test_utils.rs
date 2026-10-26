@@ -14,9 +14,7 @@ use fips204::{
     ml_dsa_65,
     traits::{KeyGen, SerDes, Signer},
 };
-use saorsa_transport::webrtc::{
-    accept_pq_session, encode_response_frame, parse_request_frame, BrowserResponse,
-};
+use saorsa_transport::webrtc::{accept_pq_session, encode_response_frame, BrowserResponse};
 
 /// Exercise bootstrap readiness after actual LRU pool eviction.
 #[wasm_bindgen]
@@ -472,7 +470,9 @@ impl BrowserTestNode {
             return encode_pq_frame(&accept).unwrap();
         }
         let plaintext = self.session.as_mut().unwrap().open(&payload).unwrap();
-        let request = parse_request_frame(&plaintext).unwrap();
+        // As a storer that prices by size: quotes come at the next version.
+        let (request, _version) =
+            crate::browser::protocol::parse_request_frame_versioned(&plaintext).unwrap();
         if !self.hello_received && !matches!(&request.request.body, BrowserRequestBody::Hello) {
             let response = BrowserResponse::error(
                 request.request.request_id,
@@ -1298,6 +1298,7 @@ pub async fn test_cancelled_read_reservation(endpoint: &str) {
         Duration::from_secs(1),
         Some(permit),
         false,
+        crate::browser::protocol::BROWSER_PROTOCOL_VERSION,
     );
     assert!(crate::runtime::timeout(Duration::from_millis(20), request)
         .await
@@ -1324,6 +1325,7 @@ pub async fn test_cancelled_read_reservation(endpoint: &str) {
             Duration::from_secs(1),
             Some(permit),
             false,
+            crate::browser::protocol::BROWSER_PROTOCOL_VERSION,
         )
         .await
         .unwrap();

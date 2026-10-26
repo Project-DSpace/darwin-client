@@ -54,16 +54,16 @@ pub const DATA_TYPE_CHUNK: u32 = 0;
 ///
 /// Carrying the version in the quote request lets a storer refuse to quote a
 /// client it knows cannot pay correctly, before that client spends anything.
-pub const CURRENT_SETTLEMENT_VERSION: u32 = 1;
+pub const CURRENT_SETTLEMENT_VERSION: u32 = 2;
 
 /// Oldest settlement version this build will issue a quote for.
 ///
 /// Kept as a separate constant from [`CURRENT_SETTLEMENT_VERSION`] so a
 /// settlement change can ship without immediately locking out the previous
 /// client generation: raise `CURRENT` first, let clients adopt, raise `MIN`
-/// once the payment rule actually changes. They are equal today because
-/// version 1 is the first versioned rule set, so there is no earlier one to
-/// keep serving.
+/// once the payment rule actually changes. Version 2 pays a record by its
+/// size class; version 1 pays every record as a full chunk, which a version-2
+/// storer still accepts, so the minimum stays 1.
 pub const MIN_SUPPORTED_SETTLEMENT_VERSION: u32 = 1;
 
 /// Whether a storer on this build can promise to accept what a client

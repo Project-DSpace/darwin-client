@@ -706,8 +706,11 @@ mod wasm {
     /// Its price must lie in the band its committed key count allows. Its
     /// `amount` is a full chunk's, three times its price, unless
     /// `chunk_length` is given: then it is the weighted amount for a chunk
-    /// of that many bytes, by its size class, which only a node quoting at
-    /// settlement version 2 accepts.
+    /// of that many bytes, by its size class. Pass `chunk_length` only for a
+    /// quote obtained by a request at the next browser protocol version
+    /// (`BROWSER_QUOTE_PROTOCOL_VERSION`), as this core's own quotes are: a
+    /// node quoting a request at the current version expects the full
+    /// amount, which every node accepts.
     #[wasm_bindgen(js_name = verifyStorageQuote)]
     pub fn verify_storage_quote_wasm(
         quote: JsValue,

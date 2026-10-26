@@ -375,6 +375,10 @@ impl BrowserNetwork for SharedNetworkAdapter {
                     timeout,
                     read_permit,
                     exclusive,
+                    crate::browser::protocol::request_version(
+                        &BrowserRequestBody::ChunkProtocol,
+                        crate::browser::protocol::is_quote_request(&request.body),
+                    ),
                 )
                 .await
                 .map_err(rpc_data_error)?;

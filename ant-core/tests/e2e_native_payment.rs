@@ -261,3 +261,156 @@ async fn stale_nonce_on_an_unsent_payment_is_prepared_again_and_pays_once() {
     );
     assert!(state.pending_payment.is_some_and(|p| p.receipt.is_some()));
 }
+
+/// The plan of a chunk of `data_size` bytes at `address`, as a client at
+/// settlement version 1 saved it: one quote at `price`, paid the full
+/// amount.
+fn plan_before_the_switch(
+    address: [u8; 32],
+    data_size: u64,
+    price: Amount,
+    rewards: [u8; 20],
+) -> ant_core::data::client::batch::ChunkPaymentPlan {
+    use ant_core::data::client::batch::SingleNodeQuotePayment;
+    use ant_protocol::evm::{EncodedPeerId, PaymentQuote, RewardsAddress};
+    use ant_protocol::payment::pricing::RecordWeight;
+    use ant_protocol::transport::NodeIdentity;
+
+    let identity = NodeIdentity::generate().unwrap();
+    let mut quote = PaymentQuote {
+        content: xor_name::XorName(address),
+        timestamp: std::time::SystemTime::now(),
+        price,
+        rewards_address: RewardsAddress::new(rewards),
+        pub_key: identity.public_key().as_bytes().to_vec(),
+        signature: Vec::new(),
+        committed_key_count: 0,
+        commitment_pin: None,
+    };
+    quote.signature = identity
+        .sign(&quote.bytes_for_sig())
+        .unwrap()
+        .as_bytes()
+        .to_vec();
+    ChunkPaymentPlan {
+        address,
+        data_size,
+        quoted_peers: Vec::new(),
+        payment: SingleNodeQuotePayment::from_quotes(vec![quote.clone()], RecordWeight::FULL)
+            .unwrap(),
+        peer_quotes: vec![(
+            EncodedPeerId::new(*blake3::hash(&quote.pub_key).as_bytes()),
+            quote,
+        )],
+        commitment_sidecars: Vec::new(),
+    }
+}
+
+/// A checkpoint saved before the pricing switch, holding a journaled payment
+/// of a plan under 4 MiB at the full amount, restores in the switched client
+/// (settlement version 2, which pays such a plan less) and reconciles from
+/// the journal with no new transaction: the plan keeps its recorded amount,
+/// the transaction found is the journaled one, and nothing more is paid.
+#[tokio::test]
+async fn a_journaled_payment_saved_before_the_switch_reconciles_with_no_new_transaction() {
+    use ant_core::data::client::batch::SingleNodeQuotePayment;
+    use ant_protocol::payment::pricing::record_weight;
+
+    assert_eq!(ant_protocol::CURRENT_SETTLEMENT_VERSION, 2);
+    let chain = Testnet::new().await.unwrap();
+    let wallet = Wallet::new_from_private_key(
+        chain.to_network(),
+        &chain.default_wallet_private_key().unwrap(),
+    )
+    .unwrap();
+    let client = client(wallet.clone()).await;
+    let before = wallet.balance_of_tokens().await.unwrap();
+
+    let (address, size) = ([26u8; 32], 300_000u64);
+    let plan = plan_before_the_switch(address, size, Amount::from(1_000), [27; 20]);
+    let full = plan.payment.total_amount();
+    let weighted = SingleNodeQuotePayment::from_quotes(
+        plan.peer_quotes.iter().map(|(_, q)| q.clone()).collect(),
+        record_weight(ant_protocol::DATA_TYPE_CHUNK, size as usize),
+    )
+    .unwrap()
+    .total_amount();
+    assert!(
+        weighted < full,
+        "the switched client would pay this class less"
+    );
+    let request = PaymentRequest::Quotes(
+        plan.payment
+            .quotes
+            .iter()
+            .filter(|q| !q.amount.is_zero())
+            .map(|q| (q.quote_hash, q.rewards_address, q.amount))
+            .collect(),
+    );
+
+    // Before the switch: the plan is kept and its payment signed and
+    // journaled, then the client stops.
+    let mut state = UploadState::default();
+    state.prepare(plan.clone());
+    let interrupted = Checkpoints {
+        stop_after_signed: true,
+        ..Default::default()
+    };
+    assert!(client
+        .test_execute_native_payment(&interrupted, &request, &mut state, true)
+        .await
+        .is_err());
+    let saved = interrupted
+        .last
+        .lock()
+        .unwrap()
+        .clone()
+        .unwrap()
+        .checkpoint()
+        .unwrap();
+    // The journaled transaction is sent, as the client before the switch
+    // sent it before it stopped for good.
+    let mut sending = UploadState::restore(&saved).unwrap();
+    let sent = client
+        .test_execute_native_payment(&Checkpoints::default(), &request, &mut sending, true)
+        .await
+        .unwrap();
+    assert_eq!(wallet.balance_of_tokens().await.unwrap(), before - full);
+
+    // The switched client restores the checkpoint saved before the switch:
+    // the plan keeps its full amount, and the journal is reconciled from the
+    // chain, sending nothing.
+    let mut restored = UploadState::restore(&saved).unwrap();
+    let kept = restored
+        .retained_plan(&address, size, std::time::SystemTime::now())
+        .expect("the plan saved before the switch is kept");
+    assert_eq!(kept.payment.total_amount(), full);
+    let nonce = || async {
+        use alloy::providers::Provider;
+        wallet
+            .to_provider()
+            .get_transaction_count(wallet.address())
+            .await
+            .unwrap()
+    };
+    let sent_before = nonce().await;
+    let recovered = client
+        .test_execute_native_payment(&Checkpoints::default(), &request, &mut restored, false)
+        .await
+        .unwrap();
+    assert_eq!(recovered.transaction_hash, sent.transaction_hash);
+    assert_eq!(recovered.amount, full);
+    assert_eq!(nonce().await, sent_before, "no new transaction");
+    assert_eq!(wallet.balance_of_tokens().await.unwrap(), before - full);
+    let transactions = plan
+        .payment
+        .quotes
+        .iter()
+        .filter(|q| !q.amount.is_zero())
+        .map(|q| (q.quote_hash, recovered.transaction_hash))
+        .collect();
+    restored
+        .confirm(&[address], &transactions, std::time::SystemTime::now())
+        .unwrap();
+    assert!(restored.is_paid(&address, std::time::SystemTime::now()));
+}

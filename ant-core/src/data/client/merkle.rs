@@ -22,8 +22,8 @@ use ant_protocol::payment::commitment::{
 use ant_protocol::payment::{serialize_merkle_proof, verify_merkle_candidate_signature};
 use ant_protocol::transport::PeerId;
 use ant_protocol::{
-    compute_address, ChunkMessage, ChunkMessageBody, MerkleCandidateQuoteRequest,
-    MerkleCandidateQuoteRequestV2, MerkleCandidateQuoteResponse, ProtocolError,
+    compute_address, ChunkMessage, ChunkMessageBody, MerkleCandidateQuoteRequestV2,
+    MerkleCandidateQuoteResponse, ProtocolError,
 };
 #[cfg(test)]
 use bytes::Bytes;
@@ -32,7 +32,6 @@ use rand::Rng;
 use std::collections::HashMap;
 #[cfg(test)]
 use std::collections::VecDeque;
-use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
@@ -229,9 +228,6 @@ fn short_pool_error(valid: usize, batch_refusals: usize, failures: &[String]) ->
 /// Turn a merkle candidate quote response into the candidate it carries, or
 /// the error that explains why there is none.
 ///
-/// Shared by the versioned request and its legacy retry so the two cannot
-/// interpret the same response differently.
-///
 /// `ClientUpdateRequired` is lifted out of the generic protocol-error case
 /// deliberately. It is the one rejection that is about this client rather than
 /// about this request, it already carries wording aimed at the person running
@@ -272,9 +268,8 @@ fn map_merkle_candidate_response(
         ChunkMessageBody::MerkleCandidateQuoteResponse(MerkleCandidateQuoteResponse::Error(
             behind @ ProtocolError::StorerUpdateRequired { .. },
         )) => Some(Err(Error::StorerUpdateRequired(behind.to_string()))),
-        // darwin-node takes per-chunk payments only. Neither a settlement
-        // refusal (it sets no latch, and per-chunk payment goes on) nor a
-        // reason to ask again in the legacy shape: the node understood us.
+        // darwin-node takes per-chunk payments only. Not a settlement
+        // refusal: it sets no latch, and per-chunk payment goes on.
         ChunkMessageBody::MerkleCandidateQuoteResponse(MerkleCandidateQuoteResponse::Error(
             ProtocolError::QuoteFailed(reason),
         )) if reason == BATCH_PAYMENTS_REFUSED => Some(Err(Error::BatchPaymentsRefused(reason))),
@@ -285,45 +280,6 @@ fn map_merkle_candidate_response(
         }
         _ => None,
     }
-}
-
-/// Should this failure be retried as an unversioned request?
-///
-/// A storer built before the settlement version existed cannot decode the
-/// versioned request, so it never replies and the send fails at the transport
-/// layer. Any response this client *recognises*, refusal included, means the
-/// storer understood us, and retrying that in an older shape would defeat the
-/// gate.
-///
-/// A reply that decodes but carries a body the mapper does not recognise is
-/// not distinguished: the wait continues and ends in a timeout, so it takes
-/// the fallback too. That is no more than a peer could achieve by saying
-/// nothing, which is why it is bounded by the cutover guard rather than
-/// special-cased here.
-///
-/// # This is a downgrade path, and it is only safe because nothing can be
-/// refused yet
-///
-/// Silence is **not** proof that a peer cannot parse the request. A dropped
-/// response, packet loss, an overloaded peer, or one deliberately discarding
-/// versioned requests all look identical from here. So this predicate can be
-/// provoked, and a peer that provokes it gets asked again without a version.
-///
-/// That is harmless only while no client can be refused on version grounds,
-/// which is exactly the case while `MIN_SUPPORTED_SETTLEMENT_VERSION` is the
-/// first declarable version. The moment the minimum is raised, this becomes a
-/// way to obtain a quote the gate meant to withhold, and then to burn a
-/// payment against it.
-///
-/// The guard below turns "remember to delete the fallback before raising the
-/// minimum" from a comment into a build failure. It lives in
-/// [`crate::data::client::UNVERSIONED_RETRY_REQUIRES_MIN_V1`] and is referenced
-/// from every fallback site, including the independent single-node one in
-/// `quote.rs`, so deleting one path cannot silently leave the other unguarded.
-const _: () = crate::data::client::UNVERSIONED_RETRY_REQUIRES_MIN_V1;
-
-const fn is_version_unaware(error: &Error) -> bool {
-    matches!(error, Error::Network(_) | Error::Timeout(_))
 }
 
 /// Payment mode for uploads.
@@ -1439,51 +1395,17 @@ impl Client {
 
         let mut candidate_futures = FuturesUnordered::new();
 
-        let unversioned_peers = self.unversioned_quote_peers();
-        let versioned_capable = self.versioned_quote_capable_handle();
-
         for (peer_id, peer_addrs) in &remote_peers {
             let request_id = self.next_request_id();
-            // A peer that already failed to answer a versioned request is
-            // asked in the legacy shape directly. Re-probing costs a full
-            // per-peer timeout every time, and a merkle pool asks sixteen
-            // candidates per pool, so against a fleet that predates the
-            // versioned requests the probes dominate the run: measured on this
-            // suite it went from ~24 minutes to past the 60-minute CI cap.
-            // The capable set wins. The two sets are updated under separate
-            // locks, so a slow probe can insert into the legacy set after a
-            // concurrent request has already proved the peer capable; letting
-            // capability win makes that interleaving harmless instead of
-            // permanently preferring the legacy shape.
-            let known_legacy = !versioned_capable
-                .lock()
-                .is_ok_and(|peers| peers.contains(peer_id))
-                && unversioned_peers
-                    .lock()
-                    .is_ok_and(|peers| peers.contains(peer_id));
-
-            let legacy_request = MerkleCandidateQuoteRequest {
-                address: *address,
-                data_type,
-                data_size,
-                merkle_payment_timestamp,
-            };
-
             // Declare the settlement version so a storer can turn us away
             // before we pay, rather than refusing the payment afterwards.
+            // There is no unversioned retry: see `request_store_quote_from_peer`.
+            let mut request =
+                MerkleCandidateQuoteRequestV2::new(*address, data_size, merkle_payment_timestamp);
+            request.data_type = data_type;
             let message = ChunkMessage {
                 request_id,
-                body: if known_legacy {
-                    ChunkMessageBody::MerkleCandidateQuoteRequest(legacy_request.clone())
-                } else {
-                    ChunkMessageBody::MerkleCandidateQuoteRequestV2(
-                        MerkleCandidateQuoteRequestV2::new(
-                            *address,
-                            data_size,
-                            merkle_payment_timestamp,
-                        ),
-                    )
-                },
+                body: ChunkMessageBody::MerkleCandidateQuoteRequestV2(request),
             };
 
             let message_bytes = match message.encode() {
@@ -1494,51 +1416,17 @@ impl Client {
                 }
             };
 
-            // Fallback for the mixed fleet. A storer that predates the
-            // versioned request cannot decode it and simply never answers, so
-            // without this every quote would fail until the whole network had
-            // upgraded. Retried only on a transport-level failure, never on a
-            // refusal: see `is_version_unaware` below.
-            //
-            // Delete this, and the second request id, once the fleet is known
-            // to answer V2.
-            let legacy_request_id = self.next_request_id();
-            let legacy_message_bytes = match (ChunkMessage {
-                request_id: legacy_request_id,
-                body: ChunkMessageBody::MerkleCandidateQuoteRequest(legacy_request),
-            })
-            .encode()
-            {
-                Ok(bytes) => bytes,
-                Err(e) => {
-                    warn!("Failed to encode legacy merkle candidate request for {peer_id}: {e}");
-                    continue;
-                }
-            };
-
             let peer_id_clone = *peer_id;
             let addrs_clone = peer_addrs.clone();
             let node_clone = node.clone();
-            let peers_handle = Arc::clone(&unversioned_peers);
-            let capable_handle = Arc::clone(&versioned_capable);
 
             let fut = async move {
-                // First contact waits only long enough to learn whether the
-                // peer can parse the shape. A peer already known to be legacy
-                // gets the caller's full patience, because that request is the
-                // real one rather than a probe.
-                let attempt_timeout = if known_legacy {
-                    timeout
-                } else {
-                    timeout.min(crate::data::client::VERSIONED_QUOTE_PROBE_CEILING)
-                };
-
                 let result = send_and_await_chunk_response(
                     &node_clone,
                     &peer_id_clone,
                     message_bytes,
                     request_id,
-                    attempt_timeout,
+                    timeout,
                     &addrs_clone,
                     |body| map_merkle_candidate_response(peer_id_clone, body),
                     |e| {
@@ -1553,70 +1441,6 @@ impl Client {
                     },
                 )
                 .await;
-
-                // Any answer at all to the versioned shape proves the peer
-                // can parse it, so it can never later be demoted.
-                // Any recognised answer proves the peer parsed the versioned
-                // shape, including a structured error. Only silence and send
-                // failures leave the question open.
-                let answered = match &result {
-                    Ok(_) => true,
-                    Err(e) => !is_version_unaware(e),
-                };
-                if !known_legacy && answered {
-                    if let Ok(mut peers) = capable_handle.lock() {
-                        peers.insert(peer_id_clone);
-                    }
-                }
-
-                // Silence from a storer means it could not decode the
-                // versioned request, so ask again in the shape it understands.
-                // A storer that answered with a refusal is NOT retried: it
-                // understood us and said no, and asking again without the
-                // version would talk it into quoting a client that cannot pay.
-                let result = match result {
-                    Err(ref e) if is_version_unaware(e) && !known_legacy => {
-                        // Only silence is evidence the peer cannot parse the
-                        // shape. A send failure means the request never
-                        // arrived and teaches nothing, so it must not strand
-                        // the peer in the legacy shape for the whole session.
-                        // Nor may a peer that has answered a versioned request
-                        // before be demoted by one lost response.
-                        let ever_answered = capable_handle
-                            .lock()
-                            .is_ok_and(|peers| peers.contains(&peer_id_clone));
-                        if matches!(e, Error::Timeout(_)) && !ever_answered {
-                            if let Ok(mut peers) = peers_handle.lock() {
-                                peers.insert(peer_id_clone);
-                            }
-                        }
-                        debug!(
-                            "Peer {peer_id_clone} did not answer a versioned merkle quote; \
-                             retrying in the legacy shape"
-                        );
-                        send_and_await_chunk_response(
-                            &node_clone,
-                            &peer_id_clone,
-                            legacy_message_bytes,
-                            legacy_request_id,
-                            timeout,
-                            &addrs_clone,
-                            |body| map_merkle_candidate_response(peer_id_clone, body),
-                            |e| {
-                                Error::Network(format!(
-                                    "Failed to send merkle candidate request to {peer_id_clone}: {e}"
-                                ))
-                            },
-                            || {
-                                Error::Timeout(format!(
-                                    "Timeout waiting for merkle candidate from {peer_id_clone}"
-                                ))
-                            },
-                        )
-                        .await
-                    }
-                    other => other,
-                };
 
                 (peer_id_clone, result)
             };
@@ -4144,8 +3968,7 @@ mod tests {
     }
 
     /// darwin-node's refusal of a merkle candidate request comes back typed,
-    /// with the node's sentence, and as an answer: it is never retried in
-    /// the legacy request shape, and never taken for a settlement refusal.
+    /// with the node's sentence, and is never taken for a settlement refusal.
     /// Any other quote failure stays a protocol error.
     #[test]
     fn a_nodes_refusal_of_batch_payments_is_typed() {
@@ -4167,7 +3990,6 @@ mod tests {
                     error.to_string().contains(BATCH_PAYMENTS_REFUSED),
                     "{error}"
                 );
-                assert!(!is_version_unaware(&error), "an answer, not silence");
             }
             other => panic!("expected BatchPaymentsRefused, got {other:?}"),
         }

@@ -204,6 +204,11 @@ impl Client {
 
     /// As [`Self::pay_for_storage_split`], paying for a record of `weight`:
     /// [`record_weight`] of the bytes the caller stores.
+    ///
+    /// Every quote paid on came from a request declaring this client's
+    /// settlement version (there is no unversioned retry), and in a browser
+    /// from a frame at `BROWSER_QUOTE_PROTOCOL_VERSION`, so each storer
+    /// quoted the record by its weight and takes the weighted amount.
     pub(crate) async fn pay_for_storage_split_at(
         &self,
         routing: &[u8; 32],

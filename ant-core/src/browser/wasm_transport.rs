@@ -9,7 +9,7 @@ use super::manifest::{
 };
 use super::payment::{BrowserQuoteArtifact, VerifiedStorageQuote};
 use super::protocol::{
-    encode_request_frame, ice_password_from_sdp, parse_response_frame,
+    encode_request_frame_at, ice_password_from_sdp, parse_response_frame,
     parse_webrtc_direct_multiaddr, server_answer_sdp, v2_server_ice_credential,
     validate_hello_metadata, BrowserEndpoint, BrowserEndpointInput, BrowserHello, BrowserNode,
     BrowserRequest, BrowserRequestBody, BrowserResponseBody, BrowserResponseFrame,
@@ -1269,7 +1269,8 @@ impl LockedBrowserClient<'_> {
         response_timeout: Duration,
     ) -> Result<BrowserResponseFrame, RpcError> {
         let exclusive = matches!(&body, BrowserRequestBody::PutChunk { .. });
-        self.request_reserved(body, content, response_timeout, None, exclusive)
+        let version = super::protocol::request_version(&body, false);
+        self.request_reserved(body, content, response_timeout, None, exclusive, version)
             .await
             .map(|(response, _)| response)
     }
@@ -1281,6 +1282,7 @@ impl LockedBrowserClient<'_> {
         response_timeout: Duration,
         read_permit: Option<crate::client_engine::read_budget::ReadPermit>,
         exclusive: bool,
+        version: u16,
     ) -> Result<
         (
             BrowserResponseFrame,
@@ -1313,8 +1315,10 @@ impl LockedBrowserClient<'_> {
         let request_id = self.next_request_id.get();
         self.next_request_id.set(request_id.wrapping_add(1).max(1));
         let request = BrowserRequest::new(request_id, body, content.len());
-        let plaintext =
-            encode_request_frame(&request, content).map_err(|error| error.to_string())?;
+        // A quote goes at the next protocol version, so only a storer that
+        // quotes by size answers it (`BROWSER_QUOTE_PROTOCOL_VERSION`).
+        let plaintext = encode_request_frame_at(&request, content, version)
+            .map_err(|error| error.to_string())?;
         let slot = self.slot.borrow_mut().take();
         let (response, processing, read_permit) = rpc
             .request(
