@@ -10,12 +10,12 @@ use std::{
 
 pub(crate) const MAX_GET_FALLBACK_PEERS: usize = 20;
 pub(crate) const CLOSE_GROUP_RETRY_DELAY: Duration = Duration::from_secs(1);
-/// Rounds a read waits for a peer that declined it while busy, before
-/// reporting the record's holders busy. Each wait lasts until the first
-/// refusal that may hide a holder ends, so with the browser's 15 s refusal
-/// hold-off the waits add at most 45 s and three lookups to a read on a
-/// network that is full.
-const MAX_REFUSAL_WAITS: usize = 3;
+/// Rounds a read, of a chunk or a pointer, waits for a peer that declined it
+/// while busy, before reporting the record's holders busy. Each wait lasts
+/// until the first refusal that may hide a holder ends, so with the browser's
+/// 15 s refusal hold-off the waits add at most 45 s and three lookups to a
+/// read on a network that is full.
+pub(crate) const MAX_REFUSAL_WAITS: usize = 3;
 pub(crate) const EARLY_READ_HEDGE_DELAY: Duration = Duration::from_secs(1);
 /// Speculative GETs per round are bounded by this multiple of the early
 /// allowance, including hints that may hold the record after stale hints used it.
