@@ -225,34 +225,6 @@ name = "bench-quoting"
 path = "examples/bench-quoting.rs"
 
 [[test]]
-name = "e2e_chunk"
-path = "tests/e2e_chunk.rs"
-
-[[test]]
-name = "e2e_data"
-path = "tests/e2e_data.rs"
-
-[[test]]
-name = "e2e_file"
-path = "tests/e2e_file.rs"
-
-[[test]]
-name = "e2e_payment"
-path = "tests/e2e_payment.rs"
-
-[[test]]
-name = "e2e_size_pricing"
-path = "tests/e2e_size_pricing.rs"
-
-[[test]]
-name = "e2e_occupied_quotes"
-path = "tests/e2e_occupied_quotes.rs"
-
-[[test]]
-name = "e2e_security"
-path = "tests/e2e_security.rs"
-
-[[test]]
 name = "unit_self_encrypt"
 path = "tests/unit_self_encrypt.rs"
 
@@ -261,8 +233,16 @@ name = "merkle_unit"
 path = "tests/merkle_unit.rs"
 
 [[test]]
-name = "e2e_merkle"
-path = "tests/e2e_merkle.rs"
+name = "datamap_file"
+path = "tests/datamap_file.rs"
+
+# The end-to-end cases, on one shared in-process darwin-node network: its own
+# runner (tests/support/runner.rs) starts the network once, so not libtest.
+[[test]]
+name = "e2e"
+path = "tests/e2e.rs"
+harness = false
+required-features = ["native", "test-utils"]
 
 [[test]]
 name = "e2e_huge_file"
@@ -271,17 +251,3 @@ path = "tests/e2e_huge_file.rs"
 [[test]]
 name = "e2e_upload_costs"
 path = "tests/e2e_upload_costs.rs"
-
-[[test]]
-name = "datamap_file"
-path = "tests/datamap_file.rs"
-
-[[test]]
-name = "e2e_native_payment"
-path = "tests/e2e_native_payment.rs"
-required-features = ["native", "test-utils"]
-
-[[test]]
-name = "e2e_record_payment_recovery"
-path = "tests/e2e_record_payment_recovery.rs"
-required-features = ["native", "test-utils"]

@@ -9,10 +9,14 @@
 //! 2. The client's forced-price gate ACCEPTS those bound quotes (they are
 //!    self-consistent) and a full pay → store → retrieve round-trip succeeds —
 //!    so the storer accepts the bound quotes and the forwarded sidecars too.
-//! 3. A node with NO commitment emits a valid BASELINE quote `(0, None)` priced
-//!    at `calculate_price(0)`, and the full flow still works.
-//! 4. A forced-merkle upload on the commitment-bound network is refused at
+//! 3. A forced-merkle upload on the commitment-bound network is refused at
 //!    quote time with nothing paid, as darwin-node refuses every batch payment.
+//!
+//! Both run on the committed network: every node carries a live commitment
+//! over [`COMMITTED_KEYS`] keys. The baseline branch of the same gate (a node
+//! with no commitment quotes `(0, None)` at `calculate_price(0)`) is pinned
+//! by `payment::quote_collection` on the shared network, where every other
+//! case pays, stores and reads back on baseline quotes.
 //!
 //! The OFF-CURVE rejection (a node charging above its committed count is dropped
 //! before payment) is proven directly on the gate in the `quote.rs` unit tests
@@ -20,37 +24,34 @@
 //! `quote_commitment_binding_is_valid` suite) — honest nodes never emit an
 //! off-curve quote, so it cannot be surfaced through a live happy-path network.
 
-#![allow(clippy::unwrap_used, clippy::expect_used)]
-
-mod support;
-
+use crate::merkle::merkle_client;
+use crate::support::runner::{Case, COMMITTED_KEYS};
+use crate::support::{assert_batch_refused, wallet_spend, MiniTestnet};
 use ant_core::data::client::merkle::PaymentMode;
-use ant_core::data::{compute_address, Client, ClientConfig};
+use ant_core::data::compute_address;
 use ant_protocol::payment::calculate_price;
 use ant_protocol::payment::commitment::{
     commitment_hash, verify_commitment_signature, StorageCommitment,
 };
 use bytes::Bytes;
-use serial_test::serial;
 use std::io::Write;
 use std::sync::Arc;
-use support::{
-    assert_batch_refused, test_client_config, wallet_spend, MiniTestnet, DEFAULT_NODE_COUNT,
-    MERKLE_TESTNET_NODES,
-};
 
-/// The committed key count every node attests in these tests. Picked above the
-/// pricing baseline so `calculate_price(N)` is strictly greater than the
-/// empty-node baseline — a bound quote is visibly distinct from a baseline one.
-const COMMITTED_KEYS: u32 = 9_000;
+pub fn cases() -> Vec<Case> {
+    vec![
+        Case::on_committed(
+            "adr0004::bound_quotes_are_shipped_priced_and_resolve",
+            adr0004_bound_quotes_are_shipped_priced_and_resolve,
+        ),
+        Case::on_committed(
+            "adr0004::merkle_upload_against_bound_candidates_is_refused",
+            adr0004_merkle_upload_against_bound_candidates_is_refused,
+        ),
+    ]
+}
 
-#[tokio::test(flavor = "multi_thread")]
-#[serial]
-async fn adr0004_bound_quotes_are_shipped_priced_and_resolve() {
-    let testnet = MiniTestnet::start_with_commitments(DEFAULT_NODE_COUNT, COMMITTED_KEYS).await;
-    let node = testnet.node(3).expect("node 3 exists");
-    let client = Client::from_node(Arc::clone(&node), test_client_config())
-        .with_wallet(testnet.wallet().clone());
+async fn adr0004_bound_quotes_are_shipped_priced_and_resolve(testnet: Arc<MiniTestnet>) {
+    let client = testnet.client();
 
     let content = Bytes::from("adr-0004 bound-quote payload");
     let address = compute_address(&content);
@@ -138,58 +139,6 @@ async fn adr0004_bound_quotes_are_shipped_priced_and_resolve() {
         .expect("chunk_get should succeed")
         .expect("chunk must be found after storing");
     assert_eq!(retrieved.content.as_ref(), content.as_ref());
-
-    drop(client);
-    testnet.teardown().await;
-}
-
-/// The other half: a node with NO commitment emits a valid BASELINE quote
-/// `(0, None)` priced at `calculate_price(0)`, and the full flow still works.
-/// This guards the baseline branch of the same forced-price gate.
-#[tokio::test(flavor = "multi_thread")]
-#[serial]
-async fn adr0004_baseline_quotes_still_work() {
-    let testnet = MiniTestnet::start(DEFAULT_NODE_COUNT).await;
-    let node = testnet.node(3).expect("node 3 exists");
-    let client = Client::from_node(Arc::clone(&node), test_client_config())
-        .with_wallet(testnet.wallet().clone());
-
-    let content = Bytes::from("adr-0004 baseline payload");
-    let address = compute_address(&content);
-
-    let quotes = client
-        .get_store_quotes(&address, content.len() as u64, 0)
-        .await
-        .expect("quote collection should reach quorum");
-
-    let baseline = calculate_price(0);
-    for (peer_id, _addrs, quote, _price, commitment) in &quotes {
-        assert_eq!(
-            quote.committed_key_count, 0,
-            "no-commitment node must quote count 0 ({peer_id})"
-        );
-        assert!(
-            quote.commitment_pin.is_none(),
-            "baseline quote pins nothing ({peer_id})"
-        );
-        assert_eq!(
-            quote.price, baseline,
-            "baseline quote must price at calculate_price(0) ({peer_id})"
-        );
-        assert!(
-            commitment.is_none(),
-            "baseline quote ships no commitment ({peer_id})"
-        );
-    }
-
-    let stored = client
-        .chunk_put(content.clone())
-        .await
-        .expect("paid put with baseline quotes must succeed");
-    assert_eq!(stored, address);
-
-    drop(client);
-    testnet.teardown().await;
 }
 
 /// A FORCED-MERKLE upload against a network where every node carries a live
@@ -200,19 +149,9 @@ async fn adr0004_baseline_quotes_still_work() {
 /// their first commitment, 2026-07-06 19:38 UTC); here it pins that a
 /// commitment-bound network refuses batches as an unbound one does, and that
 /// per-chunk payment, which the first test in this file pins, still works.
-#[tokio::test(flavor = "multi_thread")]
-#[serial]
-async fn adr0004_merkle_upload_against_bound_candidates_is_refused() {
+async fn adr0004_merkle_upload_against_bound_candidates_is_refused(testnet: Arc<MiniTestnet>) {
     // Enough nodes that the client asks them for candidates at all.
-    let testnet = MiniTestnet::start_with_commitments(MERKLE_TESTNET_NODES, COMMITTED_KEYS).await;
-    let node = testnet.node(5).expect("node 5 exists");
-    let config = ClientConfig {
-        quote_timeout_secs: 120,
-        store_timeout_secs: 120,
-        close_group_size: 20,
-        ..Default::default()
-    };
-    let client = Client::from_node(Arc::clone(&node), config).with_wallet(testnet.wallet().clone());
+    let client = merkle_client(&testnet);
 
     // 500KB file — self-encryption produces 3+ chunks (>=2 needed for merkle).
     let data: Vec<u8> = (0u8..=255).cycle().take(500_000).collect();
@@ -231,7 +170,4 @@ async fn adr0004_merkle_upload_against_bound_candidates_is_refused() {
         before,
         "nothing may be paid for a refused batch"
     );
-
-    drop(client);
-    testnet.teardown().await;
 }

@@ -1,5 +1,7 @@
-//! Native payment journal recovery against a real Anvil chain.
-#![allow(clippy::unwrap_used, clippy::expect_used)]
+//! Native payment journal recovery (payment recovery) against a real Anvil
+//! chain of each case's own, with no nodes.
+
+use crate::support::runner::Case;
 
 use ant_core::data::client::{
     batch::ChunkPaymentPlan,
@@ -14,6 +16,31 @@ use ant_protocol::evm::journal::PaymentRequest;
 use ant_protocol::evm::{testnet::Testnet, Amount, Wallet};
 use ant_protocol::transport::{CoreNodeConfig, P2PNode};
 use std::sync::{Arc, Mutex};
+
+pub fn cases() -> Vec<Case> {
+    vec![
+        Case::alone(
+            "native_payment::insufficient_funds_then_funding_unblocks_native_payment",
+            insufficient_funds_then_funding_unblocks_native_payment,
+        ),
+        Case::alone(
+            "native_payment::signed_checkpoint_recovers_before_and_after_broadcast_without_paying_twice",
+            signed_checkpoint_recovers_before_and_after_broadcast_without_paying_twice,
+        ),
+        Case::alone(
+            "native_payment::replaced_nonce_retains_journal_until_finality_then_allows_retry",
+            replaced_nonce_retains_journal_until_finality_then_allows_retry,
+        ),
+        Case::alone(
+            "native_payment::stale_nonce_on_an_unsent_payment_is_prepared_again_and_pays_once",
+            stale_nonce_on_an_unsent_payment_is_prepared_again_and_pays_once,
+        ),
+        Case::alone(
+            "native_payment::a_journaled_payment_saved_before_the_switch_reconciles_with_no_new_transaction",
+            a_journaled_payment_saved_before_the_switch_reconciles_with_no_new_transaction,
+        ),
+    ]
+}
 
 #[derive(Default)]
 struct Checkpoints {
@@ -66,7 +93,6 @@ async fn client(wallet: Wallet) -> Client {
     let node = P2PNode::new(config).await.unwrap();
     Client::from_node(Arc::new(node), Default::default()).with_wallet(wallet)
 }
-#[tokio::test]
 async fn insufficient_funds_then_funding_unblocks_native_payment() {
     let chain = Testnet::new().await.unwrap();
     let network = chain.to_network();
@@ -111,7 +137,6 @@ async fn insufficient_funds_then_funding_unblocks_native_payment() {
     assert_eq!(receipt.amount, Amount::from(100));
     assert_eq!(wallet.balance_of_tokens().await.unwrap(), Amount::from(900));
 }
-#[tokio::test]
 async fn signed_checkpoint_recovers_before_and_after_broadcast_without_paying_twice() {
     let chain = Testnet::new().await.unwrap();
     let network = chain.to_network();
@@ -150,7 +175,6 @@ async fn signed_checkpoint_recovers_before_and_after_broadcast_without_paying_tw
     );
 }
 
-#[tokio::test]
 async fn replaced_nonce_retains_journal_until_finality_then_allows_retry() {
     use alloy::providers::ext::AnvilApi;
     let chain = Testnet::new().await.unwrap();
@@ -224,7 +248,6 @@ async fn replaced_nonce_retains_journal_until_finality_then_allows_retry() {
     );
 }
 
-#[tokio::test]
 async fn stale_nonce_on_an_unsent_payment_is_prepared_again_and_pays_once() {
     // DEV-03 run 589 (2026-09-16): a public RPC's replicas lag each other, so
     // `prepare_payment` can sign a nonce the chain has already consumed. Those
@@ -311,7 +334,6 @@ fn plan_before_the_switch(
 /// (settlement version 2, which pays such a plan less) and reconciles from
 /// the journal with no new transaction: the plan keeps its recorded amount,
 /// the transaction found is the journaled one, and nothing more is paid.
-#[tokio::test]
 async fn a_journaled_payment_saved_before_the_switch_reconciles_with_no_new_transaction() {
     use ant_core::data::client::batch::SingleNodeQuotePayment;
     use ant_protocol::payment::pricing::record_weight;

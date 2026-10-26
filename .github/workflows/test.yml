@@ -67,15 +67,15 @@ jobs:
       - name: Test the release gate's check
         run: bash scripts/test_check_workflows.sh
 
-  # One job per target, in parallel, so no single job runs every target in a
-  # row: together they outgrew one job's time limit. Every target reports,
-  # whether or not another fails. The nodes are darwin-node's, at the revision
+  # One job per target, in parallel. Every target reports, whether or not
+  # another fails. The `e2e` target runs every end-to-end case on one shared
+  # network (tests/e2e.rs). The nodes are darwin-node's, at the revision
   # ant-core/Cargo.toml pins, so the tests check this client against the nodes
-  # it pays and stores on: e2e_merkle pins that they refuse batch payments at
-  # quote time, before anything is paid. (The tests used to run on upstream's
-  # ant-node from crates.io, where e2e_merkle pinned that batch payments
-  # worked; that run was dropped on purpose, as the Darwin network refuses
-  # them.)
+  # it pays and stores on: its `refusals` cases pin that they refuse batch
+  # payments at quote time, before anything is paid. (The tests used to run
+  # on upstream's ant-node from crates.io, where the merkle tests pinned that
+  # batch payments worked; that run was dropped on purpose, as the Darwin
+  # network refuses them.)
   e2e:
     name: e2e (${{ matrix.target }})
     needs: targets
@@ -121,6 +121,8 @@ jobs:
       - name: Build the test
         run: cargo test --locked -p ant-core --features test-utils --test "${{ matrix.target }}" --no-run
 
+      # One at a time: the libtest targets' tests each start a network, and
+      # the e2e target's runner takes its cases one after another anyway.
       - name: Run it, single-threaded
         run: cargo test --locked -p ant-core --features test-utils --test "${{ matrix.target }}" -- --test-threads=1
 

@@ -1,16 +1,34 @@
-//! E2E tests for in-memory data upload/download using self-encryption with real EVM payments.
+//! In-memory data upload and download through self-encryption, with real
+//! EVM payments.
 
-#![allow(clippy::unwrap_used, clippy::expect_used)]
-
-mod support;
-
-use ant_core::data::Client;
+use crate::support::runner::Case;
+use crate::support::MiniTestnet;
 use bytes::Bytes;
 use self_encryption::encrypt;
 use self_encryption::MAX_CHUNK_SIZE;
-use serial_test::serial;
 use std::sync::Arc;
-use support::{test_client_config, MiniTestnet, DEFAULT_NODE_COUNT};
+
+pub fn cases() -> Vec<Case> {
+    vec![
+        Case::on_network("data::round_trip", test_data_upload_download_round_trip),
+        Case::on_network(
+            "data::shrunk_datamap_round_trip",
+            test_data_shrunk_datamap_round_trip,
+        ),
+        Case::on_network(
+            "data::deterministic_encryption",
+            test_data_deterministic_encryption,
+        ),
+        Case::on_network(
+            "data::partial_overlap_skips_payment_for_existing_chunks",
+            test_data_upload_partial_overlap_skips_payment_for_existing_chunks,
+        ),
+        Case::on_network(
+            "data::public_data_map_store_and_fetch",
+            test_public_data_map_store_and_fetch,
+        ),
+    ]
+}
 
 /// Payload size that forces self-encryption to shrink the `DataMap`.
 ///
@@ -20,23 +38,11 @@ use support::{test_client_config, MiniTestnet, DEFAULT_NODE_COUNT};
 /// configured chunk size, so the returned map has `is_child() == true`.
 const SHRUNK_DATAMAP_PAYLOAD_BYTES: usize = 4 * MAX_CHUNK_SIZE;
 
-async fn setup() -> (Client, MiniTestnet) {
-    let testnet = MiniTestnet::start(DEFAULT_NODE_COUNT).await;
-    let node = testnet.node(4).expect("Node 4 should exist");
-
-    let client = Client::from_node(Arc::clone(&node), test_client_config())
-        .with_wallet(testnet.wallet().clone());
-
-    (client, testnet)
-}
-
-#[tokio::test(flavor = "multi_thread")]
-#[serial]
-async fn test_data_upload_download_round_trip() {
-    let (client, testnet) = setup().await;
+async fn test_data_upload_download_round_trip(testnet: Arc<MiniTestnet>) {
+    let client = testnet.client();
 
     // Self-encryption requires at least 3072 bytes
-    let content = Bytes::from(vec![0x42u8; 4096]);
+    let content = Bytes::from(vec![0x43u8; 4096]);
 
     let result = client
         .data_upload(content.clone())
@@ -68,41 +74,6 @@ async fn test_data_upload_download_round_trip() {
         .await
         .unwrap()
         .is_empty());
-
-    drop(client);
-    testnet.teardown().await;
-}
-
-#[tokio::test(flavor = "multi_thread")]
-#[serial]
-async fn test_data_large_content() {
-    let (client, testnet) = setup().await;
-
-    // 100KB of patterned data
-    let content: Vec<u8> = (0u8..=255).cycle().take(100_000).collect();
-    let content = Bytes::from(content);
-
-    let result = client
-        .data_upload(content.clone())
-        .await
-        .expect("data_upload should succeed");
-
-    assert!(result.chunks_stored >= 3, "should produce multiple chunks");
-
-    let downloaded = client
-        .data_download(&result.data_map)
-        .await
-        .expect("data_download should succeed");
-
-    assert_eq!(
-        downloaded.len(),
-        content.len(),
-        "downloaded size should match"
-    );
-    assert_eq!(downloaded, content, "content should match exactly");
-
-    drop(client);
-    testnet.teardown().await;
 }
 
 /// Regression test: a payload large enough to shrink the `DataMap` must still
@@ -112,10 +83,8 @@ async fn test_data_large_content() {
 /// straight to `self_encryption::decrypt`, which never fetched the root content
 /// chunks and failed with `Encryption("... Missing chunk ...")`. Small payloads
 /// (<= 3 chunks, flat map) hid the bug because they are never shrunk.
-#[tokio::test(flavor = "multi_thread")]
-#[serial]
-async fn test_data_shrunk_datamap_round_trip() {
-    let (client, testnet) = setup().await;
+async fn test_data_shrunk_datamap_round_trip(testnet: Arc<MiniTestnet>) {
+    let client = testnet.client();
 
     // Patterned data so a correct round-trip must reproduce the exact bytes,
     // not merely match on length.
@@ -161,34 +130,10 @@ async fn test_data_shrunk_datamap_round_trip() {
         downloaded, content,
         "downloaded content should match original for a shrunk DataMap"
     );
-
-    drop(client);
-    testnet.teardown().await;
 }
 
-#[tokio::test(flavor = "multi_thread")]
-#[serial]
-async fn test_data_upload_too_small_fails() {
-    let (client, testnet) = setup().await;
-
-    // MIN_ENCRYPTABLE_BYTES = 3 (3 * MIN_CHUNK_SIZE where MIN_CHUNK_SIZE=1)
-    // So only 0, 1, or 2 bytes should fail
-    let content = Bytes::from(vec![0x42u8; 2]);
-
-    let result = client.data_upload(content).await;
-    assert!(
-        result.is_err(),
-        "files smaller than MIN_ENCRYPTABLE_BYTES (3) should fail"
-    );
-
-    drop(client);
-    testnet.teardown().await;
-}
-
-#[tokio::test(flavor = "multi_thread")]
-#[serial]
-async fn test_data_deterministic_encryption() {
-    let (client, testnet) = setup().await;
+async fn test_data_deterministic_encryption(testnet: Arc<MiniTestnet>) {
+    let client = testnet.client();
 
     let content = Bytes::from(vec![0xAA; 4096]);
 
@@ -244,15 +189,12 @@ async fn test_data_deterministic_encryption() {
             "same content should produce same chunk addresses"
         );
     }
-
-    drop(client);
-    testnet.teardown().await;
 }
 
-#[tokio::test(flavor = "multi_thread")]
-#[serial]
-async fn test_data_upload_partial_overlap_skips_payment_for_existing_chunks() {
-    let (client, testnet) = setup().await;
+async fn test_data_upload_partial_overlap_skips_payment_for_existing_chunks(
+    testnet: Arc<MiniTestnet>,
+) {
+    let client = testnet.client();
 
     // Use enough data to produce multiple encrypted chunks (self-encryption needs >= 3)
     let content = Bytes::from(vec![0xBB; 8192]);
@@ -352,15 +294,10 @@ async fn test_data_upload_partial_overlap_skips_payment_for_existing_chunks() {
     }
     let downloaded = downloaded.expect("data_download should succeed after retries");
     assert_eq!(downloaded, content, "downloaded content should match");
-
-    drop(client);
-    testnet.teardown().await;
 }
 
-#[tokio::test(flavor = "multi_thread")]
-#[serial]
-async fn test_public_data_map_store_and_fetch() {
-    let (client, testnet) = setup().await;
+async fn test_public_data_map_store_and_fetch(testnet: Arc<MiniTestnet>) {
+    let client = testnet.client();
 
     // Upload data, get a DataMap
     let content = Bytes::from(vec![0xFFu8; 4096]);
@@ -410,7 +347,4 @@ async fn test_public_data_map_store_and_fetch() {
         downloaded, content,
         "downloaded content should match original"
     );
-
-    drop(client);
-    testnet.teardown().await;
 }

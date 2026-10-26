@@ -49,12 +49,23 @@ the client's copy follows the node's in a change of its own, reviewed against th
 cargo test --locked -p ant-core --features test-utils --no-run
 ```
 
-Then run the end-to-end targets that pin payments, with `anvil` on PATH and one test at a time:
-at least `e2e_merkle` and `e2e_record_payment_recovery`
-(`cargo test --locked -p ant-core --features test-utils --test <target> -- --test-threads=1`),
+Then run the end-to-end cases, with `anvil` on PATH: the whole `e2e` target, or at least its
+`refusals` group and the payment-recovery cases
+(`cargo test --locked -p ant-core --features test-utils --test e2e -- refusals payment_recovery native_payment`),
 and the browser harness as `ant-core/browser-tests/README.md` describes. If the build or a test
 fails, stop and report it, with what changed in darwin-node to cause it. Do not change the tests to
 make them pass without the user's say.
+
+Some refusals are pinned only by darwin-node's tests, the client's own cases having gone for them.
+Check they still exist at the new revision before committing, and if they moved, update the doc
+that names them; if one is gone with no replacement, stop and report it:
+
+- a proof of 0 bytes and a proof of random bytes, refused (named in `ant-core/tests/e2e/security.rs`):
+  `test_attack_empty_proof_bytes` and `test_attack_garbage_bytes_as_proof` in
+  `tests/e2e/security_attacks.rs`, or the rows "0 bytes" and "garbage" of
+  `test_chunk_rejected_without_payment` in `tests/e2e/data_types/chunk.rs`;
+- the read and merge rules of pointers (named in `ant-core/tests/e2e/pointer.rs`):
+  `tests/pointer_convergence.rs`.
 
 ### Step 6: Commit
 

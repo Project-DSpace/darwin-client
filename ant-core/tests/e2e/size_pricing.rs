@@ -6,10 +6,8 @@
 //! middle class, a class's top byte and the byte past it, a full chunk, an
 //! envelope, a file whose last chunk is small, and a pointer.
 
-#![allow(clippy::unwrap_used, clippy::expect_used)]
-
-mod support;
-
+use crate::support::runner::Case;
+use crate::support::{wallet_spend, MiniTestnet};
 use ant_core::data::{compute_address, Client, EnvelopeOptions, PaymentMode, Visibility};
 use ant_protocol::evm::Amount;
 use ant_protocol::payment::pricing::{
@@ -19,17 +17,28 @@ use ant_protocol::pointer::{Pointer, PointerTarget, PointerTargetKind, DATA_TYPE
 use ant_protocol::pqc::api::ml_dsa_65;
 use ant_protocol::{DATA_TYPE_CHUNK, MAX_CHUNK_SIZE};
 use bytes::Bytes;
-use serial_test::serial;
 use std::io::Write;
 use std::sync::Arc;
-use support::{test_client_config, wallet_spend, MiniTestnet, DEFAULT_NODE_COUNT};
 
-async fn setup() -> (Client, MiniTestnet) {
-    let testnet = MiniTestnet::start(DEFAULT_NODE_COUNT).await;
-    let node = testnet.node(3).expect("Node 3 should exist");
-    let client = Client::from_node(Arc::clone(&node), test_client_config())
-        .with_wallet(testnet.wallet().clone());
-    (client, testnet)
+pub fn cases() -> Vec<Case> {
+    vec![
+        Case::on_network(
+            "size_pricing::each_chunk_pays_its_class_and_is_stored",
+            each_chunk_pays_its_class_and_is_stored,
+        ),
+        Case::on_network(
+            "size_pricing::a_file_whose_last_chunk_is_small_is_stored",
+            a_file_whose_last_chunk_is_small_is_stored,
+        ),
+        Case::on_network(
+            "size_pricing::an_envelope_is_paid_by_its_class_and_reads_back",
+            an_envelope_is_paid_by_its_class_and_reads_back,
+        ),
+        Case::on_network(
+            "size_pricing::a_pointer_pays_a_pointers_weight_and_is_stored",
+            a_pointer_pays_a_pointers_weight_and_is_stored,
+        ),
+    ]
 }
 
 /// `len` bytes no other case shares.
@@ -90,10 +99,8 @@ async fn put_and_check(client: &Client, testnet: &MiniTestnet, len: usize, seed:
     assert_eq!(read.content, bytes);
 }
 
-#[tokio::test(flavor = "multi_thread")]
-#[serial]
-async fn each_chunk_pays_its_class_and_is_stored() {
-    let (client, testnet) = setup().await;
+async fn each_chunk_pays_its_class_and_is_stored(testnet: Arc<MiniTestnet>) {
+    let client = testnet.client();
     assert_eq!(ant_protocol::CURRENT_SETTLEMENT_VERSION, 2);
     let class_top = 256 * 1024;
     for (len, seed) in [
@@ -112,17 +119,12 @@ async fn each_chunk_pays_its_class_and_is_stored() {
     assert!(
         record_weight(DATA_TYPE_CHUNK, class_top) < record_weight(DATA_TYPE_CHUNK, class_top + 1)
     );
-
-    drop(client);
-    testnet.teardown().await;
 }
 
 /// A file whose last chunk is small is stored and reads back, its chunks
 /// each paid by their class, for less than full chunks would cost.
-#[tokio::test(flavor = "multi_thread")]
-#[serial]
-async fn a_file_whose_last_chunk_is_small_is_stored() {
-    let (client, testnet) = setup().await;
+async fn a_file_whose_last_chunk_is_small_is_stored(testnet: Arc<MiniTestnet>) {
+    let client = testnet.client();
     let data = content(2 * MAX_CHUNK_SIZE + 20_000, 6);
     let (_, tokens) = wallet_spend(testnet.wallet()).await;
     let result = client.data_upload(data.clone()).await.expect("upload");
@@ -133,17 +135,12 @@ async fn a_file_whose_last_chunk_is_small_is_stored() {
         .expect("download");
     assert_eq!(read, data);
     assert!(tokens_after < tokens, "the upload paid");
-
-    drop(client);
-    testnet.teardown().await;
 }
 
 /// An upload with an envelope stores the envelope, a small record paid by
 /// its class, and reads back by it.
-#[tokio::test(flavor = "multi_thread")]
-#[serial]
-async fn an_envelope_is_paid_by_its_class_and_reads_back() {
-    let (client, testnet) = setup().await;
+async fn an_envelope_is_paid_by_its_class_and_reads_back(testnet: Arc<MiniTestnet>) {
+    let client = testnet.client();
     let data = content(20_000, 7).to_vec();
     let mut file = tempfile::NamedTempFile::new().expect("temp file");
     file.write_all(&data).expect("write");
@@ -166,17 +163,12 @@ async fn an_envelope_is_paid_by_its_class_and_reads_back() {
     let path = output.path().join("envelope.bin");
     client.file_download(&map, &path).await.expect("download");
     assert_eq!(std::fs::read(path).unwrap(), data);
-
-    drop(client);
-    testnet.teardown().await;
 }
 
 /// A pointer pays a pointer's weight, which every pointer shares, and is
 /// stored.
-#[tokio::test(flavor = "multi_thread")]
-#[serial]
-async fn a_pointer_pays_a_pointers_weight_and_is_stored() {
-    let (client, testnet) = setup().await;
+async fn a_pointer_pays_a_pointers_weight_and_is_stored(testnet: Arc<MiniTestnet>) {
+    let client = testnet.client();
     let weight = record_weight(DATA_TYPE_POINTER, 0);
     assert!(weight < RecordWeight::FULL);
     let (pk, sk) = ml_dsa_65().generate_keypair().expect("keypair");
@@ -198,7 +190,4 @@ async fn a_pointer_pays_a_pointers_weight_and_is_stored() {
         .expect("pointer_get")
         .expect("stored");
     assert_eq!(read.state_id(), created.state_id());
-
-    drop(client);
-    testnet.teardown().await;
 }

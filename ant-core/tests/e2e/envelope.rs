@@ -1,15 +1,13 @@
-//! E2E tests for uploads with an envelope: the envelope is paid in the same
+//! Uploads with an envelope, the default of our own tools: the envelope is paid in the same
 //! payment as the content, stored with it, and its proof record checks out
 //! against the chain.
 
-#![allow(clippy::unwrap_used, clippy::expect_used)]
-
-mod support;
-
+use crate::merkle::merkle_client;
+use crate::support::runner::Case;
+use crate::support::{assert_batch_refused, test_client_config, wallet_spend, MiniTestnet};
 use ant_core::ant_listings::{
     Envelope, Metadata, PaymentField, ShownFields, DATA_PAYMENT_MADE_TOPIC,
 };
-use ant_core::data::client::adaptive::{AdaptiveConfig, ChannelMax};
 use ant_core::data::client::upload::{
     MerkleUploadPayment, UploadAdapter, UploadPayment, UploadRecord,
 };
@@ -21,22 +19,57 @@ use ant_core::data::{
 };
 use ant_protocol::evm::{Amount, Wallet};
 use bytes::Bytes;
-use serial_test::serial;
 use std::io::Write;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use support::{
-    assert_batch_refused, test_client_config, wallet_spend, MiniTestnet, DEFAULT_NODE_COUNT,
-    MERKLE_TESTNET_NODES, MERKLE_TESTNET_QUOTE_CONCURRENCY,
-};
 use tempfile::{NamedTempFile, TempDir};
 
-async fn setup() -> (Client, MiniTestnet) {
-    let testnet = MiniTestnet::start(DEFAULT_NODE_COUNT).await;
-    let node = testnet.node(3).expect("Node 3 should exist");
-    let client = Client::from_node(Arc::clone(&node), test_client_config())
-        .with_wallet(testnet.wallet().clone());
-    (client, testnet)
+pub fn cases() -> Vec<Case> {
+    vec![
+        Case::on_network(
+            "envelope::the_envelope_is_never_sent_when_content_fails_to_store",
+            the_envelope_is_never_sent_when_content_fails_to_store,
+        ),
+        Case::on_network(
+            "envelope::a_private_upload_pays_its_withheld_envelope_with_the_content",
+            a_private_upload_pays_its_withheld_envelope_with_the_content,
+        ),
+        Case::on_network(
+            "envelope::an_unlisted_upload_reads_by_its_envelope_address",
+            an_unlisted_upload_reads_by_its_envelope_address,
+        ),
+        Case::on_network(
+            "envelope::a_kept_record_goes_back_only_to_the_account_that_paid",
+            a_kept_record_goes_back_only_to_the_account_that_paid,
+        ),
+        Case::on_network(
+            "envelope::hiding_everything_on_a_plain_private_upload_stores_no_envelope",
+            hiding_everything_on_a_plain_private_upload_stores_no_envelope,
+        ),
+        Case::on_network(
+            "envelope::an_external_signer_pays_the_envelope_in_the_same_intent",
+            an_external_signer_pays_the_envelope_in_the_same_intent,
+        ),
+        Case::on_network(
+            "envelope::the_file_shortcuts_store_envelopes_by_default",
+            the_file_shortcuts_store_envelopes_by_default,
+        ),
+    ]
+}
+
+/// The refusal pins: a merkle batch refused with nothing paid, and `Auto`
+/// falling back to per-chunk payment with the envelope in the last payment.
+pub fn refusals() -> Vec<Case> {
+    vec![
+        Case::on_network(
+            "envelope::from_33_content_records_a_merkle_batch_is_refused_and_nothing_is_paid",
+            from_33_content_records_a_merkle_batch_is_refused_and_nothing_is_paid,
+        ),
+        Case::on_network(
+            "envelope::from_65_content_records_auto_pays_per_chunk_and_the_envelope_joins_the_last_payment",
+            from_65_content_records_auto_pays_per_chunk_and_the_envelope_joins_the_last_payment,
+        ),
+    ]
 }
 
 fn input(byte: u8) -> (NamedTempFile, Vec<u8>) {
@@ -48,7 +81,7 @@ fn input(byte: u8) -> (NamedTempFile, Vec<u8>) {
 }
 
 /// How many vault payments the transaction `tx_hash` made.
-async fn payments_in(chain: &ListingChain, tx_hash: &[u8; 32]) -> usize {
+pub async fn payments_in(chain: &ListingChain, tx_hash: &[u8; 32]) -> usize {
     let (receipt, _) = chain
         .transaction(tx_hash)
         .await
@@ -240,10 +273,8 @@ fn content_and_envelope(count: usize, size: usize) -> (Vec<Bytes>, [u8; 32]) {
     (chunks, envelope.address())
 }
 
-#[tokio::test(flavor = "multi_thread")]
-#[serial]
-async fn the_envelope_is_never_sent_when_content_fails_to_store() {
-    let (client, testnet) = setup().await;
+async fn the_envelope_is_never_sent_when_content_fails_to_store(testnet: Arc<MiniTestnet>) {
+    let client = testnet.client();
     let (chunks, envelope) = content_and_envelope(4, 2_000);
     // The second content record fails to store after payment.
     let staged = StagedRecords::new(chunks, testnet.wallet(), Some(1));
@@ -274,35 +305,6 @@ async fn the_envelope_is_never_sent_when_content_fails_to_store() {
         "{failed:?}"
     );
     assert!(client.chunk_get(&envelope).await.expect("fetch").is_none());
-
-    drop(client);
-    testnet.teardown().await;
-}
-
-/// A testnet large enough that a client asks its nodes for merkle
-/// candidates, and a client on it, set up as for the batch payments the
-/// tests below attempt. The client quotes at most
-/// [`MERKLE_TESTNET_QUOTE_CONCURRENCY`] records at a time, so that it can pay
-/// a 64-record wave per chunk on this testnet ([`MERKLE_TESTNET_NODES`]
-/// says why).
-async fn setup_merkle_sized() -> (Client, MiniTestnet) {
-    let testnet = MiniTestnet::start(MERKLE_TESTNET_NODES).await;
-    let node = testnet.node(5).expect("Node 5 should exist");
-    let config = ant_core::data::ClientConfig {
-        quote_timeout_secs: 120,
-        store_timeout_secs: 120,
-        close_group_size: 20,
-        adaptive: AdaptiveConfig {
-            max: ChannelMax {
-                quote: MERKLE_TESTNET_QUOTE_CONCURRENCY,
-                ..ChannelMax::default()
-            },
-            ..AdaptiveConfig::default()
-        },
-        ..Default::default()
-    };
-    let client = Client::from_node(Arc::clone(&node), config).with_wallet(testnet.wallet().clone());
-    (client, testnet)
 }
 
 /// From 33 content records the upload engine would pay a merkle batch of 32,
@@ -313,10 +315,10 @@ async fn setup_merkle_sized() -> (Client, MiniTestnet) {
 /// a paid batch: the split is pinned in `merkle_unit.rs`, and the envelope's
 /// place after the batches (the final per-chunk wave, stored last) in
 /// `src/data/client/upload.rs`'s unit tests (`PerChunkWaves`).
-#[tokio::test(flavor = "multi_thread")]
-#[serial]
-async fn from_33_content_records_a_merkle_batch_is_refused_and_nothing_is_paid() {
-    let (client, testnet) = setup_merkle_sized().await;
+async fn from_33_content_records_a_merkle_batch_is_refused_and_nothing_is_paid(
+    testnet: Arc<MiniTestnet>,
+) {
+    let client = merkle_client(&testnet);
     let (chunks, envelope) = content_and_envelope(33, 1_024);
     let staged = StagedRecords::new(chunks, testnet.wallet(), None);
     let mut records = staged.records();
@@ -334,9 +336,6 @@ async fn from_33_content_records_a_merkle_batch_is_refused_and_nothing_is_paid()
     assert!(!staged.paid.load(Ordering::SeqCst));
     assert_eq!(wallet_spend(testnet.wallet()).await, before);
     assert!(client.chunk_get(&envelope).await.expect("fetch").is_none());
-
-    drop(client);
-    testnet.teardown().await;
 }
 
 /// From 65 content records, at the merkle threshold, `PaymentMode::Auto` asks
@@ -344,10 +343,10 @@ async fn from_33_content_records_a_merkle_batch_is_refused_and_nothing_is_paid()
 /// record is paid per chunk instead, and the envelope joins the last
 /// per-chunk payment after the content: the first payment is 64 content
 /// records, the second the last one and the envelope, in one transaction.
-#[tokio::test(flavor = "multi_thread")]
-#[serial]
-async fn from_65_content_records_auto_pays_per_chunk_and_the_envelope_joins_the_last_payment() {
-    let (client, testnet) = setup_merkle_sized().await;
+async fn from_65_content_records_auto_pays_per_chunk_and_the_envelope_joins_the_last_payment(
+    testnet: Arc<MiniTestnet>,
+) {
+    let client = merkle_client(&testnet);
     let chain = ListingChain::new(testnet.evm_network()).expect("chain reader");
     let (chunks, envelope) = content_and_envelope(65, 1_024);
     let envelope_bytes = chunks.last().cloned().expect("the envelope");
@@ -384,15 +383,10 @@ async fn from_65_content_records_auto_pays_per_chunk_and_the_envelope_joins_the_
         .expect("fetch")
         .expect("the envelope is stored");
     assert_eq!(chunk.content, envelope_bytes);
-
-    drop(client);
-    testnet.teardown().await;
 }
 
-#[tokio::test(flavor = "multi_thread")]
-#[serial]
-async fn a_private_upload_pays_its_withheld_envelope_with_the_content() {
-    let (client, testnet) = setup().await;
+async fn a_private_upload_pays_its_withheld_envelope_with_the_content(testnet: Arc<MiniTestnet>) {
+    let client = testnet.client();
     let chain = ListingChain::new(testnet.evm_network()).expect("chain reader");
     let (file, data) = input(0x11);
     let options = EnvelopeOptions::private().with_metadata(Metadata {
@@ -477,15 +471,10 @@ async fn a_private_upload_pays_its_withheld_envelope_with_the_content() {
         .await
         .expect("download");
     assert_eq!(std::fs::read(path).unwrap(), data);
-
-    drop(client);
-    testnet.teardown().await;
 }
 
-#[tokio::test(flavor = "multi_thread")]
-#[serial]
-async fn an_unlisted_upload_reads_by_its_envelope_address() {
-    let (client, testnet) = setup().await;
+async fn an_unlisted_upload_reads_by_its_envelope_address(testnet: Arc<MiniTestnet>) {
+    let client = testnet.client();
     let chain = ListingChain::new(testnet.evm_network()).expect("chain reader");
     let (file, data) = input(0x22);
     let options = EnvelopeOptions::unlisted().hiding([PaymentField::Quote]);
@@ -547,16 +536,11 @@ async fn an_unlisted_upload_reads_by_its_envelope_address() {
     assert!(third
         .proof_problem
         .is_some_and(|problem| problem.contains("already stored")));
-
-    drop(client);
-    testnet.teardown().await;
 }
 
-#[tokio::test(flavor = "multi_thread")]
-#[serial]
-async fn a_kept_record_goes_back_only_to_the_account_that_paid() {
-    let (client, testnet) = setup().await;
-    let (file, _) = input(0x44);
+async fn a_kept_record_goes_back_only_to_the_account_that_paid(testnet: Arc<MiniTestnet>) {
+    let client = testnet.client();
+    let (file, _) = input(0x45);
     let options = EnvelopeOptions::unlisted().hiding([PaymentField::Quote]);
     let upload = |account: &'static str| {
         let payer = AccountPayer {
@@ -590,15 +574,10 @@ async fn a_kept_record_goes_back_only_to_the_account_that_paid() {
     let again = upload("account a").await;
     assert_eq!(again.proof, Some(record));
     forget_upload_record(&first.address()).expect("forget");
-
-    drop(client);
-    testnet.teardown().await;
 }
 
-#[tokio::test(flavor = "multi_thread")]
-#[serial]
-async fn hiding_everything_on_a_plain_private_upload_stores_no_envelope() {
-    let (client, testnet) = setup().await;
+async fn hiding_everything_on_a_plain_private_upload_stores_no_envelope(testnet: Arc<MiniTestnet>) {
+    let client = testnet.client();
     let (file, _) = input(0x33);
     let options = EnvelopeOptions {
         shown: ShownFields::NONE,
@@ -616,78 +595,14 @@ async fn hiding_everything_on_a_plain_private_upload_stores_no_envelope() {
     assert!(result.envelope.is_none());
     assert_eq!(result.total_chunks, result.data_map.infos().len());
     assert_eq!(result.data_map_address, None);
-
-    drop(client);
-    testnet.teardown().await;
 }
 
-/// A forced-merkle upload with a listed envelope would pay the content in a
-/// batch and the envelope per chunk after it. darwin-node refuses the batch
-/// at quote time, so nothing is paid; the same upload paid per chunk then
-/// pays the envelope with the content, and its record checks out.
-#[tokio::test(flavor = "multi_thread")]
-#[serial]
-async fn a_forced_merkle_upload_with_an_envelope_is_refused_before_anything_is_paid() {
-    let (client, testnet) = setup_merkle_sized().await;
-    let chain = ListingChain::new(testnet.evm_network()).expect("chain reader");
-    let (file, data) = input(0x44);
-    let upload = |mode| {
-        client.file_upload_with_visibility_and_progress(
-            file.path(),
-            mode,
-            Visibility::Envelope(EnvelopeOptions::listed()),
-            None,
-        )
-    };
-    let before = wallet_spend(testnet.wallet()).await;
-    let error = upload(PaymentMode::Merkle)
-        .await
-        .expect_err("darwin-node refuses batch payments");
-    assert_batch_refused(&error);
-    assert_eq!(
-        wallet_spend(testnet.wallet()).await,
-        before,
-        "nothing may be paid for a refused batch"
-    );
-
-    let result = upload(PaymentMode::Single).await.expect("upload");
-    assert_eq!(result.payment_mode_used, PaymentMode::Single);
-    assert_eq!(result.total_chunks, result.data_map.infos().len() + 1);
-    assert_eq!(result.chunks_stored, result.total_chunks);
-    let envelope = result.envelope.clone().expect("an envelope");
-    assert!(envelope.proof_checked, "{:?}", envelope.proof_problem);
-    let record = envelope.proof.clone().expect("a record");
-    // The envelope's transaction paid every chunk, the envelope's among them.
-    assert_eq!(
-        payments_in(&chain, &record.tx_hash).await,
-        result.total_chunks
-    );
-    chain
-        .check_proof(&record)
-        .await
-        .expect("the proof checks out");
-
-    let map = client
-        .data_map_fetch(&envelope.address())
-        .await
-        .expect("readable");
-    let output = TempDir::new().unwrap();
-    let path = output.path().join("listed.bin");
-    client.file_download(&map, &path).await.expect("download");
-    assert_eq!(std::fs::read(path).unwrap(), data);
-
-    drop(client);
-    testnet.teardown().await;
-}
-
-#[tokio::test(flavor = "multi_thread")]
-#[serial]
-async fn an_external_signer_pays_the_envelope_in_the_same_intent() {
+async fn an_external_signer_pays_the_envelope_in_the_same_intent(testnet: Arc<MiniTestnet>) {
     use ant_core::data::{ExternalPaymentInfo, FinalizeOutcome};
     use ant_protocol::evm::{QuoteHash, TxHash};
     use std::collections::HashMap;
 
-    let (client, testnet) = setup().await;
+    let client = testnet.client();
     let chain = ListingChain::new(testnet.evm_network()).expect("chain reader");
     let (file, data) = input(0x55);
     let prepared = client
@@ -770,8 +685,10 @@ async fn an_external_signer_pays_the_envelope_in_the_same_intent() {
 
     // A client without an EVM network: said before payment, and finalize
     // still stores everything and builds the record, unchecked.
-    let node = testnet.node(3).expect("Node 3 should exist");
-    let bare = Client::from_node(Arc::clone(&node), test_client_config());
+    let node = testnet
+        .node(crate::support::CLIENT_NODE)
+        .expect("client node");
+    let bare = Client::from_node(node, test_client_config());
     let (file, data) = input(0x57);
     let prepared = bare
         .file_prepare_upload_with_mode(
@@ -818,20 +735,19 @@ async fn an_external_signer_pays_the_envelope_in_the_same_intent() {
         .await
         .expect("download");
     assert_eq!(std::fs::read(path).unwrap(), data);
-
-    drop(bare);
-    drop(client);
-    testnet.teardown().await;
 }
 
 /// The library's file shortcuts store envelopes by default, every payment
 /// field shown: `file_prepare_upload` prepares a private one (withheld, not
 /// in the index, with a salt), and `file_upload_public_with_progress` stores
 /// an unlisted one (readable, not in the index) at the upload's address.
-#[tokio::test(flavor = "multi_thread")]
-#[serial]
-async fn the_file_shortcuts_store_envelopes_by_default() {
-    let (client, testnet) = setup().await;
+///
+/// The public shortcut stores what `darwin file upload --public` stores: the
+/// data map in that envelope, paid with the content, so the returned
+/// address, the envelope's, is readable at once without a second payment,
+/// and no plain data map chunk is stored.
+async fn the_file_shortcuts_store_envelopes_by_default(testnet: Arc<MiniTestnet>) {
+    let client = testnet.client();
 
     let (file, _) = input(0x31);
     let prepared = client
@@ -845,7 +761,7 @@ async fn the_file_shortcuts_store_envelopes_by_default() {
     assert!(flags.withheld);
     assert!(private.salt.is_some());
 
-    let (file, _) = input(0x32);
+    let (file, original) = input(0x32);
     let result = client
         .file_upload_public_with_progress(file.path(), PaymentMode::Single, None)
         .await
@@ -856,8 +772,37 @@ async fn the_file_shortcuts_store_envelopes_by_default() {
     assert!(!flags.in_index);
     assert!(!flags.withheld);
     assert!(unlisted.salt.is_none());
-    assert_eq!(result.data_map_address, Some(unlisted.address()));
-
-    drop(client);
-    testnet.teardown().await;
+    assert!(unlisted.readable());
+    assert_eq!(
+        unlisted.envelope.flags(),
+        EnvelopeOptions::unlisted().flags()
+    );
+    assert!(unlisted.proof.is_some(), "{:?}", unlisted.proof_problem);
+    let address = result
+        .data_map_address
+        .expect("public upload must return an address");
+    assert_eq!(address, unlisted.address(), "the address is the envelope's");
+    forget_upload_record(&address).expect("forget the kept record");
+    let plain = compute_address(&rmp_serde::to_vec(&result.data_map).expect("serialize DataMap"));
+    assert_ne!(address, plain);
+    assert!(
+        !client.chunk_exists(&plain).await.expect("check"),
+        "no plain data map chunk is stored"
+    );
+    assert_eq!(
+        result.chunks_stored, result.total_chunks,
+        "public upload should store every chunk, including the envelope"
+    );
+    let fetched = client
+        .data_map_fetch(&address)
+        .await
+        .expect("public DataMap should be retrievable by returned address");
+    let output = TempDir::new().unwrap();
+    let path = output.path().join("direct_public_out.bin");
+    let bytes_written = client
+        .file_download(&fetched, &path)
+        .await
+        .expect("file_download should succeed");
+    assert_eq!(bytes_written, original.len() as u64);
+    assert_eq!(std::fs::read(path).unwrap(), original);
 }
