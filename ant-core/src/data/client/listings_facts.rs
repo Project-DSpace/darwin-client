@@ -7,7 +7,10 @@
 //! - **Chain facts**, kept per vault, which is all a listing's check reads
 //!   from the chain:
 //!   - a transaction's receipt, as little of it as a check reads: whether it
-//!     succeeded, its block, and the vault's logs in it;
+//!     succeeded, its block, and the logs in it of the vaults read and of the
+//!     root vault's token, each with its own address and data. A reader with
+//!     a root vault keeps its receipts and quotes' payments apart from a
+//!     reader of the per-quote vault alone, whose receipts hold fewer logs;
 //!   - a block's timestamp;
 //!   - a quote's payments, as log queries found them: the vault records a
 //!     quote's payment once and skips any repeat, so once found they are all
@@ -25,7 +28,7 @@ use std::collections::HashMap;
 use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
-use ant_listings::{Envelope, PaymentLog, PaymentReceipt};
+use ant_listings::{Envelope, PaymentLog, PaymentReceipt, VaultSet};
 use ant_protocol::{compute_address, XorName};
 use heed::types::Bytes;
 use heed::Database;
@@ -57,6 +60,19 @@ pub(crate) const FINALIZED_REFRESH: Duration = Duration::from_secs(60);
 
 /// The version of the encoding of every chain fact kept, its first byte.
 const FORMAT: u8 = 1;
+
+/// The version of the encoding of a receipt kept, its first byte: each log
+/// with its own address and data ([`encode_receipt`]). Receipts of
+/// [`FORMAT`] held the per-quote vault's logs alone, with no address or
+/// data; they are read only by a reader of the per-quote vault alone.
+const RECEIPT_FORMAT: u8 = 2;
+
+/// Whether a receipt read with `vaults` keeps the log of `address`: the
+/// vaults' logs, and the root vault's token's, whose transfers show what a
+/// wave paid ([`ant_listings::recorded_wave`]).
+pub(crate) fn receipt_keeps(vaults: &VaultSet, address: &[u8; 20]) -> bool {
+    vaults.contains(address) || vaults.root.is_some_and(|root| root.token == *address)
+}
 
 /// A vault `DataPaymentMade` log, located: a payment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -123,7 +139,7 @@ pub(crate) struct Finalized {
 
 /// The envelopes and chain facts a reader keeps. See the module docs.
 pub(crate) struct Facts {
-    vault: [u8; 20],
+    vaults: VaultSet,
     store: ListingsStore,
     envelopes: Database<Bytes, Bytes>,
     receipts: Database<Bytes, Bytes>,
@@ -139,21 +155,21 @@ pub(crate) struct Facts {
 impl std::fmt::Debug for Facts {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Facts")
-            .field("vault", &hex::encode(self.vault))
+            .field("vault", &hex::encode(self.vaults.v2))
             .finish_non_exhaustive()
     }
 }
 
 impl Facts {
-    /// The facts about `vault` kept in `store`, its databases created if
+    /// The facts about `vaults` kept in `store`, its databases created if
     /// they don't exist.
     ///
     /// # Errors
     ///
     /// If the databases can't be opened.
-    pub(crate) fn open(store: &ListingsStore, vault: [u8; 20]) -> Result<Self> {
+    pub(crate) fn open(store: &ListingsStore, vaults: VaultSet) -> Result<Self> {
         Ok(Self {
-            vault,
+            vaults,
             store: store.clone(),
             envelopes: store.database(ENVELOPES_DB)?,
             receipts: store.database(RECEIPTS_DB)?,
@@ -163,6 +179,18 @@ impl Facts {
             held: Mutex::default(),
             finalized: tokio::sync::Mutex::default(),
         })
+    }
+
+    /// Read `vaults` from now on: the receipts and quotes' payments held of
+    /// the vaults read before are dropped, and those kept for them are no
+    /// longer read.
+    pub(crate) fn set_vaults(&mut self, vaults: VaultSet) {
+        if vaults != self.vaults {
+            self.vaults = vaults;
+            let mut held = self.held();
+            held.receipts.clear();
+            held.quotes.clear();
+        }
     }
 
     fn held(&self) -> MutexGuard<'_, Held> {
@@ -245,8 +273,8 @@ impl Facts {
 
     /// The receipt of `tx_hash`, if kept for good.
     pub(crate) fn kept_receipt(&self, tx_hash: &[u8; 32]) -> Option<PaymentReceipt> {
-        let bytes = self.get(&self.receipts, &self.key(tx_hash))?;
-        decode_receipt(*tx_hash, &self.vault, &bytes)
+        let bytes = self.get(&self.receipts, &self.logs_key(tx_hash))?;
+        decode_receipt(*tx_hash, &self.vaults, &bytes)
     }
 
     /// The timestamp of block `number`, kept or held.
@@ -275,7 +303,7 @@ impl Facts {
         let read = || -> heed::Result<Vec<(u64, u64)>> {
             let txn = self.store.env().read_txn()?;
             let mut blocks = Vec::new();
-            for entry in self.blocks.prefix_iter(&txn, &self.vault[..])? {
+            for entry in self.blocks.prefix_iter(&txn, &self.vaults.v2[..])? {
                 let (key, value) = entry?;
                 let number = key
                     .get(20..28)
@@ -311,7 +339,7 @@ impl Facts {
 
     /// The payments of `quote_hash`, if kept for good.
     pub(crate) fn kept_quote(&self, quote_hash: &[u8; 32]) -> Option<Vec<VaultLog>> {
-        let bytes = self.get(&self.quotes, &self.key(quote_hash))?;
+        let bytes = self.get(&self.quotes, &self.logs_key(quote_hash))?;
         decode_payments(&bytes)
     }
 
@@ -473,9 +501,9 @@ impl Facts {
         let write = || -> heed::Result<()> {
             let mut txn = self.store.env().write_txn()?;
             for receipt in &keep.receipts {
-                if let Some(bytes) = encode_receipt(receipt, &self.vault) {
+                if let Some(bytes) = encode_receipt(receipt, &self.vaults) {
                     self.receipts
-                        .put(&mut txn, &self.key(&receipt.tx_hash), &bytes)?;
+                        .put(&mut txn, &self.logs_key(&receipt.tx_hash), &bytes)?;
                 }
             }
             for (number, timestamp) in &keep.blocks {
@@ -488,7 +516,8 @@ impl Facts {
             // No payment found is "not found": never kept.
             for (quote_hash, payments) in keep.quotes.iter().filter(|(_, p)| !p.is_empty()) {
                 if let Some(bytes) = encode_payments(payments) {
-                    self.quotes.put(&mut txn, &self.key(quote_hash), &bytes)?;
+                    self.quotes
+                        .put(&mut txn, &self.logs_key(quote_hash), &bytes)?;
                 }
             }
             for ((block, log_index), tx_hash) in &keep.block_logs {
@@ -519,10 +548,26 @@ impl Facts {
         true
     }
 
-    /// `id` keyed under the vault.
+    /// `id` keyed under the per-quote vault.
     fn key(&self, id: &[u8]) -> Vec<u8> {
         let mut key = Vec::with_capacity(20 + id.len());
-        key.extend_from_slice(&self.vault);
+        key.extend_from_slice(&self.vaults.v2);
+        key.extend_from_slice(id);
+        key
+    }
+
+    /// `id` keyed under the vaults whose logs are read: the per-quote
+    /// vault's alone as [`Self::key`], and with a root vault, its address and
+    /// token after it. A receipt or a quote's payments read with a root vault
+    /// hold logs a reader of the per-quote vault alone never reads, and those
+    /// read without one lack them, so neither reads the other's.
+    fn logs_key(&self, id: &[u8]) -> Vec<u8> {
+        let mut key = Vec::with_capacity(60 + id.len());
+        key.extend_from_slice(&self.vaults.v2);
+        if let Some(root) = self.vaults.root {
+            key.extend_from_slice(&root.address);
+            key.extend_from_slice(&root.token);
+        }
         key.extend_from_slice(id);
         key
     }
@@ -535,37 +580,46 @@ impl Facts {
     }
 }
 
-/// `receipt` as kept: [`FORMAT`], success (0 or 1), the block (8 bytes, big
-/// endian), the number of logs (2 bytes), then each of the vault's logs: its
-/// index (8 bytes), its number of topics (1 byte) and the topics (32 bytes
-/// each). Only the vault's logs are kept. `None` if it has more logs or
-/// topics than that holds.
-fn encode_receipt(receipt: &PaymentReceipt, vault: &[u8; 20]) -> Option<Vec<u8>> {
+/// `receipt` as kept: [`RECEIPT_FORMAT`], success (0 or 1), the block (8
+/// bytes, big endian), the number of logs (2 bytes), then each log a reader
+/// of `vaults` keeps ([`receipt_keeps`]): its address (20 bytes), index (8
+/// bytes), number of topics (1 byte), the topics (32 bytes each), the length
+/// of its data (4 bytes) and the data. `None` if it has more logs, topics or
+/// data than that holds.
+fn encode_receipt(receipt: &PaymentReceipt, vaults: &VaultSet) -> Option<Vec<u8>> {
     let logs: Vec<&PaymentLog> = receipt
         .logs
         .iter()
-        .filter(|log| log.address == *vault)
+        .filter(|log| receipt_keeps(vaults, &log.address))
         .collect();
-    let mut bytes = vec![FORMAT, u8::from(receipt.success)];
+    let mut bytes = vec![RECEIPT_FORMAT, u8::from(receipt.success)];
     bytes.extend_from_slice(&receipt.block_number.to_be_bytes());
     bytes.extend_from_slice(&u16::try_from(logs.len()).ok()?.to_be_bytes());
     for log in logs {
+        bytes.extend_from_slice(&log.address);
         bytes.extend_from_slice(&log.log_index.to_be_bytes());
         bytes.push(u8::try_from(log.topics.len()).ok()?);
         for topic in &log.topics {
             bytes.extend_from_slice(topic);
         }
+        bytes.extend_from_slice(&u32::try_from(log.data.len()).ok()?.to_be_bytes());
+        bytes.extend_from_slice(&log.data);
     }
     Some(bytes)
 }
 
-/// A receipt kept for `tx_hash` ([`encode_receipt`]), its logs the vault's.
-/// `None` for bytes of another format, cut short, or with bytes left over.
-fn decode_receipt(tx_hash: [u8; 32], vault: &[u8; 20], bytes: &[u8]) -> Option<PaymentReceipt> {
+/// A receipt kept for `tx_hash` ([`encode_receipt`]), as a reader of
+/// `vaults` reads it. One of [`FORMAT`], whose logs are the per-quote vault's
+/// with no data, is read only with no root vault. `None` for bytes of
+/// another format, cut short, with bytes left over, or with a log the
+/// reader doesn't keep.
+fn decode_receipt(tx_hash: [u8; 32], vaults: &VaultSet, bytes: &[u8]) -> Option<PaymentReceipt> {
     let mut reader = Reader(bytes);
-    if reader.u8()? != FORMAT {
-        return None;
-    }
+    let addressed = match reader.u8()? {
+        RECEIPT_FORMAT => true,
+        FORMAT if vaults.root.is_none() => false,
+        _ => return None,
+    };
     let success = match reader.u8()? {
         0 => false,
         1 => true,
@@ -575,14 +629,30 @@ fn decode_receipt(tx_hash: [u8; 32], vault: &[u8; 20], bytes: &[u8]) -> Option<P
     let count = u16::from_be_bytes(reader.take()?);
     let mut logs = Vec::with_capacity(usize::from(count));
     for _ in 0..count {
+        let address = if addressed {
+            reader.take::<20>()?
+        } else {
+            vaults.v2
+        };
+        if !receipt_keeps(vaults, &address) {
+            return None;
+        }
         let log_index = reader.u64()?;
         let topics = (0..reader.u8()?)
             .map(|_| reader.take::<32>())
             .collect::<Option<Vec<[u8; 32]>>>()?;
+        let data = if addressed {
+            let length = usize::try_from(u32::from_be_bytes(reader.take()?)).ok()?;
+            let (data, rest) = reader.0.split_at_checked(length)?;
+            reader.0 = rest;
+            data.to_vec()
+        } else {
+            Vec::new()
+        };
         logs.push(PaymentLog {
-            address: *vault,
+            address,
             topics,
-            data: Vec::new(),
+            data,
             log_index,
         });
     }
@@ -663,9 +733,14 @@ impl Reader<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ant_listings::DATA_PAYMENT_MADE_TOPIC;
+    use ant_listings::{RootVault, DATA_PAYMENT_MADE_TOPIC};
 
     const VAULT: [u8; 20] = [0x69; 20];
+    const VAULTS: VaultSet = VaultSet::v2_only(VAULT);
+    const ROOT: RootVault = RootVault {
+        address: [0xf6; 20],
+        token: [0x7a; 20],
+    };
 
     fn store(dir: &std::path::Path) -> ListingsStore {
         ListingsStore::open_with_map_size(dir, 16 * 1024 * 1024).unwrap()
@@ -705,18 +780,110 @@ mod tests {
                 log_index: 1,
             },
         );
-        let bytes = encode_receipt(&with_others, &VAULT).unwrap();
-        assert_eq!(decode_receipt([0xaa; 32], &VAULT, &bytes), Some(receipt()));
+        let bytes = encode_receipt(&with_others, &VAULTS).unwrap();
+        assert_eq!(decode_receipt([0xaa; 32], &VAULTS, &bytes), Some(receipt()));
         // Another format, cut short or with bytes over: nothing.
         let mut other = bytes.clone();
-        other[0] = 2;
-        assert_eq!(decode_receipt([0xaa; 32], &VAULT, &other), None);
+        other[0] = 3;
+        assert_eq!(decode_receipt([0xaa; 32], &VAULTS, &other), None);
         for end in 0..bytes.len() {
-            assert_eq!(decode_receipt([0xaa; 32], &VAULT, &bytes[..end]), None);
+            assert_eq!(decode_receipt([0xaa; 32], &VAULTS, &bytes[..end]), None);
         }
         let mut longer = bytes;
         longer.push(0);
-        assert_eq!(decode_receipt([0xaa; 32], &VAULT, &longer), None);
+        assert_eq!(decode_receipt([0xaa; 32], &VAULTS, &longer), None);
+    }
+
+    /// A receipt of the first format: the per-quote vault's logs, each its
+    /// index and topics, with no address or data.
+    fn first_format(receipt: &PaymentReceipt) -> Vec<u8> {
+        let mut bytes = vec![FORMAT, u8::from(receipt.success)];
+        bytes.extend_from_slice(&receipt.block_number.to_be_bytes());
+        bytes.extend_from_slice(&u16::try_from(receipt.logs.len()).unwrap().to_be_bytes());
+        for log in &receipt.logs {
+            bytes.extend_from_slice(&log.log_index.to_be_bytes());
+            bytes.push(u8::try_from(log.topics.len()).unwrap());
+            for topic in &log.topics {
+                bytes.extend_from_slice(topic);
+            }
+        }
+        bytes
+    }
+
+    #[test]
+    fn a_first_format_receipt_is_read_only_without_a_root_vault() {
+        let bytes = first_format(&receipt());
+        assert_eq!(decode_receipt([0xaa; 32], &VAULTS, &bytes), Some(receipt()));
+        let with_root = VaultSet::with_root(VAULT, ROOT);
+        assert_eq!(decode_receipt([0xaa; 32], &with_root, &bytes), None);
+    }
+
+    /// A root wave's receipt: a per-quote vault log, the root vault's
+    /// payment and `RootPaid` logs, the token's transfer, each with its data,
+    /// and another contract's log.
+    fn root_receipt() -> PaymentReceipt {
+        let log = |address: [u8; 20], topics: Vec<[u8; 32]>, data: Vec<u8>, log_index| PaymentLog {
+            address,
+            topics,
+            data,
+            log_index,
+        };
+        PaymentReceipt {
+            tx_hash: [0xcc; 32],
+            success: true,
+            block_number: 81_942_900,
+            logs: vec![
+                log(VAULT, vec![DATA_PAYMENT_MADE_TOPIC, [1; 32]], Vec::new(), 0),
+                log(
+                    ROOT.address,
+                    vec![DATA_PAYMENT_MADE_TOPIC, [2; 32], [3; 32], [4; 32]],
+                    Vec::new(),
+                    1,
+                ),
+                log(ROOT.address, vec![[5; 32], [6; 32]], vec![7; 96], 2),
+                log(
+                    ROOT.token,
+                    vec![[8; 32], [9; 32], [10; 32]],
+                    vec![11; 32],
+                    3,
+                ),
+                log([0x11; 20], vec![[12; 32]], vec![13; 4], 4),
+            ],
+        }
+    }
+
+    #[test]
+    fn a_root_waves_receipt_is_kept_with_each_logs_address_and_data() {
+        let dir = tempfile::tempdir().unwrap();
+        let with_root = VaultSet::with_root(VAULT, ROOT);
+        let mut expected = root_receipt();
+        expected.logs.retain(|log| log.address != [0x11; 20]);
+        {
+            let facts = Facts::open(&store(dir.path()), with_root).unwrap();
+            assert!(facts.keep(&Keep {
+                receipts: vec![root_receipt()],
+                ..Keep::default()
+            }));
+        }
+        let store = store(dir.path());
+        let facts = Facts::open(&store, with_root).unwrap();
+        let kept = facts.receipt(&[0xcc; 32]).unwrap();
+        assert!(kept.kept);
+        assert_eq!(kept.value, expected);
+        // A reader of the per-quote vault alone keeps its own: it never
+        // reads one kept with a root vault, nor the other way round.
+        let mut v2_only = Facts::open(&store, VAULTS).unwrap();
+        assert!(v2_only.receipt(&[0xcc; 32]).is_none());
+        assert!(v2_only.keep(&Keep {
+            receipts: vec![receipt()],
+            ..Keep::default()
+        }));
+        assert_eq!(v2_only.kept_receipt(&[0xaa; 32]), Some(receipt()));
+        assert!(facts.receipt(&[0xaa; 32]).is_none());
+        // Moving the reader to the root vault moves what it reads.
+        v2_only.set_vaults(with_root);
+        assert_eq!(v2_only.kept_receipt(&[0xcc; 32]), Some(expected));
+        assert!(v2_only.receipt(&[0xaa; 32]).is_none());
     }
 
     #[test]
@@ -753,7 +920,7 @@ mod tests {
             log_index: 4,
         }];
         {
-            let facts = Facts::open(&store(dir.path()), VAULT).unwrap();
+            let facts = Facts::open(&store(dir.path()), VAULTS).unwrap();
             // Held, not kept.
             facts.hold_receipt(&receipt(), 1);
             facts.hold_block(81_942_857, 1_791_321_603, 1);
@@ -774,7 +941,7 @@ mod tests {
             assert_eq!(facts.held_count(), 0);
         }
         let store = store(dir.path());
-        let facts = Facts::open(&store, VAULT).unwrap();
+        let facts = Facts::open(&store, VAULTS).unwrap();
         let kept = facts.receipt(&[0xaa; 32]).unwrap();
         assert!(kept.kept);
         assert_eq!(kept.value, receipt());
@@ -783,7 +950,7 @@ mod tests {
         assert_eq!(facts.kept_quote(&[3; 32]), Some(payments));
         assert_eq!(facts.kept_block_log(81_942_857, 4), Some([0xaa; 32]));
         // Another vault's reader sees none of them.
-        let other = Facts::open(&store, [0x70; 20]).unwrap();
+        let other = Facts::open(&store, VaultSet::v2_only([0x70; 20])).unwrap();
         assert!(other.receipt(&[0xaa; 32]).is_none());
         assert!(other.block(81_942_857).is_none());
         assert!(other.kept_blocks().is_empty());
@@ -794,7 +961,7 @@ mod tests {
     #[test]
     fn held_facts_can_be_dropped() {
         let dir = tempfile::tempdir().unwrap();
-        let facts = Facts::open(&store(dir.path()), VAULT).unwrap();
+        let facts = Facts::open(&store(dir.path()), VAULTS).unwrap();
         facts.hold_receipt(&receipt(), 0);
         facts.hold_block(5, 6, 0);
         facts.hold_quote([3; 32], Vec::new());

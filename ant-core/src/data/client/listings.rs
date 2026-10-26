@@ -43,7 +43,9 @@
 //! stopped early carries on in the next read ([`WalkState`]), and a read
 //! never says a listing it didn't decide is gone ([`ListingsIndex::carry`]).
 
-use crate::data::client::listings_facts::{Facts, Keep, Known, VaultLog, FINALIZED_REFRESH};
+use crate::data::client::listings_facts::{
+    receipt_keeps, Facts, Keep, Known, VaultLog, FINALIZED_REFRESH,
+};
 use crate::data::client::listings_rpc::{Answer, Call, Kind, Rpc};
 use crate::data::client::listings_store::ListingsStore;
 use crate::data::client::listings_v1::RpcCalls;
@@ -2561,11 +2563,11 @@ impl Unconfirmed {
     }
 
     /// Whether `answer`, to [`Self::call`], says the same.
-    fn agrees(&self, answer: &Value, vault: &[u8; 20]) -> bool {
+    fn agrees(&self, answer: &Value, vaults: &VaultSet) -> bool {
         match self {
             Self::Receipt(receipt, _) => {
                 !answer.is_null()
-                    && parse_receipt(receipt.tx_hash, answer, vault)
+                    && parse_receipt(receipt.tx_hash, answer, vaults)
                         .is_ok_and(|read| read == *receipt)
             }
             Self::Block(_, timestamp, _) => {
@@ -2703,7 +2705,7 @@ impl ListingChain {
     ///
     /// If the store's databases can't be opened.
     pub fn with_store(mut self, store: &ListingsStore) -> Result<Self> {
-        let facts = Facts::open(store, self.vault)?;
+        let facts = Facts::open(store, self.vaults)?;
         for (number, timestamp) in facts.kept_blocks() {
             self.remember_block(number, timestamp);
         }
@@ -2791,6 +2793,9 @@ impl ListingChain {
     #[must_use]
     pub fn with_root_vault(mut self, root: RootVault) -> Self {
         self.vaults = VaultSet::with_root(self.vault, root);
+        if let Some(facts) = self.facts.as_mut() {
+            facts.set_vaults(self.vaults);
+        }
         self
     }
 
@@ -3246,7 +3251,7 @@ impl ListingChain {
             if value.is_null() {
                 continue;
             }
-            let receipt = parse_receipt(tx_hashes[i], &value, &self.vault)?;
+            let receipt = parse_receipt(tx_hashes[i], &value, &self.vaults)?;
             found[i] = Some(Known::read(receipt, provider));
         }
         Ok(found)
@@ -3398,7 +3403,7 @@ impl ListingChain {
                 let answers = self.rpc.batch_to(provider, Kind::Chain, &calls).await;
                 for ((fact, mut others), answer) in facts_asked.into_iter().zip(answers) {
                     match answer {
-                        Ok(value) if fact.agrees(&value, &self.vault) => match fact {
+                        Ok(value) if fact.agrees(&value, &self.vaults) => match fact {
                             Unconfirmed::Receipt(receipt, _) => keep.receipts.push(receipt),
                             Unconfirmed::Block(number, timestamp, _) => {
                                 keep.blocks.push((number, timestamp));
@@ -3932,11 +3937,13 @@ struct RpcSetup {
 
 /// The receipt in `answer`, an `eth_getTransactionReceipt` answer for
 /// `tx_hash`, as little of it as a check reads: whether it succeeded, its
-/// block, and `vault`'s logs in it.
+/// block, and the logs in it of `vaults` and of the root vault's token, each
+/// with its data ([`receipt_keeps`]): a root vault's payment is checked from
+/// its wave's `RootPaid` log and the token's transfers after it.
 fn parse_receipt(
     tx_hash: [u8; 32],
     answer: &Value,
-    vault: &[u8; 20],
+    vaults: &VaultSet,
 ) -> std::result::Result<PaymentReceipt, String> {
     let block_number = answer["blockNumber"]
         .as_str()
@@ -3951,7 +3958,7 @@ fn parse_receipt(
             .map(|logs| {
                 logs.iter()
                     .filter_map(parse_log)
-                    .filter(|log| log.address == *vault)
+                    .filter(|log| receipt_keeps(vaults, &log.address))
                     .collect()
             })
             .unwrap_or_default(),
@@ -3960,7 +3967,8 @@ fn parse_receipt(
 
 /// Whether `receipt` shows `payment`: it is the payment's transaction, in
 /// its block, with the vault's `DataPaymentMade` log at its log index, of
-/// `quote_hash` where given. `receipt` holds only the vault's logs.
+/// `quote_hash` where given. `receipt` holds only the vaults' logs and the
+/// root vault's token's, which never log `DataPaymentMade`.
 fn shows_payment(
     receipt: &PaymentReceipt,
     payment: &VaultLog,
@@ -4235,6 +4243,7 @@ pub(crate) mod test_chain {
             "logs": receipt.logs.iter().map(|log| json!({
                 "address": format!("0x{}", hex::encode(log.address)),
                 "topics": log.topics.iter().map(|t| format!("0x{}", hex::encode(t))).collect::<Vec<_>>(),
+                "data": format!("0x{}", hex::encode(&log.data)),
                 "logIndex": quantity(log.log_index),
             })).collect::<Vec<_>>(),
         })
