@@ -415,7 +415,7 @@ fn payment_plan_from_quotes(
     // its record out once interrupted, so it is refused before anything is sent.
     if !super::upload_state::plan_weight_restores(data_size, weight) {
         return Err(Error::Payment(format!(
-            "a {data_size}-byte record can't be paid at weight {}/{}: only a full chunk's              amount or its size class's restores from a checkpoint",
+            "a {data_size}-byte record can't be paid at weight {}/{}: only a full chunk's amount or its size class's restores from a checkpoint",
             weight.numerator(),
             ant_protocol::payment::pricing::WEIGHT_DENOMINATOR
         )));
