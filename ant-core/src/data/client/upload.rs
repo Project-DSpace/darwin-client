@@ -1477,9 +1477,12 @@ pub(crate) fn proof_paid_outside(
 
 /// Whether `left_out`, peers the client left out of its lookups, holds a
 /// storer that could be within `address`'s width but missing from `peers`,
-/// its PUT targets, nearest first: the paid node `paid`, or a peer nearer
-/// `address` than the width's last of `peers`. A list shorter than the
-/// width can't show who is outside it, so it answers `true`.
+/// its PUT targets: the paid node `paid`, or a peer nearer `address` than
+/// the farthest of the width's targets (the first
+/// [`PUT_TARGET_WIDTH`](crate::quote_policy::PUT_TARGET_WIDTH) of `peers`,
+/// by XOR distance: the list is ordered for sending, the median issuer's
+/// supporters first, not by distance). A list shorter than the width can't
+/// show who is outside it, so it answers `true`.
 pub(crate) fn left_out_within_width(
     address: &[u8; 32],
     paid: &[u8; 32],
@@ -1490,10 +1493,18 @@ pub(crate) fn left_out_within_width(
     left_out: &[[u8; 32]],
 ) -> bool {
     let distance = |peer: &[u8; 32]| -> [u8; 32] { std::array::from_fn(|i| peer[i] ^ address[i]) };
-    let Some((last, _)) = peers.get(crate::quote_policy::PUT_TARGET_WIDTH - 1) else {
+    let width = crate::quote_policy::PUT_TARGET_WIDTH;
+    if peers.len() < width {
+        return true;
+    }
+    let Some(bound) = peers
+        .iter()
+        .take(width)
+        .map(|(peer, _)| distance(peer.as_bytes()))
+        .max()
+    else {
         return true;
     };
-    let bound = distance(last.as_bytes());
     left_out
         .iter()
         .any(|peer| peer == paid || distance(peer) < bound)
@@ -2208,6 +2219,52 @@ mod tests {
             &fresh.quoted_peers,
             &[farthest, median]
         ));
+    }
+
+    /// The PUT targets are ordered for sending (the median issuer's
+    /// supporters first), not by distance, so the width's farthest target
+    /// need not be its last. A peer left out nearer the record than the
+    /// farthest target, though farther than the last, could be within the
+    /// width: the proof is kept.
+    #[test]
+    fn the_width_bound_is_the_farthest_target_not_the_last() {
+        use crate::data::client::upload_state::test_state::{plan_priced, transactions};
+        use ant_protocol::transport::PeerId;
+        let now = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000);
+        let paid = plan_priced(b"paid earlier", now, &[30, 10, 20]);
+        let mut state = UploadState::default();
+        state.prepare(paid.clone());
+        state
+            .confirm(&[paid.address], &transactions(&paid), now)
+            .unwrap();
+        // A peer at XOR distance `top` (first byte) from the record.
+        let at = |top: u8| -> [u8; 32] {
+            let mut peer = paid.address;
+            peer[0] ^= top;
+            peer
+        };
+        // Supporters first: the farthest target leads, the last is near.
+        let width = crate::quote_policy::PUT_TARGET_WIDTH;
+        let mut fresh = paid.clone();
+        fresh.quoted_peers = (0..width)
+            .map(|i| {
+                let top = if i == 0 {
+                    0x80
+                } else {
+                    u8::try_from(i).unwrap()
+                };
+                (PeerId::from_bytes(at(top)), Vec::new())
+            })
+            .collect();
+        let last = u8::try_from(width - 1).unwrap();
+        let between = at(0x40);
+        assert!(0x40 > last);
+        let beyond = at(0xC0);
+        assert!(proof_paid_outside(&state, &fresh, Some(&[])));
+        // Left out between the last target and the farthest: kept.
+        assert!(!proof_paid_outside(&state, &fresh, Some(&[between])));
+        // Left out beyond the farthest target: dropped.
+        assert!(proof_paid_outside(&state, &fresh, Some(&[beyond])));
     }
 
     /// A record whose earlier proof every failing storer refused is paid
