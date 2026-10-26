@@ -1,27 +1,62 @@
-//! Security attack tests for ant-core.
+//! Payment verification of proofs built the client's way: each case
+//! collects real quotes, tampers with the proof or the payment in one way,
+//! and asserts the network refuses it. darwin-node's own tests cover
+//! malformed proofs, so these are not repeated there.
 //!
-//! Each test sets up a `MiniTestnet`, collects real quotes, tampers with the
-//! proof in a specific way, and asserts the attack is REJECTED by the network.
+//! A proof that is not a proof at all (0 bytes, or random bytes) is refused
+//! by darwin-node's tests, so this client no longer sends one; its
+//! `test_chunk_put_with_insufficient_proof_rejected`,
+//! `test_chunk_put_with_invalid_proof_rejected` and the garbage-proof half of
+//! `test_payment_required_enforcement` went for them. At the revision
+//! ant-core/Cargo.toml pins (94bf342) they are `test_attack_empty_proof_bytes`
+//! and `test_attack_garbage_bytes_as_proof` in `tests/e2e/security_attacks.rs`.
+//! darwin-node's test-cleanse branch folds them into the table of
+//! `test_chunk_rejected_without_payment` in `tests/e2e/data_types/chunk.rs`,
+//! its rows "0 bytes" and "garbage". A pin bump checks that one or the other
+//! exists at the new revision (the update-ant-node-ref skill, Step 5).
 
-#![allow(clippy::unwrap_used, clippy::expect_used)]
-
-mod support;
-
+use crate::support::runner::Case;
+use crate::support::MiniTestnet;
 use ant_core::data::{compute_address, Client, SingleNodeQuotePayment};
 use ant_protocol::evm::{Amount, EncodedPeerId, ProofOfPayment, RewardsAddress, TxHash};
 use ant_protocol::payment::{serialize_single_node_proof, PaymentProof};
 use ant_protocol::transport::PeerId;
 use bytes::Bytes;
-use serial_test::serial;
 use std::sync::Arc;
-use support::{test_client_config, MiniTestnet, DEFAULT_NODE_COUNT};
 
-async fn setup() -> (Client, MiniTestnet) {
-    let testnet = MiniTestnet::start(DEFAULT_NODE_COUNT).await;
-    let node = testnet.node(3).expect("Node 3 should exist");
-    let client = Client::from_node(Arc::clone(&node), test_client_config())
-        .with_wallet(testnet.wallet().clone());
-    (client, testnet)
+pub fn cases() -> Vec<Case> {
+    vec![
+        Case::on_network("security::forged_signature", test_attack_forged_signature),
+        Case::on_network(
+            "security::wrong_chunk_address",
+            test_attack_wrong_chunk_address,
+        ),
+        Case::on_network(
+            "security::replay_to_a_different_chunk",
+            test_attack_replay_different_chunk,
+        ),
+        Case::on_network("security::zero_amount", test_attack_zero_amount_payment),
+        Case::on_network(
+            "security::fabricated_tx_hash",
+            test_attack_fabricated_tx_hash,
+        ),
+        Case::on_network(
+            "security::double_spend_same_proof",
+            test_attack_double_spend_same_proof,
+        ),
+        Case::on_network(
+            "security::corrupted_public_key",
+            test_attack_corrupted_public_key,
+        ),
+        Case::on_network(
+            "security::underpayment_one_atto",
+            test_attack_underpayment_single_node,
+        ),
+        Case::on_network(
+            "security::underpayment_half_price",
+            test_attack_underpayment_half_price,
+        ),
+    ]
 }
 
 /// Helper: collect quotes, pay on-chain, and return the raw `PaymentProof` struct,
@@ -71,10 +106,8 @@ async fn collect_and_pay(client: &Client, content: &Bytes) -> (PaymentProof, Vec
 
 // ─── Test 1: Forged ML-DSA-65 Signatures ────────────────────────────────────
 
-#[tokio::test(flavor = "multi_thread")]
-#[serial]
-async fn test_attack_forged_signature() {
-    let (client, testnet) = setup().await;
+async fn test_attack_forged_signature(testnet: Arc<MiniTestnet>) {
+    let client = testnet.client();
 
     let content = Bytes::from("forged signature attack test data");
     let (proof, _, target_peer) = collect_and_pay(&client, &content).await;
@@ -104,17 +137,12 @@ async fn test_attack_forged_signature() {
         result.is_err(),
         "PUT with forged signatures should be rejected"
     );
-
-    drop(client);
-    testnet.teardown().await;
 }
 
 // ─── Test 2: Wrong Chunk Address ─────────────────────────────────────────────
 
-#[tokio::test(flavor = "multi_thread")]
-#[serial]
-async fn test_attack_wrong_chunk_address() {
-    let (client, testnet) = setup().await;
+async fn test_attack_wrong_chunk_address(testnet: Arc<MiniTestnet>) {
+    let client = testnet.client();
 
     // Get quotes and pay for chunk A
     let content_a = Bytes::from("chunk A - the one we paid for");
@@ -130,17 +158,12 @@ async fn test_attack_wrong_chunk_address() {
         result.is_err(),
         "PUT with wrong chunk address should be rejected"
     );
-
-    drop(client);
-    testnet.teardown().await;
 }
 
 // ─── Test 3: Replay Proof for Different Chunk ────────────────────────────────
 
-#[tokio::test(flavor = "multi_thread")]
-#[serial]
-async fn test_attack_replay_different_chunk() {
-    let (client, testnet) = setup().await;
+async fn test_attack_replay_different_chunk(testnet: Arc<MiniTestnet>) {
+    let client = testnet.client();
 
     // Legitimately store chunk A
     let content_a = Bytes::from("replay attack - legitimate chunk A");
@@ -175,17 +198,12 @@ async fn test_attack_replay_different_chunk() {
         result.is_err(),
         "Replaying chunk A's proof for chunk B should be rejected"
     );
-
-    drop(client);
-    testnet.teardown().await;
 }
 
 // ─── Test 4: Zero-Amount Payment (Empty TX Hashes) ──────────────────────────
 
-#[tokio::test(flavor = "multi_thread")]
-#[serial]
-async fn test_attack_zero_amount_payment() {
-    let (client, testnet) = setup().await;
+async fn test_attack_zero_amount_payment(testnet: Arc<MiniTestnet>) {
+    let client = testnet.client();
 
     let content = Bytes::from("zero amount attack test data");
     let address = compute_address(&content);
@@ -220,17 +238,12 @@ async fn test_attack_zero_amount_payment() {
         result.is_err(),
         "PUT with zero-amount (empty tx_hashes) should be rejected"
     );
-
-    drop(client);
-    testnet.teardown().await;
 }
 
 // ─── Test 5: Fabricated Transaction Hash ─────────────────────────────────────
 
-#[tokio::test(flavor = "multi_thread")]
-#[serial]
-async fn test_attack_fabricated_tx_hash() {
-    let (client, testnet) = setup().await;
+async fn test_attack_fabricated_tx_hash(testnet: Arc<MiniTestnet>) {
+    let client = testnet.client();
 
     let content = Bytes::from("fabricated tx hash attack test data");
     let address = compute_address(&content);
@@ -266,17 +279,12 @@ async fn test_attack_fabricated_tx_hash() {
         result.is_err(),
         "PUT with fabricated tx hash should be rejected"
     );
-
-    drop(client);
-    testnet.teardown().await;
 }
 
 // ─── Test 6: Double-Spend Same Proof (Idempotent) ───────────────────────────
 
-#[tokio::test(flavor = "multi_thread")]
-#[serial]
-async fn test_attack_double_spend_same_proof() {
-    let (client, testnet) = setup().await;
+async fn test_attack_double_spend_same_proof(testnet: Arc<MiniTestnet>) {
+    let client = testnet.client();
 
     let content = Bytes::from("double spend idempotency test data");
     let (_, proof_bytes, target_peer) = collect_and_pay(&client, &content).await;
@@ -297,17 +305,12 @@ async fn test_attack_double_spend_same_proof() {
         addr1, addr2,
         "Double-spend with same proof should return same address (idempotent)"
     );
-
-    drop(client);
-    testnet.teardown().await;
 }
 
 // ─── Test 7: Corrupted Public Key ───────────────────────────────────────────
 
-#[tokio::test(flavor = "multi_thread")]
-#[serial]
-async fn test_attack_corrupted_public_key() {
-    let (client, testnet) = setup().await;
+async fn test_attack_corrupted_public_key(testnet: Arc<MiniTestnet>) {
+    let client = testnet.client();
 
     let content = Bytes::from("corrupted public key attack test data");
     let (proof, _, target_peer) = collect_and_pay(&client, &content).await;
@@ -338,48 +341,17 @@ async fn test_attack_corrupted_public_key() {
         result.is_err(),
         "PUT with corrupted public keys should be rejected"
     );
-
-    drop(client);
-    testnet.teardown().await;
 }
 
-// ─── Test 8: Client Without Wallet ──────────────────────────────────────────
-
-#[tokio::test(flavor = "multi_thread")]
-#[serial]
-async fn test_attack_client_without_wallet() {
-    let testnet = MiniTestnet::start(DEFAULT_NODE_COUNT).await;
-    let node = testnet.node(3).expect("Node 3 should exist");
-
-    // Create client WITHOUT wallet
-    let client = Client::from_node(Arc::clone(&node), test_client_config());
-
-    let content = Bytes::from("no wallet attack test data");
-    let result = client.chunk_put(content).await;
-
-    assert!(result.is_err(), "chunk_put without wallet should fail");
-    let err_msg = format!("{}", result.expect_err("should have error"));
-    let err_lower = err_msg.to_lowercase();
-    assert!(
-        err_lower.contains("wallet"),
-        "Error should mention wallet, got: {err_msg}"
-    );
-
-    drop(client);
-    testnet.teardown().await;
-}
-
-// ─── Test 9: Underpayment — Single Node ─────────────────────────────────────
+// ─── Test 8: Underpayment — Single Node ─────────────────────────────────────
 //
 // Collects real quotes, builds a valid single-node payment, then tampers with
 // the median quote's amount (reducing it to 1 atto). Pays on-chain with the
 // reduced amount. The node's on-chain verifyPayment check should detect that
 // the paid amount is far below the expected 3× median price and reject the PUT.
 
-#[tokio::test(flavor = "multi_thread")]
-#[serial]
-async fn test_attack_underpayment_single_node() {
-    let (client, testnet) = setup().await;
+async fn test_attack_underpayment_single_node(testnet: Arc<MiniTestnet>) {
+    let client = testnet.client();
 
     let content = Bytes::from("underpayment attack: client pays too little");
     let address = compute_address(&content);
@@ -462,21 +434,16 @@ async fn test_attack_underpayment_single_node() {
         result.is_err(),
         "PUT with underpayment (1 atto instead of {original_amount}) should be rejected"
     );
-
-    drop(client);
-    testnet.teardown().await;
 }
 
-// ─── Test 10: Underpayment — Pay Half the Required Amount ───────────────────
+// ─── Test 9: Underpayment — Pay Half the Required Amount ────────────────────
 //
 // Verifies the boundary more closely: pays roughly half the expected 3× median
 // price. The contract should still reject this because the amount is below the
 // 3× threshold, even though it's not trivially small like 1 atto.
 
-#[tokio::test(flavor = "multi_thread")]
-#[serial]
-async fn test_attack_underpayment_half_price() {
-    let (client, testnet) = setup().await;
+async fn test_attack_underpayment_half_price(testnet: Arc<MiniTestnet>) {
+    let client = testnet.client();
 
     let content = Bytes::from("half-price underpayment attack test data");
     let address = compute_address(&content);
@@ -545,7 +512,4 @@ async fn test_attack_underpayment_half_price() {
         result.is_err(),
         "PUT with half-price payment ({half_amount} instead of {original_amount}) should be rejected"
     );
-
-    drop(client);
-    testnet.teardown().await;
 }

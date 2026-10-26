@@ -29,13 +29,17 @@
 //! Tests that rely on which peers form the close group check that the group
 //! has not changed before they read, so a moved group fails loudly rather than
 //! as a puzzling assertion.
+//!
+//! The read and merge rules themselves (four answers, two that agree, the
+//! merge winner in any order, a stored state resubmitted, raced final
+//! states) are pinned without nodes by `src/data/client/pointer.rs`'s unit
+//! tests and darwin-node's `tests/pointer_convergence.rs`; a resolve's
+//! cycles, broken chains and depth limit by the unit tests of
+//! `resolve_chain`.
 
-#![allow(clippy::unwrap_used, clippy::expect_used)]
-
-mod support;
-
-use ant_core::data::client::pointer::MAX_POINTER_RESOLVE_DEPTH;
-use ant_core::data::{Client, ClientConfig, Error, FinalityStatus, XorName};
+use crate::support::runner::Case;
+use crate::support::{test_client_config, MiniTestnet, PointerSilence, CLIENT_NODE};
+use ant_core::data::{Client, ClientConfig, Error, XorName};
 use ant_node::storage::AntProtocol;
 use ant_protocol::chunk::{
     ChunkMessage, ChunkMessageBody, PointerGetRequest, PointerGetResponse, PointerPutRequest,
@@ -50,38 +54,74 @@ use ant_protocol::pqc::api::{ml_dsa_65, MlDsaPublicKey, MlDsaSecretKey};
 use ant_protocol::transport::{MultiAddr, PeerId};
 use ant_protocol::{send_and_await_chunk_response, CLOSE_GROUP_SIZE};
 use bytes::Bytes;
-use serial_test::serial;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
-use support::{test_client_config, MiniTestnet, PointerSilence, DEFAULT_NODE_COUNT};
 
-/// The node the client is built on. Its own lookups leave it out, so it is
-/// never one of the close group a test addresses.
-const CLIENT_NODE: usize = 3;
+pub fn cases() -> Vec<Case> {
+    vec![
+        Case::on_network(
+            "pointer::a_pointer_is_created_paid_for_and_read_back",
+            a_pointer_is_created_paid_for_and_read_back,
+        ),
+        Case::on_network(
+            "pointer::an_update_is_paid_for_and_replaces_what_the_network_serves",
+            an_update_is_paid_for_and_replaces_what_the_network_serves,
+        ),
+        Case::on_network(
+            "pointer::every_node_accepts_a_paid_update",
+            every_node_accepts_a_paid_update,
+        ),
+        Case::on_network(
+            "pointer::a_write_that_fails_leaves_a_fork_that_the_next_counter_heals",
+            a_write_that_fails_leaves_a_fork_that_the_next_counter_heals,
+        ),
+        Case::on_network(
+            "pointer::a_node_refuses_unpaid_forged_and_misdirected_writes_over_the_network",
+            a_node_refuses_unpaid_forged_and_misdirected_writes_over_the_network,
+        ),
+        Case::on_network(
+            "pointer::creating_a_pointer_that_exists_is_refused_before_paying",
+            creating_a_pointer_that_exists_is_refused_before_paying,
+        ),
+        Case::on_network(
+            "pointer::a_chain_of_pointers_resolves_to_the_chunk_at_its_end",
+            a_chain_of_pointers_resolves_to_the_chunk_at_its_end,
+        ),
+        Case::on_network(
+            "pointer::a_read_asks_bootstrap_peers_by_peer_id",
+            a_read_asks_bootstrap_peers_by_peer_id,
+        ),
+        Case::on_network(
+            "pointer::a_transfer_hands_the_address_over_for_good",
+            a_transfer_hands_the_address_over_for_good,
+        ),
+        Case::on_network(
+            "pointer::a_final_state_left_on_one_node_refuses_a_second_transfer_before_paying",
+            a_final_state_left_on_one_node_refuses_a_second_transfer_before_paying,
+        ),
+    ]
+}
 
-async fn setup() -> (Client, MiniTestnet) {
-    let testnet = MiniTestnet::start(DEFAULT_NODE_COUNT).await;
+/// How long a reader waits for one peer's answer to a pointer GET in the
+/// cases that silence peers: well past what an answering peer takes, so
+/// those cases don't wait out the default for each silent one.
+const SILENCED_READ_TIMEOUT_SECS: u64 = 5;
 
+/// The client the cases use, once the testnet has converged.
+async fn setup(testnet: &MiniTestnet) -> Client {
     // The harness waits for convergence but carries on if it runs out of
     // time. These tests address close groups by name, so an unconverged
     // network would fail them in confusing ways; say so here instead.
+    let peers = testnet.running_node_count() - 1;
     for (index, node) in testnet.nodes.iter().enumerate() {
-        if let Some(p2p) = &node.p2p_node {
-            let known = p2p.dht().get_routing_table_size().await;
-            assert!(
-                known >= DEFAULT_NODE_COUNT - 1,
-                "the testnet did not converge: node {index} knows {known} of {} peers",
-                DEFAULT_NODE_COUNT - 1
-            );
-        }
+        let known = node.p2p_node.dht().get_routing_table_size().await;
+        assert!(
+            known >= peers,
+            "the testnet did not converge: node {index} knows {known} of {peers} peers"
+        );
     }
-
-    let node = testnet.node(CLIENT_NODE).expect("client node");
-    let client = Client::from_node(Arc::clone(&node), test_client_config())
-        .with_wallet(testnet.wallet().clone());
-
-    (client, testnet)
+    testnet.client()
 }
 
 /// A fresh owner. Every test needs its own: the address *is* the key, so two
@@ -116,15 +156,14 @@ async fn close_group(client: &Client, testnet: &MiniTestnet, address: &XorName) 
     let group: Vec<Member> = peers
         .into_iter()
         .filter_map(|(peer_id, addrs)| {
-            testnet.nodes.iter().find_map(|node| {
-                let p2p = node.p2p_node.as_ref()?;
-                if *p2p.peer_id() != peer_id {
+            testnet.running().find_map(|node| {
+                if *node.p2p_node.peer_id() != peer_id {
                     return None;
                 }
                 Some(Member {
                     peer_id,
                     addrs: addrs.clone(),
-                    protocol: Arc::clone(node.protocol.as_ref()?),
+                    protocol: Arc::clone(&node.protocol),
                     silence: Arc::clone(&node.pointer_silence),
                 })
             })
@@ -295,11 +334,7 @@ async fn assert_held(members: &[Member], record: &Pointer) {
 /// How many nodes anywhere in the testnet serve exactly `record`'s state.
 async fn holders_anywhere(testnet: &MiniTestnet, record: &Pointer) -> usize {
     let mut count = 0;
-    for protocol in testnet
-        .nodes
-        .iter()
-        .filter_map(|node| node.protocol.as_ref())
-    {
+    for protocol in testnet.running().map(|node| &node.protocol) {
         if held_by(protocol, &record.address())
             .await
             .is_some_and(|held| held.state_id() == record.state_id())
@@ -384,10 +419,8 @@ fn number_after(message: &str, prefix: &str) -> Option<usize> {
         .ok()
 }
 
-#[tokio::test(flavor = "multi_thread")]
-#[serial]
-async fn a_pointer_is_created_paid_for_and_read_back() {
-    let (client, testnet) = setup().await;
+async fn a_pointer_is_created_paid_for_and_read_back(testnet: Arc<MiniTestnet>) {
+    let client = setup(&testnet).await;
     let (pk, sk) = owner();
 
     let before = balance(&client).await;
@@ -417,17 +450,12 @@ async fn a_pointer_is_created_paid_for_and_read_back() {
         pk.to_bytes(),
         "the record carries its own owner key"
     );
-
-    drop(client);
-    testnet.teardown().await;
 }
 
 /// Pay to update: each update is its own paid state, and the network serves
 /// the new one.
-#[tokio::test(flavor = "multi_thread")]
-#[serial]
-async fn an_update_is_paid_for_and_replaces_what_the_network_serves() {
-    let (client, testnet) = setup().await;
+async fn an_update_is_paid_for_and_replaces_what_the_network_serves(testnet: Arc<MiniTestnet>) {
+    let client = setup(&testnet).await;
     let (pk, sk) = owner();
 
     let address = client
@@ -459,20 +487,25 @@ async fn an_update_is_paid_for_and_replaces_what_the_network_serves() {
         );
         assert_eq!(record.target(), chunk_target(expected_counter as u8 + 1));
     }
-
-    drop(client);
-    testnet.teardown().await;
 }
 
-/// A node that already holds a pointer takes a paid update to it, even one that
-/// skips counters. The chunk path answers "already exists" and stops; a
-/// pointer must not, or every update after the first is lost. Checked on every
-/// node of the close group, not just a quorum, then through the client's own
-/// update path.
-#[tokio::test(flavor = "multi_thread")]
-#[serial]
-async fn every_close_group_node_accepts_a_paid_update_to_a_pointer_it_holds() {
-    let (client, testnet) = setup().await;
+/// Paid updates are accepted wherever they land.
+///
+/// A node that already holds a pointer takes a paid update to it, even one
+/// that skips counters: the chunk path answers "already exists" and stops; a
+/// pointer must not, or every update after the first is lost. Checked on
+/// every node of the close group, not just a quorum, then through the
+/// client's own update path.
+///
+/// The counter orders states; it does not meter them. A paid record that
+/// skips counters is taken, and the client's next update carries on from it.
+///
+/// A write ends once its quorum has answered, so a node can miss updates. The
+/// next update brings it level, however far behind it was.
+async fn every_node_accepts_a_paid_update(testnet: Arc<MiniTestnet>) {
+    let client = setup(&testnet).await;
+
+    // Every close-group node takes a paid update to a pointer it holds.
     let (pk, sk) = owner();
     let address = pointer_address(&pk);
     let group = close_group(&client, &testnet, &address).await;
@@ -500,18 +533,8 @@ async fn every_close_group_node_accepts_a_paid_update_to_a_pointer_it_holds() {
     assert_eq!(record.counter(), 6);
     assert_eq!(record.target(), chunk_target(3));
 
-    drop(client);
-    testnet.teardown().await;
-}
-
-/// The counter orders states; it does not meter them. A paid record that skips
-/// counters is taken, and the client's next update carries on from it.
-#[tokio::test(flavor = "multi_thread")]
-#[serial]
-async fn a_paid_update_may_skip_counters() {
-    let (client, testnet) = setup().await;
+    // A paid update through the client may skip counters.
     let (pk, sk) = owner();
-
     let address = client
         .pointer_create(&sk, &pk, chunk_target(1))
         .await
@@ -542,16 +565,7 @@ async fn a_paid_update_may_skip_counters() {
     assert_eq!(held.counter(), 10);
     assert_eq!(held.target(), chunk_target(3));
 
-    drop(client);
-    testnet.teardown().await;
-}
-
-/// A write ends once its quorum has answered, so a node can miss updates. The
-/// next update brings it level, however far behind it was.
-#[tokio::test(flavor = "multi_thread")]
-#[serial]
-async fn nodes_that_missed_updates_take_the_next_one() {
-    let (client, testnet) = setup().await;
+    // Nodes that missed updates take the next one.
     let (pk, sk) = owner();
     let address = pointer_address(&pk);
     let group = close_group(&client, &testnet, &address).await;
@@ -583,57 +597,6 @@ async fn nodes_that_missed_updates_take_the_next_one() {
     let next = second.update(&sk, chunk_target(4)).expect("sign");
     store_on(&client, &group, &next).await;
     assert_held(&group, &next).await;
-
-    drop(client);
-    testnet.teardown().await;
-}
-
-/// Two competing writes that both complete: each reached the write quorum. Any
-/// node that saw both keeps the merge winner, so the winner ends on at least
-/// five of the seven, every read of four answers includes two of them, and the
-/// read returns the winner however the replies are ordered.
-#[tokio::test(flavor = "multi_thread")]
-#[serial]
-async fn two_completed_competing_writes_read_as_the_merge_winner() {
-    let (client, testnet) = setup().await;
-    let (pk, sk) = owner();
-    let address = pointer_address(&pk);
-    let group = close_group(&client, &testnet, &address).await;
-
-    let created = Pointer::create(&sk, &pk, chunk_target(1)).expect("sign");
-    client
-        .pointer_put(&created)
-        .await
-        .expect("create completes");
-
-    let loser = Pointer::sign(&sk, &pk, 1, chunk_target(9)).expect("sign");
-    let winner = Pointer::sign(&sk, &pk, 1, chunk_target(2)).expect("sign");
-    assert!(winner.replaces(&loser), "smaller target bytes win");
-    client
-        .pointer_put(&loser)
-        .await
-        .expect("the losing write completes");
-    client
-        .pointer_put(&winner)
-        .await
-        .expect("the winning write completes");
-
-    assert!(
-        holders_anywhere(&testnet, &winner).await >= 5,
-        "a completed write reaches the write quorum"
-    );
-    assert_group_unchanged(&client, &address, &group).await;
-    for _ in 0..3 {
-        let read = client
-            .pointer_get(&address)
-            .await
-            .expect("get")
-            .expect("present");
-        assert_eq!(read.state_id(), winner.state_id());
-    }
-
-    drop(client);
-    testnet.teardown().await;
 }
 
 /// A write that fails leaves a fork. Every node holds one state at counter 1;
@@ -643,10 +606,8 @@ async fn two_completed_competing_writes_read_as_the_merge_winner() {
 /// answers can see either side corroborated, so it returns one of the two,
 /// both owner-signed and paid for. The next update heals the fork on every
 /// node.
-#[tokio::test(flavor = "multi_thread")]
-#[serial]
-async fn a_write_that_fails_leaves_a_fork_that_the_next_counter_heals() {
-    let (client, testnet) = setup().await;
+async fn a_write_that_fails_leaves_a_fork_that_the_next_counter_heals(testnet: Arc<MiniTestnet>) {
+    let client = setup(&testnet).await;
     let (pk, sk) = owner();
     let address = pointer_address(&pk);
     let group = close_group(&client, &testnet, &address).await;
@@ -735,18 +696,15 @@ async fn a_write_that_fails_leaves_a_fork_that_the_next_counter_heals() {
         }
     }
     assert_held(&group, &healed).await;
-
-    drop(client);
-    testnet.teardown().await;
 }
 
 /// Over QUIC, from the client's node to one close-group peer: an unpaid record
 /// is refused, a forged one is refused, a proof paid for a different state is
 /// refused, and only the genuine record paid for itself is stored.
-#[tokio::test(flavor = "multi_thread")]
-#[serial]
-async fn a_node_refuses_unpaid_forged_and_misdirected_writes_over_the_network() {
-    let (client, testnet) = setup().await;
+async fn a_node_refuses_unpaid_forged_and_misdirected_writes_over_the_network(
+    testnet: Arc<MiniTestnet>,
+) {
+    let client = setup(&testnet).await;
     let (pk, sk) = owner();
     let address = pointer_address(&pk);
     let group = close_group(&client, &testnet, &address).await;
@@ -806,94 +764,12 @@ async fn a_node_refuses_unpaid_forged_and_misdirected_writes_over_the_network() 
         other => panic!("a paid update must be stored, got {other:?}"),
     }
     assert_held(std::slice::from_ref(peer), &update).await;
-
-    drop(client);
-    testnet.teardown().await;
-}
-
-/// The read's two rules, over QUIC: it needs answers from four of the seven,
-/// and a state is an answer once two peers name it.
-///
-/// Two higher states, each owner-signed and paid for but held by one peer,
-/// never displace the one the rest agree on. Three answers that all agree
-/// still do not settle a read. Four answers — the two lone states and exactly
-/// two that agree — do. A corroboration bar of one or three, or a quorum of
-/// three, fails this test.
-#[tokio::test(flavor = "multi_thread")]
-#[serial]
-async fn a_read_needs_four_answers_and_two_that_agree() {
-    let (client, testnet) = setup().await;
-    let (pk, sk) = owner();
-    let address = pointer_address(&pk);
-    let group = close_group(&client, &testnet, &address).await;
-
-    let agreed = Pointer::create(&sk, &pk, chunk_target(1)).expect("sign");
-    store_on(&client, &group, &agreed).await;
-    let first_lone = Pointer::sign(&sk, &pk, 5, chunk_target(9)).expect("sign");
-    store_on(&client, group.get(..1).expect("a peer"), &first_lone).await;
-    let second_lone = Pointer::sign(&sk, &pk, 6, chunk_target(8)).expect("sign");
-    store_on(&client, group.get(1..2).expect("a peer"), &second_lone).await;
-
-    // A reader that gives up on a silent peer after twenty seconds rather than
-    // a minute, still well past what an answering peer takes.
-    let reader = Client::from_node(
-        testnet.node(CLIENT_NODE).expect("client node"),
-        ClientConfig {
-            chunk_get_timeout_secs: 20,
-            ..test_client_config()
-        },
-    );
-    assert_group_unchanged(&reader, &address, &group).await;
-
-    for _ in 0..3 {
-        let read = reader
-            .pointer_get(&address)
-            .await
-            .expect("get")
-            .expect("present");
-        assert_eq!(
-            read.state_id(),
-            agreed.state_id(),
-            "a state one peer names is not the network's answer"
-        );
-    }
-
-    // Only three answer, and all three hold the agreed state: corroborated
-    // three times over, but three answers are not a quorum.
-    let (_, agreeing) = group.split_at_checked(2).expect("a full close group");
-    let three_agreeing = agreeing.get(..3).expect("three agreeing peers");
-    let too_few = read_answered_by(&reader, &testnet, &address, three_agreeing).await;
-
-    // Four answer: the two lone states and exactly two peers holding the
-    // agreed state. Two is enough, and neither lone state is.
-    let four = group.get(..4).expect("four peers");
-    let settled = read_answered_by(&reader, &testnet, &address, four).await;
-
-    match too_few {
-        Err(Error::CloseGroupShortfall(message))
-            if message.contains("only 3 of the close group answered") => {}
-        other => panic!("three answers must not settle a read, got {other:?}"),
-    }
-    let read = settled
-        .expect("four answers settle a read")
-        .expect("present");
-    assert_eq!(
-        read.state_id(),
-        agreed.state_id(),
-        "two peers agreeing settle the read over two lone states"
-    );
-
-    drop(reader);
-    drop(client);
-    testnet.teardown().await;
 }
 
 /// Creating a pointer that already exists is refused before anything is
 /// paid: the payment would buy nothing, whatever state the network holds.
-#[tokio::test(flavor = "multi_thread")]
-#[serial]
-async fn creating_a_pointer_that_exists_is_refused_before_paying() {
-    let (client, testnet) = setup().await;
+async fn creating_a_pointer_that_exists_is_refused_before_paying(testnet: Arc<MiniTestnet>) {
+    let client = setup(&testnet).await;
     let (pk, sk) = owner();
     client
         .pointer_create(&sk, &pk, chunk_target(1))
@@ -907,62 +783,12 @@ async fn creating_a_pointer_that_exists_is_refused_before_paying() {
         .expect_err("a second create must be refused");
     assert!(err.to_string().contains("already exists"), "got: {err}");
     assert_eq!(balance(&client).await, before, "the refused create paid");
-
-    drop(client);
-    testnet.teardown().await;
-}
-
-/// Re-submitting a state the network already holds is answered as stored
-/// without writing anything, so a retry after a timeout cannot lose the update
-/// or fork it.
-///
-/// "Buys nothing" is literal: the write is still paid for, because the node
-/// cannot tell a retry from a fresh submission until it has been paid to look.
-/// What the retry cannot do is move the pointer.
-#[tokio::test(flavor = "multi_thread")]
-#[serial]
-async fn resubmitting_a_stored_state_is_accepted_and_changes_nothing() {
-    let (client, testnet) = setup().await;
-    let (pk, sk) = owner();
-
-    let address = client
-        .pointer_create(&sk, &pk, chunk_target(7))
-        .await
-        .expect("create");
-    let stored = client
-        .pointer_get(&address)
-        .await
-        .expect("get")
-        .expect("present");
-
-    let before = balance(&client).await;
-    client
-        .pointer_put(&stored)
-        .await
-        .expect("re-submitting a stored record must not be refused");
-    assert!(
-        balance(&client).await < before,
-        "a retry pays again: the client cannot know the state is held"
-    );
-
-    let after = client
-        .pointer_get(&address)
-        .await
-        .expect("get")
-        .expect("present");
-    assert_eq!(after.state_id(), stored.state_id(), "nothing moved");
-    assert_eq!(after.counter(), 0);
-
-    drop(client);
-    testnet.teardown().await;
 }
 
 /// A pointer may target another pointer. Resolution walks the chain client-side
 /// — the node never reads a target — and ends at the chunk.
-#[tokio::test(flavor = "multi_thread")]
-#[serial]
-async fn a_chain_of_pointers_resolves_to_the_chunk_at_its_end() {
-    let (client, testnet) = setup().await;
+async fn a_chain_of_pointers_resolves_to_the_chunk_at_its_end(testnet: Arc<MiniTestnet>) {
+    let client = setup(&testnet).await;
     let (last_pk, last_sk) = owner();
     let (first_pk, first_sk) = owner();
 
@@ -1002,91 +828,6 @@ async fn a_chain_of_pointers_resolves_to_the_chunk_at_its_end() {
         .expect("chunk_get")
         .expect("the chunk the chain names must be there");
     assert_eq!(fetched.content.as_ref(), content.as_ref());
-
-    drop(client);
-    testnet.teardown().await;
-}
-
-/// Resolution refuses what the node cannot: it never reads a target, so a
-/// cycle, a broken chain and an over-long chain are all the client's to stop.
-/// The depth limit is checked on both sides of the boundary.
-#[tokio::test(flavor = "multi_thread")]
-#[serial]
-async fn pointer_resolve_refuses_cycles_broken_chains_and_chains_past_its_depth() {
-    let (client, testnet) = setup().await;
-
-    // A pointer that targets itself.
-    let (pk, sk) = owner();
-    let own = pointer_address(&pk);
-    client
-        .pointer_create(
-            &sk,
-            &pk,
-            PointerTarget::new(PointerTargetKind::Pointer, own),
-        )
-        .await
-        .expect("create a self-referencing pointer");
-    let err = client
-        .pointer_resolve(&own)
-        .await
-        .expect_err("a cycle must not resolve");
-    assert!(err.to_string().contains("cycles back"), "got: {err}");
-
-    // A pointer to a pointer nobody wrote.
-    let (pk, sk) = owner();
-    let (nobody, _) = owner();
-    let dangling = client
-        .pointer_create(
-            &sk,
-            &pk,
-            PointerTarget::new(PointerTargetKind::Pointer, pointer_address(&nobody)),
-        )
-        .await
-        .expect("create a pointer to nothing");
-    let err = client
-        .pointer_resolve(&dangling)
-        .await
-        .expect_err("a broken chain must not resolve");
-    assert!(err.to_string().contains("breaks at"), "got: {err}");
-
-    // One pointer more than the limit. Built from the end, so each head is
-    // one hop longer than the last.
-    let chunk = client
-        .chunk_put(Bytes::from("the chunk at the end of a long chain"))
-        .await
-        .expect("chunk_put");
-    let mut next = PointerTarget::new(PointerTargetKind::Chunk, chunk);
-    let mut heads = Vec::with_capacity(MAX_POINTER_RESOLVE_DEPTH + 1);
-    for _ in 0..=MAX_POINTER_RESOLVE_DEPTH {
-        let (pk, sk) = owner();
-        let head = client
-            .pointer_create(&sk, &pk, next)
-            .await
-            .expect("create a hop");
-        heads.push(head);
-        next = PointerTarget::new(PointerTargetKind::Pointer, head);
-    }
-    let mut from_the_longest = heads.iter().rev();
-    let too_long = from_the_longest.next().expect("the longest chain");
-    let at_the_limit = from_the_longest.next().expect("a chain at the limit");
-
-    let resolved = client
-        .pointer_resolve(at_the_limit)
-        .await
-        .expect("a chain of exactly the limit resolves");
-    assert_eq!(resolved.address, chunk);
-    let err = client
-        .pointer_resolve(too_long)
-        .await
-        .expect_err("a chain past the limit must not resolve");
-    assert!(
-        err.to_string()
-            .contains(&format!("longer than {MAX_POINTER_RESOLVE_DEPTH} hops")),
-        "got: {err}"
-    );
-
-    drop(client);
-    testnet.teardown().await;
 }
 
 /// Bootstrap peers named by `/p2p/` address are read directly. Two members
@@ -1094,10 +835,8 @@ async fn pointer_resolve_refuses_cycles_broken_chains_and_chains_past_its_depth(
 /// pointer GETs: a read of the close group alone falls short, and one that
 /// also asks the bootstrap peers returns the state, whether they were given to
 /// a client built on a node or are the seeds it connected through.
-#[tokio::test(flavor = "multi_thread")]
-#[serial]
-async fn a_read_asks_bootstrap_peers_by_peer_id() {
-    let (client, testnet) = setup().await;
+async fn a_read_asks_bootstrap_peers_by_peer_id(testnet: Arc<MiniTestnet>) {
+    let client = setup(&testnet).await;
     let (pk, sk) = owner();
     let address = client
         .pointer_create(&sk, &pk, chunk_target(1))
@@ -1105,6 +844,14 @@ async fn a_read_asks_bootstrap_peers_by_peer_id() {
         .expect("create");
     let group = close_group(&client, &testnet, &address).await;
     let (answering, _) = group.split_at_checked(2).expect("a full close group");
+    let config = ClientConfig {
+        chunk_get_timeout_secs: SILENCED_READ_TIMEOUT_SECS,
+        ..test_client_config()
+    };
+    let reader = Client::from_node(
+        testnet.node(CLIENT_NODE).expect("client node"),
+        config.clone(),
+    );
     let seeds: Vec<MultiAddr> = answering
         .iter()
         .flat_map(|member| {
@@ -1115,7 +862,7 @@ async fn a_read_asks_bootstrap_peers_by_peer_id() {
         })
         .collect();
 
-    let read = read_answered_by(&client, &testnet, &address, answering).await;
+    let read = read_answered_by(&reader, &testnet, &address, answering).await;
     assert!(
         matches!(&read, Err(Error::CloseGroupShortfall(message))
             if message.contains("only 2 of the close group answered")),
@@ -1123,13 +870,13 @@ async fn a_read_asks_bootstrap_peers_by_peer_id() {
     );
 
     let node = testnet.node(CLIENT_NODE).expect("client node");
-    let given = Client::from_node(node, test_client_config()).with_bootstrap_peers(&seeds);
+    let given = Client::from_node(node, config.clone()).with_bootstrap_peers(&seeds);
     let connected = Client::connect_multiaddrs(
         &seeds,
         ClientConfig {
             allow_loopback: true,
             ipv6: false,
-            ..test_client_config()
+            ..config
         },
     )
     .await
@@ -1145,28 +892,6 @@ async fn a_read_asks_bootstrap_peers_by_peer_id() {
 
     drop(connected);
     drop(given);
-    drop(client);
-    testnet.teardown().await;
-}
-
-/// A pointer that does not exist reads as absent, not as an error.
-#[tokio::test(flavor = "multi_thread")]
-#[serial]
-async fn an_address_nobody_wrote_reads_as_absent() {
-    let (client, testnet) = setup().await;
-    let (pk, _sk) = owner();
-
-    assert!(
-        client
-            .pointer_get(&pointer_address(&pk))
-            .await
-            .expect("a read of an empty address is not an error")
-            .is_none(),
-        "nothing was ever written here"
-    );
-
-    drop(client);
-    testnet.teardown().await;
 }
 
 /// A transfer hands the address over for good (ADR-0018 in `ant-node`).
@@ -1178,10 +903,8 @@ async fn an_address_nobody_wrote_reads_as_absent() {
 /// the client refuses before paying, and a paid final state sent straight to
 /// every node that holds the transfer is refused by each, whichever way its
 /// target sorts.
-#[tokio::test(flavor = "multi_thread")]
-#[serial]
-async fn a_transfer_hands_the_address_over_for_good() {
-    let (client, testnet) = setup().await;
+async fn a_transfer_hands_the_address_over_for_good(testnet: Arc<MiniTestnet>) {
+    let client = setup(&testnet).await;
     let (pk, sk) = owner();
     let (recipient_pk, recipient_sk) = owner();
 
@@ -1328,9 +1051,6 @@ async fn a_transfer_hands_the_address_over_for_good() {
         .await
         .expect("finality")
         .is_final());
-
-    drop(client);
-    testnet.teardown().await;
 }
 
 /// A transfer that fell short left its final state on one node. A read does
@@ -1338,10 +1058,10 @@ async fn a_transfer_hands_the_address_over_for_good() {
 /// read would sign past it, pay, and fork the pointer for good on the nodes
 /// that never heard of the first. The whole group is asked first, and the
 /// second transfer is refused before anything is paid.
-#[tokio::test(flavor = "multi_thread")]
-#[serial]
-async fn a_final_state_left_on_one_node_refuses_a_second_transfer_before_paying() {
-    let (client, testnet) = setup().await;
+async fn a_final_state_left_on_one_node_refuses_a_second_transfer_before_paying(
+    testnet: Arc<MiniTestnet>,
+) {
+    let client = setup(&testnet).await;
     let (pk, sk) = owner();
     let (recipient_pk, recipient_sk) = owner();
     let address = client
@@ -1399,107 +1119,4 @@ async fn a_final_state_left_on_one_node_refuses_a_second_transfer_before_paying(
         1,
         "and nothing else changed"
     );
-
-    drop(client);
-    testnet.teardown().await;
-}
-
-/// The one fork a final state allows: the owner signs two and races them to
-/// different nodes, each of which keeps what it took first. With a majority
-/// on one side, reads return it and the finality check reports the fork; with
-/// no majority, reads fail as forked rather than pick a side, and the client
-/// will not build on either.
-#[tokio::test(flavor = "multi_thread")]
-#[serial]
-async fn a_raced_final_state_is_read_by_its_majority_or_reported_as_forked() {
-    let (client, testnet) = setup().await;
-
-    // Four against three: the four win every read.
-    let (pk, sk) = owner();
-    let address = pointer_address(&pk);
-    let group = close_group(&client, &testnet, &address).await;
-    let created = Pointer::create(&sk, &pk, chunk_target(1)).expect("sign");
-    client.pointer_put(&created).await.expect("create");
-    let majority = Pointer::sign(&sk, &pk, FINAL_COUNTER, chunk_target(9)).expect("sign");
-    let minority = Pointer::sign(&sk, &pk, FINAL_COUNTER, chunk_target(2)).expect("sign");
-    let (four, three) = group.split_at(4);
-    store_on(&client, four, &majority).await;
-    store_on(&client, three, &minority).await;
-    assert_held(four, &majority).await;
-    assert_held(three, &minority).await;
-    assert_group_unchanged(&client, &address, &group).await;
-
-    for _ in 0..3 {
-        let read = client
-            .pointer_get(&address)
-            .await
-            .expect("a majority answers")
-            .expect("present");
-        assert_eq!(
-            read.state_id(),
-            majority.state_id(),
-            "the majority wins even though the minority's target sorts first"
-        );
-    }
-    match client
-        .pointer_finality(&address)
-        .await
-        .expect("finality")
-        .status
-    {
-        FinalityStatus::Forked {
-            states,
-            majority: held,
-        } => {
-            assert_eq!(states.len(), 2);
-            assert_eq!(held.map(|s| s.state_id), Some(majority.state_id()));
-        }
-        other => panic!("expected the fork to be reported, got {other:?}"),
-    }
-
-    // Three against three, one left behind: no answer.
-    let (pk, sk) = owner();
-    let address = pointer_address(&pk);
-    let group = close_group(&client, &testnet, &address).await;
-    let created = Pointer::create(&sk, &pk, chunk_target(1)).expect("sign");
-    client.pointer_put(&created).await.expect("create");
-    let one = Pointer::sign(&sk, &pk, FINAL_COUNTER, chunk_target(7)).expect("sign");
-    let other = Pointer::sign(&sk, &pk, FINAL_COUNTER, chunk_target(8)).expect("sign");
-    let (first, rest) = group.split_at(3);
-    let (second, _behind) = rest.split_at(3);
-    store_on(&client, first, &one).await;
-    store_on(&client, second, &other).await;
-    assert_group_unchanged(&client, &address, &group).await;
-
-    let read = client.pointer_get(&address).await;
-    assert!(matches!(read, Err(Error::PointerForked(_))), "got {read:?}");
-    match client
-        .pointer_finality(&address)
-        .await
-        .expect("finality")
-        .status
-    {
-        FinalityStatus::Forked { states, majority } => {
-            assert_eq!(states.len(), 2);
-            assert!(majority.is_none());
-        }
-        other => panic!("expected a fork with no majority, got {other:?}"),
-    }
-    let before = balance(&client).await;
-    let (recipient_pk, recipient_sk) = owner();
-    let recipient = client
-        .pointer_create(&recipient_sk, &recipient_pk, chunk_target(3))
-        .await
-        .expect("recipient");
-    let paid_recipient = balance(&client).await;
-    assert!(paid_recipient < before);
-    let transfer = client.pointer_transfer(&sk, &pk, recipient).await;
-    assert!(
-        matches!(transfer, Err(Error::PointerForked(_))),
-        "got {transfer:?}"
-    );
-    assert_eq!(balance(&client).await, paid_recipient, "nothing was paid");
-
-    drop(client);
-    testnet.teardown().await;
 }

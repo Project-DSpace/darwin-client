@@ -7,6 +7,15 @@ default-members = ["ant-core", "ant-cli"]
 exclude = ["vendor/ant-protocol"]
 resolver = "2"
 
+# Dependencies are optimised in dev and test builds, while the workspace's own
+# crates (ant-core, ant-cli, ant-listings) stay unoptimised for debugging. "*"
+# covers darwin-node (ant-node) and vendor/ant-protocol too, which are not
+# members here: the e2e tests' in-process testnets run their code. Debug builds
+# of saorsa-pqc's ML-DSA checks are about 200 times slower than release ones,
+# and they dominate those testnets. `cargo test` inherits this profile.
+[profile.dev.package."*"]
+opt-level = 2
+
 
 [patch.crates-io]
 # Autonomi's protocol crate with our price multiplier; see vendor/ant-protocol/VENDORED.md.

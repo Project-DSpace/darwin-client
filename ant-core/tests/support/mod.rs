@@ -2,9 +2,13 @@
 //!
 //! Spawns a small local testnet of darwin-node's `AntProtocol` handlers (the
 //! revision ant-core/Cargo.toml pins) and an Anvil EVM testnet for real
-//! on-chain payment verification.
+//! on-chain payment verification. The payment vault on that chain runs the
+//! DARWIN vault's code, as the network's does.
+//!
+//! The `e2e` target starts one such testnet and runs every case on it, with
+//! [`runner`]; the targets run by hand start their own.
 
-// This module is compiled into every [[test]] binary separately.
+// This module is compiled into every [[test]] binary that uses it.
 // Each binary uses a different subset of methods, so Rust flags
 // the unused ones as dead code. All items ARE used by at least
 // one test binary.
@@ -37,77 +41,32 @@ use ant_protocol::transport::{
     CoreNodeConfig, IPDiversityConfig, MlDsa65, MultiAddr, NodeIdentity, P2PEvent, P2PNode,
 };
 use ant_protocol::{CLOSE_GROUP_SIZE, MAX_WIRE_MESSAGE_SIZE};
-use rand::Rng;
 use std::collections::HashMap;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::time::sleep;
 
-const TEST_PORT_RANGE_MIN: u16 = 20_000;
-const TEST_PORT_RANGE_MAX: u16 = 60_000;
+pub mod runner;
+
 const BOOTSTRAP_COUNT: usize = 2;
-const SPAWN_DELAY_MS: u64 = 200;
+/// The pause between two nodes joining. Started all at once, nodes met only
+/// the peers that had joined before their own lookup, and in a 20-node
+/// testnet a pair of them never met in 180 s; 50 ms apart, every node knows
+/// every other within about 15 s (it was 200 ms, from the days of
+/// unoptimised signature checks).
+const SPAWN_DELAY: Duration = Duration::from_millis(50);
 const STABILIZATION_TIMEOUT_SECS: u64 = 180;
+
+/// The DHT request timeout (saorsa-core's `connection_timeout`) of every
+/// testnet node, as this harness has always set it for its testnets.
+const DHT_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// darwin-node's answer to a merkle (batch) payment. Its nodes give it at
 /// quote time to every merkle candidate request, before anything is signed,
 /// and to every merkle-tagged proof on a PUT: a batch is paid on-chain before
 /// any storer sees it, so a refusal after payment would lose the money.
 pub use ant_node::payment::BATCH_PAYMENTS_REFUSED;
-
-/// Nodes in the testnets the merkle cases run on, as they always have. A
-/// client needs 16 peers to ask for a merkle candidate pool; on a network
-/// where it knows fewer it gives up before asking any node, and the nodes'
-/// refusal of the batch is never seen.
-///
-/// Paying many records per chunk on this testnet is limited by the testnet,
-/// not by the client. Its nodes all run in the test process, built without
-/// optimisation, where checking an ML-DSA-65 signature takes 5 to 20 ms
-/// (under 0.1 ms in a release build), and every message is checked, as is
-/// every signed address in a lookup's answer. Every peer is 127.0.0.1, so a
-/// node takes all its inbound messages on one dispatch shard, which drops
-/// what overflows it, and it gives up handling a message after 10 s
-/// (saorsa-core's own limit). A client quotes as many records at once as its
-/// quote limiter allows, each with a witnessed close-group lookup that asks
-/// 21 or more peers for their 20 nearest, and the merkle preflight's checks
-/// grow the limiter (to its ceiling of 128, from 65 records) before
-/// `PaymentMode::Auto` falls back to paying per chunk. A 64-record wave
-/// quoted all at once sends more answers than the client's node can check in
-/// time: lookups come back with no peers, and the upload stops with
-/// `InsufficientPeers` before payment. So a client that pays many records
-/// per chunk here quotes at most [`MERKLE_TESTNET_QUOTE_CONCURRENCY`] at a
-/// time.
-///
-/// For the same reason this testnet's nodes wait for a DHT answer as long as
-/// a user's node does, saorsa-core's default of 25 s, where smaller testnets
-/// wait [`SMALL_TESTNET_DHT_REQUEST_TIMEOUT`] ([`dht_request_timeout`]). On
-/// a loaded machine answers here took longer than 5 s even 8 lookups at a
-/// time, and a request that times out is reported to every lookup waiting on
-/// the same peer, which gives up on that peer too: lookups found no peer
-/// while every node was up.
-pub const MERKLE_TESTNET_NODES: usize = 35;
-
-/// The DHT request timeout (saorsa-core's `connection_timeout`) of the nodes
-/// on testnets smaller than [`MERKLE_TESTNET_NODES`], as this harness has
-/// always set it.
-const SMALL_TESTNET_DHT_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
-
-/// The DHT request timeout given to the nodes of a `node_count`-node
-/// testnet, or `None` to keep saorsa-core's default (25 s), which a user's
-/// node has. A [`MERKLE_TESTNET_NODES`] testnet keeps the default, for the
-/// reason given there.
-fn dht_request_timeout(node_count: usize) -> Option<Duration> {
-    (node_count < MERKLE_TESTNET_NODES).then_some(SMALL_TESTNET_DHT_REQUEST_TIMEOUT)
-}
-
-/// The most records a client on a [`MERKLE_TESTNET_NODES`] testnet quotes
-/// at once (the quote ceiling in its `AdaptiveConfig::max`), for the reason
-/// given there. Measured on a loaded machine: a 64-record wave quoted 8 at a
-/// time found every lookup's full width of 20 peers; quoted all at once,
-/// none did, and in two runs 28 and 38 of the 64 lookups found no peer.
-pub const MERKLE_TESTNET_QUOTE_CONCURRENCY: usize = 8;
 
 /// What `wallet` has spent, as its chain shows it: the transactions it has
 /// sent (its nonce) and the tokens it holds. Unchanged across a call, nothing
@@ -144,23 +103,19 @@ pub fn assert_batch_refused(error: &ant_core::data::Error) {
     );
 }
 
-/// Default node count for standard E2E tests.
+/// Nodes in a testnet.
 ///
-/// `CLOSE_GROUP_SIZE` (7) is the quorum the client needs for a quote to
-/// succeed. Spawning only that many nodes leaves the DHT and direct
-/// connection set too thin during startup, especially while every test node is
-/// still stabilising.
-///
-/// This is systematic on macOS CI runners, which are heavily virtualised
-/// (nested virt) and roughly half the CPU throughput of Linux runners.
-/// The QUIC handshake burst saturates the CPU and can leave too few peers
-/// ready for a `CLOSE_GROUP_SIZE` quote attempt. Linux runners finish those
-/// handshakes more comfortably.
-///
-/// Spawning `CLOSE_GROUP_SIZE * 2` gives the lookup layer enough nearby peers
-/// to return a full close group reliably. Each extra node is cheap (~200 ms
-/// spawn delay) compared to a flaky suite.
-pub const DEFAULT_NODE_COUNT: usize = CLOSE_GROUP_SIZE * 2;
+/// A client asks 16 peers for a merkle candidate pool, and on a network where
+/// it knows fewer it gives up before asking any node, so the nodes' refusal
+/// of the batch would never be seen. The client's own node is not one of the
+/// peers it asks, so 17 nodes is the floor for the refusal pins; 20 leaves a
+/// margin and gives every close group of `CLOSE_GROUP_SIZE` (7) room around
+/// it.
+pub const DEFAULT_NODE_COUNT: usize = 20;
+
+/// The node the e2e cases build their clients on. Its own lookups leave it
+/// out, so it is never one of the close group a case addresses.
+pub const CLIENT_NODE: usize = 3;
 
 /// Test rewards address (20 bytes, all 0x01).
 const TEST_REWARDS_ADDRESS: [u8; 20] = [0x01; 20];
@@ -179,7 +134,6 @@ const TEST_MAX_RECORDS: usize = 1280;
 ///
 /// 60 s is deliberately conservative: in the happy path everything completes
 /// in well under a second, so the larger budget only shows up on flakes.
-/// The merkle cases use 120 s for the same reason.
 #[must_use]
 pub fn test_client_config() -> ClientConfig {
     ClientConfig {
@@ -190,13 +144,22 @@ pub fn test_client_config() -> ClientConfig {
 }
 
 pub struct TestNode {
-    pub p2p_node: Option<Arc<P2PNode>>,
-    pub protocol: Option<Arc<AntProtocol>>,
+    pub p2p_node: Arc<P2PNode>,
+    pub protocol: Arc<AntProtocol>,
     /// Which pointer requests the node takes off the wire and ignores.
     pub pointer_silence: Arc<PointerSilence>,
     /// Chunk GET requests the node has received.
     pub chunk_gets: Arc<ChunkGetCounts>,
-    _handler_task: Option<tokio::task::JoinHandle<()>>,
+    /// Cleared once the node is shut down.
+    up: AtomicBool,
+    handler: Mutex<Option<tokio::task::JoinHandle<()>>>,
+}
+
+impl TestNode {
+    /// Whether the node is still running.
+    pub fn is_up(&self) -> bool {
+        self.up.load(Ordering::SeqCst)
+    }
 }
 
 /// Switches that make a node ignore pointer requests while staying in the
@@ -288,22 +251,20 @@ pub struct MiniTestnet {
     evm_network: EvmNetwork,
 }
 
-impl MiniTestnet {
-    /// Start a testnet with the given number of nodes.
-    ///
-    /// Use `DEFAULT_NODE_COUNT` for standard tests, `MERKLE_TESTNET_NODES` for
-    /// merkle cases (a client asks 16 peers per pool, so the nodes refuse).
-    /// Nodes emit baseline `(0, None)` quotes (no commitment source wired).
-    pub async fn start(node_count: usize) -> Self {
-        Self::start_inner(node_count, None, false).await
-    }
+/// What [`MiniTestnet::spawn_node`] starts.
+struct Spawned {
+    node: Arc<P2PNode>,
+    protocol: Arc<AntProtocol>,
+    pointer_silence: Arc<PointerSilence>,
+    chunk_gets: Arc<ChunkGetCounts>,
+    handler: tokio::task::JoinHandle<()>,
+}
 
-    /// Start a testnet whose payment vault runs the DARWIN vault's code, with
-    /// write-once payment records: a quote hash's first non-zero payment is
-    /// kept and later ones are skipped. The evmlib test vault lets a later
-    /// payment overwrite the record instead.
-    pub async fn start_with_darwin_vault(node_count: usize) -> Self {
-        Self::start_inner(node_count, None, true).await
+impl MiniTestnet {
+    /// Start a testnet with the given number of nodes. Nodes emit baseline
+    /// `(0, None)` quotes (no commitment source wired).
+    pub async fn start(node_count: usize) -> Self {
+        Self::start_inner(node_count, None).await
     }
 
     /// ADR-0004: start a testnet where every node carries a live storage
@@ -312,14 +273,15 @@ impl MiniTestnet {
     /// in the quote response). Exercises the full node→client→storer binding
     /// handshake against real QUIC + Anvil.
     pub async fn start_with_commitments(node_count: usize, key_count: u32) -> Self {
-        Self::start_inner(node_count, Some(key_count), false).await
+        Self::start_inner(node_count, Some(key_count)).await
     }
 
-    async fn start_inner(
-        node_count: usize,
-        commitment_key_count: Option<u32>,
-        darwin_vault: bool,
-    ) -> Self {
+    /// Anvil, with the DARWIN vault's code as the payment vault, so payment
+    /// records are write-once: a quote hash's first non-zero payment is kept
+    /// and later ones are skipped (evmlib's test vault lets a later payment
+    /// overwrite the record instead). Then `node_count` nodes, each on a port
+    /// the system picks, so no two testnets on one machine collide.
+    async fn start_inner(node_count: usize, commitment_key_count: Option<u32>) -> Self {
         // Start Anvil EVM testnet FIRST
         let testnet = Testnet::new().await.expect("start Anvil testnet");
 
@@ -327,78 +289,58 @@ impl MiniTestnet {
         let private_key = testnet
             .default_wallet_private_key()
             .expect("get wallet key");
-        let evm_network = if darwin_vault {
-            deploy_darwin_vault(&testnet.to_network(), &private_key).await
-        } else {
-            testnet.to_network()
-        };
+        let evm_network = deploy_darwin_vault(&testnet.to_network(), &private_key).await;
         let wallet = Wallet::new_from_private_key(evm_network.clone(), &private_key)
             .expect("create funded wallet");
 
         let bootstrap_count = BOOTSTRAP_COUNT.min(node_count);
-        let request_timeout = dht_request_timeout(node_count);
-        let base_port = rand::thread_rng()
-            .gen_range(TEST_PORT_RANGE_MIN..TEST_PORT_RANGE_MAX - node_count as u16);
-        let mut nodes = Vec::with_capacity(node_count);
-        let mut temp_dirs = Vec::with_capacity(node_count);
-        let mut bootstrap_addrs = Vec::new();
+        let temp_dirs: Vec<tempfile::TempDir> = (0..node_count)
+            .map(|_| tempfile::TempDir::new().expect("create temp dir"))
+            .collect();
+        let mut spawned = Vec::with_capacity(node_count);
 
-        // Phase 1: Spawn bootstrap nodes
-        for i in 0..bootstrap_count {
-            let port = base_port + i as u16;
-            let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
-
-            let temp_dir = tempfile::TempDir::new().expect("create temp dir");
-            let (node, protocol, pointer_silence, chunk_gets, handler) = Self::spawn_node(
-                addr,
+        // Phase 1: the bootstrap nodes, one after another, each joining the
+        // ones before it.
+        let mut bootstrap_addrs: Vec<MultiAddr> = Vec::new();
+        for (i, temp_dir) in temp_dirs.iter().enumerate().take(bootstrap_count) {
+            let node = Self::spawn_node(
                 &bootstrap_addrs,
                 temp_dir.path(),
                 &evm_network,
                 i,
                 commitment_key_count,
-                request_timeout,
             )
             .await;
-
-            bootstrap_addrs.push(addr);
-            nodes.push(TestNode {
-                p2p_node: Some(Arc::clone(&node)),
-                protocol: Some(protocol),
-                pointer_silence,
-                chunk_gets,
-                _handler_task: Some(handler),
-            });
-            temp_dirs.push(temp_dir);
-            sleep(Duration::from_millis(SPAWN_DELAY_MS)).await;
+            bootstrap_addrs.extend(node.node.listen_addrs().await);
+            spawned.push(node);
         }
 
-        // Phase 2: Spawn regular nodes
-        for i in bootstrap_count..node_count {
-            let port = base_port + i as u16;
-            let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
-
-            let temp_dir = tempfile::TempDir::new().expect("create temp dir");
-            let (node, protocol, pointer_silence, chunk_gets, handler) = Self::spawn_node(
-                addr,
+        // Phase 2: every other node, one after another, through the
+        // bootstrap nodes.
+        for (i, temp_dir) in temp_dirs.iter().enumerate().skip(bootstrap_count) {
+            let node = Self::spawn_node(
                 &bootstrap_addrs,
                 temp_dir.path(),
                 &evm_network,
                 i,
                 commitment_key_count,
-                request_timeout,
             )
             .await;
-
-            nodes.push(TestNode {
-                p2p_node: Some(Arc::clone(&node)),
-                protocol: Some(protocol),
-                pointer_silence,
-                chunk_gets,
-                _handler_task: Some(handler),
-            });
-            temp_dirs.push(temp_dir);
-            sleep(Duration::from_millis(SPAWN_DELAY_MS)).await;
+            spawned.push(node);
+            sleep(SPAWN_DELAY).await;
         }
+
+        let nodes: Vec<TestNode> = spawned
+            .into_iter()
+            .map(|node| TestNode {
+                p2p_node: node.node,
+                protocol: node.protocol,
+                pointer_silence: node.pointer_silence,
+                chunk_gets: node.chunk_gets,
+                up: AtomicBool::new(true),
+                handler: Mutex::new(Some(node.handler)),
+            })
+            .collect();
 
         // Phase 3: Wait for DHT convergence.
         // Every node's routing table must know about all other nodes
@@ -411,21 +353,22 @@ impl MiniTestnet {
             tokio::time::Instant::now() + Duration::from_secs(STABILIZATION_TIMEOUT_SECS);
 
         loop {
-            let mut converged = true;
+            let mut short = 0;
             for n in &nodes {
-                if let Some(ref node) = n.p2p_node {
-                    if node.dht().get_routing_table_size().await < min_routing_table_size {
-                        converged = false;
-                        break;
-                    }
+                if n.p2p_node.dht().get_routing_table_size().await < min_routing_table_size {
+                    short += 1;
                 }
             }
 
-            if converged {
+            if short == 0 {
                 break;
             }
 
             if tokio::time::Instant::now() > deadline {
+                eprintln!(
+                    "WARNING: {short} of {node_count} nodes still know fewer than \
+                     {min_routing_table_size} peers after {STABILIZATION_TIMEOUT_SECS} s"
+                );
                 break;
             }
 
@@ -443,19 +386,13 @@ impl MiniTestnet {
         // artifact.
         let paid_quote_close_group_override: Vec<[u8; 32]> = nodes
             .iter()
-            .filter_map(|test_node| {
-                test_node
-                    .p2p_node
-                    .as_ref()
-                    .map(|p2p_node| *p2p_node.peer_id().as_bytes())
-            })
+            .map(|test_node| *test_node.p2p_node.peer_id().as_bytes())
             .collect();
         for test_node in &nodes {
-            if let Some(protocol) = &test_node.protocol {
-                protocol
-                    .payment_verifier_arc()
-                    .set_paid_quote_close_group_for_tests(paid_quote_close_group_override.clone());
-            }
+            test_node
+                .protocol
+                .payment_verifier_arc()
+                .set_paid_quote_close_group_for_tests(paid_quote_close_group_override.clone());
         }
 
         // Approve token spend for the unified payment vault contract
@@ -474,8 +411,38 @@ impl MiniTestnet {
         }
     }
 
+    /// The node at `index`, while it runs.
     pub fn node(&self, index: usize) -> Option<Arc<P2PNode>> {
-        self.nodes.get(index).and_then(|n| n.p2p_node.clone())
+        self.nodes
+            .get(index)
+            .filter(|node| node.is_up())
+            .map(|node| Arc::clone(&node.p2p_node))
+    }
+
+    /// The nodes still running.
+    pub fn running(&self) -> impl Iterator<Item = &TestNode> {
+        self.nodes.iter().filter(|node| node.is_up())
+    }
+
+    /// A client on [`CLIENT_NODE`] with [`test_client_config`], paying from
+    /// the funded wallet.
+    pub fn client(&self) -> ant_core::data::Client {
+        self.client_with(test_client_config())
+    }
+
+    /// A client on [`CLIENT_NODE`] with `config`, paying from the funded
+    /// wallet.
+    pub fn client_with(&self, config: ClientConfig) -> ant_core::data::Client {
+        let node = self.node(CLIENT_NODE).expect("the client node runs");
+        ant_core::data::Client::from_node(node, config).with_wallet(self.wallet.clone())
+    }
+
+    /// Let every node handle every pointer request again.
+    pub fn reset_switches(&self) {
+        for node in &self.nodes {
+            node.pointer_silence.gets.store(false, Ordering::Relaxed);
+            node.pointer_silence.puts.store(false, Ordering::Relaxed);
+        }
     }
 
     /// Get a reference to the funded wallet for payment operations.
@@ -490,41 +457,30 @@ impl MiniTestnet {
 
     #[allow(clippy::too_many_lines)]
     async fn spawn_node(
-        listen_addr: SocketAddr,
-        bootstrap_peers: &[SocketAddr],
+        bootstrap_peers: &[MultiAddr],
         data_dir: &std::path::Path,
         evm_network: &EvmNetwork,
         node_index: usize,
         commitment_key_count: Option<u32>,
-        dht_request_timeout: Option<Duration>,
-    ) -> (
-        Arc<P2PNode>,
-        Arc<AntProtocol>,
-        Arc<PointerSilence>,
-        Arc<ChunkGetCounts>,
-        tokio::task::JoinHandle<()>,
-    ) {
+    ) -> Spawned {
         // Generate ML-DSA-65 identity for this node
         let identity = Arc::new(NodeIdentity::generate().expect("generate node identity"));
 
         // IPv4-only is intentional for these loopback-only tests: everything
         // binds to 127.0.0.1 on the local host, so dual-stack would add no
-        // value and pulls in v6 loopback quirks on some CI runners.
+        // value and pulls in v6 loopback quirks on some CI runners. Port 0:
+        // the system picks a free port, which the node then lists among its
+        // listen addresses.
         let mut core_config = CoreNodeConfig::builder()
-            .port(listen_addr.port())
+            .port(0)
             .ipv6(false)
             .local(true)
             .max_message_size(MAX_WIRE_MESSAGE_SIZE)
             .build()
             .expect("create core config");
 
-        core_config.bootstrap_peers = bootstrap_peers
-            .iter()
-            .map(|addr| MultiAddr::quic(*addr))
-            .collect();
-        if let Some(timeout) = dht_request_timeout {
-            core_config.connection_timeout = timeout;
-        }
+        core_config.bootstrap_peers = bootstrap_peers.to_vec();
+        core_config.connection_timeout = DHT_REQUEST_TIMEOUT;
         core_config.node_identity = Some(Arc::clone(&identity));
         core_config.diversity_config = Some(IPDiversityConfig::permissive());
 
@@ -680,20 +636,24 @@ impl MiniTestnet {
             }
         });
 
-        (node, protocol, pointer_silence, chunk_gets, handler)
+        Spawned {
+            node,
+            protocol,
+            pointer_silence,
+            chunk_gets,
+            handler,
+        }
     }
 
-    /// Shut down a node by index, simulating a failure.
-    ///
-    /// Aborts the handler task and drops the P2P node reference so the
-    /// transport shuts down. The slot remains in the `nodes` vec (as `None`).
-    pub fn shutdown_node(&mut self, index: usize) {
-        if let Some(node) = self.nodes.get_mut(index) {
-            if let Some(task) = node._handler_task.take() {
+    /// Shut down a node by index, simulating a failure: its handler stops
+    /// and its transport closes. The slot stays in `nodes`, no longer up.
+    pub async fn shutdown_node(&self, index: usize) {
+        if let Some(node) = self.nodes.get(index) {
+            node.up.store(false, Ordering::SeqCst);
+            if let Some(task) = lock(&node.handler).take() {
                 task.abort();
             }
-            node.protocol = None;
-            node.p2p_node = None;
+            let _ = node.p2p_node.shutdown().await;
         }
     }
 
@@ -724,10 +684,8 @@ impl MiniTestnet {
         .expect("encode sentinel GET");
 
         let mut pending = Vec::new();
-        for node in &self.nodes {
-            let Some(p2p_node) = &node.p2p_node else {
-                continue;
-            };
+        for node in self.running() {
+            let p2p_node = &node.p2p_node;
             if p2p_node.peer_id() == sender.peer_id() {
                 continue;
             }
@@ -757,30 +715,33 @@ impl MiniTestnet {
         }
     }
 
-    /// Count how many nodes are still running (have a P2P node).
+    /// Count how many nodes are still running.
     pub fn running_node_count(&self) -> usize {
-        self.nodes.iter().filter(|n| n.p2p_node.is_some()).count()
+        self.running().count()
     }
 
-    pub async fn teardown(self) {
+    pub async fn teardown(&self) {
         // 1. Abort handler tasks first so they stop processing messages
         for node in &self.nodes {
-            if let Some(ref task) = node._handler_task {
+            if let Some(task) = lock(&node.handler).take() {
                 task.abort();
             }
         }
 
         // 2. Gracefully shut down each P2P node — this sends DHT leave
         //    messages, closes QUIC endpoints, and releases ports so the
-        //    OS can reclaim them before the next sequential test starts.
-        //    Without this, ports remain in TIME_WAIT and subsequent tests
-        //    encounter "Peer not found" / "Stream error" transport failures.
-        for node in &self.nodes {
-            if let Some(ref p2p_node) = node.p2p_node {
-                let _ = p2p_node.shutdown().await;
-            }
+        //    OS can reclaim them before the next testnet starts.
+        for node in self.running() {
+            let _ = node.p2p_node.shutdown().await;
         }
     }
+}
+
+/// `mutex`'s value, whether or not a panicking case poisoned it.
+fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 /// ADR-0004: build a live `ResponderCommitmentState` holding one current

@@ -1,11 +1,9 @@
 //! ADR-0006 end-to-end: build a manifest from a directory, share it as a
 //! `.darwin` file and as a manifest link, and extract it against a real
-//! in-process testnet with Anvil payments.
+//! in-process testnet with Anvil payments; each file in an envelope.
 
-#![allow(clippy::unwrap_used, clippy::expect_used)]
-
-mod support;
-
+use crate::support::runner::Case;
+use crate::support::MiniTestnet;
 use std::fs;
 use std::num::NonZeroUsize;
 use std::path::Path;
@@ -21,12 +19,47 @@ use ant_core::data::{
     Visibility, MAX_EMBEDDED_ROOT_MAP_BYTES,
 };
 use self_encryption::{shrink_data_map, ChunkInfo, DataMap};
-use serial_test::serial;
-use support::{test_client_config, MiniTestnet, DEFAULT_NODE_COUNT};
 use tempfile::TempDir;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use xor_name::XorName;
+
+pub fn cases() -> Vec<Case> {
+    vec![
+        Case::on_network(
+            "manifest::manifest_round_trips_through_file_and_link",
+            manifest_round_trips_through_file_and_link,
+        ),
+        Case::on_network(
+            "manifest::failed_build_keeps_completed_uploads_for_history_and_extraction",
+            failed_build_keeps_completed_uploads_for_history_and_extraction,
+        ),
+        Case::on_network(
+            "manifest::a_build_stores_each_file_in_an_envelope_with_its_record",
+            a_build_stores_each_file_in_an_envelope_with_its_record,
+        ),
+        Case::on_network(
+            "manifest::readable_envelopes_added_by_their_address_extract",
+            readable_envelopes_added_by_their_address_extract,
+        ),
+        Case::on_network(
+            "manifest::compact_mode_uses_public_addresses_only_when_the_datamap_is_on_the_network",
+            compact_mode_uses_public_addresses_only_when_the_datamap_is_on_the_network,
+        ),
+        Case::on_network(
+            "manifest::compact_export_finds_readable_envelopes_and_publishes_only_when_asked",
+            compact_export_finds_readable_envelopes_and_publishes_only_when_asked,
+        ),
+        Case::on_network(
+            "manifest::embedding_uses_the_root_map_only_when_it_is_small_enough",
+            embedding_uses_the_root_map_only_when_it_is_small_enough,
+        ),
+        Case::on_network(
+            "manifest::embedded_root_identity_is_the_published_address",
+            embedded_root_identity_is_the_published_address,
+        ),
+    ]
+}
 
 /// Payload size for each test file; comfortably above the self-encryption
 /// minimum and below one chunk so uploads stay quick.
@@ -67,19 +100,13 @@ async fn shrink_and_store(client: &Client, root: DataMap) -> DataMap {
     child
 }
 
-async fn setup() -> (Client, MiniTestnet) {
-    let testnet = MiniTestnet::start(DEFAULT_NODE_COUNT).await;
-    let node = testnet.node(3).expect("Node 3 should exist");
-    let client = Client::from_node(Arc::clone(&node), test_client_config())
-        .with_wallet(testnet.wallet().clone());
-    (client, testnet)
-}
-
-fn write_tree(root: &Path) {
+/// `a.bin`, `docs/b.bin` and `docs/c.bin`, each filled with its byte of
+/// `fills`: each case its own, since the network is shared.
+fn write_tree(root: &Path, fills: [u8; 3]) {
     fs::create_dir_all(root.join("docs")).unwrap();
-    fs::write(root.join("a.bin"), vec![0x11u8; FILE_BYTES]).unwrap();
-    fs::write(root.join("docs/b.bin"), vec![0x22u8; FILE_BYTES]).unwrap();
-    fs::write(root.join("docs/c.bin"), vec![0x33u8; FILE_BYTES]).unwrap();
+    fs::write(root.join("a.bin"), vec![fills[0]; FILE_BYTES]).unwrap();
+    fs::write(root.join("docs/b.bin"), vec![fills[1]; FILE_BYTES]).unwrap();
+    fs::write(root.join("docs/c.bin"), vec![fills[2]; FILE_BYTES]).unwrap();
 }
 
 fn extract_options(output: &Path, selection: Vec<String>) -> ExtractOptions {
@@ -92,13 +119,11 @@ fn extract_options(output: &Path, selection: Vec<String>) -> ExtractOptions {
     }
 }
 
-#[tokio::test(flavor = "multi_thread")]
-#[serial]
-async fn manifest_round_trips_through_file_and_link() {
-    let (client, testnet) = setup().await;
+async fn manifest_round_trips_through_file_and_link(testnet: Arc<MiniTestnet>) {
+    let client = testnet.client();
 
     let source = TempDir::new().unwrap();
-    write_tree(source.path());
+    write_tree(source.path(), [0x11, 0x22, 0x33]);
 
     // A public file added by address, uploaded separately: in the unlisted
     // envelope the public shortcut stores, whose address reads the file.
@@ -224,15 +249,12 @@ async fn manifest_round_trips_through_file_and_link() {
         .await
         .expect("overwrite extract");
     assert_eq!(report.written(), 1);
-
-    drop(client);
-    testnet.teardown().await;
 }
 
-#[tokio::test(flavor = "multi_thread")]
-#[serial]
-async fn failed_build_keeps_completed_uploads_for_history_and_extraction() {
-    let (client, testnet) = setup().await;
+async fn failed_build_keeps_completed_uploads_for_history_and_extraction(
+    testnet: Arc<MiniTestnet>,
+) {
+    let client = testnet.client();
     let source = TempDir::new().unwrap();
 
     for remove in [false, true] {
@@ -340,23 +362,18 @@ async fn failed_build_keeps_completed_uploads_for_history_and_extraction() {
     assert_eq!(cancelled.total_to_upload, 2);
     assert_eq!(cancelled.manifest.entries.len(), 1);
     assert!(cancelled.envelopes.is_empty());
-
-    drop(client);
-    testnet.teardown().await;
 }
 
 /// A manifest's files are uploaded as a file upload uploads one: by default
 /// each in a private envelope that shows every payment field, with a record
 /// that checks out against the chain; readable with the unlisted envelope,
 /// and then named in a compact manifest by the envelope's address.
-#[tokio::test(flavor = "multi_thread")]
-#[serial]
-async fn a_build_stores_each_file_in_an_envelope_with_its_record() {
-    let (client, testnet) = setup().await;
+async fn a_build_stores_each_file_in_an_envelope_with_its_record(testnet: Arc<MiniTestnet>) {
+    let client = testnet.client();
     let chain = ListingChain::new(testnet.evm_network()).expect("chain reader");
 
     let source = TempDir::new().unwrap();
-    write_tree(source.path());
+    write_tree(source.path(), [0x14, 0x25, 0x36]);
     let mut builder = ManifestBuilder::new(&client, BuildOptions::default());
     builder.add_directory(source.path(), None).unwrap();
     let built = builder.finish(None).await.expect("build");
@@ -409,7 +426,7 @@ async fn a_build_stores_each_file_in_an_envelope_with_its_record() {
     assert_eq!(report.written(), 3, "{:?}", report.entries);
     assert_eq!(
         fs::read(out.path().join("docs/c.bin")).unwrap(),
-        vec![0x33u8; FILE_BYTES]
+        vec![0x36u8; FILE_BYTES]
     );
 
     // `--public --compact`: the file is readable at its unlisted envelope's
@@ -463,19 +480,14 @@ async fn a_build_stores_each_file_in_an_envelope_with_its_record() {
         fs::read(out.path().join("e.bin")).unwrap(),
         vec![0x5au8; FILE_BYTES]
     );
-
-    drop(client);
-    testnet.teardown().await;
 }
 
 /// A file uploaded in a readable envelope, unlisted or listed, is added to a
 /// manifest by the envelope's address, as `darwin manifest create
 /// --embed-public` adds it, and extracts to its bytes. Its plain data map's
 /// address, an embedded entry's identity, holds nothing.
-#[tokio::test(flavor = "multi_thread")]
-#[serial]
-async fn readable_envelopes_added_by_their_address_extract() {
-    let (client, testnet) = setup().await;
+async fn readable_envelopes_added_by_their_address_extract(testnet: Arc<MiniTestnet>) {
+    let client = testnet.client();
     let source = TempDir::new().unwrap();
     let mut builder = ManifestBuilder::new(&client, BuildOptions::default());
     let mut expected = Vec::new();
@@ -539,19 +551,16 @@ async fn readable_envelopes_added_by_their_address_extract() {
     for (name, bytes) in expected {
         assert_eq!(fs::read(out.path().join(name)).unwrap(), bytes, "{name}");
     }
-
-    drop(client);
-    testnet.teardown().await;
 }
 
-#[tokio::test(flavor = "multi_thread")]
-#[serial]
-async fn compact_mode_uses_public_addresses_only_when_the_datamap_is_on_the_network() {
-    let (client, testnet) = setup().await;
+async fn compact_mode_uses_public_addresses_only_when_the_datamap_is_on_the_network(
+    testnet: Arc<MiniTestnet>,
+) {
+    let client = testnet.client();
 
     let source = TempDir::new().unwrap();
     fs::write(source.path().join("private.bin"), vec![0x55u8; FILE_BYTES]).unwrap();
-    fs::write(source.path().join("public.bin"), vec![0x66u8; FILE_BYTES]).unwrap();
+    fs::write(source.path().join("public.bin"), vec![0x67u8; FILE_BYTES]).unwrap();
 
     // Make public.bin's DataMap public ahead of time, as a plain DataMap
     // chunk (the public shortcut stores an envelope instead); private.bin
@@ -627,11 +636,8 @@ async fn compact_mode_uses_public_addresses_only_when_the_datamap_is_on_the_netw
     assert_eq!(report.written(), 2, "{:?}", report.entries);
     assert_eq!(
         fs::read(out.path().join("public.bin")).unwrap(),
-        vec![0x66u8; FILE_BYTES]
+        vec![0x67u8; FILE_BYTES]
     );
-
-    drop(client);
-    testnet.teardown().await;
 }
 
 /// `export --compact` finds a file readable in the envelope
@@ -643,10 +649,10 @@ async fn compact_mode_uses_public_addresses_only_when_the_datamap_is_on_the_netw
 /// map address holds nothing. Once its data map is published as `--yes`
 /// publishes it, a plain chunk with no envelope, every entry compacts, a new
 /// plan finds the private file in that form, and all three extract.
-#[tokio::test(flavor = "multi_thread")]
-#[serial]
-async fn compact_export_finds_readable_envelopes_and_publishes_only_when_asked() {
-    let (client, testnet) = setup().await;
+async fn compact_export_finds_readable_envelopes_and_publishes_only_when_asked(
+    testnet: Arc<MiniTestnet>,
+) {
+    let client = testnet.client();
 
     let source = TempDir::new().unwrap();
     let files = [
@@ -825,15 +831,10 @@ async fn compact_export_finds_readable_envelopes_and_publishes_only_when_asked()
             "{name}"
         );
     }
-
-    drop(client);
-    testnet.teardown().await;
 }
 
-#[tokio::test(flavor = "multi_thread")]
-#[serial]
-async fn embedding_uses_the_root_map_only_when_it_is_small_enough() {
-    let (client, testnet) = setup().await;
+async fn embedding_uses_the_root_map_only_when_it_is_small_enough(testnet: Arc<MiniTestnet>) {
+    let client = testnet.client();
 
     // A small file's shrunk map resolves back to its root for embedding, so a
     // reader starts on data chunks with no wrapper-record fetches.
@@ -864,15 +865,10 @@ async fn embedding_uses_the_root_map_only_when_it_is_small_enough() {
     // A map that is already a root is returned without any fetch.
     let root = synthetic_root(SMALL_ROOT_CHUNKS, 0x70);
     assert_eq!(embeddable_data_map(&client, &root).await.unwrap(), root);
-
-    drop(client);
-    testnet.teardown().await;
 }
 
-#[tokio::test(flavor = "multi_thread")]
-#[serial]
-async fn embedded_root_identity_is_the_published_address() {
-    let (client, testnet) = setup().await;
+async fn embedded_root_identity_is_the_published_address(testnet: Arc<MiniTestnet>) {
+    let client = testnet.client();
 
     let source = TempDir::new().unwrap();
     let file = source.path().join("big.bin");
@@ -925,7 +921,4 @@ async fn embedded_root_identity_is_the_published_address() {
         panic!("link form keeps the entry embedded");
     };
     assert_eq!(data_map, &result.data_map);
-
-    drop(client);
-    testnet.teardown().await;
 }

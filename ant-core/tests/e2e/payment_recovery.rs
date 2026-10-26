@@ -13,10 +13,8 @@
 //! instead of paying again. Each test counts the transactions the wallet sent
 //! (its nonce, read from Anvil directly).
 
-#![allow(clippy::unwrap_used, clippy::expect_used)]
-
-mod support;
-
+use crate::support::runner::Case;
+use crate::support::{test_client_config, MiniTestnet, CLIENT_NODE};
 use alloy::providers::Provider;
 use ant_core::data::{compute_address, ml_dsa_65, Client, Error, PointerTarget, PointerTargetKind};
 use ant_protocol::evm::{CustomNetwork, Network as EvmNetwork, Wallet, U256};
@@ -24,14 +22,22 @@ use axum::extract::State;
 use axum::response::{IntoResponse, Response};
 use bytes::Bytes;
 use serde_json::{json, Value};
-use serial_test::serial;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
-use support::{test_client_config, MiniTestnet, DEFAULT_NODE_COUNT};
 
-/// The node the clients are built on.
-const CLIENT_NODE: usize = 3;
+pub fn cases() -> Vec<Case> {
+    vec![
+        Case::on_network(
+            "payment_recovery::a_chunk_put_the_rpc_errored_on_pays_once",
+            a_chunk_put_the_rpc_errored_on_pays_once,
+        ),
+        Case::on_network(
+            "payment_recovery::a_pointer_write_the_rpc_errored_on_pays_once",
+            a_pointer_write_the_rpc_errored_on_pays_once,
+        ),
+    ]
+}
 
 /// What the proxy in front of Anvil does.
 #[derive(Default)]
@@ -118,10 +124,9 @@ async fn relay(State(proxy): State<Arc<Proxy>>, body: axum::body::Bytes) -> Resp
         .into_response()
 }
 
-/// A testnet on the DARWIN vault's code; the proxy in front of its Anvil;
-/// and a funded wallet, as Anvil sees it directly and as the proxy shows it.
-async fn setup() -> (MiniTestnet, Arc<Proxy>, Wallet, Wallet) {
-    let testnet = MiniTestnet::start_with_darwin_vault(DEFAULT_NODE_COUNT).await;
+/// The proxy in front of the testnet's Anvil (the DARWIN vault's code), and
+/// a funded wallet, as Anvil sees it directly and as the proxy shows it.
+async fn setup(testnet: &MiniTestnet) -> (Arc<Proxy>, Wallet, Wallet) {
     let anvil = testnet.evm_network().clone();
 
     let proxy = Arc::new(Proxy {
@@ -158,7 +163,7 @@ async fn setup() -> (MiniTestnet, Arc<Proxy>, Wallet, Wallet) {
         .await
         .unwrap();
     let proxied = Wallet::new_from_private_key(proxied, &key).unwrap();
-    (testnet, proxy, direct, proxied)
+    (proxy, direct, proxied)
 }
 
 /// A client paying through the proxy. Each attempt below takes a new one,
@@ -202,10 +207,8 @@ fn random_chunk() -> Bytes {
 /// `chunk_put` whose payment the RPC answered with an error pays once: in
 /// one run when the chain shows the payment 10 seconds later, and across two
 /// when it doesn't, the second run finding the journaled payment.
-#[tokio::test(flavor = "multi_thread")]
-#[serial]
-async fn a_chunk_put_the_rpc_errored_on_pays_once() {
-    let (testnet, proxy, direct, proxied) = setup().await;
+async fn a_chunk_put_the_rpc_errored_on_pays_once(testnet: Arc<MiniTestnet>) {
+    let (proxy, direct, proxied) = setup(&testnet).await;
     let checkpoints = record_checkpoints();
 
     let content = random_chunk();
@@ -266,17 +269,13 @@ async fn a_chunk_put_the_rpc_errored_on_pays_once() {
         checkpoints,
         "nothing kept once stored"
     );
-
-    testnet.teardown().await;
 }
 
 /// A pointer write whose payment the RPC answered with an error pays once,
 /// as a chunk put does: a create recovered in one run, and an update across
 /// two, the second signing the same state and finding its payment.
-#[tokio::test(flavor = "multi_thread")]
-#[serial]
-async fn a_pointer_write_the_rpc_errored_on_pays_once() {
-    let (testnet, proxy, direct, proxied) = setup().await;
+async fn a_pointer_write_the_rpc_errored_on_pays_once(testnet: Arc<MiniTestnet>) {
+    let (proxy, direct, proxied) = setup(&testnet).await;
     let checkpoints = record_checkpoints();
     let (owner, secret) = ml_dsa_65().generate_keypair().unwrap();
     let first = PointerTarget::new(PointerTargetKind::Chunk, [1; 32]);
@@ -337,6 +336,4 @@ async fn a_pointer_write_the_rpc_errored_on_pays_once() {
         checkpoints,
         "nothing kept once stored"
     );
-
-    testnet.teardown().await;
 }

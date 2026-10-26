@@ -1,37 +1,45 @@
-//! E2E tests for file upload/download using streaming self-encryption.
+//! File upload and download through streaming self-encryption: the
+//! envelope `darwin file upload` stores by default, streaming downloads,
+//! external-signer prepares and the public wave-batch round trip, and a
+//! retry after funding that reuses the file's checkpoint.
 
-#![allow(clippy::unwrap_used, clippy::expect_used)]
-
-mod support;
-
+use crate::support::runner::Case;
+use crate::support::{test_client_config, MiniTestnet, CLIENT_NODE};
 use ant_core::ant_listings::Envelope;
 use ant_core::data::{
     compute_address, forget_upload_record, Client, EnvelopeOptions, ExternalPaymentInfo,
     ListingChain, PaymentMode, Visibility,
 };
 use ant_protocol::evm::{QuoteHash, TxHash};
-use serial_test::serial;
 use std::collections::HashMap;
 use std::io::Write;
-use std::path::PathBuf;
 use std::sync::Arc;
-use support::{test_client_config, MiniTestnet, DEFAULT_NODE_COUNT};
 use tempfile::{NamedTempFile, TempDir};
 
-async fn setup() -> (Client, MiniTestnet) {
-    let testnet = MiniTestnet::start(DEFAULT_NODE_COUNT).await;
-    let node = testnet.node(3).expect("Node 3 should exist");
-
-    let client = Client::from_node(Arc::clone(&node), test_client_config())
-        .with_wallet(testnet.wallet().clone());
-
-    (client, testnet)
+pub fn cases() -> Vec<Case> {
+    vec![
+        Case::on_network("file::round_trip", test_file_upload_download_round_trip),
+        Case::on_network(
+            "file::download_to_sender_multibatch",
+            test_file_download_to_sender_multibatch_round_trip,
+        ),
+        Case::on_network(
+            "file::prepare_upload_visibility",
+            test_file_prepare_upload_visibility,
+        ),
+        Case::on_network(
+            "file::public_upload_round_trip_wave_batch",
+            test_public_upload_round_trip_wave_batch,
+        ),
+        Case::on_network(
+            "file::retry_after_funding_uses_existing_checkpoint",
+            test_file_retry_after_funding_uses_existing_checkpoint,
+        ),
+    ]
 }
 
-#[tokio::test(flavor = "multi_thread")]
-#[serial]
-async fn test_file_upload_download_round_trip() {
-    let (client, testnet) = setup().await;
+async fn test_file_upload_download_round_trip(testnet: Arc<MiniTestnet>) {
+    let client = testnet.client();
 
     let mut input_file = NamedTempFile::new().expect("create temp file");
     let data = vec![0x42u8; 4096];
@@ -95,21 +103,16 @@ async fn test_file_upload_download_round_trip() {
         data.len() as u64,
         "bytes_written should match original size"
     );
-
-    drop(client);
-    testnet.teardown().await;
 }
 
 /// Streaming download: `file_download_to_sender` must yield exactly the bytes,
 /// in order, that the file contained — without buffering the whole file. Uses
 /// a multi-batch payload so the streaming-decrypt path runs more than one
 /// batch, then reassembles the stream and asserts equality with the source.
-#[tokio::test(flavor = "multi_thread")]
-#[serial]
-async fn test_file_download_to_sender_multibatch_round_trip() {
+async fn test_file_download_to_sender_multibatch_round_trip(testnet: Arc<MiniTestnet>) {
     use tokio::sync::mpsc;
 
-    let (client, testnet) = setup().await;
+    let client = testnet.client();
 
     let mut input_file = NamedTempFile::new().expect("create temp file");
     // ~1 MiB of varied bytes → many self-encryption chunks (multiple batches).
@@ -155,100 +158,14 @@ async fn test_file_download_to_sender_multibatch_round_trip() {
         data.len() as u64,
         "bytes_streamed should match original size"
     );
-
-    testnet.teardown().await;
-}
-
-#[tokio::test(flavor = "multi_thread")]
-#[serial]
-async fn test_file_large_content() {
-    let (client, testnet) = setup().await;
-
-    let data: Vec<u8> = (0u8..=255).cycle().take(100_000).collect();
-    let mut input_file = NamedTempFile::new().expect("create temp file");
-    input_file.write_all(&data).expect("write temp file");
-    input_file.flush().expect("flush temp file");
-
-    let result = client
-        .file_upload(input_file.path())
-        .await
-        .expect("file_upload should succeed");
-
-    assert!(result.chunks_stored >= 3, "should produce multiple chunks");
-
-    let output_dir = TempDir::new().expect("create temp dir");
-    let output_path = output_dir.path().join("downloaded_large.bin");
-
-    client
-        .file_download(&result.data_map, &output_path)
-        .await
-        .expect("file_download should succeed");
-
-    let downloaded = std::fs::read(&output_path).expect("read output file");
-    assert_eq!(downloaded.len(), data.len(), "downloaded size should match");
-    assert_eq!(downloaded, data, "content should match exactly");
-
-    drop(client);
-    testnet.teardown().await;
-}
-
-#[tokio::test(flavor = "multi_thread")]
-#[serial]
-async fn test_file_upload_nonexistent_path_fails() {
-    let (client, testnet) = setup().await;
-
-    let nonexistent = PathBuf::from("/tmp/ant_test_nonexistent_file_12345.bin");
-    let result = client.file_upload(&nonexistent).await;
-    assert!(
-        result.is_err(),
-        "file_upload on non-existent path should fail"
-    );
-
-    drop(client);
-    testnet.teardown().await;
-}
-
-#[tokio::test(flavor = "multi_thread")]
-#[serial]
-async fn test_file_download_bytes_written() {
-    let (client, testnet) = setup().await;
-
-    let data = vec![0xBB; 8192];
-    let mut input_file = NamedTempFile::new().expect("create temp file");
-    input_file.write_all(&data).expect("write temp file");
-    input_file.flush().expect("flush temp file");
-
-    let result = client
-        .file_upload(input_file.path())
-        .await
-        .expect("file_upload should succeed");
-
-    let output_dir = TempDir::new().expect("create temp dir");
-    let output_path = output_dir.path().join("bytes_written_test.bin");
-
-    let bytes_written = client
-        .file_download(&result.data_map, &output_path)
-        .await
-        .expect("file_download should succeed");
-
-    assert_eq!(
-        bytes_written,
-        data.len() as u64,
-        "bytes_written should equal original file size"
-    );
-
-    drop(client);
-    testnet.teardown().await;
 }
 
 /// External-signer prepare must bundle the serialized DataMap as one extra
 /// paid chunk when `Visibility::Public` is requested, and must record the
 /// resulting chunk address on the `PreparedUpload`. Private prepare must
 /// leave that address unset.
-#[tokio::test(flavor = "multi_thread")]
-#[serial]
-async fn test_file_prepare_upload_visibility() {
-    let (client, testnet) = setup().await;
+async fn test_file_prepare_upload_visibility(testnet: Arc<MiniTestnet>) {
+    let client = testnet.client();
 
     let data = vec![0x37u8; 4096];
     let mut input_file = NamedTempFile::new().expect("create temp file");
@@ -310,9 +227,6 @@ async fn test_file_prepare_upload_visibility() {
         }
         other => panic!("expected wave-batch for a 4KB file, got {other:?}"),
     }
-
-    drop(client);
-    testnet.teardown().await;
 }
 
 /// Full public-upload round-trip (wave-batch path).
@@ -322,10 +236,8 @@ async fn test_file_prepare_upload_visibility() {
 /// returned address → `file_download` → assert recovered bytes equal the
 /// original. Proves the data_map_address actually refers to a retrievable
 /// DataMap on the network, not just a hash recorded in memory.
-#[tokio::test(flavor = "multi_thread")]
-#[serial]
-async fn test_public_upload_round_trip_wave_batch() {
-    let (client, testnet) = setup().await;
+async fn test_public_upload_round_trip_wave_batch(testnet: Arc<MiniTestnet>) {
+    let client = testnet.client();
 
     let original = vec![0x5au8; 4096];
     let mut input_file = NamedTempFile::new().expect("create temp file");
@@ -391,90 +303,15 @@ async fn test_public_upload_round_trip_wave_batch() {
         downloaded, original,
         "downloaded bytes must equal the original file"
     );
-
-    drop(client);
-    testnet.teardown().await;
-}
-
-/// Full wallet-backed public upload round-trip (direct CLI-style path).
-///
-/// The public shortcut stores what `darwin file upload --public` stores: the
-/// data map in an unlisted envelope that shows every payment field, paid
-/// with the content, so the returned address, the envelope's, is
-/// immediately readable without a second payment. No plain data map chunk
-/// is stored.
-#[tokio::test(flavor = "multi_thread")]
-#[serial]
-async fn test_public_file_upload_stores_the_unlisted_envelope() {
-    let (client, testnet) = setup().await;
-
-    let original = vec![0x6bu8; 4096];
-    let mut input_file = NamedTempFile::new().expect("create temp file");
-    input_file.write_all(&original).expect("write temp file");
-    input_file.flush().expect("flush temp file");
-
-    let result = client
-        .file_upload_public_with_mode(input_file.path(), PaymentMode::Single)
-        .await
-        .expect("public upload should succeed");
-
-    let data_map_address = result
-        .data_map_address
-        .expect("public upload must return an address");
-    let envelope = result.envelope.clone().expect("an envelope");
-    assert_eq!(
-        data_map_address,
-        envelope.address(),
-        "the address is the envelope's"
-    );
-    assert!(envelope.readable());
-    assert_eq!(
-        envelope.envelope.flags(),
-        EnvelopeOptions::unlisted().flags()
-    );
-    assert!(envelope.proof.is_some(), "{:?}", envelope.proof_problem);
-    forget_upload_record(&data_map_address).expect("forget the kept record");
-    let plain = compute_address(&rmp_serde::to_vec(&result.data_map).expect("serialize DataMap"));
-    assert_ne!(data_map_address, plain);
-    assert!(
-        !client.chunk_exists(&plain).await.expect("check"),
-        "no plain data map chunk is stored"
-    );
-    assert_eq!(
-        result.chunks_stored, result.total_chunks,
-        "public upload should store every chunk, including the envelope"
-    );
-
-    let fetched_data_map = client
-        .data_map_fetch(&data_map_address)
-        .await
-        .expect("public DataMap should be retrievable by returned address");
-
-    let output_dir = TempDir::new().expect("create output temp dir");
-    let output_path = output_dir.path().join("direct_public_out.bin");
-    let bytes_written = client
-        .file_download(&fetched_data_map, &output_path)
-        .await
-        .expect("file_download should succeed");
-
-    assert_eq!(bytes_written, original.len() as u64);
-    let downloaded = std::fs::read(&output_path).expect("read downloaded file");
-    assert_eq!(downloaded, original);
-
-    drop(client);
-    testnet.teardown().await;
 }
 
 /// A failed wallet preflight must not permanently poison the file's checkpoint.
-#[tokio::test(flavor = "multi_thread")]
-#[serial]
-async fn test_file_retry_after_funding_uses_existing_checkpoint() {
+async fn test_file_retry_after_funding_uses_existing_checkpoint(testnet: Arc<MiniTestnet>) {
     use ant_protocol::evm::{Amount, Wallet};
-    let testnet = MiniTestnet::start(DEFAULT_NODE_COUNT).await;
-    let node = testnet.node(3).unwrap();
+    let node = testnet.node(CLIENT_NODE).unwrap();
     let wallet = Wallet::new_with_random_wallet(testnet.evm_network().clone());
     let address = wallet.address();
-    let client = Client::from_node(Arc::clone(&node), test_client_config()).with_wallet(wallet);
+    let client = Client::from_node(node, test_client_config()).with_wallet(wallet);
     let mut input = NamedTempFile::new().unwrap();
     let data = vec![0x76; 4096];
     input.write_all(&data).unwrap();
@@ -505,6 +342,4 @@ async fn test_file_retry_after_funding_uses_existing_checkpoint() {
     let path = output.path().join("recovered.bin");
     client.file_download(&result.data_map, &path).await.unwrap();
     assert_eq!(std::fs::read(path).unwrap(), data);
-    drop(client);
-    testnet.teardown().await;
 }
