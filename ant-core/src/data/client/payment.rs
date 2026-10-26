@@ -47,6 +47,19 @@ pub(crate) fn declared_size_weight(data_type: u32) -> RecordWeight {
     }
 }
 
+/// The size a record is quoted and planned at when only its declared size is
+/// known ([`Client::pay_for_storage`]): a pointer's wire length, whatever size
+/// the caller declared, since every pointer is one size and is paid at its
+/// class ([`declared_size_weight`]), and otherwise the declared size. A plan
+/// whose size and weight are one class is one its journal restores.
+pub(crate) fn declared_quote_size(data_type: u32, data_size: u64) -> u64 {
+    if data_type == ant_protocol::pointer::DATA_TYPE_POINTER {
+        ant_protocol::pointer::POINTER_WIRE_LEN as u64
+    } else {
+        data_size
+    }
+}
+
 /// A record paid for by this client's wallet and not stored yet
 /// ([`Client::pay_for_record`]): its proof, where to store it, and its
 /// checkpoint, which keeps the proof, and holds the record's lock, until
@@ -144,7 +157,9 @@ impl Client {
     ///
     /// `data_size` is the size quoted, not bytes this call can check, so a
     /// chunk is paid at a full chunk's amount, which every storer accepts
-    /// whatever the chunk's size; a pointer is paid by its data type.
+    /// whatever the chunk's size; a pointer is paid by its data type, and
+    /// quoted at its wire length whatever size is declared, so its journal
+    /// restores ([`declared_quote_size`]).
     /// `Client::chunk_put` and the upload engine pay a chunk by the size class
     /// of its bytes.
     pub async fn pay_for_storage(
@@ -195,7 +210,7 @@ impl Client {
         self.pay_for_storage_split_at(
             routing,
             content,
-            data_size,
+            declared_quote_size(data_type, data_size),
             data_type,
             declared_size_weight(data_type),
         )
@@ -206,9 +221,11 @@ impl Client {
     /// [`record_weight`] of the bytes the caller stores.
     ///
     /// Every quote paid on came from a request declaring this client's
-    /// settlement version (there is no unversioned retry), and in a browser
-    /// from a frame at `BROWSER_QUOTE_PROTOCOL_VERSION`, so each storer
-    /// quoted the record by its weight and takes the weighted amount.
+    /// settlement version (there is no unversioned retry), in a browser too,
+    /// where it is a `chunk_protocol` frame at `BROWSER_PROTOCOL_VERSION`
+    /// carrying that request, so each storer quoted the record by its weight
+    /// and takes the weighted amount, and a storer that predates size pricing
+    /// answered `StorerUpdateRequired` and was skipped.
     pub(crate) async fn pay_for_storage_split_at(
         &self,
         routing: &[u8; 32],
@@ -735,6 +752,41 @@ mod tests {
         let client = Client::from_node(Arc::clone(node.node()), Default::default())
             .with_wallet(Wallet::new_with_random_wallet(network(closed)));
         (client, node)
+    }
+
+    /// A pointer paid through `pay_for_storage` with a declared size other
+    /// than its wire length (here 1 MiB, well above the smallest class) is
+    /// quoted and planned at its wire length, so its plan's size and weight
+    /// are one class and the journal restores it. Planned at the declared
+    /// size, the same amounts would match neither form, and a pending
+    /// payment's checkpoint would never open again.
+    #[test]
+    fn a_pointer_declared_at_any_size_plans_at_its_wire_length_and_restores() {
+        use crate::data::client::upload_state::plan_amounts_recomputed;
+        use crate::data::client::upload_state::test_state::plan_priced;
+        let declared = 1024 * 1024;
+        assert_eq!(
+            declared_quote_size(DATA_TYPE_POINTER, declared),
+            POINTER_WIRE_LEN as u64
+        );
+        assert_eq!(
+            declared_quote_size(ant_protocol::DATA_TYPE_CHUNK, declared),
+            declared
+        );
+        let weight = declared_size_weight(DATA_TYPE_POINTER);
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+        let mut plan = plan_priced(&[5u8; 64], now, &[10_000_000, 20_000_000, 30_000_000]);
+        plan.data_size = declared_quote_size(DATA_TYPE_POINTER, declared);
+        for quote in &mut plan.payment.quotes {
+            if !quote.amount.is_zero() {
+                quote.amount =
+                    ant_protocol::payment::pricing::weighted_amount(quote.price, weight).unwrap();
+            }
+        }
+        assert!(plan_amounts_recomputed(&plan));
+        let mut at_declared = plan;
+        at_declared.data_size = declared;
+        assert!(!plan_amounts_recomputed(&at_declared));
     }
 
     /// A pointer's first state.

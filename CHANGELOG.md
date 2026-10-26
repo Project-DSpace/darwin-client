@@ -46,6 +46,8 @@ commit `darwin --version` prints. Upstream's entries follow.
   can't parse such a frame and gives no quote, so it's never paid an amount it would refuse. Every
   quote the core pays on comes from such a request. JavaScript passes `chunk_length` to
   `verifyStorageQuote` only for a quote obtained at that version.
+- `pay_for_storage` and `pay_for_storage_split` quote and plan a pointer at its wire length,
+  whatever size is declared, so an interrupted payment's journal restores.
 - Upload checkpoints have a format of their own (`DSCK` and a version byte, then msgpack). The
   browser core still hands `on_checkpoint` a string, now the checkpoint's bytes as base64: store
   it as text, as it is, and pass it back to resume. It also takes the bytes as a `Uint8Array` or
