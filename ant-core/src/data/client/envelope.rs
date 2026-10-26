@@ -480,8 +480,12 @@ fn paid_quote(proof_bytes: &[u8]) -> Result<ProvenPayment, String> {
         .into_iter()
         .map(|(_, quote)| quote)
         .collect();
-    let plan = super::batch::SingleNodeQuotePayment::from_quotes(quotes.clone())
-        .map_err(|e| e.to_string())?;
+    // Which quote is paid doesn't depend on the record's weight.
+    let plan = super::batch::SingleNodeQuotePayment::from_quotes(
+        quotes.clone(),
+        ant_protocol::payment::pricing::RecordWeight::FULL,
+    )
+    .map_err(|e| e.to_string())?;
     let paid: Vec<_> = plan
         .quotes
         .iter()

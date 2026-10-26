@@ -4,6 +4,7 @@
 //! discovery, signature verification, wallet submission, and proof encoding
 //! remain the responsibility of the adapters.
 
+use ant_protocol::payment::pricing::{RecordWeight, WEIGHT_DENOMINATOR};
 use ant_protocol::CLOSE_GROUP_SIZE;
 
 pub(crate) const SINGLE_NODE_PAYMENT_MULTIPLIER: u64 = 3;
@@ -12,6 +13,10 @@ pub(crate) const SINGLE_NODE_PAYMENT_MULTIPLIER: u64 = 3;
 pub(crate) trait PaymentAmount: Copy + Ord + std::fmt::Display {
     const ZERO: Self;
     fn checked_mul_multiplier(self, multiplier: u64) -> Option<Self>;
+    /// `self × numerator ÷ denominator`, rounded up, overflowing only when
+    /// the result does: `self` is split into whole denominators and a
+    /// remainder, so `self × numerator` is never formed.
+    fn checked_scale_ceil(self, numerator: u64, denominator: u64) -> Option<Self>;
 }
 
 impl PaymentAmount for u128 {
@@ -19,12 +24,24 @@ impl PaymentAmount for u128 {
     fn checked_mul_multiplier(self, multiplier: u64) -> Option<Self> {
         self.checked_mul(u128::from(multiplier))
     }
+    fn checked_scale_ceil(self, numerator: u64, denominator: u64) -> Option<Self> {
+        let (numerator, denominator) = (u128::from(numerator), u128::from(denominator));
+        (self / denominator)
+            .checked_mul(numerator)?
+            .checked_add((self % denominator * numerator).div_ceil(denominator))
+    }
 }
 
 impl PaymentAmount for ant_protocol::evm::Amount {
     const ZERO: Self = Self::ZERO;
     fn checked_mul_multiplier(self, multiplier: u64) -> Option<Self> {
         self.checked_mul(Self::from(multiplier))
+    }
+    fn checked_scale_ceil(self, numerator: u64, denominator: u64) -> Option<Self> {
+        let (numerator, denominator) = (Self::from(numerator), Self::from(denominator));
+        (self / denominator)
+            .checked_mul(numerator)?
+            .checked_add((self % denominator * numerator).div_ceil(denominator))
     }
 }
 
@@ -62,9 +79,19 @@ pub(crate) fn median_quote_index<P: Ord>(prices: &[P]) -> Option<usize> {
     rank_quotes(prices).map(|ranked| ranked.quote_indices[ranked.paid_position])
 }
 
-pub(crate) fn enhanced_payment_amount<P: PaymentAmount>(price: P) -> Result<P, PaymentPlanError> {
+/// What the paid quote of a record of `weight` receives: 3 × `price` ×
+/// `weight`, rounded up to the next wei, as the vendored
+/// `pricing::weighted_amount` computes it. A full chunk
+/// ([`RecordWeight::FULL`]) pays exactly 3 × `price`, which every node
+/// accepts whatever the record's size; a smaller weight pays less, which
+/// nodes from settlement version 2 accept for a record of that size class.
+pub(crate) fn enhanced_payment_amount<P: PaymentAmount>(
+    price: P,
+    weight: RecordWeight,
+) -> Result<P, PaymentPlanError> {
     price
         .checked_mul_multiplier(SINGLE_NODE_PAYMENT_MULTIPLIER)
+        .and_then(|amount| amount.checked_scale_ceil(weight.numerator(), WEIGHT_DENOMINATOR))
         .ok_or(PaymentPlanError::PriceOverflow)
 }
 
@@ -83,16 +110,22 @@ pub(crate) struct SingleNodePaymentPlan<P> {
 }
 
 impl<P: PaymentAmount> SingleNodePaymentPlan<P> {
-    pub(crate) fn from_prices(prices: &[P]) -> Result<Self, PaymentPlanError> {
-        Self::from_prices_within(prices, None)
+    /// The plan for a record of `weight`: the median quote receives
+    /// [`enhanced_payment_amount`] of its price, the others zero.
+    pub(crate) fn from_prices(
+        prices: &[P],
+        weight: RecordWeight,
+    ) -> Result<Self, PaymentPlanError> {
+        Self::from_prices_within(prices, weight, None)
     }
 
     /// As [`Self::from_prices`], refusing to plan a payment on a quote asking
     /// more than `ceiling` (`ClientConfig::max_chunk_price`): the last line
     /// behind the quote checks, which drop such quotes first. `None`: no
-    /// ceiling.
+    /// ceiling. The ceiling compares the quote's price, whatever the weight.
     pub(crate) fn from_prices_within(
         prices: &[P],
+        weight: RecordWeight,
         ceiling: Option<P>,
     ) -> Result<Self, PaymentPlanError> {
         if !(1..=CLOSE_GROUP_SIZE).contains(&prices.len()) {
@@ -108,7 +141,7 @@ impl<P: PaymentAmount> SingleNodePaymentPlan<P> {
                 ceiling: ceiling.to_string(),
             });
         }
-        let amount = enhanced_payment_amount(paid_price)?;
+        let amount = enhanced_payment_amount(paid_price, weight)?;
         Ok(Self {
             quotes: ranked
                 .quote_indices
@@ -135,6 +168,8 @@ impl<P: PaymentAmount> SingleNodePaymentPlan<P> {
 mod tests {
     use super::*;
 
+    const FULL: RecordWeight = RecordWeight::FULL;
+
     #[test]
     fn median_and_payment_vectors() {
         // Shared expectations for selection and amount calculation, including
@@ -146,7 +181,7 @@ mod tests {
             (vec![7, 7, 7, 7], 2, 21),
             (vec![9], 0, 27),
         ] {
-            let plan = SingleNodePaymentPlan::from_prices(&prices).expect("valid plan");
+            let plan = SingleNodePaymentPlan::from_prices(&prices, FULL).expect("valid plan");
             assert_eq!(median_quote_index(&prices), Some(index));
             assert_eq!(plan.paid_quote().quote_index, index);
             assert_eq!(plan.paid_quote().amount, amount);
@@ -154,7 +189,7 @@ mod tests {
                 use ant_protocol::evm::Amount;
                 let native_prices = prices.iter().copied().map(Amount::from).collect::<Vec<_>>();
                 let native =
-                    SingleNodePaymentPlan::from_prices(&native_prices).expect("native plan");
+                    SingleNodePaymentPlan::from_prices(&native_prices, FULL).expect("native plan");
                 for (native, portable) in native.quotes.iter().zip(&plan.quotes) {
                     assert_eq!(native.quote_index, portable.quote_index);
                     assert_eq!(native.amount, Amount::from(portable.amount));
@@ -169,17 +204,17 @@ mod tests {
     fn rejects_invalid_counts_and_overflow() {
         for count in [0, CLOSE_GROUP_SIZE + 1] {
             assert_eq!(
-                SingleNodePaymentPlan::from_prices(&vec![1_u128; count]).unwrap_err(),
+                SingleNodePaymentPlan::from_prices(&vec![1_u128; count], FULL).unwrap_err(),
                 PaymentPlanError::InvalidQuoteCount(count),
             );
         }
         assert_eq!(median_quote_index::<u128>(&[]), None);
         assert_eq!(
-            SingleNodePaymentPlan::from_prices(&[u128::MAX]).unwrap_err(),
+            SingleNodePaymentPlan::from_prices(&[u128::MAX], FULL).unwrap_err(),
             PaymentPlanError::PriceOverflow,
         );
         assert_eq!(
-            SingleNodePaymentPlan::from_prices(&[u128::MAX / 3])
+            SingleNodePaymentPlan::from_prices(&[u128::MAX / 3], FULL)
                 .unwrap()
                 .paid_quote()
                 .amount,
@@ -187,7 +222,7 @@ mod tests {
         );
         // An unpaid outlier must not trigger multiplication overflow.
         assert_eq!(
-            SingleNodePaymentPlan::from_prices(&[1, 1, u128::MAX])
+            SingleNodePaymentPlan::from_prices(&[1, 1, u128::MAX], FULL)
                 .unwrap()
                 .paid_quote()
                 .amount,
@@ -200,11 +235,11 @@ mod tests {
         // The median quote, 30, is the one paid.
         let prices = [10_u128, 30, 40, 20];
         for ceiling in [None, Some(30), Some(u128::MAX)] {
-            let plan = SingleNodePaymentPlan::from_prices_within(&prices, ceiling).unwrap();
+            let plan = SingleNodePaymentPlan::from_prices_within(&prices, FULL, ceiling).unwrap();
             assert_eq!(plan.paid_quote().amount, 90);
         }
         assert_eq!(
-            SingleNodePaymentPlan::from_prices_within(&prices, Some(29)).unwrap_err(),
+            SingleNodePaymentPlan::from_prices_within(&prices, FULL, Some(29)).unwrap_err(),
             PaymentPlanError::AboveCeiling {
                 price: "30".into(),
                 ceiling: "29".into()
@@ -212,13 +247,18 @@ mod tests {
         );
         // Only the paid quote matters: an unpaid one above the ceiling costs
         // nothing.
-        assert!(SingleNodePaymentPlan::from_prices_within(&[1_u128, 1, 1_000], Some(1)).is_ok());
+        assert!(
+            SingleNodePaymentPlan::from_prices_within(&[1_u128, 1, 1_000], FULL, Some(1)).is_ok()
+        );
         {
             use ant_protocol::evm::Amount;
             let native = prices.map(Amount::from);
-            assert!(
-                SingleNodePaymentPlan::from_prices_within(&native, Some(Amount::from(29))).is_err()
-            );
+            assert!(SingleNodePaymentPlan::from_prices_within(
+                &native,
+                FULL,
+                Some(Amount::from(29))
+            )
+            .is_err());
         }
     }
 
@@ -227,15 +267,76 @@ mod tests {
         use ant_protocol::evm::Amount;
         let price = Amount::from(u128::MAX) + Amount::from(1);
         assert_eq!(
-            SingleNodePaymentPlan::from_prices(&[price])
+            SingleNodePaymentPlan::from_prices(&[price], FULL)
                 .unwrap()
                 .paid_quote()
                 .amount,
             price * Amount::from(3),
         );
         assert_eq!(
-            SingleNodePaymentPlan::from_prices(&[Amount::MAX]).unwrap_err(),
+            SingleNodePaymentPlan::from_prices(&[Amount::MAX], FULL).unwrap_err(),
             PaymentPlanError::PriceOverflow,
         );
+    }
+
+    /// Every size class and a pointer: the planner pays what the vendored
+    /// `weighted_amount` computes, for portable and native amounts alike,
+    /// and a full chunk pays exactly 3 × the median.
+    #[test]
+    fn a_plan_pays_the_weighted_amount_of_its_record() {
+        use ant_protocol::evm::Amount;
+        use ant_protocol::payment::pricing::{record_weight, weighted_amount};
+        use ant_protocol::pointer::{DATA_TYPE_POINTER, POINTER_WIRE_LEN};
+        use ant_protocol::DATA_TYPE_CHUNK;
+        let weights = [
+            record_weight(DATA_TYPE_CHUNK, 1),
+            record_weight(DATA_TYPE_CHUNK, 16 * 1024),
+            record_weight(DATA_TYPE_CHUNK, 16 * 1024 + 1),
+            record_weight(DATA_TYPE_CHUNK, 100_000),
+            record_weight(DATA_TYPE_CHUNK, 256 * 1024),
+            record_weight(DATA_TYPE_CHUNK, 300_000),
+            record_weight(DATA_TYPE_CHUNK, 1024 * 1024 + 1),
+            record_weight(DATA_TYPE_CHUNK, 3_000_000),
+            record_weight(DATA_TYPE_CHUNK, 4 * 1024 * 1024),
+            record_weight(DATA_TYPE_POINTER, POINTER_WIRE_LEN),
+            record_weight(DATA_TYPE_POINTER, 0),
+        ];
+        let counts = [0usize, 1, 999, 6_000, 1_000_000];
+        for weight in weights {
+            for count in counts {
+                let price = ant_protocol::payment::calculate_price(count);
+                let prices = [
+                    price,
+                    price + Amount::from(7u64),
+                    price + Amount::from(9u64),
+                ];
+                let median = prices[1];
+                let expected = weighted_amount(median, weight).unwrap();
+                let native = SingleNodePaymentPlan::from_prices(&prices, weight).unwrap();
+                assert_eq!(
+                    native.paid_quote().amount,
+                    expected,
+                    "{weight:?} at {count}"
+                );
+                let portable = prices.map(|price| price.to::<u128>());
+                let portable = SingleNodePaymentPlan::from_prices(&portable, weight).unwrap();
+                assert_eq!(Amount::from(portable.paid_quote().amount), expected);
+                assert!(expected <= median * Amount::from(3u64));
+            }
+        }
+        let price = Amount::from(1_000_003u64);
+        assert_eq!(
+            enhanced_payment_amount(price, FULL).unwrap(),
+            price * Amount::from(3u64)
+        );
+        // The smallest class, 259/1,024 at φ = 1/4: 3 × 1,024 × 259 / 1,024.
+        let smallest = record_weight(DATA_TYPE_CHUNK, 0);
+        assert_eq!(enhanced_payment_amount(1_024_u128, smallest).unwrap(), 777);
+        // Rounded up, never down: 3 × 1 × 259 / 1,024 is below one wei.
+        assert_eq!(enhanced_payment_amount(1_u128, smallest).unwrap(), 1);
+        // Overflow is judged on the result, not on 3 × price × numerator,
+        // which would overflow here.
+        let large = enhanced_payment_amount(u128::MAX / 3, smallest).unwrap();
+        assert!(large < u128::MAX / 3 && large > u128::MAX / 16, "{large}");
     }
 }

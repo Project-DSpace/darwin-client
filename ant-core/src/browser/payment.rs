@@ -6,6 +6,7 @@ use ant_protocol::evm::{Amount, PaymentQuote, RewardsAddress};
 #[cfg(test)]
 use ant_protocol::payment::commitment::commitment_hash;
 use ant_protocol::payment::commitment::{StorageCommitment, MAX_COMMITMENT_SIDECAR_BYTES};
+use ant_protocol::payment::pricing::RecordWeight;
 use serde::{Deserialize, Serialize};
 
 /// Compute the native EVM quote identifier from its signed fields.
@@ -31,7 +32,8 @@ pub struct VerifiedStorageQuote {
     /// Checksummed-independent lowercase rewards address with `0x`.
     #[serde(rename = "rewardsAddress")]
     pub rewards_address: String,
-    /// Decimal amount paid after applying Autonomi's replication multiplier.
+    /// Decimal amount paid if this quote is the one paid: its price after
+    /// applying Autonomi's replication multiplier, times the record's weight.
     pub amount: String,
 }
 
@@ -45,16 +47,19 @@ pub struct StorageQuoteError(pub String);
 /// Quotes must already have passed [`verify_storage_quote`] for distinct,
 /// eligible peers requiring payment for the same record. Input order breaks
 /// ties; one through seven quotes are supported. The selected issuer receives
-/// three times its price. Transport-specific storage-quorum checks remain
-/// with the caller.
+/// three times its price times `weight`, the record's
+/// ([`record_weight`](ant_protocol::payment::pricing::record_weight));
+/// [`RecordWeight::FULL`] pays three times its price, which every node
+/// accepts. Transport-specific storage-quorum checks remain with the caller.
 pub fn select_storage_quote(
     mut quotes: Vec<VerifiedStorageQuote>,
+    weight: RecordWeight,
 ) -> Result<VerifiedStorageQuote, StorageQuoteError> {
     let prices = quotes
         .iter()
         .map(|quote| parse_decimal_amount(&quote.quote.price, "quote price"))
         .collect::<Result<Vec<_>, _>>()?;
-    let plan = crate::payment_policy::SingleNodePaymentPlan::from_prices(&prices)
+    let plan = crate::payment_policy::SingleNodePaymentPlan::from_prices(&prices, weight)
         .map_err(|error| StorageQuoteError(error.to_string()))?;
     let paid = plan.paid_quote();
     let mut selected = quotes.swap_remove(paid.quote_index);
@@ -77,10 +82,15 @@ pub fn storage_payment_total(quotes: &[VerifiedStorageQuote]) -> Result<String, 
 }
 
 /// Fully verify a quote, its commitment, peer binding, price, and EVM hash.
+///
+/// The price must lie in the band its committed key count allows, as the
+/// native client checks it. The amount is what the quote receives if it is
+/// the one paid for a record of `weight`.
 pub fn verify_storage_quote(
     mut quote: BrowserQuoteArtifact,
     expected_address: &str,
     expected_peer_id: &str,
+    weight: RecordWeight,
 ) -> Result<VerifiedStorageQuote, StorageQuoteError> {
     let expected_address = normalize_hex(expected_address, 32).map_err(StorageQuoteError)?;
     let expected_peer_id = normalize_hex(expected_peer_id, 32).map_err(StorageQuoteError)?;
@@ -167,7 +177,7 @@ pub fn verify_storage_quote(
         }
     }
 
-    let amount = crate::payment_policy::enhanced_payment_amount(price)
+    let amount = crate::payment_policy::enhanced_payment_amount(price, weight)
         .map_err(|error| StorageQuoteError(error.to_string()))?;
     Ok(VerifiedStorageQuote {
         quote,
@@ -425,19 +435,19 @@ mod tests {
     #[test]
     fn verifies_baseline_quote_and_rejects_tampering() {
         let (quote, content, peer_id) = baseline_quote();
-        let verified =
-            verify_storage_quote(quote.clone(), &content, &peer_id).expect("valid quote");
+        let verified = verify_storage_quote(quote.clone(), &content, &peer_id, RecordWeight::FULL)
+            .expect("valid quote");
         assert_eq!(verified.amount, (calculate_price_wei(0) * 3).to_string());
         let mut tampered = quote;
         tampered.price = (calculate_price_wei(0) + 1).to_string();
-        assert!(verify_storage_quote(tampered, &content, &peer_id).is_err());
+        assert!(verify_storage_quote(tampered, &content, &peer_id, RecordWeight::FULL).is_err());
     }
 
     #[test]
     fn verifies_bound_commitment_and_exact_native_sidecar() {
         let (quote, content, peer_id) = bound_quote(23);
-        let verified =
-            verify_storage_quote(quote.clone(), &content, &peer_id).expect("valid bound quote");
+        let verified = verify_storage_quote(quote.clone(), &content, &peer_id, RecordWeight::FULL)
+            .expect("valid bound quote");
         assert_eq!(
             storage_payment_total(&[verified]).expect("payment total"),
             (calculate_price_wei(23) * PAYMENT_MULTIPLIER).to_string()
@@ -445,7 +455,7 @@ mod tests {
 
         let mut tampered = quote;
         tampered.commitment.as_mut().expect("commitment").root = hex::encode([0x99; 32]);
-        let error = verify_storage_quote(tampered, &content, &peer_id)
+        let error = verify_storage_quote(tampered, &content, &peer_id, RecordWeight::FULL)
             .expect_err("sidecar mismatch must fail");
         assert!(error.to_string().contains("sidecar differs"));
     }
@@ -512,14 +522,30 @@ mod tests {
             );
             assert_eq!(native_result.is_ok(), expected);
             assert_eq!(
-                verify_storage_quote(quote, &content, &peer).is_ok(),
+                verify_storage_quote(quote, &content, &peer, RecordWeight::FULL).is_ok(),
                 expected
             );
         }
     }
 
+    /// For a full chunk and for a record of every smaller weight, the
+    /// browser and native adapters pay the same quote the same amount.
     #[test]
     fn browser_and_native_adapters_select_the_same_signed_quote_and_payment() {
+        use ant_protocol::payment::pricing::record_weight;
+        use ant_protocol::pointer::{DATA_TYPE_POINTER, POINTER_WIRE_LEN};
+        use ant_protocol::DATA_TYPE_CHUNK;
+        for weight in [
+            RecordWeight::FULL,
+            record_weight(DATA_TYPE_CHUNK, 1),
+            record_weight(DATA_TYPE_CHUNK, 300_000),
+            record_weight(DATA_TYPE_POINTER, POINTER_WIRE_LEN),
+        ] {
+            adapters_agree_at(weight);
+        }
+    }
+
+    fn adapters_agree_at(weight: RecordWeight) {
         use crate::data::client::batch::SingleNodeQuotePayment;
         for (counts, expected_index) in [
             (vec![1_000_000, 0, 0, 0, 0, 0, 0], 4),
@@ -536,7 +562,8 @@ mod tests {
                     } else {
                         bound_quote(count)
                     };
-                    verify_storage_quote(quote, &address, &peer).expect("valid signed quote")
+                    verify_storage_quote(quote, &address, &peer, weight)
+                        .expect("valid signed quote")
                 })
                 .collect::<Vec<_>>();
             let expected_hash = verified[expected_index].quote_hash.clone();
@@ -544,8 +571,9 @@ mod tests {
                 .iter()
                 .map(|verified| native_quote(&verified.quote))
                 .collect();
-            let native = SingleNodeQuotePayment::from_quotes(native_quotes).expect("native plan");
-            let browser = select_storage_quote(verified).expect("browser plan");
+            let native =
+                SingleNodeQuotePayment::from_quotes(native_quotes, weight).expect("native plan");
+            let browser = select_storage_quote(verified, weight).expect("browser plan");
             let paid = native
                 .quotes
                 .iter()
@@ -557,8 +585,19 @@ mod tests {
             assert_eq!(browser.amount, native.total_amount().to_string());
             assert_eq!(
                 browser.amount,
-                (calculate_price_wei(counts[expected_index]) * 3).to_string()
+                ant_protocol::payment::pricing::weighted_amount(
+                    Amount::from(calculate_price_wei(counts[expected_index])),
+                    weight
+                )
+                .expect("amount")
+                .to_string()
             );
+            if weight == RecordWeight::FULL {
+                assert_eq!(
+                    browser.amount,
+                    (calculate_price_wei(counts[expected_index]) * 3).to_string()
+                );
+            }
             assert_eq!(native.quotes.len(), counts.len());
         }
     }

@@ -22,6 +22,18 @@ commit `darwin --version` prints. Upstream's entries follow.
   uploads is CI output, not for deployment.
 - The default network is ours: Robinhood Chain (chain ID 4663), with the seeds, token, vault and
   RPCs bundled in `ant-core/resources/`.
+- Size-aware payments: a record's paid quote receives 3 × its price × the record's weight,
+  rounded up, the weight being the vendored `pricing::record_weight` of its data type and the size
+  class of its bytes (a full chunk weighs 1 and pays 3 × its price, as before).
+  `SingleNodeQuotePayment::from_quotes` and the browser's `select_storage_quote` and
+  `verify_storage_quote` take the weight; `verifyStorageQuote` takes an optional chunk length and
+  pays a full chunk's amount without it. `chunk_put`, the upload engine and `pointer_put` pay by
+  the record's class; `pay_for_storage`, which is given a size and no bytes, pays a chunk at a full
+  chunk's amount, which every node accepts. The cost estimate prices each chunk paid on its own by
+  its class, merkle leaves at a full chunk's price. A quote's price is checked against a band, from
+  `calculate_price` of the smallest weight's share of its committed key count to
+  `calculate_price` of the count, in place of the exact price, in native, merkle and browser quote
+  checks alike.
 - Upload checkpoints have a format of their own (`DSCK` and a version byte, then msgpack). The
   browser core still hands `on_checkpoint` a string, now the checkpoint's bytes as base64: store
   it as text, as it is, and pass it back to resume. It also takes the bytes as a `Uint8Array` or

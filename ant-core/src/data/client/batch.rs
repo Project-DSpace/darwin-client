@@ -19,6 +19,7 @@ use ant_protocol::evm::{
 };
 #[cfg(any(feature = "native", test))]
 use ant_protocol::payment::deserialize_proof;
+use ant_protocol::payment::pricing::{record_weight, RecordWeight};
 use ant_protocol::payment::{serialize_single_node_proof, PaymentProof, QuotePaymentInfo};
 use ant_protocol::transport::{MultiAddr, PeerId};
 #[cfg(test)]
@@ -50,29 +51,36 @@ pub struct SingleNodeQuotePayment {
 }
 
 impl SingleNodeQuotePayment {
-    /// Build a single-node payment from one or more quotes.
+    /// Build a single-node payment from one or more quotes, for a record of
+    /// `weight` ([`record_weight`](crate::data::record_weight) of its data
+    /// type and length).
     ///
     /// The quotes are sorted by price, the median quote receives 3x its quoted
-    /// price, and every other quote is included with a zero amount so proof and
-    /// payment intent construction stay aligned.
+    /// price times `weight`, rounded up, and every other quote is included
+    /// with a zero amount so proof and payment intent construction stay
+    /// aligned. [`RecordWeight::FULL`] pays 3x the price, which every node
+    /// accepts for a record of any size; a smaller weight is accepted only for
+    /// a record no bigger than its size class.
     ///
     /// A raw building block: no price ceiling applies and the quotes are not
     /// checked. `Client::pay_for_storage` and the upload engine check every
     /// quote, apply `ClientConfig::max_chunk_price` and read paid quotes back.
-    pub fn from_quotes(quotes: Vec<PaymentQuote>) -> Result<Self> {
-        Self::from_quotes_within(quotes, None)
+    pub fn from_quotes(quotes: Vec<PaymentQuote>, weight: RecordWeight) -> Result<Self> {
+        Self::from_quotes_within(quotes, weight, None)
     }
 
     /// As [`Self::from_quotes`], refusing a payment whose paid quote asks
     /// more than `ceiling` (`ClientConfig::max_chunk_price`).
     pub(crate) fn from_quotes_within(
         quotes: Vec<PaymentQuote>,
+        weight: RecordWeight,
         ceiling: Option<Amount>,
     ) -> Result<Self> {
         let prices = quotes.iter().map(|quote| quote.price).collect::<Vec<_>>();
-        let plan =
-            crate::payment_policy::SingleNodePaymentPlan::from_prices_within(&prices, ceiling)
-                .map_err(|error| Error::Payment(error.to_string()))?;
+        let plan = crate::payment_policy::SingleNodePaymentPlan::from_prices_within(
+            &prices, weight, ceiling,
+        )
+        .map_err(|error| Error::Payment(error.to_string()))?;
         let quotes = plan
             .quotes
             .into_iter()
@@ -392,12 +400,13 @@ pub(crate) fn build_plan_proof(
     Ok(proof_bytes)
 }
 
-/// Turn a verified quote plan into a payment plan: the median payment and the
-/// quotes and commitments its proof carries. A payment above `ceiling`
-/// (`ClientConfig::max_chunk_price`) is refused.
+/// Turn a verified quote plan into a payment plan for a record of `weight`:
+/// the median payment and the quotes and commitments its proof carries. A
+/// payment above `ceiling` (`ClientConfig::max_chunk_price`) is refused.
 fn payment_plan_from_quotes(
     address: XorName,
     data_size: u64,
+    weight: RecordWeight,
     quote_plan: StoreQuotePlan,
     ceiling: Option<Amount>,
 ) -> Result<ChunkPaymentPlan> {
@@ -424,7 +433,7 @@ fn payment_plan_from_quotes(
         }
     }
 
-    let payment = SingleNodeQuotePayment::from_quotes_within(quotes_for_payment, ceiling)
+    let payment = SingleNodeQuotePayment::from_quotes_within(quotes_for_payment, weight, ceiling)
         .map_err(|e| Error::Payment(format!("Failed to create payment: {e}")))?;
 
     Ok(ChunkPaymentPlan {
@@ -483,7 +492,9 @@ impl Client {
     }
 
     /// Quote a content-addressed record without retaining its bytes. The
-    /// returned plan must be bound to verified content before proof construction.
+    /// returned plan must be bound to verified content before proof
+    /// construction ([`ChunkPaymentPlan::with_content`], which checks the
+    /// length): it pays for a chunk of `data_size` bytes, by its size class.
     pub async fn prepare_chunk_payment_plan(
         &self,
         address: XorName,
@@ -505,9 +516,14 @@ impl Client {
             }
             Err(e) => return Err(e),
         };
+        let weight = record_weight(
+            DATA_TYPE_CHUNK,
+            usize::try_from(data_size).unwrap_or(usize::MAX),
+        );
         payment_plan_from_quotes(
             address,
             data_size,
+            weight,
             quote_plan,
             self.config().max_chunk_price,
         )
@@ -519,12 +535,14 @@ impl Client {
     ///
     /// The two are one address for a chunk and two for a pointer, which is
     /// quoted at its state and collected from the group around its address.
+    /// The plan pays for a record of `weight`.
     pub(crate) async fn prepare_payment_plan_split(
         &self,
         routing: &XorName,
         content: &XorName,
         data_size: u64,
         data_type: u32,
+        weight: RecordWeight,
     ) -> Result<ChunkPaymentPlan> {
         if let Some(refusal) = self.corroborated_settlement_refusal() {
             return Err(Error::ClientUpdateRequired(refusal));
@@ -535,6 +553,7 @@ impl Client {
         payment_plan_from_quotes(
             *content,
             data_size,
+            weight,
             quote_plan,
             self.config().max_chunk_price,
         )
@@ -1078,7 +1097,7 @@ mod tests {
                 .map(|i| payment_quote(i as u8, i as u64 + 1))
                 .collect();
 
-            let payment = SingleNodeQuotePayment::from_quotes(quotes)
+            let payment = SingleNodeQuotePayment::from_quotes(quotes, RecordWeight::FULL)
                 .expect("every supported quote count should produce an SNP payment");
             let median_index = quote_count / 2;
             let enhanced_price =
@@ -1111,7 +1130,8 @@ mod tests {
             .map(|i| payment_quote(i as u8, i as u64 + 1))
             .collect::<Vec<_>>();
 
-        let local = SingleNodeQuotePayment::from_quotes(quotes.clone()).unwrap();
+        let local =
+            SingleNodeQuotePayment::from_quotes(quotes.clone(), RecordWeight::FULL).unwrap();
         let protocol = SingleNodePayment::from_quotes(
             quotes
                 .into_iter()
@@ -1134,7 +1154,7 @@ mod tests {
 
     #[test]
     fn single_node_quote_payment_rejects_zero_quotes() {
-        let err = SingleNodeQuotePayment::from_quotes(Vec::new())
+        let err = SingleNodeQuotePayment::from_quotes(Vec::new(), RecordWeight::FULL)
             .expect_err("empty SNP quote sets must remain invalid");
         assert!(
             err.to_string().contains("requires 1..="),
@@ -1148,7 +1168,7 @@ mod tests {
             .map(|i| payment_quote(i as u8, i as u64 + 1))
             .collect();
 
-        let err = SingleNodeQuotePayment::from_quotes(quotes)
+        let err = SingleNodeQuotePayment::from_quotes(quotes, RecordWeight::FULL)
             .expect_err("quote sets larger than the close group must remain invalid");
         assert!(
             err.to_string()

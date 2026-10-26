@@ -798,7 +798,11 @@ pub(super) mod test_plans {
             address,
             data_size,
             quoted_peers: Vec::new(),
-            payment: SingleNodeQuotePayment::from_quotes(vec![quote.clone()]).unwrap(),
+            payment: SingleNodeQuotePayment::from_quotes(
+                vec![quote.clone()],
+                ant_protocol::payment::pricing::RecordWeight::FULL,
+            )
+            .unwrap(),
             peer_quotes: vec![(
                 EncodedPeerId::new(*blake3::hash(&quote.pub_key).as_bytes()),
                 quote,

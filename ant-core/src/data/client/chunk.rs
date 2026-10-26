@@ -621,14 +621,16 @@ impl Client {
         let address = compute_address(&content);
         let data_size = u64::try_from(content.len())
             .map_err(|e| Error::InvalidData(format!("content size too large: {e}")))?;
+        // Paid by the size class of the bytes stored.
+        let weight = ant_protocol::payment::pricing::record_weight(CHUNK_DATA_TYPE, content.len());
 
         #[cfg(feature = "native")]
         let paid = self
-            .pay_for_record(&address, &address, data_size, CHUNK_DATA_TYPE)
+            .pay_for_record(&address, &address, data_size, CHUNK_DATA_TYPE, weight)
             .await;
         #[cfg(not(feature = "native"))]
         let paid = self
-            .pay_for_storage(&address, data_size, CHUNK_DATA_TYPE)
+            .pay_for_storage_split_at(&address, &address, data_size, CHUNK_DATA_TYPE, weight)
             .await;
         match paid {
             #[cfg(feature = "native")]
@@ -663,7 +665,7 @@ impl Client {
                         );
                         paid.refused()?;
                         let paid = match self
-                            .pay_for_record(&address, &address, data_size, CHUNK_DATA_TYPE)
+                            .pay_for_record(&address, &address, data_size, CHUNK_DATA_TYPE, weight)
                             .await
                         {
                             Err(Error::AlreadyStored) => return Ok(address),

@@ -46,6 +46,10 @@ pub use ant_protocol::pointer::{
 };
 pub use ant_protocol::pqc::api::{ml_dsa_65, MlDsaPublicKey, MlDsaSecretKey};
 
+// A record's weight by its size class, which a single-node payment is planned
+// for ([`SingleNodeQuotePayment::from_quotes`]).
+pub use ant_protocol::payment::pricing::{record_weight, RecordWeight};
+
 // Re-export client data types
 pub use client::batch::{
     finalize_batch_payment, ChunkPaymentPlan, PaidChunk, PaymentIntent, PreparedChunk,

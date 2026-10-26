@@ -1946,6 +1946,7 @@ impl Client {
                     &state_id,
                     POINTER_WIRE_LEN as u64,
                     DATA_TYPE_POINTER,
+                    crate::data::client::payment::declared_size_weight(DATA_TYPE_POINTER),
                 )
                 .await?;
             let stored = self
@@ -1987,6 +1988,7 @@ impl Client {
             &record.state_id(),
             POINTER_WIRE_LEN as u64,
             DATA_TYPE_POINTER,
+            crate::data::client::payment::declared_size_weight(DATA_TYPE_POINTER),
         )
         .await
     }
@@ -2022,8 +2024,13 @@ impl Client {
     /// already recorded for another payment (see [`Self::pointer_put_paid`]).
     #[cfg(feature = "native")]
     async fn check_paid_pointer_proof(&self, record: &Pointer, proof: &[u8]) -> Result<()> {
-        let plan = plan_of_proof(record.state_id(), POINTER_WIRE_LEN as u64, proof)
-            .map_err(|e| Error::Payment(format!("cannot read the pointer's payment proof: {e}")))?;
+        let plan = plan_of_proof(
+            record.state_id(),
+            POINTER_WIRE_LEN as u64,
+            crate::data::client::payment::declared_size_weight(DATA_TYPE_POINTER),
+            proof,
+        )
+        .map_err(|e| Error::Payment(format!("cannot read the pointer's payment proof: {e}")))?;
         let occupied = self.occupied_quotes(std::slice::from_ref(&plan)).await;
         if occupied.is_empty() {
             return Ok(());

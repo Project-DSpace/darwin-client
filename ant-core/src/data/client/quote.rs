@@ -109,8 +109,10 @@ fn quote_binding_is_valid(peer_id: &PeerId, quote: &PaymentQuote) -> bool {
 ///    baseline) are rejected.
 /// 2. **Cap.** `committed_key_count <= MAX_COMMITMENT_KEY_COUNT` — a count a
 ///    commitment could never legitimately attest is rejected before pricing.
-/// 3. **Forced price.** `price == calculate_price(committed_key_count)`, by
-///    exact recomputation with the shared `calculate_price` — never inverted.
+/// 3. **Price band.** `calculate_price(floor(w_min × committed_key_count)) <=
+///    price <= calculate_price(committed_key_count)`, `w_min` being the
+///    smallest record weight: two forward computations with the shared
+///    `calculate_price`, never inverted.
 /// 4. **Resolution (bound quotes).** The shipped commitment must: parse as a
 ///    `StorageCommitment`, be bound to the quoting peer
 ///    (`BLAKE3(sender_public_key) == sender_peer_id`), have a valid ML-DSA-65
@@ -2687,7 +2689,7 @@ mod tests {
     // Mirrors the storer-side `binding_violation` in
     // `ant-node/src/payment/verifier.rs`. The client runs this before
     // paying so it never pays a quote the storer's arithmetic gate would
-    // reject. The client now runs the FULL check (shape, cap, exact price,
+    // reject. The client now runs the FULL check (shape, cap, price band,
     // and for bound quotes: parse + peer-binding + signature + hash==pin +
     // count==key_count) using the shared ant-protocol commitment type, so an
     // unresolvable/forged commitment is never paid. A live resolve against a
@@ -2781,11 +2783,23 @@ mod tests {
     }
 
     #[test]
-    fn binding_rejects_on_curve_wrong_count() {
-        // Priced for 499 but claims count 500 — on a real price curve but the
-        // wrong count. Rejected at the exact-price check, before resolution.
-        let q = quote_with_binding(500, Some([9u8; 32]), calculate_price(499));
-        assert!(quote_commitment_binding_is_valid(&any_peer(), &q, &Some(vec![1u8; 16])).is_err());
+    fn binding_rejects_on_curve_prices_outside_the_band() {
+        // Claims count 500, so its band runs from calculate_price(126)
+        // (floor(259/1,024 × 500)) to calculate_price(500). Priced on the
+        // curve for a count past either end, it is rejected at the band
+        // check, before resolution.
+        for priced_for in [501, 125] {
+            let q = quote_with_binding(500, Some([9u8; 32]), calculate_price(priced_for));
+            let error = quote_commitment_binding_is_valid(&any_peer(), &q, &Some(vec![1u8; 16]))
+                .unwrap_err();
+            assert!(error.contains("outside the band"), "{priced_for}: {error}");
+        }
+        // Priced for a count inside the band, it passes the band check and
+        // fails later, at resolution of the unparseable commitment.
+        let q = quote_with_binding(500, Some([9u8; 32]), calculate_price(126));
+        let error =
+            quote_commitment_binding_is_valid(&any_peer(), &q, &Some(vec![1u8; 16])).unwrap_err();
+        assert!(!error.contains("outside the band"), "{error}");
     }
 
     #[test]

@@ -463,7 +463,7 @@ const STORE_SITES: &[Site] = &[
     (
         "ant-core/src/data/client/chunk.rs",
         "Client::chunk_put",
-        "pay_for_storage",
+        "pay_for_storage_split_at",
         1,
         RAW_CHUNK,
     ),
@@ -687,14 +687,21 @@ const STORE_SITES: &[Site] = &[
     (
         "ant-core/src/data/client/payment.rs",
         "Client::pay_for_storage_split",
-        "pay_for_storage_once",
+        "pay_for_storage_split_at",
         1,
         PER_CHUNK,
     ),
     (
         "ant-core/src/data/client/payment.rs",
-        "Client::pay_for_storage_split",
+        "Client::pay_for_storage_split_at",
         "pay_for_record",
+        1,
+        PER_CHUNK,
+    ),
+    (
+        "ant-core/src/data/client/payment.rs",
+        "Client::pay_for_storage_split_at",
+        "pay_for_storage_once",
         1,
         PER_CHUNK,
     ),

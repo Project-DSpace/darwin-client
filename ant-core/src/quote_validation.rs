@@ -8,8 +8,36 @@ use std::fmt::Display;
 pub(crate) const ML_DSA_PUB_KEY_LEN: usize =
     ant_protocol::pqc::api::MlDsaVariant::MlDsa65.public_key_size();
 
-pub(crate) trait QuotePrice: Copy + Eq + Display {
+pub(crate) trait QuotePrice: Copy + Ord + Display {
     fn for_key_count(count: u32) -> Self;
+}
+
+/// The lowest count of a node's price band: `floor(w_min × count)`, where
+/// `w_min` is the smallest record weight, a node of `count` records all in the
+/// smallest size class. A node prices at its weight total, which lies between
+/// this and `count` and isn't proven, so a quote's price is checked against
+/// the band from `calculate_price` of this count to `calculate_price(count)`.
+/// Both ends are computed forward; the price is never inverted.
+pub(crate) fn band_floor_count(count: u32) -> u32 {
+    use ant_protocol::payment::pricing::{record_weight, WEIGHT_DENOMINATOR};
+    let smallest = record_weight(ant_protocol::DATA_TYPE_CHUNK, 0).numerator();
+    // `smallest` is below `WEIGHT_DENOMINATOR`, so the result is below `count`.
+    u32::try_from(u64::from(count) * smallest / WEIGHT_DENOMINATOR).unwrap_or(count)
+}
+
+/// Whether `price` is in the band a node with `count` committed keys may
+/// quote ([`band_floor_count`]), or why not.
+pub(crate) fn check_price_band<P: QuotePrice>(price: P, count: u32) -> Result<(), String> {
+    let lowest = band_floor_count(count);
+    let bottom = P::for_key_count(lowest);
+    let top = P::for_key_count(count);
+    if price < bottom || price > top {
+        return Err(format!(
+            "price {price} is outside the band from calculate_price({lowest}) = {bottom} to \
+             calculate_price(committed_key_count={count}) = {top}"
+        ));
+    }
+    Ok(())
 }
 
 impl QuotePrice for ant_protocol::evm::Amount {
@@ -131,13 +159,7 @@ pub(crate) fn validate_commitment_binding<P: QuotePrice, C: Commitment>(
             C::MAX_KEY_COUNT
         ));
     }
-    let expected = P::for_key_count(count);
-    if fields.price != expected {
-        return Err(format!(
-            "price {} does not equal calculate_price(committed_key_count={count}) = {expected}",
-            fields.price
-        ));
-    }
+    check_price_band(fields.price, count)?;
     // Native baseline semantics: there is no pin to resolve. Any unsolicited
     // sidecar is irrelevant to admission, including an unparseable one.
     let Some(pin) = pin else {
@@ -176,7 +198,7 @@ pub(crate) fn validate_commitment_binding<P: QuotePrice, C: Commitment>(
 
 /// The caller's price ceiling: the most a quote may ask for one chunk
 /// (`ClientConfig::max_chunk_price`), checked after the price is known to be
-/// the one its commitment forces. A quote asking more is dropped before
+/// in the band its commitment allows. A quote asking more is dropped before
 /// payment, as if its node hadn't answered. `None`: no ceiling.
 pub(crate) fn validate_price_ceiling<P: QuotePrice + Ord>(
     price: P,
@@ -245,7 +267,7 @@ mod tests {
         };
         let error = quote_at(UPSTREAM_BASELINE_WEI).unwrap_err().to_string();
         assert!(
-            error.contains("does not equal calculate_price(committed_key_count=0)"),
+            error.contains("is outside the band from calculate_price(0)"),
             "{error}"
         );
         assert!(quote_at(UPSTREAM_BASELINE_WEI * PRICE_MULTIPLIER).is_ok());
@@ -261,5 +283,57 @@ mod tests {
             Amount::for_key_count(6_000),
             Amount::from((UPSTREAM_BASELINE_WEI + UPSTREAM_COEFFICIENT_WEI) * PRICE_MULTIPLIER)
         );
+    }
+
+    /// The band's ends at φ = 1/4: the smallest weight is 259/1,024 of a full
+    /// chunk, so a node of 1,024 records may count from 259 to 1,024.
+    #[test]
+    fn the_band_runs_from_the_smallest_weight_to_the_key_count() {
+        assert_eq!(band_floor_count(0), 0);
+        assert_eq!(band_floor_count(3), 0);
+        assert_eq!(band_floor_count(4), 1);
+        assert_eq!(band_floor_count(1_024), 259);
+        assert_eq!(band_floor_count(u32::MAX), 1_086_324_735);
+        let price = |count: u32| Amount::for_key_count(count);
+        // K = 0: the band is the baseline alone.
+        assert!(check_price_band(price(0), 0).is_ok());
+        assert!(check_price_band(price(0) + Amount::from(1u64), 0).is_err());
+        assert!(check_price_band(price(0) - Amount::from(1u64), 0).is_err());
+        // Both ends are in, and one wei past either is out.
+        assert!(check_price_band(price(1_024), 1_024).is_ok());
+        assert!(check_price_band(price(259), 1_024).is_ok());
+        assert!(check_price_band(price(600), 1_024).is_ok());
+        let error = check_price_band(price(1_024) + Amount::from(1u64), 1_024).unwrap_err();
+        assert!(
+            error.contains("outside the band from calculate_price(259)"),
+            "{error}"
+        );
+        assert!(check_price_band(price(259) - Amount::from(1u64), 1_024).is_err());
+        assert!(check_price_band(price(1_025), 1_024).is_err());
+    }
+
+    /// The band never reaches down to upstream's price: at every count, the
+    /// price of the band's lowest count is above a thirty-second of the top,
+    /// so a quote at upstream's rate is still dropped.
+    #[test]
+    fn upstreams_rate_stays_below_the_band() {
+        for count in [
+            0u32,
+            1,
+            4,
+            100,
+            1_000,
+            6_000,
+            65_536,
+            1_000_000,
+            ant_protocol::payment::commitment::MAX_COMMITMENT_KEY_COUNT,
+        ] {
+            let top = Amount::for_key_count(count);
+            let upstream = top / Amount::from(PRICE_MULTIPLIER);
+            assert!(
+                check_price_band(upstream, count).is_err(),
+                "upstream's rate passed the band at count {count}"
+            );
+        }
     }
 }

@@ -702,15 +702,31 @@ mod wasm {
     }
 
     /// Fully verify a storage quote before exposing it to a wallet signer.
+    ///
+    /// Its price must lie in the band its committed key count allows. Its
+    /// `amount` is a full chunk's, three times its price, unless
+    /// `chunk_length` is given: then it is the weighted amount for a chunk
+    /// of that many bytes, by its size class, which only a node quoting at
+    /// settlement version 2 accepts.
     #[wasm_bindgen(js_name = verifyStorageQuote)]
     pub fn verify_storage_quote_wasm(
         quote: JsValue,
         expected_address: &str,
         expected_peer_id: &str,
+        chunk_length: Option<u32>,
     ) -> Result<JsValue, JsValue> {
         let quote: BrowserQuoteArtifact = serde_wasm_bindgen::from_value(quote)
             .map_err(|error| JsValue::from_str(&error.to_string()))?;
-        let verified = verify_storage_quote(quote, expected_address, expected_peer_id)
+        let weight = chunk_length.map_or(
+            ant_protocol::payment::pricing::RecordWeight::FULL,
+            |length| {
+                ant_protocol::payment::pricing::record_weight(
+                    ant_protocol::DATA_TYPE_CHUNK,
+                    length as usize,
+                )
+            },
+        );
+        let verified = verify_storage_quote(quote, expected_address, expected_peer_id, weight)
             .map_err(|error| JsValue::from_str(&error.to_string()))?;
         serde_wasm_bindgen::to_value(&verified)
             .map_err(|error| JsValue::from_str(&error.to_string()))

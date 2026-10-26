@@ -24,6 +24,7 @@ use crate::data::error::{Error, Result};
 #[cfg(not(feature = "native"))]
 use ant_protocol::evm::ProofOfPayment;
 use ant_protocol::evm::{EncodedPeerId, Wallet};
+use ant_protocol::payment::pricing::{record_weight, RecordWeight};
 #[cfg(not(feature = "native"))]
 use ant_protocol::payment::{serialize_single_node_proof, PaymentProof};
 use ant_protocol::transport::{MultiAddr, PeerId};
@@ -33,6 +34,18 @@ use std::sync::Arc;
 use tracing::{debug, info, warn};
 
 pub(crate) use crate::payment_policy::SINGLE_NODE_PAYMENT_MULTIPLIER;
+
+/// The weight a record is paid for when only its declared size is known, not
+/// its bytes ([`Client::pay_for_storage`]): a pointer's by its data type,
+/// since every pointer is one size, and otherwise a full chunk's, whose
+/// amount every node accepts for a record of any size.
+pub(crate) fn declared_size_weight(data_type: u32) -> RecordWeight {
+    if data_type == ant_protocol::pointer::DATA_TYPE_POINTER {
+        record_weight(data_type, ant_protocol::pointer::POINTER_WIRE_LEN)
+    } else {
+        RecordWeight::FULL
+    }
+}
 
 /// A record paid for by this client's wallet and not stored yet
 /// ([`Client::pay_for_record`]): its proof, where to store it, and its
@@ -128,6 +141,12 @@ impl Client {
     /// back ([`Self::pay_for_storage_split`]), and stores nothing; the caller
     /// stores the record with the proof, with no envelope unless it adds one.
     /// Upload files with `Client::file_upload`.
+    ///
+    /// `data_size` is the size quoted, not bytes this call can check, so a
+    /// chunk is paid at a full chunk's amount, which every storer accepts
+    /// whatever the chunk's size; a pointer is paid by its data type.
+    /// `Client::chunk_put` and the upload engine pay a chunk by the size class
+    /// of its bytes.
     pub async fn pay_for_storage(
         &self,
         address: &[u8; 32],
@@ -173,9 +192,29 @@ impl Client {
         data_size: u64,
         data_type: u32,
     ) -> Result<(Vec<u8>, Vec<(PeerId, Vec<MultiAddr>)>)> {
+        self.pay_for_storage_split_at(
+            routing,
+            content,
+            data_size,
+            data_type,
+            declared_size_weight(data_type),
+        )
+        .await
+    }
+
+    /// As [`Self::pay_for_storage_split`], paying for a record of `weight`:
+    /// [`record_weight`] of the bytes the caller stores.
+    pub(crate) async fn pay_for_storage_split_at(
+        &self,
+        routing: &[u8; 32],
+        content: &[u8; 32],
+        data_size: u64,
+        data_type: u32,
+        weight: RecordWeight,
+    ) -> Result<(Vec<u8>, Vec<(PeerId, Vec<MultiAddr>)>)> {
         #[cfg(feature = "native")]
         {
-            self.pay_for_record(routing, content, data_size, data_type)
+            self.pay_for_record(routing, content, data_size, data_type, weight)
                 .await
                 .map(PaidRecord::handed_over)
         }
@@ -184,7 +223,7 @@ impl Client {
             let mut history = Vec::new();
             for requote in 0..=MAX_OCCUPIED_REQUOTES {
                 let (proof, put_peers, plan) = self
-                    .pay_for_storage_once(routing, content, data_size, data_type)
+                    .pay_for_storage_once(routing, content, data_size, data_type, weight)
                     .await?;
                 let occupied = self.occupied_quotes(std::slice::from_ref(&plan)).await;
                 if occupied.is_empty() {
@@ -216,6 +255,9 @@ impl Client {
     /// As [`Self::pay_for_storage_split`], and [`Error::AlreadyStored`] when
     /// the quotes show a chunk the network already holds: nothing is paid,
     /// and its checkpoint goes.
+    ///
+    /// The record is paid for at `weight`: [`record_weight`] of the bytes
+    /// the caller stores, or [`declared_size_weight`] when it has none.
     #[cfg(feature = "native")]
     pub(crate) async fn pay_for_record(
         &self,
@@ -223,11 +265,12 @@ impl Client {
         content: &[u8; 32],
         data_size: u64,
         data_type: u32,
+        weight: RecordWeight,
     ) -> Result<PaidRecord> {
         let directory = crate::config::data_dir()
             .map_err(|e| Error::Config(e.to_string()))?
             .join(RECORD_CHECKPOINTS);
-        self.pay_for_record_in(&directory, routing, content, data_size, data_type)
+        self.pay_for_record_in(&directory, routing, content, data_size, data_type, weight)
             .await
     }
 
@@ -240,6 +283,7 @@ impl Client {
         content: &[u8; 32],
         data_size: u64,
         data_type: u32,
+        weight: RecordWeight,
     ) -> Result<PaidRecord> {
         // Checked before the checkpoint is opened, so a client without a
         // wallet neither waits for a lock nor collects quotes.
@@ -266,6 +310,7 @@ impl Client {
                 content,
                 data_size,
                 data_type,
+                weight,
                 &mut state,
                 &checkpoint,
             ))
@@ -328,12 +373,14 @@ impl Client {
     /// node is among the [`PUT_TARGET_WIDTH`](crate::quote_policy::PUT_TARGET_WIDTH)
     /// nearest storers a fresh quote names, and paid again otherwise.
     #[cfg(feature = "native")]
+    #[allow(clippy::too_many_arguments)] // The record, its weight, and its checkpoint.
     async fn settle_record(
         &self,
         routing: &[u8; 32],
         content: &[u8; 32],
         data_size: u64,
         data_type: u32,
+        weight: RecordWeight,
         state: &mut UploadState,
         checkpoint: &RecordCheckpoint,
     ) -> Result<(Vec<u8>, Vec<(PeerId, Vec<MultiAddr>)>, bool)> {
@@ -382,7 +429,9 @@ impl Client {
         }
         for requote in 0..=MAX_OCCUPIED_REQUOTES {
             let (plan, payment) = self
-                .pay_for_storage_once(routing, content, data_size, data_type, state, checkpoint)
+                .pay_for_storage_once(
+                    routing, content, data_size, data_type, weight, state, checkpoint,
+                )
                 .await?;
             let occupied = self.occupied_quotes(std::slice::from_ref(&plan)).await;
             if let Some(proof) = confirm_record(&plan, &payment, &occupied, state, checkpoint)? {
@@ -447,12 +496,14 @@ impl Client {
     /// signed, before it is sent and once it is confirmed. Returns the plan
     /// paid and what the wallet paid, for its paid quote to be read back.
     #[cfg(feature = "native")]
+    #[allow(clippy::too_many_arguments)] // The record, its weight, and its checkpoint.
     async fn pay_for_storage_once(
         &self,
         routing: &[u8; 32],
         content: &[u8; 32],
         data_size: u64,
         data_type: u32,
+        weight: RecordWeight,
         state: &mut UploadState,
         checkpoint: &RecordCheckpoint,
     ) -> Result<(ChunkPaymentPlan, UploadPayment)> {
@@ -461,7 +512,7 @@ impl Client {
         // established a settlement refusal; quotes over the price ceiling
         // are left out.
         let plan = self
-            .prepare_payment_plan_split(routing, content, data_size, data_type)
+            .prepare_payment_plan_split(routing, content, data_size, data_type, weight)
             .await?;
         info!(
             "Paying {} atto for address {}",
@@ -495,6 +546,7 @@ impl Client {
         content: &[u8; 32],
         data_size: u64,
         data_type: u32,
+        weight: RecordWeight,
     ) -> Result<(Vec<u8>, Vec<(PeerId, Vec<MultiAddr>)>, ChunkPaymentPlan)> {
         let address = content;
         // A refusal established by any earlier upload on this client stops
@@ -549,6 +601,7 @@ impl Client {
         // 3. Create single-node payment (sorts by price, selects median)
         let payment = SingleNodeQuotePayment::from_quotes_within(
             quotes_for_payment,
+            weight,
             self.config().max_chunk_price,
         )
         .map_err(|e| Error::Payment(format!("Failed to create payment: {e}")))?;
@@ -727,6 +780,7 @@ mod tests {
                 &record.state_id(),
                 POINTER_WIRE_LEN as u64,
                 DATA_TYPE_POINTER,
+                declared_size_weight(DATA_TYPE_POINTER),
             )
             .await
     }

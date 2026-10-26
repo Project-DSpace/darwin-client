@@ -250,9 +250,11 @@ pub(crate) fn set_aside_occupied(
 }
 
 /// The payment plan a single-node payment proof was paid from, for the
-/// record it pays for (`address`: a chunk's address, or a pointer's state):
-/// the quotes it carries, the median paid three times its price, as
-/// [`SingleNodeQuotePayment::from_quotes`] plans them.
+/// record it pays for (`address`: a chunk's address, or a pointer's state)
+/// of `weight`: the quotes it carries, the median paid three times its price
+/// times `weight`, as [`SingleNodeQuotePayment::from_quotes`] plans them. A
+/// vault record of at least that amount is the payment, so a proof paid at a
+/// full chunk's amount reads as paid too.
 ///
 /// # Errors
 ///
@@ -262,6 +264,7 @@ pub(crate) fn set_aside_occupied(
 pub(crate) fn plan_of_proof(
     address: XorName,
     data_size: u64,
+    weight: ant_protocol::payment::pricing::RecordWeight,
     proof: &[u8],
 ) -> Result<ChunkPaymentPlan, String> {
     let (proof, _) = ant_protocol::payment::deserialize_proof(proof)?;
@@ -270,7 +273,7 @@ pub(crate) fn plan_of_proof(
         .iter()
         .map(|(_, quote)| quote.clone())
         .collect();
-    let payment = SingleNodeQuotePayment::from_quotes(quotes).map_err(|e| e.to_string())?;
+    let payment = SingleNodeQuotePayment::from_quotes(quotes, weight).map_err(|e| e.to_string())?;
     Ok(ChunkPaymentPlan {
         address,
         data_size,
@@ -535,6 +538,7 @@ mod tests {
     }
     use crate::data::client::batch::SingleNodeQuotePayment;
     use ant_protocol::evm::PaymentQuote;
+    use ant_protocol::payment::pricing::RecordWeight;
     use std::time::SystemTime;
 
     fn quote(seed: u8, price: u64, content: [u8; 32]) -> PaymentQuote {
@@ -558,7 +562,8 @@ mod tests {
             address: [address; 32],
             data_size: 1,
             quoted_peers: Vec::new(),
-            payment: SingleNodeQuotePayment::from_quotes(quotes.clone()).unwrap(),
+            payment: SingleNodeQuotePayment::from_quotes(quotes.clone(), RecordWeight::FULL)
+                .unwrap(),
             peer_quotes: quotes
                 .into_iter()
                 .map(|q| (EncodedPeerId::new([q.rewards_address.0[0]; 32]), q))
@@ -773,6 +778,7 @@ mod outside_payer_tests {
     use crate::data::client::listings::test_chain::{serve, MockChain, VAULT};
     use ant_protocol::compute_address;
     use ant_protocol::evm::{Address, CustomNetwork, Network as EvmNetwork, PaymentQuote, TxHash};
+    use ant_protocol::payment::pricing::RecordWeight;
     use ant_protocol::pointer::{Pointer, PointerTarget, PointerTargetKind};
     use bytes::Bytes;
     use std::sync::{Arc, Mutex};
@@ -802,7 +808,8 @@ mod outside_payer_tests {
             address,
             data_size,
             quoted_peers: Vec::new(),
-            payment: SingleNodeQuotePayment::from_quotes(quotes.clone()).unwrap(),
+            payment: SingleNodeQuotePayment::from_quotes(quotes.clone(), RecordWeight::FULL)
+                .unwrap(),
             peer_quotes: quotes
                 .into_iter()
                 .map(|q| (EncodedPeerId::new([q.rewards_address.0[0]; 32]), q))
@@ -999,7 +1006,7 @@ mod outside_payer_tests {
     fn a_proof_plans_back_to_the_payment_it_carries() {
         let plan = plan_for([5; 32], 2048);
         let proof = build_plan_proof(&plan, &transactions(std::slice::from_ref(&plan))).unwrap();
-        let back = plan_of_proof(plan.address, 2048, &proof).unwrap();
+        let back = plan_of_proof(plan.address, 2048, RecordWeight::FULL, &proof).unwrap();
         let quotes = |plan: &ChunkPaymentPlan| {
             plan.payment
                 .quotes
@@ -1010,7 +1017,41 @@ mod outside_payer_tests {
         assert_eq!(quotes(&back), quotes(&plan));
         assert_eq!(back.address, plan.address);
         assert_eq!(back.peer_quotes.len(), plan.peer_quotes.len());
-        assert!(plan_of_proof(plan.address, 2048, b"not a proof").is_err());
+        assert!(plan_of_proof(plan.address, 2048, RecordWeight::FULL, b"not a proof").is_err());
+    }
+
+    /// A proof planned back at a smaller weight expects the weighted amount,
+    /// and a vault record of a full chunk's amount, which an earlier client
+    /// pays for every record, is still the payment.
+    #[test]
+    fn a_proof_plans_back_at_its_weight() {
+        use ant_protocol::payment::pricing::{record_weight, weighted_amount};
+        use ant_protocol::pointer::{DATA_TYPE_POINTER, POINTER_WIRE_LEN};
+        let plan = plan_for([6; 32], POINTER_WIRE_LEN as u64);
+        let proof = build_plan_proof(&plan, &transactions(std::slice::from_ref(&plan))).unwrap();
+        let weight = record_weight(DATA_TYPE_POINTER, POINTER_WIRE_LEN);
+        let back = plan_of_proof(plan.address, POINTER_WIRE_LEN as u64, weight, &proof).unwrap();
+        let paid = |plan: &ChunkPaymentPlan| {
+            plan.payment
+                .quotes
+                .iter()
+                .find(|q| !q.amount.is_zero())
+                .map(|q| (q.quote_hash, q.rewards_address, q.price, q.amount))
+                .unwrap()
+        };
+        let (hash, rewards, price, full) = paid(&plan);
+        let (back_hash, back_rewards, _, weighted) = paid(&back);
+        assert_eq!((back_hash, back_rewards), (hash, rewards));
+        assert_eq!(full, price * Amount::from(3u64));
+        assert_eq!(Some(weighted), weighted_amount(price, weight));
+        assert!(weighted < full);
+        let record = |amount| VaultRecord {
+            rewards_prefix: rewards.as_slice()[..16].try_into().unwrap(),
+            amount,
+        };
+        assert!(record(full).pays(&rewards, weighted));
+        assert!(record(weighted).pays(&rewards, weighted));
+        assert!(!record(weighted - Amount::from(1u64)).pays(&rewards, weighted));
     }
 
     /// `finalize_upload` sets the chunk whose quote was occupied aside before

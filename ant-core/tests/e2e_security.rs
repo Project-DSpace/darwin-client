@@ -7,7 +7,7 @@
 
 mod support;
 
-use ant_core::data::{compute_address, Client, SingleNodeQuotePayment};
+use ant_core::data::{compute_address, Client, RecordWeight, SingleNodeQuotePayment};
 use ant_protocol::evm::{Amount, EncodedPeerId, ProofOfPayment, RewardsAddress, TxHash};
 use ant_protocol::payment::{serialize_single_node_proof, PaymentProof};
 use ant_protocol::transport::PeerId;
@@ -53,8 +53,8 @@ async fn collect_and_pay(client: &Client, content: &Bytes) -> (PaymentProof, Vec
     }
 
     // Pay on-chain
-    let payment =
-        SingleNodeQuotePayment::from_quotes(quotes_for_payment).expect("payment creation");
+    let payment = SingleNodeQuotePayment::from_quotes(quotes_for_payment, RecordWeight::FULL)
+        .expect("payment creation");
     let wallet = client.wallet().expect("wallet should be set");
     let tx_hashes = payment.pay(wallet).await.expect("on-chain payment");
 
@@ -411,7 +411,7 @@ async fn test_attack_underpayment_single_node() {
         }
     }
 
-    let mut payment = SingleNodeQuotePayment::from_quotes(quotes_for_payment)
+    let mut payment = SingleNodeQuotePayment::from_quotes(quotes_for_payment, RecordWeight::FULL)
         .expect("payment creation should succeed");
 
     // Target the median peer specifically — it's the only one that receives
@@ -504,7 +504,7 @@ async fn test_attack_underpayment_half_price() {
         }
     }
 
-    let mut payment = SingleNodeQuotePayment::from_quotes(quotes_for_payment)
+    let mut payment = SingleNodeQuotePayment::from_quotes(quotes_for_payment, RecordWeight::FULL)
         .expect("payment creation should succeed");
 
     // Halve the median payment (3× → ~1.5×).

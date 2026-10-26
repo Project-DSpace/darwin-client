@@ -19,9 +19,7 @@ use ant_protocol::payment::commitment::{
     commitment_hash, verify_commitment_signature, StorageCommitment, MAX_COMMITMENT_KEY_COUNT,
     MAX_COMMITMENT_SIDECAR_BYTES,
 };
-use ant_protocol::payment::{
-    calculate_price, serialize_merkle_proof, verify_merkle_candidate_signature,
-};
+use ant_protocol::payment::{serialize_merkle_proof, verify_merkle_candidate_signature};
 use ant_protocol::transport::PeerId;
 use ant_protocol::{
     compute_address, ChunkMessage, ChunkMessageBody, MerkleCandidateQuoteRequest,
@@ -68,7 +66,7 @@ use crate::data::client::payment::SINGLE_NODE_PAYMENT_MULTIPLIER as MERKLE_PAYME
 
 /// ADR-0004 resolve-before-pay gate for a merkle candidate — the merkle-path
 /// equivalent of the single-node `quote_commitment_binding_is_valid`. Runs the
-/// FULL binding check (shape, cap, exact price, and for bound candidates the
+/// FULL binding check (shape, cap, price band, and for bound candidates the
 /// commitment parse, peer-binding, signature, `hash == pin`, and
 /// `count == key_count`) before the candidate is allowed into a pool the client
 /// may pay. `peer_id` is derived from the candidate's `pub_key`
@@ -98,13 +96,7 @@ fn merkle_candidate_binding_is_valid(
             "committed_key_count={count} exceeds MAX_COMMITMENT_KEY_COUNT={MAX_COMMITMENT_KEY_COUNT}"
         ));
     }
-    let expected = calculate_price(count as usize);
-    if candidate.price != expected {
-        return Err(format!(
-            "price {} does not equal calculate_price(committed_key_count={count}) = {expected}",
-            candidate.price
-        ));
-    }
+    crate::quote_validation::check_price_band(candidate.price, count)?;
 
     let Some(pin) = pin else {
         return Ok(()); // baseline candidate pins nothing
@@ -441,8 +433,11 @@ impl PreparedMerkleBatch {
                     !verify_merkle_candidate_signature(candidate)
                         || candidate.merkle_payment_timestamp != self.merkle_payment_timestamp
                         || candidate.committed_key_count > MAX_COMMITMENT_KEY_COUNT
-                        || candidate.price
-                            != calculate_price(candidate.committed_key_count as usize)
+                        || crate::quote_validation::check_price_band(
+                            candidate.price,
+                            candidate.committed_key_count,
+                        )
+                        .is_err()
                 })
             {
                 return Err(Error::InvalidData("invalid Merkle checkpoint pool".into()));
@@ -1175,7 +1170,7 @@ impl Client {
 
         // 3. Collect candidate pools from the network (all pools in parallel).
         //    Each candidate's ADR-0004 binding is fully verified during
-        //    collection (shape, cap, exact price, commitment resolution); the
+        //    collection (shape, cap, price band, commitment resolution); the
         //    sidecars themselves are consumed by that validation and NOT
         //    forwarded in the PUT bundles (see `finalize_merkle_batch`).
         let candidate_pools = self

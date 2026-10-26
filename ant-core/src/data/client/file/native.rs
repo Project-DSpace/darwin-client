@@ -2422,14 +2422,32 @@ impl Client {
         };
 
         // Use the median price × 3, matching the settlement multiplier both
-        // payment paths now apply.
+        // payment paths now apply, times each chunk's weight where it is
+        // paid per chunk (by the size class of its bytes).
         let prices: Vec<Amount> = quotes.iter().map(|(_, _, _, price, _)| *price).collect();
         let median_price = crate::payment_policy::median_quote_index(&prices)
             .map_or(Amount::ZERO, |index| prices[index]);
-        let per_chunk_cost = crate::payment_policy::enhanced_payment_amount(median_price)
-            .map_err(|error| Error::Payment(error.to_string()))?;
+        let chunk_cost = |len: u64| {
+            crate::payment_policy::enhanced_payment_amount(
+                median_price,
+                ant_protocol::payment::pricing::record_weight(
+                    DATA_TYPE_CHUNK,
+                    usize::try_from(len).unwrap_or(usize::MAX),
+                ),
+            )
+            .map_err(|error| Error::Payment(error.to_string()))
+        };
+        let per_chunk_cost = crate::payment_policy::enhanced_payment_amount(
+            median_price,
+            ant_protocol::payment::pricing::RecordWeight::FULL,
+        )
+        .map_err(|error| Error::Payment(error.to_string()))?;
+        let extra_cost = extra
+            .as_ref()
+            .map(|(_, bytes)| chunk_cost(bytes.len() as u64))
+            .transpose()?
+            .unwrap_or(Amount::ZERO);
 
-        let chunk_count_u64 = u64::try_from(chunk_count).unwrap_or(u64::MAX);
         let batched_u64 = u64::try_from(batched).unwrap_or(u64::MAX);
         // Merkle settles per *padded* leaf, not per chunk: the contract charges
         // `median16 × 2^depth` per batch and the tree rounds up to a power of
@@ -2438,14 +2456,31 @@ impl Client {
         // it pays per chunk (`merkle_upload_split`), so the estimate cannot
         // drift from execution. An envelope is paid per chunk on top.
         let merkle_split = merkle_upload_split(batched, batched);
-        let billable_units = if only_extra {
-            1
+        // A merkle leaf pays a full chunk's price whatever the chunk's size;
+        // a chunk paid on its own pays by its size class.
+        let total_storage = if only_extra {
+            extra_cost
         } else if uses_merkle {
-            merkle_upload_billable_units(batched_u64).saturating_add(u64::from(envelope_per_chunk))
+            let leaves = merkle_upload_billable_units(batched_u64);
+            let envelope = if envelope_per_chunk {
+                extra_cost
+            } else {
+                Amount::ZERO
+            };
+            per_chunk_cost
+                .checked_mul(Amount::from(leaves))
+                .and_then(|total| total.checked_add(envelope))
+                .ok_or_else(|| Error::Payment("estimated storage cost overflows".into()))?
         } else {
-            chunk_count_u64
+            spill
+                .chunk_entries()?
+                .into_iter()
+                .try_fold(extra_cost, |total, (_, len)| {
+                    total
+                        .checked_add(chunk_cost(len)?)
+                        .ok_or_else(|| Error::Payment("estimated storage cost overflows".into()))
+                })?
         };
-        let total_storage = per_chunk_cost * Amount::from(billable_units);
 
         // Estimate gas cost from realistic per-transaction budgets rather
         // than a flat per-chunk or per-wave number.

@@ -45,7 +45,7 @@ use super::batch::{
 use crate::data::error::{Error, Result};
 use ant_protocol::{
     evm::{QuoteHash, TxHash},
-    payment::deserialize_proof,
+    payment::{deserialize_proof, pricing::RecordWeight},
     XorName,
 };
 use serde::{Deserialize, Serialize};
@@ -283,12 +283,14 @@ pub(crate) fn paid_quote(
         return None;
     }
     let (proof, _) = deserialize_proof(bytes).ok()?;
+    // Which quote is paid doesn't depend on the record's weight.
     let payment = SingleNodeQuotePayment::from_quotes(
         proof
             .peer_quotes
             .iter()
             .map(|(_, quote)| quote.clone())
             .collect(),
+        RecordWeight::FULL,
     )
     .ok()?;
     let paid = payment.quotes.iter().find(|q| !q.amount.is_zero())?;
@@ -332,6 +334,7 @@ pub(crate) fn plan_amounts_recomputed(plan: &ChunkPaymentPlan) -> bool {
             .iter()
             .map(|(_, quote)| quote.clone())
             .collect(),
+        RecordWeight::FULL,
     ) else {
         return false;
     };
@@ -1016,6 +1019,7 @@ pub(crate) mod test_state {
             quoted_peers: Vec::new(),
             payment: SingleNodeQuotePayment::from_quotes(
                 peer_quotes.iter().map(|(_, q)| q.clone()).collect(),
+                RecordWeight::FULL,
             )
             .unwrap(),
             peer_quotes,
