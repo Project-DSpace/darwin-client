@@ -342,12 +342,7 @@ pub(crate) fn plan_amounts_recomputed(plan: &ChunkPaymentPlan) -> bool {
     if recorded == quote_tuples(&full.quotes) {
         return true;
     }
-    // A pointer's plan is sized at POINTER_WIRE_LEN, which a chunk of that
-    // size shares its class with, so one function covers both.
-    let weight = ant_protocol::payment::pricing::record_weight(
-        ant_protocol::DATA_TYPE_CHUNK,
-        usize::try_from(plan.data_size).unwrap_or(usize::MAX),
-    );
+    let weight = plan_size_weight(plan.data_size);
     let weighted = full
         .quotes
         .iter()
@@ -361,6 +356,24 @@ pub(crate) fn plan_amounts_recomputed(plan: &ChunkPaymentPlan) -> bool {
         })
         .collect::<Option<Vec<_>>>();
     weighted.is_some_and(|weighted| weighted == recorded)
+}
+
+/// The weight of the size class of a plan's `data_size`, the one weighted
+/// amount [`plan_amounts_recomputed`] restores. A pointer's plan is sized at
+/// POINTER_WIRE_LEN, which a chunk of that size shares its class with, so one
+/// function covers both.
+fn plan_size_weight(data_size: u64) -> RecordWeight {
+    ant_protocol::payment::pricing::record_weight(
+        ant_protocol::DATA_TYPE_CHUNK,
+        usize::try_from(data_size).unwrap_or(usize::MAX),
+    )
+}
+
+/// Whether a plan of `data_size` paid at `weight` is one a checkpoint
+/// restores ([`plan_amounts_recomputed`]): paid in full, or at the weight of
+/// its size's class. A plan is refused before anything is sent otherwise.
+pub(crate) fn plan_weight_restores(data_size: u64, weight: RecordWeight) -> bool {
+    weight == RecordWeight::FULL || weight == plan_size_weight(data_size)
 }
 
 /// Whether every quote is for `address` and signed by the node its peer id

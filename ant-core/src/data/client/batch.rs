@@ -410,6 +410,16 @@ fn payment_plan_from_quotes(
     quote_plan: StoreQuotePlan,
     ceiling: Option<Amount>,
 ) -> Result<ChunkPaymentPlan> {
+    // A plan is journaled before it is paid, and a checkpoint restores it only
+    // in full or at its size's class: one paid at any other weight would lock
+    // its record out once interrupted, so it is refused before anything is sent.
+    if !super::upload_state::plan_weight_restores(data_size, weight) {
+        return Err(Error::Payment(format!(
+            "a {data_size}-byte record can't be paid at weight {}/{}: only a full chunk's              amount or its size class's restores from a checkpoint",
+            weight.numerator(),
+            ant_protocol::payment::pricing::WEIGHT_DENOMINATOR
+        )));
+    }
     let quotes_with_peers = quote_plan.quotes;
 
     // Capture the ordered PUT target set for replication. This can be

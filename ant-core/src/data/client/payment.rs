@@ -787,6 +787,17 @@ mod tests {
         let mut at_declared = plan;
         at_declared.data_size = declared;
         assert!(!plan_amounts_recomputed(&at_declared));
+
+        // Planning refuses the pairing that wouldn't restore before anything
+        // is sent, and takes the ones that would.
+        use crate::data::client::upload_state::plan_weight_restores;
+        assert!(plan_weight_restores(POINTER_WIRE_LEN as u64, weight));
+        assert!(!plan_weight_restores(declared, weight));
+        assert!(plan_weight_restores(declared, RecordWeight::FULL));
+        assert!(plan_weight_restores(
+            declared,
+            record_weight(ant_protocol::DATA_TYPE_CHUNK, declared as usize)
+        ));
     }
 
     /// A pointer's first state.
