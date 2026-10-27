@@ -32,4 +32,9 @@ ant-protocol = { path = "vendor/ant-protocol" }
 # types, without it. The lock lists saorsa-transport -> webrtc because it is
 # resolved with every feature, `devnet` included. A project that enables
 # ant-core's `devnet` repeats this entry too (README, "Rust Library API").
-webrtc = { git = "https://github.com/Project-DSpace/darwin-node.git", rev = "1315dccffef2ee924325712d59f831a761ed4b70" }
+# darwin-node also patches saorsa-core, so its nodes dial a verified direct
+# address before a relay. That patch isn't repeated here, as it would change
+# this client's own dial order too: the in-process nodes dial in upstream's
+# order, as the client does, while the browser tests' devnet, built in
+# darwin-node's own workspace, has it. The dial order changes no message.
+webrtc = { git = "https://github.com/Project-DSpace/darwin-node.git", rev = "0deb78780a1e8a3f2e4e2f2688d51a0784f7016b" }

@@ -16,9 +16,9 @@ prints. Upstream's entries follow.
   own (below), one wallet's small payments shared in waves of up to 64 records, paid proofs kept
   until stored and paid again at most once, pointer writes paid only when 5 of the 7 quote, and the
   listings reader's log queries sent to Robinhood Chain's RPC first. It is tested against
-  darwin-node 0.23.0+ds.16 (`1315dcc` on darwin-node's main); its pointer-write check pairs with
-  darwin-node 0.23.0+ds.17. Its notes are `release-notes/v0.3.11+ds.2.md`, which say how to go back
-  to v0.3.11+ds.1.
+  darwin-node 0.23.0+ds.17 (`0deb787` on darwin-node's main), whose full nodes decline to quote a
+  pointer they don't hold, which its pointer-write check counts. Its notes are
+  `release-notes/v0.3.11+ds.2.md`, which say how to go back to v0.3.11+ds.1.
 - `v0.3.11+ds.1`, the first published release: ant-cli's version is 0.3.11+ds.1 (ant-core stays
   0.13.0; library users take it by the tag, README "Rust Library API"). It is tested against
   darwin-node 0.23.0+ds.16 (node release 1a, `1315dcc` on darwin-node's main), the first node

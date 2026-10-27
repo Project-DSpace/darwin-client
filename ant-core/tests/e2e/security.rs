@@ -8,7 +8,7 @@
 //! `test_chunk_put_with_insufficient_proof_rejected`,
 //! `test_chunk_put_with_invalid_proof_rejected` and the garbage-proof half of
 //! `test_payment_required_enforcement` went for them. At the revision
-//! ant-core/Cargo.toml pins (1315dcc) they are the rows "0 bytes" and
+//! ant-core/Cargo.toml pins (0deb787) they are the rows "0 bytes" and
 //! "garbage" of the table in `test_chunk_rejected_without_payment`, in
 //! `tests/e2e/data_types/chunk.rs`. A pin bump checks that they still exist at
 //! the new revision (the update-ant-node-ref skill, Step 5).
