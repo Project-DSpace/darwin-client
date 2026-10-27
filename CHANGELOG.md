@@ -8,9 +8,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## Darwin fork
 
 Our changes on top of upstream 0.3.11 (ant-core 0.13.0). Releases are tagged `vX.Y.Z+ds.N`, with
-ant-cli's version set to match, and none is published yet; other builds are told apart by the
-commit `darwin --version` prints. Upstream's entries follow.
+ant-cli's version set to match; other builds are told apart by the commit `darwin --version`
+prints. Upstream's entries follow.
 
+- `v0.3.11+ds.1`, the first published release: ant-cli's version is 0.3.11+ds.1 (ant-core stays
+  0.13.0; library users take it by the tag, README "Rust Library API"). It is tested against
+  darwin-node 0.23.0+ds.16 (node release 1a, `1315dcc` on darwin-node's main), the first node
+  release that declines a busy browser session quickly. Everything below is in it.
 - Releases: `.github/workflows/release.yml` publishes `darwin-linux-x64.tar.gz` and its
   `SHA256SUMS.txt` for a `vX.Y.Z+ds.N` tag a person pushes, only after the tagged commit's Test run
   (the end-to-end and browser tests) and its Build run from the push to main both succeeded, and
