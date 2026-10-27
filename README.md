@@ -2,7 +2,7 @@
 
 A CLI and Rust library for storing data on the Darwin storage network.
 
-Based on Autonomi's [ant-client](https://github.com/WithAutonomi/ant-client), licensed MIT or Apache-2.0.
+Based on [ant-client](https://github.com/WithAutonomi/ant-client), licensed MIT or Apache-2.0.
 
 ## Overview
 
@@ -156,36 +156,36 @@ cargo build --release --locked -p ant-cli --bin darwin
 ```
 
 Or take a release: the Linux x86-64 `darwin`, as `darwin-linux-x64.tar.gz` with its
-`SHA256SUMS.txt`, from this repository's GitHub releases (tags `vX.Y.Z+ds.N`). None is published
-yet; until then, build from source. A release is published by the Release workflow
-(`.github/workflows/release.yml`) only once the tagged commit's Test run (the end-to-end and
-browser tests, with the payment-recovery, batch-refusal and occupied-quote pins) and Build run
-(the unit tests, the targets that need no nodes, the censuses, and the build) both succeeded, and
-once approved in the repository's `release` environment; the archive is that Build run's, checked
-against its sums, and its `darwin --version` names the tag and the commit. Next to `darwin`, the
-archive holds its license files (`LICENSE-MIT`, `LICENSE-APACHE`) and the notices for the
-third-party code in it (`THIRD-PARTY-NOTICES.txt`, `RUST-STD-COPYRIGHT.html`). Check it with
-`sha256sum -c SHA256SUMS.txt`.
+`SHA256SUMS.txt`, from this repository's GitHub releases (tags `vX.Y.Z+ds.N`). A release is
+published by the Release workflow (`.github/workflows/release.yml`) only once the tagged commit's
+Test run (the end-to-end and browser tests, with the payment-recovery, batch-refusal and
+occupied-quote pins) and Build run (the unit tests, the targets that need no nodes, the censuses,
+and the build) both succeeded, and once approved in the repository's `release` environment; the
+archive is that Build run's, checked against its sums, and its `darwin --version` names the tag and
+the commit. Next to `darwin`, the archive holds its license files (`LICENSE-MIT`, `LICENSE-APACHE`)
+and the notices for the third-party code in it (`THIRD-PARTY-NOTICES.txt`,
+`RUST-STD-COPYRIGHT.html`). Check it with `sha256sum -c SHA256SUMS.txt`.
 
 Every push also uploads its build as the `darwin-linux-x64` workflow artifact. That is CI output,
 made whether or not the end-to-end tests pass: for trying a commit, not for deployment. Deploy a
-release (none is published yet; until then, build from source).
+release.
 
 `darwin --version` prints the package version and, on a second line, the git commit the binary
 was built from (`unknown` outside a git checkout of this repository; uncommitted changes don't
-show). The version is upstream's, 0.3.11 now and 0.3.9 in earlier builds, so go by the
-commit: builds before `0995cba` (2026-10-06) pay the retired test token and can't upload to
+show). A release's version is its tag's without the `v`, such as 0.3.11+ds.1; builds between
+releases print the last release's version (upstream's 0.3.11, or 0.3.9, before the first), so go
+by the commit: builds before `0995cba` (2026-10-06) pay the retired test token and can't upload to
 the current network.
 
 `darwin` keeps the data and configuration directories of the `ant` name (for example
 `~/.local/share/ant` and `~/.config/ant` on Linux), so files written by earlier builds are found
-where they were. Autonomi's `ant` keeps its upload history in `uploads/` there; darwin's is
+where they were. Upstream's `ant` keeps its upload history in `uploads/` there; darwin's is
 `darwin-uploads/`, so neither lists or loads the other's.
 
 The seeds bundled in `darwin` are replaced only by a `darwin_bootstrap_peers.toml` in that config
 directory, and `darwin` keeps its peer cache in `darwin_client_peer_cache.json` in the data
-directory. The `bootstrap_peers.toml` and `client_peer_cache.json` that Autonomi's `ant` and its
-installers leave in the same directories name Autonomi's network, and `darwin` never reads them.
+directory. The `bootstrap_peers.toml` and `client_peer_cache.json` that upstream's `ant` and its
+installers leave in the same directories name upstream's network, and `darwin` never reads them.
 A seed file written for an earlier `darwin` build is read again once renamed
 `darwin_bootstrap_peers.toml`. See [Bootstrap multiaddresses and browser defaults](#bootstrap-multiaddresses-and-browser-defaults).
 
@@ -267,7 +267,7 @@ A raw chunk has no data map, so it carries no envelope: no payment record, listi
 | `--allow-loopback` | Allow loopback connections (required for local devnet) |
 | `--timeout-secs <N>` | Network operation timeout in seconds (default: 60) |
 | `-v, --verbose` | Increase verbosity: `-v` info, `-vv` debug, `-vvv` trace. Default: no logs (privacy by design) |
-| `--evm-network <NET>` | Payment network: `robinhood` (default: Robinhood Chain, DARWIN) or `local` (the devnet manifest's chain). Upstream's `arbitrum-one` and `arbitrum-sepolia`, which pay Autonomi's ANT, are refused |
+| `--evm-network <NET>` | Payment network: `robinhood` (default: Robinhood Chain, DARWIN) or `local` (the devnet manifest's chain). Upstream's `arbitrum-one` and `arbitrum-sepolia`, which pay upstream's ANT, are refused |
 | `--max-chunk-price <BASE_UNITS>` | The most a node's quote may ask to store one chunk, in the token's base units (10^-18 DARWIN, a whole number). Quotes asking more are ignored, as if their node hadn't answered; a chunk then costs at most 3 times this. Default: no ceiling |
 
 ### `darwin file` — File Operations
@@ -403,7 +403,7 @@ Checks a proof (or record) against the payment chain alone: the envelope hashes 
 A manifest is a `.darwin` file, or a `darwin://manifest/...` link, that names files and holds what reads each one: its data map, embedded, or the address of its public data map chunk ([ADR-0006](docs/adr/ADR-0006-file-manifests-and-links.md)). Whoever has a manifest with embedded data maps can read those files. `darwin://` links and `.darwin` files are what `darwin` writes; upstream's `ant://` links and `.ant` files, the same bytes under upstream's names, are also read. A manifest file is read by its content, whatever its name.
 
 - `darwin manifest create [PATH]...` uploads files, or one directory's contents, and writes a manifest of them (`<name>.darwin`, or `-o <PATH>`). Each file is uploaded as `darwin file upload` uploads it, with the same `--visibility`, `--public`, `--readable`, `--index` and `--hide` choices: private by default, in an envelope that shows every payment field. The same warnings are given before anything is paid, mistakes in the choices are reported before `SECRET_KEY` is read or the network is joined, and it pays per chunk and refuses `--merkle`. Each file's record is saved in `<manifest>.records/` next to the manifest (`photos.records/` for `photos.darwin`, under the file's own directories), never over an older record; a private file's record holds its data map and salt, so keep it as safe as the manifest. A build that fails or is cancelled still saves the records of the files it uploaded. `--name` names the manifest; files get no envelope name or content type. `--public-file ADDRESS[=PATH]` adds a file that is already public, without uploading anything. `--embed-public ADDRESS[=PATH]` does too, and embeds the file's data map so recipients skip fetching it; a file stored with an envelope (as `darwin file upload --public` stores it) is added by its envelope address instead, which keeps its payment record, and its data map is not embedded. A private file's envelope address is refused, before anything is uploaded.
-- `darwin manifest list` lists the upload history, newest first: the readable uploads of `darwin file upload` and `darwin manifest create`, recorded as manifests in `darwin-uploads/` under the client's data directory. A `darwin file upload` is recorded by the address it stored, a `darwin manifest create` as the manifest written. Private uploads are not recorded, so no private data map is kept there: theirs stay in their `.datamap` and `.record` files, or in the manifest file written. Autonomi's `ant` keeps its own history in `uploads/` in the same data directory, and neither lists the other's.
+- `darwin manifest list` lists the upload history, newest first: the readable uploads of `darwin file upload` and `darwin manifest create`, recorded as manifests in `darwin-uploads/` under the client's data directory. A `darwin file upload` is recorded by the address it stored, a `darwin manifest create` as the manifest written. Private uploads are not recorded, so no private data map is kept there: theirs stay in their `.datamap` and `.record` files, or in the manifest file written. Upstream's `ant` keeps its own history in `uploads/` in the same data directory, and neither lists the other's.
 - `darwin manifest show`, `link`, `download` and `export` take a `.darwin` file, a `darwin://manifest/...` link, or an id from `darwin manifest list`. `export --compact` replaces embedded data maps with addresses for files already readable by address, including files uploaded with `darwin file upload --public`. A file is found in the envelope `--public` (or `--visibility listed`) stores when it has no name, content type or hidden payment field, since that envelope's address follows from the data map alone, or as a plain data map chunk (`--hide all`). A file not yet readable is listed with the standard way to make it so, `darwin file upload --visibility unlisted`, which stores it in an envelope, and nothing is written. With `--yes`, as upstream, the data maps of those files are published as plain chunks instead, after a warning: paid, and with no envelope, so no payment record, listing or `.record`. Each is paid as `darwin chunk put` pays for a chunk, recovering a payment the RPC answered with an error; if one still can't be seen, the export fails and says so, and running the same export again finds it on the chain instead of paying twice. It needs the network, and `SECRET_KEY` only with `--yes`.
 
 ### `darwin listings` — The Listings Index
@@ -528,7 +528,7 @@ user profile). Losing it means the pointer can never be updated again.
 The key cannot change hands, but the pointer can: `darwin pointer transfer` signs
 its final state, pointing at a pointer the new owner holds the key to. Readers
 of the address are redirected there, the address stays the same, and the
-former owner's key can change nothing any more (ADR-0018 in Autonomi's
+former owner's key can change nothing any more (ADR-0018 in upstream's
 `ant-node`).
 
 Pointer writes (`create`, `update` and `transfer`) are paid in DARWIN, one
@@ -678,18 +678,18 @@ $ SECRET_KEY=0x... darwin wallet balance
 ### `darwin node` — Node Management
 
 Off in this build: every `darwin node` command exits with an error, before it downloads, writes
-or starts anything, or reaches the network. Upstream's node manager would install Autonomi's
-`ant-node` from WithAutonomi's GitHub releases, and those nodes join Autonomi's network and take
+or starts anything, or reaches the network. Upstream's node manager would install
+`ant-node` from upstream's GitHub releases, and those nodes join upstream's network and take
 payment on Arbitrum; its log forwarding (`darwin node logs forward`) ships node logs to
-Autonomi's endpoint, and its daemon serves both through a REST API. Darwin storage nodes run from
+upstream's endpoint, and its daemon serves both through a REST API. Darwin storage nodes run from
 the storage-node image (see the darwin-node repository's `docker/README.md`). Nodes added by an
-earlier build are managed with Autonomi's `ant`.
+earlier build are managed with upstream's `ant`.
 
 ### `darwin-nodes` — the storage-node image's node manager
 
 A second binary of `ant-cli`, for the storage-node image only: only darwin-node's image build
 ships it, built with `cargo build --release --locked -p ant-cli --bin darwin-nodes` from a
-darwin-client commit it pins, in place of Autonomi's `ant` 0.3.9, which the image downloaded
+darwin-client commit it pins, in place of upstream's `ant` 0.3.9, which the image downloaded
 before. This repository's CI builds it only to check it (`scripts/check-darwin-nodes.sh`), and
 never packages it. It is not `darwin node`, which stays off. It runs and supervises the nodes on one
 machine with the registry, REST API and node start arguments `ant` 0.3.9 had (`--evm-network
@@ -721,16 +721,16 @@ marker until dismissed, reports as `evicted`, and never starts again under its o
 ### `darwin update` — Self-Update
 
 Off in this build: `darwin update` exits with an error. Upstream's release feed (the `ant-cli-v*`
-releases of `WithAutonomi/ant-client`) would replace `darwin` with Autonomi's `ant`. Darwin's own
+releases of `WithAutonomi/ant-client`) would replace `darwin` with upstream's `ant`. Darwin's own
 releases are installed by hand: update by building a new `darwin` or taking the latest release.
 
 ---
 
 ## Beta Programme
 
-Off in this build. Upstream's beta programme is Autonomi's, for `ant` and `ant-node`: beta builds
+Off in this build. Upstream's beta programme, for `ant` and `ant-node`, offers beta builds
 of the client through `darwin update`, nodes on the beta channel through
-`darwin node add --upgrade-channel beta`, and the optional forwarding of node logs to Autonomi's
+`darwin node add --upgrade-channel beta`, and the optional forwarding of node logs to upstream's
 beta log endpoint through `darwin node logs forward`. Darwin has no beta channel, and
 `darwin update` and `darwin node` are off.
 
@@ -767,7 +767,7 @@ ant-protocol = { git = "https://github.com/Project-DSpace/darwin-client", tag = 
 ```
 
 `<tag>` is a release's tag, such as `v0.3.11+ds.1`, the same in both lines. The patch puts
-`vendor/ant-protocol`, Autonomi's protocol crate with this network's price multiplier, in place
+`vendor/ant-protocol`, upstream's protocol crate with this network's price multiplier, in place
 of the crates.io release. Cargo applies a `[patch]` only in the top-level workspace, so taking
 `ant-core` alone isn't enough, and `ant-core` doesn't compile without it. `ant-core` requires
 exactly `ant-protocol` 5.0.0, the vendored copy's version, so a later crates.io release can't
@@ -1000,7 +1000,7 @@ longer serves it is forgotten. Reading a chunk again soon after costs no lookup.
 ### Node Management (Programmatic)
 
 `ant-core` keeps upstream's node manager, which `darwin node` used before it was turned off. It
-installs and runs Autonomi's `ant-node`, which joins Autonomi's network, not Darwin's, and takes
+installs and runs upstream's `ant-node`, which joins upstream's network, not Darwin's, and takes
 payment on Arbitrum. Darwin storage nodes run from the storage-node image.
 
 ```rust
@@ -1112,7 +1112,7 @@ Data operations (upload/download) go directly to the P2P network — they do not
 | `local` | Custom (Anvil) | Local development (requires `--devnet-manifest`) |
 
 Payments are made in DARWIN only. Upstream's `arbitrum-one` and `arbitrum-sepolia` presets, which
-pay Autonomi's ANT on Arbitrum, are refused when the command line is read, before `SECRET_KEY` or
+pay upstream's ANT on Arbitrum, are refused when the command line is read, before `SECRET_KEY` or
 the network, and `ant_core::config::resolve_evm_network` refuses them too.
 
 Payments on `robinhood` are signed for chain 4663 only: an RPC that reports another chain is refused before anything is signed. On `local` the same check uses the devnet manifest's `evm.chain_id` when it has one (`"chain_id": 4663` for your own Robinhood Chain RPC); without one, payments are signed for whatever chain the RPC reports.
@@ -1242,12 +1242,12 @@ busy, to try again shortly, rather than the chunk missing.
 The config directory is `ant`'s: `~/.config/ant` on Linux,
 `~/Library/Application Support/ant` on macOS, `%APPDATA%\ant` on Windows.
 `darwin` reads its seed file there only as `darwin_bootstrap_peers.toml`, never
-the `bootstrap_peers.toml` that Autonomi's `ant` and its installers write, which
-names Autonomi's network; and its peer cache, whose peers are dialled before the
+the `bootstrap_peers.toml` that upstream's `ant` and its installers write, which
+names upstream's network; and its peer cache, whose peers are dialled before the
 seeds, is `darwin_client_peer_cache.json` in the data directory, never `ant`'s
 `client_peer_cache.json`. So `darwin` keeps to its own network on a machine that
-also has `ant`. Before, it joined Autonomi's network there; the price check
-refused to pay Autonomi's nodes, but uploads and lookups went to them.
+also has `ant`. Before, it joined upstream's network there; the price check
+refused to pay upstream's nodes, but uploads and lookups went to them.
 
 Native library callers can use `config::resolve_bootstrap_multiaddrs()` and
 `Client::connect_multiaddrs()` to retain peer pins, which reads then use; a

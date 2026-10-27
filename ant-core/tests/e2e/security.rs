@@ -8,12 +8,10 @@
 //! `test_chunk_put_with_insufficient_proof_rejected`,
 //! `test_chunk_put_with_invalid_proof_rejected` and the garbage-proof half of
 //! `test_payment_required_enforcement` went for them. At the revision
-//! ant-core/Cargo.toml pins (ef5c5d0) they are `test_attack_empty_proof_bytes`
-//! and `test_attack_garbage_bytes_as_proof` in `tests/e2e/security_attacks.rs`.
-//! darwin-node's test-cleanse branch folds them into the table of
-//! `test_chunk_rejected_without_payment` in `tests/e2e/data_types/chunk.rs`,
-//! its rows "0 bytes" and "garbage". A pin bump checks that one or the other
-//! exists at the new revision (the update-ant-node-ref skill, Step 5).
+//! ant-core/Cargo.toml pins (1315dcc) they are the rows "0 bytes" and
+//! "garbage" of the table in `test_chunk_rejected_without_payment`, in
+//! `tests/e2e/data_types/chunk.rs`. A pin bump checks that they still exist at
+//! the new revision (the update-ant-node-ref skill, Step 5).
 
 use crate::support::runner::Case;
 use crate::support::MiniTestnet;

@@ -21,7 +21,9 @@
 #   run they found, and checks the archive against its SHA256SUMS.txt and the
 #   binary's version and commit;
 # - its publish job runs in the release environment and needs checks and
-#   package;
+#   package, and writes the release's fixed text first and then, when the
+#   tagged commit has one, release-notes/<tag>.md into the notes it
+#   publishes;
 # - test.yml's jobs run every end-to-end target (the matrix that
 #   scripts/test-targets.py lists, after its check), the browser core's tests
 #   and the browser harness;
@@ -184,6 +186,22 @@ else
             problem "release.yml's publish job must need ${need}"
         fi
     done
+
+    # A release's own notes: the publish job checks out the tagged commit
+    # and writes the fixed text, then release-notes/<tag>.md's text when it
+    # has any, then publishes.
+    publish=$(job publish | sed 's/^[[:space:]]*//')
+    require "release.yml's publish job must add the tagged commit's release-notes/<tag>.md to the notes when it has any text" "${publish}" \
+        'uses: actions/checkout@' \
+        'if [[ -s "release-notes/$TAG.md" ]]; then' \
+        '--title "darwin $TAG" --notes-file notes.md'
+    fixed=$(grep -nxF -- '> notes.md' <<<"${publish}" | cut -d: -f1 | tr '\n' ' ' || true)
+    added=$(grep -nxF -- 'cat "release-notes/$TAG.md" >> notes.md' <<<"${publish}" | cut -d: -f1 | tr '\n' ' ' || true)
+    created=$(grep -nF -- 'gh release create "$TAG"' <<<"${publish}" | cut -d: -f1 | tr '\n' ' ' || true)
+    if [[ ! "${fixed}" =~ ^[0-9]+\ $ || ! "${added}" =~ ^[0-9]+\ $ || ! "${created}" =~ ^[0-9]+\ $ ]] \
+        || ((fixed > added || added > created)); then
+        problem "release.yml's publish job must write the fixed text to notes.md once, then add release-notes/<tag>.md once (cat \"release-notes/\$TAG.md\" >> notes.md), then create the release"
+    fi
 fi
 
 if [[ ! -f "${TEST}" ]]; then
@@ -245,4 +263,4 @@ if ((PROBLEMS > 0)); then
     echo "${PROBLEMS} problem(s) in ${DIR}" >&2
     exit 1
 fi
-echo "${DIR}: build.yml, release.yml and test.yml, every action pinned; release.yml runs for v*+ds.* tags with no default permissions, and publishes, in the release environment (checked to ask for approval), the darwin-linux-x64 of the tagged commit's Build run, checked, only after that run and the commit's Test run succeeded; test.yml runs every end-to-end target, the browser core's tests and the browser harness; build.yml runs the unit tests and the targets that need no nodes before the build it uploads; both run this check; no workflow has a condition or continues on error."
+echo "${DIR}: build.yml, release.yml and test.yml, every action pinned; release.yml runs for v*+ds.* tags with no default permissions, and publishes, in the release environment (checked to ask for approval), the darwin-linux-x64 of the tagged commit's Build run, checked, only after that run and the commit's Test run succeeded, with the tagged commit's release notes after the fixed text; test.yml runs every end-to-end target, the browser core's tests and the browser harness; build.yml runs the unit tests and the targets that need no nodes before the build it uploads; both run this check; no workflow has a condition or continues on error."

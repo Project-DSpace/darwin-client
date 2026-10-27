@@ -6,8 +6,8 @@
 # Versions are <upstream base>+ds.<build>, as darwin-node's are. Bump
 # ant-cli/Cargo.toml's version (and Cargo.lock's ant-cli entry) to the tag's
 # first, so `darwin --version` names the release; the package job checks it.
-# The first release's commit also takes "none is published yet" out of
-# README.md and CHANGELOG.md.
+# A release's notes are a fixed text, then release-notes/<tag>.md (for
+# example release-notes/v0.3.11+ds.1.md) when the tagged commit has one.
 #
 # The tag has to come from a person: GitHub won't let GITHUB_TOKEN create a
 # tag on a commit that changes .github/workflows, so this only publishes an
@@ -199,10 +199,18 @@ jobs:
       TAG: ${{ github.ref_name }}
       RUN: ${{ needs.checks.outputs.build_run }}
     steps:
+      # The tagged commit, for its release-notes/<tag>.md. Before the
+      # download: a checkout empties the folder it checks out into.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: release-files
 
+      # The release's own notes, from release-notes/<tag>.md in the tagged
+      # commit, follow the fixed text.
       - name: Publish
         env:
           GH_TOKEN: ${{ github.token }}
@@ -217,6 +225,10 @@ jobs:
             "" \
             "The archive holds darwin, LICENSE-MIT and LICENSE-APACHE, plus THIRD-PARTY-NOTICES.txt and RUST-STD-COPYRIGHT.html with the licences and copyright notices of the third-party code in the binary and of the tools used to build it." \
             > notes.md
+          if [[ -s "release-notes/$TAG.md" ]]; then
+            echo >> notes.md
+            cat "release-notes/$TAG.md" >> notes.md
+          fi
           gh release create "$TAG" --verify-tag --latest \
             --title "darwin $TAG" --notes-file notes.md \
             darwin-linux-x64.tar.gz SHA256SUMS.txt
