@@ -17,8 +17,10 @@ chain_id = 4663
 # Where reads of payments (listings, upload proofs, and the vault record of
 # each quote an upload paid, read back after paying) go when `rpc_url` refuses
 # or fails a call: PublicNode refuses `eth_getLogs`, which finding a payment
-# whose transaction hash is hidden needs. Robinhood's own RPC comes last, for
-# the reason above.
+# whose transaction hash is hidden needs. Robinhood's own RPC comes last for
+# other calls, for the reason above; log queries go to it first, then
+# PublicNode, then ordofi last, since ordofi answered payment reads "busy" or
+# too late in October 2026.
 fallback_rpc_urls = ["https://rpc.ordofi.network", "https://rpc.mainnet.chain.robinhood.com"]
 payment_token_address = "0x511f76a3de41f000ec11ea4fd212fb3587c6cef3"
 payment_vault_address = "0xE0f627986c0438De0E314B644f3C8aA21D3f4f6B"

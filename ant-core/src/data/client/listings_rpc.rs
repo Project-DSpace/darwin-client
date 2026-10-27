@@ -6,10 +6,10 @@
 //!   ([`Kind`]), on to the next whenever one fails it, and the next call
 //!   starts at the first again. Log queries have an order of their own. On
 //!   the bundled network, receipts and blocks go to the network's own RPC
-//!   (PublicNode's) first, log queries to its first fallback (ordofi's)
-//!   first, and its last fallback (Robinhood's RPC) comes last for both,
-//!   which keeps readers off the RPC the nodes check uploads' payments
-//!   through. A provider that refuses a kind of call outright (HTTP 403, as
+//!   (PublicNode's) first, then ordofi's, then Robinhood's RPC; log queries
+//!   go to Robinhood's RPC first, then PublicNode's, then ordofi's last,
+//!   since ordofi answered payment reads "busy" or too late in October
+//!   2026. A provider that refuses a kind of call outright (HTTP 403, as
 //!   PublicNode refuses ranged `eth_getLogs`) is asked last for that kind
 //!   for the next [`BUSY_MAX`], then in its place again.
 //! - **Batches.** Calls known together go to a provider in one request, a
@@ -23,8 +23,9 @@
 //!   twice as long each time in a row, up to [`BUSY_MAX`]; an answer ends it.
 //!   Calls go to the next provider meanwhile, the rest of a set sent in
 //!   batches too, and wait for one held off only when every other has failed
-//!   them. [`BUSY_CODE`] in answer to a log query fails that query alone:
-//!   ordofi gives it to a query over a wider span than it serves.
+//!   them. [`BUSY_CODE`] in answer to a log query, from any provider, fails
+//!   that query alone and holds nothing off: ordofi gives it to a query over
+//!   a wider span than it serves, and the query goes on to the next provider.
 //! - **Redaction.** An error names a provider by its host alone, never its
 //!   URL, which can carry a key.
 //! - **Chain.** Where the chain is known (a list of RPCs given in place of
@@ -630,8 +631,9 @@ impl Rpc {
                 }
                 Err(failure) => {
                     // ordofi answers a log query over a wider span than it
-                    // serves with BUSY_CODE too: the query fails there, and
-                    // goes on to the next provider, but holds nothing off.
+                    // serves with BUSY_CODE too: from any provider, the query
+                    // fails there and goes on to the next provider, if any,
+                    // but holds nothing off, so its other calls go on.
                     let failure = match failure {
                         Failure::Busy(message)
                             if over_rpc && Kind::of(call.method) == Kind::Logs =>

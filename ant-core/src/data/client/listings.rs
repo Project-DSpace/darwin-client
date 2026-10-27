@@ -2555,10 +2555,12 @@ impl ListingChain {
     ///
     /// It reads through `network`'s RPC and then the RPCs it falls back to
     /// ([`crate::config::fallback_rpc_urls`]), except that log queries go to
-    /// the first fallback first: on the bundled network, receipts and blocks
-    /// go to PublicNode first and log queries to ordofi first, which
-    /// PublicNode refuses, and Robinhood's RPC comes last for both. On the
-    /// bundled network, [`RPC_URLS_ENV`] replaces them when set.
+    /// the last fallback first and the first fallback last: on the bundled
+    /// network, receipts and blocks go to PublicNode first, then ordofi, then
+    /// Robinhood's RPC, and log queries to Robinhood's RPC first, then
+    /// PublicNode (which refuses ranged ones), then ordofi, which answered
+    /// payment reads "busy" or too late in October 2026. On the bundled
+    /// network, [`RPC_URLS_ENV`] replaces them when set.
     ///
     /// # Errors
     ///
@@ -3764,8 +3766,9 @@ impl ListingChain {
 /// `listed` (the value of [`RPC_URLS_ENV`]), those listed, in that order for
 /// everything, each checked to be on the network's chain; otherwise the
 /// network's own RPC and then the RPCs it falls back to
-/// ([`crate::config::fallback_rpc_urls`]), log queries going to the first
-/// fallback first.
+/// ([`crate::config::fallback_rpc_urls`]), log queries going to the last
+/// fallback first, then to the network's own RPC and the other fallbacks in
+/// order, so the first fallback comes last.
 fn rpc_setup(network: &EvmNetwork, listed: Option<&str>) -> std::result::Result<RpcSetup, String> {
     if let (Some(chain_id), Some(listed)) = (crate::config::chain_id(network), listed) {
         let urls: Vec<String> = listed.split_whitespace().map(str::to_string).collect();
@@ -3793,8 +3796,9 @@ fn rpc_setup(network: &EvmNetwork, listed: Option<&str>) -> std::result::Result<
     let mut urls = vec![network.rpc_url().to_string()];
     urls.extend(crate::config::fallback_rpc_urls(network));
     let logs_order = (urls.len() > 1).then(|| {
-        let mut order = vec![1, 0];
-        order.extend(2..urls.len());
+        let last = urls.len() - 1;
+        let mut order = vec![last];
+        order.extend(0..last);
         order
     });
     Ok(RpcSetup {
@@ -7349,7 +7353,7 @@ mod tests {
     }
 
     #[test]
-    fn the_bundled_network_reads_through_publicnode_ordofi_for_logs_and_robinhood_last() {
+    fn the_bundled_network_reads_through_publicnode_robinhood_for_logs_and_ordofi_last() {
         let bundled = crate::config::bundled_payment_network().unwrap();
         let setup = rpc_setup(&bundled, None).unwrap();
         let host = |index: usize| crate::data::client::listings_rpc::rpc_host(&setup.urls[index]);
@@ -7357,11 +7361,13 @@ mod tests {
         assert_eq!(host(0), "robinhood-rpc.publicnode.com");
         assert_eq!(host(1), "rpc.ordofi.network");
         assert_eq!(host(2), "rpc.mainnet.chain.robinhood.com");
-        assert_eq!(setup.logs_order, Some(vec![1, 0, 2]));
+        assert_eq!(setup.logs_order, Some(vec![2, 0, 1]));
         assert_eq!(setup.chain_id, None);
         let rpc = Rpc::new(setup.urls, setup.logs_order, None).unwrap();
+        // Calls: PublicNode, ordofi, Robinhood's RPC.
         assert_eq!(rpc.order(Kind::Chain), vec![0, 1, 2]);
-        assert_eq!(rpc.order(Kind::Logs), vec![1, 0, 2]);
+        // Log queries: Robinhood's RPC, PublicNode, ordofi last.
+        assert_eq!(rpc.order(Kind::Logs), vec![2, 0, 1]);
     }
 
     #[test]
