@@ -14,7 +14,8 @@ prints. Upstream's entries follow.
 - `v0.3.11+ds.1`, the first published release: ant-cli's version is 0.3.11+ds.1 (ant-core stays
   0.13.0; library users take it by the tag, README "Rust Library API"). It is tested against
   darwin-node 0.23.0+ds.16 (node release 1a, `1315dcc` on darwin-node's main), the first node
-  release that declines a busy browser session quickly. Everything below is in it.
+  release that declines a busy browser session quickly. Everything below is in it; its notes are
+  `release-notes/v0.3.11+ds.1.md`.
 - Releases: `.github/workflows/release.yml` publishes `darwin-linux-x64.tar.gz` and its
   `SHA256SUMS.txt` for a `vX.Y.Z+ds.N` tag a person pushes, only after the tagged commit's Test run
   (the end-to-end and browser tests) and its Build run from the push to main both succeeded, and
@@ -22,8 +23,9 @@ prints. Upstream's entries follow.
   approval. The archive is that Build run's artifact, checked against its sums, with a `darwin`
   that reports the tag's version and the tagged commit. `scripts/check-workflows.sh`, run by Build
   and Test and tested by `scripts/test_check_workflows.sh`, fails if the workflows lose that order
-  or a run could succeed without running every pin. The `darwin-linux-x64` artifact every push
-  uploads is CI output, not for deployment.
+  or a run could succeed without running every pin. A release's notes are a fixed text, then the
+  tagged commit's `release-notes/<tag>.md` when it has one. The `darwin-linux-x64` artifact every
+  push uploads is CI output, not for deployment.
 - The default network is ours: Robinhood Chain (chain ID 4663), with the seeds, token, vault and
   RPCs bundled in `ant-core/resources/`.
 - Payments in DARWIN (`0x511f76A3…`, vault `0xE0f62798…`), priced like Autonomi with a price
