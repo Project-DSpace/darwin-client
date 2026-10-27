@@ -11,6 +11,16 @@ Our changes on top of upstream 0.3.11 (ant-core 0.13.0). Releases are tagged `vX
 ant-cli's version set to match; other builds are told apart by the commit `darwin --version`
 prints. Upstream's entries follow.
 
+- Not yet released, the readers release: every reader of payments reads two vaults, the per-quote
+  payment vault and the root vault (DarwinRootVault, `0xf6675722f443132b045857546E57e35360Bb03b9`
+  on the bundled network), which records each wave of payments under one key. `ListingChain::new`
+  reads both on the bundled network, so the listings producer, `darwin file verify`, listing
+  lookups and envelope records accept a payment from either vault, each checked by the vault whose
+  log it is; one `eth_getLogs` asks both addresses. Kept receipts are keyed by the vaults read.
+  Nothing in this client pays the root vault, and no price, quote or payment changes.
+  `vendor/ant-listings` is darwin-listings 0.4.0. Readers that aren't updated (older darwin-listings,
+  older CLIs, other indexers) will report root-paid listings and upload proofs as unpaid until they
+  update. A census test (`every_payment_reader_reads_the_vault_set`) lists every reader of payments.
 - `v0.3.11+ds.2`: ant-cli's version is 0.3.11+ds.2 (ant-core stays 0.13.0). It changes how
   uploads pay and resume, with prices and quotes unchanged: upload checkpoints in a format of their
   own (below), one wallet's small payments shared in waves of up to 64 records, paid proofs kept

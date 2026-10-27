@@ -30,6 +30,12 @@
 //! uploader keeps an [`EnvelopeProof`] that proves the payment, hidden fields
 //! included, from the chain alone ([`check_proof`]).
 //!
+//! Payments are read from a [`VaultSet`]: the per-quote vault, and a root
+//! vault where the network has one, each by its own address. A root vault
+//! records each wave of payments under one key ([`root`]), and its payment
+//! counts only where the receipt shows its wave whole, token transfers
+//! included. A payment log from any other contract never counts.
+//!
 //! An indexer reads every node's index with [`IndexWalk`]. A node's pages are
 //! only shape-checked, so it can serve as many made-up listings as it likes;
 //! the walk reads each node for as long as other nodes back what it sends,
@@ -60,8 +66,11 @@ pub mod listing;
 pub mod message;
 pub mod payment;
 pub mod proof;
+pub mod root;
 pub mod walk;
 
+#[cfg(test)]
+mod census;
 #[cfg(test)]
 mod test_support;
 mod wire;
@@ -94,7 +103,8 @@ pub use message::{
 pub use payment::{
     check_offline, choose_verified, find_payment, payment_lookup, quorum_needed, verify_listing,
     verify_listing_receipts, CheckLevel, ChosenVerified, ListingCheck, Lookup, PaidAt,
-    PaymentError, PaymentLog, PaymentReceipt, DATA_PAYMENT_MADE_TOPIC, QUORUM_THRESHOLD,
+    PaymentError, PaymentLog, PaymentReceipt, RootVault, VaultSet, DATA_PAYMENT_MADE_TOPIC,
+    QUORUM_THRESHOLD,
 };
 pub use proof::{check_proof, EnvelopeProof, ProofError, ProvenUpload, PROOF_VERSION};
 pub use walk::{

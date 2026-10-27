@@ -111,6 +111,30 @@ const WALLETS: Counting = &[
     (None, "with_chain_id"),
 ];
 
+/// Readers of payments, and what they read: every reader of the payment
+/// chain built, every vault set named, every check of a payment against the
+/// chain, and every read of a vault's own records or logs.
+const VAULT_READS: Counting = &[
+    (Some("ListingChain"), "new"),
+    (Some("ListingChain"), "with_rpc"),
+    (Some("ListingChain"), "with_rpcs"),
+    (None, "with_rpc_setup"),
+    (None, "with_root_vault"),
+    (None, "root_vault_address"),
+    (None, "VaultSet"),
+    (None, "RootVault"),
+    (None, "v2_only"),
+    (None, "with_root"),
+    (None, "find_payment"),
+    (None, "verify_listing"),
+    (None, "verify_listing_receipts"),
+    (None, "check_offline"),
+    (None, "check_proof"),
+    (None, "completed_payment"),
+    (None, "root_record"),
+    (None, "\"eth_getLogs\""),
+];
+
 /// Replacing the running binary.
 const SELF_UPDATE: Counting = &[
     (None, "check_for_update"),
@@ -1105,6 +1129,283 @@ const WALLET_SITES: &[Site] = &[
         "new_from_private_key",
         1,
         DEVNET_WALLET,
+    ),
+];
+
+const BOTH_VAULTS: &str = "Builds the reader of the network's payments that reads the vault set: \
+    ListingChain::new reads the per-quote vault and, on the bundled network, the root vault.";
+const VERIFY_READER: &str = "`darwin file verify`: the reader of both vaults (ListingChain::new) \
+    checks the upload proof, by the vault whose log it is.";
+const LISTINGS_READER: &str = "darwin's listings and listing commands read listings through the \
+    reader of both vaults (ListingChain::new).";
+const ENVELOPE_READER: &str = "An upload's envelope record is found and checked through the \
+    reader of both vaults (ListingChain::new) and its vault set (ListingChain::vaults).";
+const PRODUCER_READER: &str = "The listings producer reads payments through the reader of both \
+    vaults (ListingChain::new), with its kept facts keyed by that vault set.";
+const SET_CHECK: &str = "A payment check of ant-listings, given the reader's vault set \
+    (ListingChain::vaults): each payment checked by the vault whose log it is.";
+const SET_BUILT: &str = "The reader's vault set: the per-quote vault alone, until \
+    ListingChain::with_root_vault adds the root vault; ListingChain::new adds the bundled \
+    network's.";
+const SET_KEPT: &str = "The listings producer's kept receipts and quotes' payments, keyed by the \
+    vault set read and holding the logs of every vault in it and of the root vault's token; \
+    those kept for the per-quote vault alone are dropped once a root vault is read.";
+const ROOT_CONFIG: &str = "The bundled network's root vault address \
+    (resources/payment_network.toml), read only by ListingChain::new; nothing pays it.";
+const ROOT_LOGS: &str = "One eth_getLogs for every vault in the set (both addresses where a \
+    root vault is read).";
+const LOGS_KIND: &str = "Sorts RPC calls by method, to send log queries to the RPCs that \
+    answer them; reads no vault.";
+const PAYER_READ_BACK: &str = "A payer's read-back: the per-quote vault's record of a quote this \
+    client paid there (completedPayments), the only vault this client pays.";
+const PAYER_CHAIN: &str = "The reader a payer reads its paid quotes back through; it reads them \
+    at the per-quote vault only (completed_payment).";
+
+const VAULT_READ_SITES: &[Site] = &[
+    (
+        "ant-cli/src/commands/data/file.rs",
+        "FileAction::execute_offline",
+        "ListingChain::new",
+        1,
+        VERIFY_READER,
+    ),
+    (
+        "ant-cli/src/commands/data/file.rs",
+        "handle_file_verify",
+        "check_proof",
+        1,
+        VERIFY_READER,
+    ),
+    (
+        "ant-cli/src/main.rs",
+        "run",
+        "ListingChain::new",
+        2,
+        LISTINGS_READER,
+    ),
+    (
+        "ant-core/src/config.rs",
+        "<module>",
+        "root_vault_address",
+        1,
+        ROOT_CONFIG,
+    ),
+    (
+        "ant-core/src/config.rs",
+        "root_vault_address",
+        "root_vault_address",
+        1,
+        ROOT_CONFIG,
+    ),
+    (
+        "ant-core/src/data/client/envelope.rs",
+        "Client::complete_upload_envelope",
+        "ListingChain::new",
+        1,
+        ENVELOPE_READER,
+    ),
+    (
+        "ant-core/src/data/client/envelope.rs",
+        "Client::reuse_upload_record",
+        "ListingChain::new",
+        1,
+        ENVELOPE_READER,
+    ),
+    (
+        "ant-core/src/data/client/envelope.rs",
+        "complete_upload_envelope",
+        "check_proof",
+        1,
+        SET_CHECK,
+    ),
+    (
+        "ant-core/src/data/client/envelope.rs",
+        "complete_upload_envelope",
+        "find_payment",
+        1,
+        SET_CHECK,
+    ),
+    (
+        "ant-core/src/data/client/envelope.rs",
+        "reuse_upload_record",
+        "check_proof",
+        1,
+        ENVELOPE_READER,
+    ),
+    (
+        "ant-core/src/data/client/listings.rs",
+        "<module>",
+        "RootVault",
+        2,
+        SET_BUILT,
+    ),
+    (
+        "ant-core/src/data/client/listings.rs",
+        "<module>",
+        "VaultSet",
+        5,
+        SET_BUILT,
+    ),
+    (
+        "ant-core/src/data/client/listings.rs",
+        "<module>",
+        "check_offline",
+        1,
+        SET_CHECK,
+    ),
+    (
+        "ant-core/src/data/client/listings.rs",
+        "<module>",
+        "verify_listing_receipts",
+        1,
+        SET_CHECK,
+    ),
+    (
+        "ant-core/src/data/client/listings.rs",
+        "ListingChain::check_proof",
+        "check_proof",
+        1,
+        SET_CHECK,
+    ),
+    (
+        "ant-core/src/data/client/listings.rs",
+        "ListingChain::new",
+        "RootVault",
+        1,
+        BOTH_VAULTS,
+    ),
+    (
+        "ant-core/src/data/client/listings.rs",
+        "ListingChain::new",
+        "root_vault_address",
+        1,
+        BOTH_VAULTS,
+    ),
+    (
+        "ant-core/src/data/client/listings.rs",
+        "ListingChain::new",
+        "with_root_vault",
+        1,
+        BOTH_VAULTS,
+    ),
+    (
+        "ant-core/src/data/client/listings.rs",
+        "ListingChain::new",
+        "with_rpc_setup",
+        1,
+        BOTH_VAULTS,
+    ),
+    (
+        "ant-core/src/data/client/listings.rs",
+        "ListingChain::vault_logs",
+        "\"eth_getLogs\"",
+        1,
+        ROOT_LOGS,
+    ),
+    (
+        "ant-core/src/data/client/listings.rs",
+        "ListingChain::with_root_vault",
+        "VaultSet",
+        1,
+        SET_BUILT,
+    ),
+    (
+        "ant-core/src/data/client/listings.rs",
+        "ListingChain::with_root_vault",
+        "with_root",
+        1,
+        SET_BUILT,
+    ),
+    (
+        "ant-core/src/data/client/listings.rs",
+        "ListingChain::with_rpc_setup",
+        "VaultSet",
+        1,
+        SET_BUILT,
+    ),
+    (
+        "ant-core/src/data/client/listings.rs",
+        "ListingChain::with_rpc_setup",
+        "v2_only",
+        1,
+        SET_BUILT,
+    ),
+    (
+        "ant-core/src/data/client/listings.rs",
+        "ListingChain::with_rpcs",
+        "with_rpc_setup",
+        1,
+        SET_BUILT,
+    ),
+    (
+        "ant-core/src/data/client/listings.rs",
+        "check_group",
+        "check_offline",
+        1,
+        SET_CHECK,
+    ),
+    (
+        "ant-core/src/data/client/listings.rs",
+        "check_group",
+        "verify_listing_receipts",
+        1,
+        SET_CHECK,
+    ),
+    (
+        "ant-core/src/data/client/listings.rs",
+        "check_quorum_group",
+        "check_offline",
+        1,
+        SET_CHECK,
+    ),
+    (
+        "ant-core/src/data/client/listings.rs",
+        "check_quorum_group",
+        "verify_listing_receipts",
+        1,
+        SET_CHECK,
+    ),
+    (
+        "ant-core/src/data/client/listings_facts.rs",
+        "<module>",
+        "VaultSet",
+        7,
+        SET_KEPT,
+    ),
+    (
+        "ant-core/src/data/client/listings_rpc.rs",
+        "Kind::of",
+        "\"eth_getLogs\"",
+        1,
+        LOGS_KIND,
+    ),
+    (
+        "ant-core/src/data/client/listings_serve.rs",
+        "Producer::open",
+        "ListingChain::new",
+        1,
+        PRODUCER_READER,
+    ),
+    (
+        "ant-core/src/data/client/occupied.rs",
+        "occupied_quotes_via",
+        "completed_payment",
+        1,
+        PAYER_READ_BACK,
+    ),
+    (
+        "ant-core/src/data/client/occupied.rs",
+        "read_back_chain",
+        "ListingChain::new",
+        1,
+        PAYER_CHAIN,
+    ),
+    (
+        "ant-core/src/data/client/occupied.rs",
+        "read_record",
+        "completed_payment",
+        1,
+        PAYER_READ_BACK,
     ),
 ];
 
@@ -2996,6 +3297,24 @@ fn every_wallet_is_built_where_it_is_reviewed() {
         WALLET_SITES,
         "A wallet is built from the configured key and bound to the configured chain \
          (config::wallet), or funded on a local devnet; nowhere else.",
+    );
+}
+
+/// Two vaults for good: the per-quote vault and the root vault. A reader
+/// that misses the root vault would read root payments as unpaid without any
+/// error, so every reader of listings and payment records is listed here
+/// with the vault set it reads.
+#[test]
+fn every_payment_reader_reads_the_vault_set() {
+    check(
+        VAULT_READS,
+        VAULT_READ_SITES,
+        "Every reader of listings and payment records (the listings producer, `darwin file \
+         verify`, envelope records, listing lookups) reads the vault set: the per-quote vault \
+         and, on the bundled network, the root vault (ListingChain::new), each payment checked \
+         by the vault whose log it is. A reader of one vault alone is built only for another \
+         network or in tests. A payer reads only the vault it paid (completed_payment reads the \
+         per-quote vault's record of a quote it paid).",
     );
 }
 

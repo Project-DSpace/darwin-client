@@ -189,6 +189,7 @@ struct PaymentNetworkConfig {
     payment_vault_deployment_block: Option<u64>,
     payment_vault_deployment_time: Option<u64>,
     payment_vault_first_payment_time: Option<u64>,
+    root_vault_address: Option<String>,
     token_symbol: String,
 }
 
@@ -241,6 +242,23 @@ pub fn vault_deployment_block(network: &EvmNetwork) -> Option<u64> {
         bundled_payment_network(),
     ) {
         (Ok(config), Ok(bundled)) if &bundled == network => config.payment_vault_deployment_block,
+        _ => None,
+    }
+}
+
+/// The root vault of `network`: the bundled network's `root_vault_address`,
+/// and none for any other network. Readers of listings and payment records
+/// read its payments beside `network`'s payment vault's
+/// (`ListingChain::new`); nothing in this client pays it.
+#[must_use]
+pub fn root_vault_address(network: &EvmNetwork) -> Option<EvmAddress> {
+    match (
+        toml::from_str::<PaymentNetworkConfig>(BUNDLED_PAYMENT_NETWORK),
+        bundled_payment_network(),
+    ) {
+        (Ok(config), Ok(bundled)) if &bundled == network => config
+            .root_vault_address
+            .and_then(|address| address.parse().ok()),
         _ => None,
     }
 }
@@ -390,6 +408,54 @@ fn home_dir() -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The bundled network's root vault is the address the shared tree
+    /// code's production vectors pin, and its keys there are the vectors'
+    /// keys; no other network has one built in.
+    #[test]
+    fn the_root_vault_is_the_pinned_production_vault() {
+        let bundled = bundled_payment_network().unwrap();
+        let root = root_vault_address(&bundled).unwrap();
+        let vectors: serde_json::Value = serde_json::from_str(include_str!(
+            "../../vendor/ant-listings/src/root/production-vectors.json"
+        ))
+        .unwrap();
+        assert_eq!(
+            format!("{root:#x}"),
+            vectors["productionVault"].as_str().unwrap()
+        );
+        assert_ne!(&root, bundled.payment_vault_address());
+        let word = |hex: &str| -> [u8; 32] {
+            hex::decode(hex.trim_start_matches("0x"))
+                .unwrap()
+                .try_into()
+                .unwrap()
+        };
+        for vector in vectors["keyVectors"].as_array().unwrap() {
+            let leaf_count = u64::from_str_radix(
+                vector["leafCount"]
+                    .as_str()
+                    .unwrap()
+                    .trim_start_matches("0x"),
+                16,
+            )
+            .unwrap();
+            assert_eq!(
+                ant_listings::root::key(
+                    &root.0 .0,
+                    &word(vector["root"].as_str().unwrap()),
+                    leaf_count
+                ),
+                word(vector["key"].as_str().unwrap())
+            );
+        }
+        let other = EvmNetwork::Custom(CustomNetwork {
+            rpc_url_http: bundled.rpc_url().clone(),
+            payment_token_address: *bundled.payment_token_address(),
+            payment_vault_address: root,
+        });
+        assert_eq!(root_vault_address(&other), None);
+    }
 
     #[test]
     fn data_dir_ends_with_ant() {

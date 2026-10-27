@@ -1,0 +1,33 @@
+{
+ "leafCount": "0x2",
+ "quoteHashes": [
+  "0x328980ad712f219ed576ec9e98059ca64bc468ea162b7a5090e39c58ce614f3a",
+  "0x8a4916c64fb8d9acb3358fc63792a80679b9dac827f0df25204ed2710852c347"
+ ],
+ "payees": [
+  "0xf579b35c6085a3cd464014659742c7dec8d812b0",
+  "0xf579b35c6085a3cd464014659742c7dec8d812b0"
+ ],
+ "amounts": [
+  "0x54ab46fe867d454",
+  "0x322"
+ ],
+ "leaves": [
+  "0xac6bcfdfa68488bfaad796f537339baa1a3292cfb7830b0e112fb1da9c9889f7",
+  "0x230eccb431155705f038c10670c8166d28dd0f7435d4f2ca711d814ae3a9efdd"
+ ],
+ "root": "0x7a191dff4fe862de44c506732f13b6b137d1b7d542798ceb18bf335f6e850036",
+ "key": "0x162073ff41ffa07dccfedf3866c2344a5e29566dee876b9c337e503f3440a5e1",
+ "pathIndices": [
+  "0x0",
+  "0x1"
+ ],
+ "paths": [
+  [
+   "0x230eccb431155705f038c10670c8166d28dd0f7435d4f2ca711d814ae3a9efdd"
+  ],
+  [
+   "0xac6bcfdfa68488bfaad796f537339baa1a3292cfb7830b0e112fb1da9c9889f7"
+  ]
+ ]
+}

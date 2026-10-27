@@ -43,7 +43,9 @@
 //! stopped early carries on in the next read ([`WalkState`]), and a read
 //! never says a listing it didn't decide is gone ([`ListingsIndex::carry`]).
 
-use crate::data::client::listings_facts::{Facts, Keep, Known, VaultLog, FINALIZED_REFRESH};
+use crate::data::client::listings_facts::{
+    receipt_keeps, Facts, Keep, Known, VaultLog, FINALIZED_REFRESH,
+};
 use crate::data::client::listings_rpc::{Answer, Call, Kind, Rpc};
 use crate::data::client::listings_store::ListingsStore;
 use crate::data::client::listings_v1::RpcCalls;
@@ -58,9 +60,9 @@ use ant_listings::{
     push_request_id, quorum_needed, verify_listing_receipts, AddressWalk, ChangesResponse,
     CheckLevel, Envelope, EnvelopeProof, IndexWalk, Listing, ListingCheck, ListingKey,
     ListingPayment, ListingsBody, ListingsMessage, Lookup, MergedListing, NodeReport, PaidAt,
-    PaymentError, PaymentLog, PaymentReceipt, ProvenUpload, WalkOutcome, WalkResult, CLOCK_MARGIN,
-    DATA_PAYMENT_MADE_TOPIC, FIRST_SEEN_ROUNDING, MAX_LIST_LIMIT, QUORUM_THRESHOLD, TOPIC,
-    WALK_FREE_LISTINGS, WATCH_LEASE,
+    PaymentError, PaymentLog, PaymentReceipt, ProvenUpload, RootVault, VaultSet, WalkOutcome,
+    WalkResult, CLOCK_MARGIN, DATA_PAYMENT_MADE_TOPIC, FIRST_SEEN_ROUNDING, MAX_LIST_LIMIT,
+    QUORUM_THRESHOLD, TOPIC, WALK_FREE_LISTINGS, WATCH_LEASE,
 };
 use ant_protocol::evm::{Amount, Network as EvmNetwork, QuoteHash};
 use ant_protocol::transport::{MultiAddr, P2PEvent, P2PNode, PeerId};
@@ -2197,7 +2199,7 @@ pub(crate) async fn check_quorum_group(
     let listing = listing_to_check(group, nearest, needed).ok_or_else(|| {
         GroupProblem::Invalid("none of the nodes nearest its address gives it a first_seen".into())
     })?;
-    check_offline(&listing, envelope, chain.vault())
+    check_offline(&listing, envelope, chain.vaults())
         .map_err(|e| GroupProblem::Invalid(e.to_string()))?;
     check_vault_deployment(group, nearest, needed, chain).map_err(GroupProblem::Invalid)?;
     let lookup = payment_lookup(&listing).map_err(|e| GroupProblem::Invalid(e.to_string()))?;
@@ -2206,7 +2208,7 @@ pub(crate) async fn check_quorum_group(
         .await
         .map_err(|e| GroupProblem::Again(CheckProblem::ChainUnread(e).to_string()))?;
     check_copies(group, nearest, needed, |listing| {
-        verify_listing_receipts(listing, envelope, &fetched, chain.vault(), now)
+        verify_listing_receipts(listing, envelope, &fetched, chain.vaults(), now)
     })
     .map_err(|e| match e {
         PaymentError::NotFound => {
@@ -2318,7 +2320,7 @@ pub(crate) async fn check_group<P: PartialEq>(
         CheckProblem::Invalid("none of the nodes nearest its address gives it a first_seen".into())
     })?;
     // A copy that can't check out is never looked up.
-    check_offline(&listing, envelope, chain.vault())?;
+    check_offline(&listing, envelope, chain.vaults())?;
     check_vault_deployment(group, nearest, needed, chain).map_err(CheckProblem::Invalid)?;
     let lookup = payment_lookup(&listing)?;
     let fetched = chain
@@ -2326,7 +2328,7 @@ pub(crate) async fn check_group<P: PartialEq>(
         .await
         .map_err(CheckProblem::ChainUnread)?;
     Ok(check_copies(group, nearest, needed, |listing| {
-        verify_listing_receipts(listing, envelope, &fetched, chain.vault(), now)
+        verify_listing_receipts(listing, envelope, &fetched, chain.vaults(), now)
     })?)
 }
 
@@ -2428,6 +2430,47 @@ fn check_vault_deployment<P: PartialEq>(
 /// through their own RPC alone.
 pub const RPC_URLS_ENV: &str = "RPC_URLS";
 
+/// `records(bytes32)`: the root vault's view of the record under a wave's
+/// key.
+const ROOT_RECORDS_SELECTOR: [u8; 4] = [0x01, 0xe6, 0x47, 0x25];
+
+/// A root vault's record of a wave ([`ListingChain::root_record`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RootRecord {
+    /// The block time it was recorded at, in Unix seconds.
+    pub time: u64,
+    /// How many payments the wave holds.
+    pub leaf_count: u32,
+    /// The account that paid it.
+    pub payer: [u8; 20],
+}
+
+impl RootRecord {
+    /// The record `records(bytes32)` answers with: three words, the time,
+    /// the leaf count and the payer; `None` if all are zero.
+    fn from_words(bytes: &[u8]) -> std::result::Result<Option<Self>, String> {
+        let malformed = || "the root vault's record is not three words".to_string();
+        let [time, leaf_count, payer]: [&[u8]; 3] = [
+            bytes.get(..32).ok_or_else(malformed)?,
+            bytes.get(32..64).ok_or_else(malformed)?,
+            bytes.get(64..96).ok_or_else(malformed)?,
+        ];
+        if bytes.len() != 96
+            || time[..24].iter().any(|b| *b != 0)
+            || leaf_count[..28].iter().any(|b| *b != 0)
+            || payer[..12].iter().any(|b| *b != 0)
+        {
+            return Err(malformed());
+        }
+        let record = Self {
+            time: u64::from_be_bytes(time[24..].try_into().map_err(|_| malformed())?),
+            leaf_count: u32::from_be_bytes(leaf_count[28..].try_into().map_err(|_| malformed())?),
+            payer: payer[12..].try_into().map_err(|_| malformed())?,
+        };
+        Ok((record != Self::default()).then_some(record))
+    }
+}
+
 /// The most block timestamps kept to narrow later searches for the block at
 /// a time. When full, every other one is dropped. darwin-node's number for
 /// the same search.
@@ -2449,6 +2492,9 @@ const MAX_KNOWN_BLOCKS: usize = 4_096;
 pub struct ListingChain {
     rpc: Rpc,
     vault: [u8; 20],
+    /// The vaults whose payments this reader reads: `vault`, and the root
+    /// vault where the reader knows one ([`Self::with_root_vault`]).
+    vaults: VaultSet,
     /// The block the vault was deployed in, where known.
     vault_deployment_block: Option<u64>,
     /// That block's timestamp (Unix seconds), where known.
@@ -2517,11 +2563,11 @@ impl Unconfirmed {
     }
 
     /// Whether `answer`, to [`Self::call`], says the same.
-    fn agrees(&self, answer: &Value, vault: &[u8; 20]) -> bool {
+    fn agrees(&self, answer: &Value, vaults: &VaultSet) -> bool {
         match self {
             Self::Receipt(receipt, _) => {
                 !answer.is_null()
-                    && parse_receipt(receipt.tx_hash, answer, vault)
+                    && parse_receipt(receipt.tx_hash, answer, vaults)
                         .is_ok_and(|read| read == *receipt)
             }
             Self::Block(_, timestamp, _) => {
@@ -2575,6 +2621,12 @@ impl ListingChain {
         let mut vault = [0u8; 20];
         vault.copy_from_slice(network.payment_vault_address().as_slice());
         let mut reader = Self::with_rpc_setup(setup, vault)?;
+        if let Some(root) = crate::config::root_vault_address(network) {
+            reader = reader.with_root_vault(RootVault {
+                address: root.into_array(),
+                token: network.payment_token_address().into_array(),
+            });
+        }
         if let Some(block) = crate::config::vault_deployment_block(network) {
             reader = reader.with_vault_deployment_block(block);
         }
@@ -2641,6 +2693,7 @@ impl ListingChain {
         Ok(Self {
             rpc,
             vault,
+            vaults: VaultSet::v2_only(vault),
             vault_deployment_block: None,
             vault_deployment_time: None,
             vault_first_payment_time: None,
@@ -2662,7 +2715,7 @@ impl ListingChain {
     ///
     /// If the store's databases can't be opened.
     pub fn with_store(mut self, store: &ListingsStore) -> Result<Self> {
-        let facts = Facts::open(store, self.vault)?;
+        let facts = Facts::open(store, self.vaults)?;
         for (number, timestamp) in facts.kept_blocks() {
             self.remember_block(number, timestamp);
         }
@@ -2742,6 +2795,20 @@ impl ListingChain {
         self
     }
 
+    /// This reader, reading the payments of the root vault `root` beside
+    /// the per-quote vault's: each log query asks both addresses in one
+    /// `eth_getLogs`, and a payment is checked by the vault whose log it is
+    /// (`ant_listings::VaultSet`). Payments to the root vault are recorded
+    /// a wave at a time; its token's transfers show what each payee got.
+    #[must_use]
+    pub fn with_root_vault(mut self, root: RootVault) -> Self {
+        self.vaults = VaultSet::with_root(self.vault, root);
+        if let Some(facts) = self.facts.as_mut() {
+            facts.set_vaults(self.vaults);
+        }
+        self
+    }
+
     /// This reader, knowing that the block the vault was deployed in is
     /// timed `time` (Unix seconds): block timestamps never go back, so no
     /// payment to the vault is in a block timed earlier. A listing showing
@@ -2777,6 +2844,12 @@ impl ListingChain {
     #[must_use]
     pub fn vault(&self) -> &[u8; 20] {
         &self.vault
+    }
+
+    /// The vaults whose payments this reader reads.
+    #[must_use]
+    pub fn vaults(&self) -> &VaultSet {
+        &self.vaults
     }
 
     /// The block the payment vault was deployed in, where known.
@@ -2838,7 +2911,7 @@ impl ListingChain {
             .transaction(&proof.tx_hash)
             .await?
             .ok_or("the payment transaction is not on chain")?;
-        ant_listings::check_proof(proof, &receipt, timestamp, &self.vault)
+        ant_listings::check_proof(proof, &receipt, timestamp, &self.vaults)
             .map_err(|e| e.to_string())
     }
 
@@ -2884,6 +2957,42 @@ impl ListingChain {
             rewards_prefix: record.rewardsAddress.0,
             amount: Amount::from(record.amount),
         })
+    }
+
+    /// The root vault `vault`'s record under the wave key `key`
+    /// (`records(bytes32)`): the block time it was recorded at, its leaf
+    /// count and its payer, or `None` for a key never recorded, which the
+    /// vault answers with zeros.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the call fails or the answer is not three words.
+    pub async fn root_record(
+        &self,
+        vault: &[u8; 20],
+        key: &[u8; 32],
+    ) -> std::result::Result<Option<RootRecord>, String> {
+        let mut data = ROOT_RECORDS_SELECTOR.to_vec();
+        data.extend_from_slice(key);
+        let answer = self
+            .rpc
+            .call(
+                "eth_call",
+                json!([
+                    {
+                        "to": format!("0x{}", hex::encode(vault)),
+                        "data": format!("0x{}", hex::encode(data)),
+                    },
+                    "latest",
+                ]),
+            )
+            .await?
+            .value;
+        let bytes = answer
+            .as_str()
+            .and_then(|hex| hex::decode(hex.trim_start_matches("0x")).ok())
+            .ok_or("payment chain eth_call: the answer is not hex")?;
+        RootRecord::from_words(&bytes)
     }
 
     /// The receipt of `tx_hash` (as little of it as a check reads: whether
@@ -3152,7 +3261,7 @@ impl ListingChain {
             if value.is_null() {
                 continue;
             }
-            let receipt = parse_receipt(tx_hashes[i], &value, &self.vault)?;
+            let receipt = parse_receipt(tx_hashes[i], &value, &self.vaults)?;
             found[i] = Some(Known::read(receipt, provider));
         }
         Ok(found)
@@ -3304,7 +3413,7 @@ impl ListingChain {
                 let answers = self.rpc.batch_to(provider, Kind::Chain, &calls).await;
                 for ((fact, mut others), answer) in facts_asked.into_iter().zip(answers) {
                     match answer {
-                        Ok(value) if fact.agrees(&value, &self.vault) => match fact {
+                        Ok(value) if fact.agrees(&value, &self.vaults) => match fact {
                             Unconfirmed::Receipt(receipt, _) => keep.receipts.push(receipt),
                             Unconfirmed::Block(number, timestamp, _) => {
                                 keep.blocks.push((number, timestamp));
@@ -3736,8 +3845,17 @@ impl ListingChain {
                 None => Value::Null,
             })
             .collect();
+        // Both vaults' logs in one query where the reader knows a root
+        // vault; one address, as before, where it doesn't.
+        let address = match self.vaults.root {
+            Some(root) => json!([
+                format!("0x{}", hex::encode(self.vault)),
+                format!("0x{}", hex::encode(root.address)),
+            ]),
+            None => json!(format!("0x{}", hex::encode(self.vault))),
+        };
         let filter = json!({
-            "address": format!("0x{}", hex::encode(self.vault)),
+            "address": address,
             "fromBlock": quantity(from),
             "toBlock": quantity(to),
             "topics": topics,
@@ -3876,11 +3994,13 @@ struct RpcSetup {
 
 /// The receipt in `answer`, an `eth_getTransactionReceipt` answer for
 /// `tx_hash`, as little of it as a check reads: whether it succeeded, its
-/// block, and `vault`'s logs in it.
+/// block, and the logs in it of `vaults` and of the root vault's token, each
+/// with its data ([`receipt_keeps`]): a root vault's payment is checked from
+/// its wave's `RootPaid` log and the token's transfers after it.
 fn parse_receipt(
     tx_hash: [u8; 32],
     answer: &Value,
-    vault: &[u8; 20],
+    vaults: &VaultSet,
 ) -> std::result::Result<PaymentReceipt, String> {
     let block_number = answer["blockNumber"]
         .as_str()
@@ -3895,7 +4015,7 @@ fn parse_receipt(
             .map(|logs| {
                 logs.iter()
                     .filter_map(parse_log)
-                    .filter(|log| log.address == *vault)
+                    .filter(|log| receipt_keeps(vaults, &log.address))
                     .collect()
             })
             .unwrap_or_default(),
@@ -3904,7 +4024,8 @@ fn parse_receipt(
 
 /// Whether `receipt` shows `payment`: it is the payment's transaction, in
 /// its block, with the vault's `DataPaymentMade` log at its log index, of
-/// `quote_hash` where given. `receipt` holds only the vault's logs.
+/// `quote_hash` where given. `receipt` holds only the vaults' logs and the
+/// root vault's token's, which never log `DataPaymentMade`.
 fn shows_payment(
     receipt: &PaymentReceipt,
     payment: &VaultLog,
@@ -3951,6 +4072,13 @@ fn parse_log(log: &Value) -> Option<PaymentLog> {
             .iter()
             .map(|topic| topic.as_str().and_then(parse_bytes))
             .collect::<Option<Vec<[u8; 32]>>>()?,
+        data: hex::decode(
+            log["data"]
+                .as_str()
+                .unwrap_or("0x")
+                .trim_start_matches("0x"),
+        )
+        .ok()?,
         log_index: parse_u64(log["logIndex"].as_str()?)?,
     })
 }
@@ -3991,6 +4119,9 @@ pub(crate) mod test_chain {
 
     /// The vault the tests pay into.
     pub(crate) const VAULT: [u8; 20] = [0x69; 20];
+
+    /// The vaults the tests read: the per-quote vault alone.
+    pub(crate) const VAULTS: VaultSet = VaultSet::v2_only(VAULT);
 
     /// Receipts (each with the block it is in), and block timestamps.
     #[derive(Default)]
@@ -4091,8 +4222,17 @@ pub(crate) mod test_chain {
                         .and_then(parse_u64)
                         .unwrap_or(0);
                     let to = filter["toBlock"].as_str().and_then(parse_u64).unwrap_or(0);
-                    // Only the contract asked about, as a chain answers.
-                    let address = filter["address"].as_str().and_then(parse_bytes::<20>);
+                    // Only the contracts asked about, as a chain answers: one
+                    // address, or a list of them.
+                    let address: Option<Vec<[u8; 20]>> = match &filter["address"] {
+                        Value::String(one) => parse_bytes::<20>(one).map(|one| vec![one]),
+                        Value::Array(many) => Some(
+                            many.iter()
+                                .filter_map(|one| one.as_str().and_then(parse_bytes::<20>))
+                                .collect(),
+                        ),
+                        _ => None,
+                    };
                     let topics: Vec<Option<[u8; 32]>> = filter["topics"]
                         .as_array()
                         .map(|topics| {
@@ -4108,7 +4248,9 @@ pub(crate) mod test_chain {
                             continue;
                         }
                         for log in &receipt.logs {
-                            let matches = address.is_none_or(|address| log.address == address)
+                            let matches = address
+                                .as_ref()
+                                .is_none_or(|addresses| addresses.contains(&log.address))
                                 && topics.iter().enumerate().all(|(i, topic)| {
                                     topic.is_none_or(|topic| log.topics.get(i) == Some(&topic))
                                 });
@@ -4158,6 +4300,7 @@ pub(crate) mod test_chain {
             "logs": receipt.logs.iter().map(|log| json!({
                 "address": format!("0x{}", hex::encode(log.address)),
                 "topics": log.topics.iter().map(|t| format!("0x{}", hex::encode(t))).collect::<Vec<_>>(),
+                "data": format!("0x{}", hex::encode(&log.data)),
                 "logIndex": quantity(log.log_index),
             })).collect::<Vec<_>>(),
         })
@@ -4282,6 +4425,7 @@ pub(crate) mod test_chain {
         PaymentLog {
             address: VAULT,
             topics: vec![DATA_PAYMENT_MADE_TOPIC, rewards, amount, quote.hash().0],
+            data: Vec::new(),
             log_index,
         }
     }
@@ -4316,8 +4460,107 @@ pub(crate) mod test_chain {
 
 #[cfg(test)]
 mod tests {
-    use super::test_chain::{paying_log, reader, serve, signed_quote, MockChain, VAULT};
+    use super::test_chain::{paying_log, reader, serve, signed_quote, MockChain, VAULT, VAULTS};
     use super::*;
+
+    /// The root vault's record is read through `records(bytes32)`, the view
+    /// the frozen vault's interface fixes.
+    #[test]
+    fn the_root_record_selector_is_records_bytes32() {
+        assert_eq!(
+            ROOT_RECORDS_SELECTOR,
+            alloy::primitives::keccak256(b"records(bytes32)")[..4]
+        );
+    }
+
+    /// A root vault's record reads as its three words; all zeros, a key
+    /// never recorded, as none; anything but three clean words as an error.
+    #[test]
+    fn a_root_record_is_three_words() {
+        let mut words = [0u8; 96];
+        assert_eq!(RootRecord::from_words(&words), Ok(None));
+        words[24..32].copy_from_slice(&1_800_000_000u64.to_be_bytes());
+        words[60..64].copy_from_slice(&64u32.to_be_bytes());
+        words[76..96].copy_from_slice(&[0x9a; 20]);
+        assert_eq!(
+            RootRecord::from_words(&words),
+            Ok(Some(RootRecord {
+                time: 1_800_000_000,
+                leaf_count: 64,
+                payer: [0x9a; 20],
+            }))
+        );
+        assert!(RootRecord::from_words(&words[..64]).is_err());
+        let mut dirty = words;
+        dirty[64] = 1;
+        assert!(RootRecord::from_words(&dirty).is_err());
+        assert!(RootRecord::from_words(&[words.as_slice(), &[0; 32]].concat()).is_err());
+    }
+
+    /// A reader that knows a root vault asks both vaults' logs in one
+    /// `eth_getLogs`, and finds a payment the root vault's log records,
+    /// which a reader of the per-quote vault alone doesn't see. Its vault
+    /// set names both, so each payment is checked by the vault that
+    /// emitted its log.
+    #[tokio::test]
+    async fn a_reader_with_a_root_vault_reads_both_vaults_logs_in_one_query() {
+        const ROOT: [u8; 20] = [0x7a; 20];
+        let quote = signed_quote([0x31; 32], 30);
+        let mut log = paying_log(&quote, 4);
+        log.address = ROOT;
+        let mut chain = MockChain::with_blocks(10, 1_700_000_000);
+        chain.add_receipt(PaymentReceipt {
+            tx_hash: [0x41; 32],
+            success: true,
+            block_number: 5,
+            logs: vec![log],
+        });
+        let mock = Arc::new(Mutex::new(chain));
+        let url = serve(Arc::clone(&mock)).await;
+        let topics = [
+            Some(DATA_PAYMENT_MADE_TOPIC),
+            None,
+            None,
+            Some(quote.hash().0),
+        ];
+
+        let v2_only = reader(url.clone());
+        assert!(v2_only.vault_logs(&topics, 0, 9).await.unwrap().is_empty());
+        assert_eq!(v2_only.vaults(), &VAULTS);
+
+        let root = RootVault {
+            address: ROOT,
+            token: [0x11; 20],
+        };
+        let both = reader(url).with_root_vault(root);
+        let before = mock.lock().unwrap().calls_to("eth_getLogs");
+        let found = both.vault_logs(&topics, 0, 9).await.unwrap();
+        assert_eq!(mock.lock().unwrap().calls_to("eth_getLogs"), before + 1);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].tx_hash, [0x41; 32]);
+        assert_eq!(both.vaults(), &VaultSet::with_root(VAULT, root));
+        assert_eq!(
+            both.vault(),
+            &VAULT,
+            "the per-quote vault stays the reader's own"
+        );
+    }
+
+    /// The bundled network's reader reads the root vault the network
+    /// config names, paying the network's token.
+    #[test]
+    fn the_bundled_networks_reader_reads_its_root_vault() {
+        let bundled = crate::config::bundled_payment_network().unwrap();
+        let chain = ListingChain::new(&bundled).unwrap();
+        let root = crate::config::root_vault_address(&bundled).unwrap();
+        assert_eq!(
+            chain.vaults().root,
+            Some(RootVault {
+                address: root.into_array(),
+                token: bundled.payment_token_address().into_array(),
+            })
+        );
+    }
     use ant_listings::{
         first_seen_at, Flags, ListingError, Metadata, Payment, PaymentField, ShownFields,
     };
@@ -4876,7 +5119,7 @@ mod tests {
         let h = FIRST_SEEN_ROUNDING;
         let now = hour + 3 * h;
         let check =
-            |listing: &Listing| verify_listing_receipts(listing, &envelope, &[], &VAULT, now);
+            |listing: &Listing| verify_listing_receipts(listing, &envelope, &[], &VAULTS, now);
         let dated_by = |dates: &[u64]| {
             let (chosen, _) = decide(dated_copies(&listing, &NEAREST, dates), check);
             chosen.map(|(listing, ..)| listing.first_seen.expect("dated"))
@@ -4917,7 +5160,7 @@ mod tests {
         let listing = Listing::new(&envelope, &upload_payment(&envelope), BLOCK_TIME);
         let hour = first_seen_at(BLOCK_TIME);
         let check =
-            |listing: &Listing| verify_listing_receipts(listing, &envelope, &[], &VAULT, hour);
+            |listing: &Listing| verify_listing_receipts(listing, &envelope, &[], &VAULTS, hour);
         // Four of the nearest date it at `hour`; ten other nodes dating it
         // in 1970 neither count nor move it.
         let mut copies = dated_copies(&listing, &NEAREST[..4], &[hour; 4]);

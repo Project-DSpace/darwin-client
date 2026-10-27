@@ -1,0 +1,30 @@
+{
+ "about": "DarwinRootVault's own test vectors. Numbers are 32-byte big-endian words, addresses their 20 bytes. leaf = keccak256(0x00 || quoteHash || payee || amount); pair = keccak256(0x01 || left || right); each level pairs its nodes in order and carries an unpaired last node up unchanged; key = keccak256(0x02 || vault || root || leafCount). A path holds a leaf's siblings from the bottom up, one per level where it has one. hashes.json holds single hashes; each wave file holds a wave, its leaves, root and key (naming `vault`) and paths. In every file here, each integer (amounts, leaf counts, places, path indices and the leaf limit) is a 0x-prefixed hex string, never a JSON number, so that readers in any language parse values up to 2^256 - 1 alike.",
+ "vault": "0xd6d757e8e685d1ac7d1a9684c8a0bf783635088a",
+ "waves": [
+  "wave-001-001.json",
+  "wave-002-001.json",
+  "wave-002-002.json",
+  "wave-003-002.json",
+  "wave-004-001.json",
+  "wave-005-002.json",
+  "wave-006-003.json",
+  "wave-007-007.json",
+  "wave-008-003.json",
+  "wave-009-004.json",
+  "wave-013-005.json",
+  "wave-016-016.json",
+  "wave-017-006.json",
+  "wave-031-008.json",
+  "wave-032-002.json",
+  "wave-033-009.json",
+  "wave-064-001.json",
+  "wave-064-019.json",
+  "wave-065-008.json",
+  "wave-255-047.json",
+  "wave-256-064.json",
+  "wave-257-003.json",
+  "wave-512-512.json",
+  "wave-001-001-edges.json"
+ ]
+}

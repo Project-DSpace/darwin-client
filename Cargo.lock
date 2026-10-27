@@ -854,7 +854,7 @@ name = "ant-core"
 version = "0.13.0"
 dependencies = [
  "alloy",
- "ant-listings 0.3.1",
+ "ant-listings 0.4.0",
  "ant-node",
  "ant-protocol",
  "anyhow",
@@ -919,6 +919,19 @@ dependencies = [
 [[package]]
 name = "ant-listings"
 version = "0.3.1"
+source = "git+https://github.com/Project-DSpace/darwin-node.git?rev=0deb78780a1e8a3f2e4e2f2688d51a0784f7016b#0deb78780a1e8a3f2e4e2f2688d51a0784f7016b"
+dependencies = [
+ "ant-protocol",
+ "postcard",
+ "rmp-serde",
+ "self_encryption",
+ "serde",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "ant-listings"
+version = "0.4.0"
 dependencies = [
  "ant-protocol",
  "postcard",
@@ -929,19 +942,6 @@ dependencies = [
  "serde",
  "serde_json",
  "sha3 0.10.9",
- "thiserror 2.0.18",
-]
-
-[[package]]
-name = "ant-listings"
-version = "0.3.1"
-source = "git+https://github.com/Project-DSpace/darwin-node.git?rev=0deb78780a1e8a3f2e4e2f2688d51a0784f7016b#0deb78780a1e8a3f2e4e2f2688d51a0784f7016b"
-dependencies = [
- "ant-protocol",
- "postcard",
- "rmp-serde",
- "self_encryption",
- "serde",
  "thiserror 2.0.18",
 ]
 
@@ -959,7 +959,7 @@ name = "ant-node"
 version = "0.23.0+ds.17"
 source = "git+https://github.com/Project-DSpace/darwin-node.git?rev=0deb78780a1e8a3f2e4e2f2688d51a0784f7016b#0deb78780a1e8a3f2e4e2f2688d51a0784f7016b"
 dependencies = [
- "ant-listings 0.3.1 (git+https://github.com/Project-DSpace/darwin-node.git?rev=0deb78780a1e8a3f2e4e2f2688d51a0784f7016b)",
+ "ant-listings 0.3.1",
  "ant-protocol",
  "bao",
  "blake3",

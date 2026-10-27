@@ -1,0 +1,292 @@
+{
+ "about": "Places, leaf counts and paths that DarwinRootVault's leafRecorded refuses, and a storer must refuse: part of the vault's own test vectors. Each case names a wave file in this folder and the place of a leaf in it (`leaf`); that leaf's hash is checked with the case's `index`, `leafCount` and `path`. The leaf's own place and path in the recorded wave verify, so each refusal comes from what the case changes. refusedBy `shape`: the place, the leaf count (0, or above `leafLimit`, up to 2^256 - 1) or the path's length doesn't fit, and the check fails before any record is read: a leaf count of 0 leaves no place inside the wave, and a leaf count above `leafLimit` is refused before any hashing. `root`: the path gives another root (`root`), whose key (`key`, naming the vectors' `vault`) isn't recorded. `key`: the path gives the wave's own root, but under another leaf count, so another key, which isn't recorded. Integers are 0x-prefixed hex strings, as index.json says.",
+ "vault": "0xd6d757e8e685d1ac7d1a9684c8a0bf783635088a",
+ "leafLimit": "0x200",
+ "cases": [
+  {
+   "name": "no leaves",
+   "wave": "wave-001-001.json",
+   "leaf": "0x0",
+   "index": "0x0",
+   "leafCount": "0x0",
+   "path": [],
+   "refusedBy": "shape"
+  },
+  {
+   "name": "a leaf count above the limit, with a path that fits 513 leaves",
+   "wave": "wave-512-512.json",
+   "leaf": "0x0",
+   "index": "0x0",
+   "leafCount": "0x201",
+   "path": [
+    "0x2ccc8fe081cf442fbd5471df173639c1a448a85e6b04275e844bcd5a62ab5bad",
+    "0x1fefbcc1f8bd385965a5b7af38520bd7a7a3323dbad554b8a248991960f6b6ca",
+    "0xc6054f4f32eb0068051b00e0875f768f31cd23ad60504ddef105fea1acacbff0",
+    "0x31b81df5f0342222e7c7b57ac8b1c7bb41ee1e0bbf5be5095145bb87b072aabd",
+    "0xe11665960600b31414babe1722a72318abca74c1be4e7d4cb08add8a9487d0d9",
+    "0x70d44066eec3ee5208f6284b05090b747695bdb7136c65c3b83ec1bd2b3847e2",
+    "0x3a7d1d82b06e6b35dffffdd2cf50ee2d8bed29d81f2bd4bd8e3fd4aedfa6b1aa",
+    "0x6194f32545fbae4e1fc18cdb974c8f2f22528c4c33b5f1b221720561bc8bf2ed",
+    "0x33bdacea412c22e0bc6d555d9b68cadc971e2d51df9eeec2b1c18ae930ffe426",
+    "0xa647bcb09d7c4d204f5e63ee2881e2bece5350cc09f99b2c32ad34cc3450a29d"
+   ],
+   "refusedBy": "shape"
+  },
+  {
+   "name": "the largest leaf count, 2^256 - 1, with a path",
+   "wave": "wave-512-512.json",
+   "leaf": "0x0",
+   "index": "0x0",
+   "leafCount": "0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+   "path": [
+    "0x2ccc8fe081cf442fbd5471df173639c1a448a85e6b04275e844bcd5a62ab5bad",
+    "0x1fefbcc1f8bd385965a5b7af38520bd7a7a3323dbad554b8a248991960f6b6ca",
+    "0xc6054f4f32eb0068051b00e0875f768f31cd23ad60504ddef105fea1acacbff0",
+    "0x31b81df5f0342222e7c7b57ac8b1c7bb41ee1e0bbf5be5095145bb87b072aabd",
+    "0xe11665960600b31414babe1722a72318abca74c1be4e7d4cb08add8a9487d0d9",
+    "0x70d44066eec3ee5208f6284b05090b747695bdb7136c65c3b83ec1bd2b3847e2",
+    "0x3a7d1d82b06e6b35dffffdd2cf50ee2d8bed29d81f2bd4bd8e3fd4aedfa6b1aa",
+    "0x6194f32545fbae4e1fc18cdb974c8f2f22528c4c33b5f1b221720561bc8bf2ed",
+    "0x33bdacea412c22e0bc6d555d9b68cadc971e2d51df9eeec2b1c18ae930ffe426"
+   ],
+   "refusedBy": "shape"
+  },
+  {
+   "name": "a place equal to the leaf count",
+   "wave": "wave-013-005.json",
+   "leaf": "0x3",
+   "index": "0xd",
+   "leafCount": "0xd",
+   "path": [
+    "0xacc8dedbb97991b1ad7daadb4dba748cfdc8569dca1d99f50a2133337354caeb",
+    "0x5654eee87b2f310cdf48e6fea74fc36241fd0aca9768ccd884c86c38aa91894d",
+    "0x43816515a4a01d054cb1a8089b5f6866ce2f994115533b860cf7c4274116ffe7",
+    "0xa3060de2acbffaaf339313d7b55c93b63b32d6c73883dfd383a8e42dded1951d"
+   ],
+   "refusedBy": "shape"
+  },
+  {
+   "name": "a place past the leaf count",
+   "wave": "wave-013-005.json",
+   "leaf": "0x3",
+   "index": "0xe",
+   "leafCount": "0xd",
+   "path": [
+    "0xacc8dedbb97991b1ad7daadb4dba748cfdc8569dca1d99f50a2133337354caeb",
+    "0x5654eee87b2f310cdf48e6fea74fc36241fd0aca9768ccd884c86c38aa91894d",
+    "0x43816515a4a01d054cb1a8089b5f6866ce2f994115533b860cf7c4274116ffe7",
+    "0xa3060de2acbffaaf339313d7b55c93b63b32d6c73883dfd383a8e42dded1951d"
+   ],
+   "refusedBy": "shape"
+  },
+  {
+   "name": "a place far past the leaf count",
+   "wave": "wave-013-005.json",
+   "leaf": "0x3",
+   "index": "0x100000000",
+   "leafCount": "0xd",
+   "path": [
+    "0xacc8dedbb97991b1ad7daadb4dba748cfdc8569dca1d99f50a2133337354caeb",
+    "0x5654eee87b2f310cdf48e6fea74fc36241fd0aca9768ccd884c86c38aa91894d",
+    "0x43816515a4a01d054cb1a8089b5f6866ce2f994115533b860cf7c4274116ffe7",
+    "0xa3060de2acbffaaf339313d7b55c93b63b32d6c73883dfd383a8e42dded1951d"
+   ],
+   "refusedBy": "shape"
+  },
+  {
+   "name": "a place past the end of a one-leaf wave",
+   "wave": "wave-001-001.json",
+   "leaf": "0x0",
+   "index": "0x1",
+   "leafCount": "0x1",
+   "path": [],
+   "refusedBy": "shape"
+  },
+  {
+   "name": "place 3 of a two-leaf wave, with place 1's path",
+   "wave": "wave-002-002.json",
+   "leaf": "0x1",
+   "index": "0x3",
+   "leafCount": "0x2",
+   "path": [
+    "0x0a9d835edde88bf93e611d946e4c6dd8ec393d32d344ec1a607bf83fd855b5eb"
+   ],
+   "refusedBy": "shape"
+  },
+  {
+   "name": "a path one hash short",
+   "wave": "wave-013-005.json",
+   "leaf": "0x3",
+   "index": "0x3",
+   "leafCount": "0xd",
+   "path": [
+    "0xacc8dedbb97991b1ad7daadb4dba748cfdc8569dca1d99f50a2133337354caeb",
+    "0x5654eee87b2f310cdf48e6fea74fc36241fd0aca9768ccd884c86c38aa91894d",
+    "0x43816515a4a01d054cb1a8089b5f6866ce2f994115533b860cf7c4274116ffe7"
+   ],
+   "refusedBy": "shape"
+  },
+  {
+   "name": "a path one hash long",
+   "wave": "wave-013-005.json",
+   "leaf": "0x3",
+   "index": "0x3",
+   "leafCount": "0xd",
+   "path": [
+    "0xacc8dedbb97991b1ad7daadb4dba748cfdc8569dca1d99f50a2133337354caeb",
+    "0x5654eee87b2f310cdf48e6fea74fc36241fd0aca9768ccd884c86c38aa91894d",
+    "0x43816515a4a01d054cb1a8089b5f6866ce2f994115533b860cf7c4274116ffe7",
+    "0xa3060de2acbffaaf339313d7b55c93b63b32d6c73883dfd383a8e42dded1951d",
+    "0xeaedc221fb6a2b376973b5fc09bf15c4822b14be89ccccebb68c1937eb8f3a33"
+   ],
+   "refusedBy": "shape"
+  },
+  {
+   "name": "no path for a wave of more than one leaf",
+   "wave": "wave-013-005.json",
+   "leaf": "0x3",
+   "index": "0x3",
+   "leafCount": "0xd",
+   "path": [],
+   "refusedBy": "shape"
+  },
+  {
+   "name": "a path of 10 hashes for 512 leaves",
+   "wave": "wave-512-512.json",
+   "leaf": "0x0",
+   "index": "0x0",
+   "leafCount": "0x200",
+   "path": [
+    "0x2ccc8fe081cf442fbd5471df173639c1a448a85e6b04275e844bcd5a62ab5bad",
+    "0x1fefbcc1f8bd385965a5b7af38520bd7a7a3323dbad554b8a248991960f6b6ca",
+    "0xc6054f4f32eb0068051b00e0875f768f31cd23ad60504ddef105fea1acacbff0",
+    "0x31b81df5f0342222e7c7b57ac8b1c7bb41ee1e0bbf5be5095145bb87b072aabd",
+    "0xe11665960600b31414babe1722a72318abca74c1be4e7d4cb08add8a9487d0d9",
+    "0x70d44066eec3ee5208f6284b05090b747695bdb7136c65c3b83ec1bd2b3847e2",
+    "0x3a7d1d82b06e6b35dffffdd2cf50ee2d8bed29d81f2bd4bd8e3fd4aedfa6b1aa",
+    "0x6194f32545fbae4e1fc18cdb974c8f2f22528c4c33b5f1b221720561bc8bf2ed",
+    "0x33bdacea412c22e0bc6d555d9b68cadc971e2d51df9eeec2b1c18ae930ffe426",
+    "0xa647bcb09d7c4d204f5e63ee2881e2bece5350cc09f99b2c32ad34cc3450a29d"
+   ],
+   "refusedBy": "shape"
+  },
+  {
+   "name": "a sibling for a carried-up leaf",
+   "wave": "wave-013-005.json",
+   "leaf": "0xc",
+   "index": "0xc",
+   "leafCount": "0xd",
+   "path": [
+    "0xa2131d750d7e49a66d5c1c9bfca9effa7881ed3983910b07f684bc14fe533a39",
+    "0x25d3ef2293c106150a1d1f8824efb60d610e0fb08b8e9d984045b427b8a9ebe4",
+    "0x15d4f6e68938f318d2b0c83f69cefd551bb86a4d00aca08af4bc87fbb83f9b4a"
+   ],
+   "refusedBy": "shape"
+  },
+  {
+   "name": "the carried-up leaf's path under a leaf count where it has a neighbour",
+   "wave": "wave-013-005.json",
+   "leaf": "0xc",
+   "index": "0xc",
+   "leafCount": "0xe",
+   "path": [
+    "0x25d3ef2293c106150a1d1f8824efb60d610e0fb08b8e9d984045b427b8a9ebe4",
+    "0x15d4f6e68938f318d2b0c83f69cefd551bb86a4d00aca08af4bc87fbb83f9b4a"
+   ],
+   "refusedBy": "shape"
+  },
+  {
+   "name": "another place of the same depth",
+   "wave": "wave-013-005.json",
+   "leaf": "0x4",
+   "index": "0x5",
+   "leafCount": "0xd",
+   "path": [
+    "0xa314551ffb4115827e031fa6d9bba7e27876172cf8439a343d85d3b8e101bf6f",
+    "0x726c23588b2d2b8a4443bad94bff0fa0426cf28aa4908250d1cfc86059f23849",
+    "0xfecbbbe405a7a6614decdc1a26daeeff82e34ef9ff333067e890ac44c3ddce36",
+    "0xa3060de2acbffaaf339313d7b55c93b63b32d6c73883dfd383a8e42dded1951d"
+   ],
+   "refusedBy": "root",
+   "root": "0x451b1db4dfb83bd1342070251bd00d80418f367f68e5038d1439b7b6e06c9134",
+   "key": "0xdf32dba362e60a13f7ea83b8e442b29b108e7294c508f1b03b7831990ab4b546"
+  },
+  {
+   "name": "another leaf's path of the same length",
+   "wave": "wave-013-005.json",
+   "leaf": "0x4",
+   "index": "0x4",
+   "leafCount": "0xd",
+   "path": [
+    "0xea43070d3c82328ea03aaa8f45331cc78d574fd1ac6bf30fdbb13bec075d15f3",
+    "0x726c23588b2d2b8a4443bad94bff0fa0426cf28aa4908250d1cfc86059f23849",
+    "0xfecbbbe405a7a6614decdc1a26daeeff82e34ef9ff333067e890ac44c3ddce36",
+    "0xa3060de2acbffaaf339313d7b55c93b63b32d6c73883dfd383a8e42dded1951d"
+   ],
+   "refusedBy": "root",
+   "root": "0x9eb89b55fccf025143eb839a3515268081ff3234df80ae8b854b72163e3dd561",
+   "key": "0x1b546c3452419b0cf15e221bc15c8e45456ca8bb6acea74eb1eb57dd75503484"
+  },
+  {
+   "name": "a sibling with one bit flipped",
+   "wave": "wave-013-005.json",
+   "leaf": "0x4",
+   "index": "0x4",
+   "leafCount": "0xd",
+   "path": [
+    "0xa314551ffb4115827e031fa6d9bba7e27876172cf8439a343d85d3b8e101bf6e",
+    "0x726c23588b2d2b8a4443bad94bff0fa0426cf28aa4908250d1cfc86059f23849",
+    "0xfecbbbe405a7a6614decdc1a26daeeff82e34ef9ff333067e890ac44c3ddce36",
+    "0xa3060de2acbffaaf339313d7b55c93b63b32d6c73883dfd383a8e42dded1951d"
+   ],
+   "refusedBy": "root",
+   "root": "0xab3af1ef9d3dc61b9ac7d49c83bd9b8117106361e05067d084b137c2669b74eb",
+   "key": "0x873832310af63d901bd74385ba1524f62c7527d9cf442d01de2d4ab09a5e3fb1"
+  },
+  {
+   "name": "an upper level passed off as a wave of two",
+   "wave": "wave-004-001.json",
+   "leaf": "0x0",
+   "index": "0x0",
+   "leafCount": "0x2",
+   "path": [
+    "0x0861506c09091a3b651689240e1190ee862cf463bfa455271f16072942d96324"
+   ],
+   "refusedBy": "root",
+   "root": "0x2445d8c4d13d6b7fb77e4234a9294161fde75b801e50403cd9d1b01ba95b4852",
+   "key": "0x913cbe3bd2514fe44d2baf2a3f58c5296e6540e26b8a14484be05928d4d39551"
+  },
+  {
+   "name": "the wave's root under one leaf more",
+   "wave": "wave-013-005.json",
+   "leaf": "0x6",
+   "index": "0x6",
+   "leafCount": "0xe",
+   "path": [
+    "0x5490b3af03c0f74b18ee7d85e36667228a2403b919c5ef6781d53d48ca254203",
+    "0x0b0e4133fc36c5f767d78c6b986e8b94f6e7907399b85f4a45d815219e208f11",
+    "0xfecbbbe405a7a6614decdc1a26daeeff82e34ef9ff333067e890ac44c3ddce36",
+    "0xa3060de2acbffaaf339313d7b55c93b63b32d6c73883dfd383a8e42dded1951d"
+   ],
+   "refusedBy": "key",
+   "root": "0xeaedc221fb6a2b376973b5fc09bf15c4822b14be89ccccebb68c1937eb8f3a33",
+   "key": "0xcfb1909422988c6fb1ffc33339ed494ab7146c62b841d8fb4464796a7f3be029"
+  },
+  {
+   "name": "the wave's root under one leaf fewer",
+   "wave": "wave-013-005.json",
+   "leaf": "0x6",
+   "index": "0x6",
+   "leafCount": "0xc",
+   "path": [
+    "0x5490b3af03c0f74b18ee7d85e36667228a2403b919c5ef6781d53d48ca254203",
+    "0x0b0e4133fc36c5f767d78c6b986e8b94f6e7907399b85f4a45d815219e208f11",
+    "0xfecbbbe405a7a6614decdc1a26daeeff82e34ef9ff333067e890ac44c3ddce36",
+    "0xa3060de2acbffaaf339313d7b55c93b63b32d6c73883dfd383a8e42dded1951d"
+   ],
+   "refusedBy": "key",
+   "root": "0xeaedc221fb6a2b376973b5fc09bf15c4822b14be89ccccebb68c1937eb8f3a33",
+   "key": "0x3532d948235c3c6917113d1a40be9730c9b31a84d9aff5fc141a0f1f692e711d"
+  }
+ ]
+}
