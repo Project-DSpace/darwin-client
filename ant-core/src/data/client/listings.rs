@@ -2570,14 +2570,10 @@ impl ListingChain {
     /// URLs, or the HTTP client can't be built.
     pub fn new(network: &EvmNetwork) -> Result<Self> {
         let listed = std::env::var(RPC_URLS_ENV).ok();
-        let RpcSetup {
-            urls,
-            logs_order,
-            chain_id,
-        } = rpc_setup(network, listed.as_deref()).map_err(Error::Network)?;
+        let setup = rpc_setup(network, listed.as_deref()).map_err(Error::Network)?;
         let mut vault = [0u8; 20];
         vault.copy_from_slice(network.payment_vault_address().as_slice());
-        let mut reader = Self::with_rpc_setup(urls, logs_order, chain_id, vault)?;
+        let mut reader = Self::with_rpc_setup(setup, vault)?;
         if let Some(block) = crate::config::vault_deployment_block(network) {
             reader = reader.with_vault_deployment_block(block);
         }
@@ -2621,16 +2617,26 @@ impl ListingChain {
     /// Returns an error if `rpc_urls` is empty or the HTTP client can't be
     /// built.
     pub fn with_rpcs(rpc_urls: Vec<String>, vault: [u8; 20]) -> Result<Self> {
-        Self::with_rpc_setup(rpc_urls, None, None, vault)
+        let span_answers = span_answers(&rpc_urls);
+        Self::with_rpc_setup(
+            RpcSetup {
+                urls: rpc_urls,
+                logs_order: None,
+                span_answers,
+                chain_id: None,
+            },
+            vault,
+        )
     }
 
-    fn with_rpc_setup(
-        urls: Vec<String>,
-        logs_order: Option<Vec<usize>>,
-        chain_id: Option<u64>,
-        vault: [u8; 20],
-    ) -> Result<Self> {
-        let rpc = Rpc::new(urls, logs_order, chain_id).map_err(Error::Network)?;
+    fn with_rpc_setup(setup: RpcSetup, vault: [u8; 20]) -> Result<Self> {
+        let RpcSetup {
+            urls,
+            logs_order,
+            span_answers,
+            chain_id,
+        } = setup;
+        let rpc = Rpc::new(urls, logs_order, &span_answers, chain_id).map_err(Error::Network)?;
         Ok(Self {
             rpc,
             vault,
@@ -3763,8 +3769,9 @@ impl ListingChain {
 }
 
 /// The RPCs a reader of `network` reads through, the order of its log
-/// queries (indexes into them; `None` for the same order), and the chain
-/// each must say it is on, where checked: on the bundled network with
+/// queries (indexes into them; `None` for the same order), those that give
+/// span answers ([`span_answers`]), and the chain each must say it is on,
+/// where checked: on the bundled network with
 /// `listed` (the value of [`RPC_URLS_ENV`]), those listed, in that order for
 /// everything, each checked to be on the network's chain; otherwise the
 /// network's own RPC and then the RPCs it falls back to
@@ -3790,20 +3797,52 @@ fn rpc_setup(network: &EvmNetwork, listed: Option<&str>) -> std::result::Result<
                 }
             }
             return Ok(RpcSetup {
+                span_answers: span_answers(&urls),
                 urls,
                 logs_order: None,
                 chain_id: Some(chain_id),
             });
         }
     }
-    let mut urls = vec![network.rpc_url().to_string()];
-    urls.extend(crate::config::fallback_rpc_urls(network));
-    let logs_order = fallback_logs_order(urls.len());
+    let urls = network_rpc_urls(network);
     Ok(RpcSetup {
+        span_answers: span_answers(&urls),
+        logs_order: fallback_logs_order(urls.len()),
         urls,
-        logs_order,
         chain_id: None,
     })
+}
+
+/// `network`'s own RPC and then the RPCs it falls back to.
+fn network_rpc_urls(network: &EvmNetwork) -> Vec<String> {
+    let mut urls = vec![network.rpc_url().to_string()];
+    urls.extend(crate::config::fallback_rpc_urls(network));
+    urls
+}
+
+/// The host of the RPC that gives
+/// [`BUSY_CODE`](super::listings_rpc::BUSY_CODE) in answer to a log query
+/// over a wider span than it serves: ordofi's, the RPC the bundled
+/// network's log queries ask last ([`fallback_logs_order`]). `None` if the
+/// bundled network has no fallback.
+fn span_answer_host() -> Option<String> {
+    let bundled = crate::config::bundled_payment_network().ok()?;
+    let urls = network_rpc_urls(&bundled);
+    let last = *fallback_logs_order(urls.len())?.last()?;
+    Some(super::listings_rpc::rpc_host(&urls[last]))
+}
+
+/// The RPCs among `urls` (indexes into them) that give span answers: those
+/// at [`span_answer_host`], wherever they are listed.
+fn span_answers(urls: &[String]) -> Vec<usize> {
+    let Some(host) = span_answer_host() else {
+        return Vec::new();
+    };
+    urls.iter()
+        .enumerate()
+        .filter(|(_, url)| super::listings_rpc::rpc_host(url) == host)
+        .map(|(index, _)| index)
+        .collect()
 }
 
 /// The order of log queries over `len` RPCs (a network's own RPC and then
@@ -3827,6 +3866,9 @@ struct RpcSetup {
     /// The order of log queries, as indexes into `urls`; `None` for the
     /// same order.
     logs_order: Option<Vec<usize>>,
+    /// Those whose busy answer to a log query is a span answer
+    /// ([`span_answers`]), as indexes into `urls`.
+    span_answers: Vec<usize>,
     /// The chain each must say it is on before it is used, where checked.
     chain_id: Option<u64>,
 }
@@ -7373,12 +7415,39 @@ mod tests {
         assert_eq!(host(1), "rpc.ordofi.network");
         assert_eq!(host(2), "rpc.mainnet.chain.robinhood.com");
         assert_eq!(setup.logs_order, Some(vec![2, 0, 1]));
+        // ordofi's busy answers to log queries are span answers.
+        assert_eq!(setup.span_answers, vec![1]);
         assert_eq!(setup.chain_id, None);
-        let rpc = Rpc::new(setup.urls, setup.logs_order, None).unwrap();
+        let rpc = Rpc::new(setup.urls, setup.logs_order, &setup.span_answers, None).unwrap();
         // Calls: PublicNode, ordofi, Robinhood's RPC.
         assert_eq!(rpc.order(Kind::Chain), vec![0, 1, 2]);
         // Log queries: Robinhood's RPC, PublicNode, ordofi last.
         assert_eq!(rpc.order(Kind::Logs), vec![2, 0, 1]);
+    }
+
+    #[test]
+    fn ordofi_gives_span_answers_wherever_it_is_listed() {
+        assert_eq!(span_answer_host().as_deref(), Some("rpc.ordofi.network"));
+        let bundled = crate::config::bundled_payment_network().unwrap();
+        // Listed as the gateway's README gives them: ordofi first, so the
+        // RPC asked last for log queries is PublicNode's, not ordofi's.
+        let listed = "https://rpc.ordofi.network https://rpc.mainnet.chain.robinhood.com \
+                      https://robinhood-rpc.publicnode.com";
+        let setup = rpc_setup(&bundled, Some(listed)).unwrap();
+        assert_eq!(setup.logs_order, None);
+        assert_eq!(setup.span_answers, vec![0]);
+        // Robinhood's RPC listed last: ordofi's, with a key in its path, is
+        // still the one.
+        let listed = "https://robinhood-rpc.publicnode.com https://rpc.ordofi.network/a-key \
+                      https://rpc.mainnet.chain.robinhood.com";
+        assert_eq!(
+            rpc_setup(&bundled, Some(listed)).unwrap().span_answers,
+            vec![1]
+        );
+        // A reader through RPCs of its own: the same.
+        let own = ["http://127.0.0.1:8545", "https://rpc.ordofi.network"].map(String::from);
+        assert_eq!(span_answers(&own), vec![1]);
+        assert!(span_answers(&own[..1]).is_empty());
     }
 
     #[test]
@@ -7404,6 +7473,7 @@ mod tests {
             RpcSetup {
                 urls: vec!["https://a.example/k1".into(), "http://b.example".into()],
                 logs_order: None,
+                span_answers: Vec::new(),
                 chain_id: crate::config::chain_id(&bundled),
             }
         );
@@ -7435,7 +7505,13 @@ mod tests {
             serve(Arc::clone(&other)).await,
             serve(Arc::clone(&right)).await,
         ];
-        let chain = ListingChain::with_rpc_setup(urls, None, Some(4_663), VAULT).unwrap();
+        let setup = RpcSetup {
+            urls,
+            logs_order: None,
+            span_answers: Vec::new(),
+            chain_id: Some(4_663),
+        };
+        let chain = ListingChain::with_rpc_setup(setup, VAULT).unwrap();
         assert_eq!(chain.latest_block().await.unwrap(), 19);
         assert_eq!(chain.latest_block().await.unwrap(), 19);
         let other = other.lock().unwrap();
