@@ -2555,7 +2555,9 @@ impl ListingChain {
     ///
     /// It reads through `network`'s RPC and then the RPCs it falls back to
     /// ([`crate::config::fallback_rpc_urls`]), except that log queries go to
-    /// the last fallback first and the first fallback last: on the bundled
+    /// the last fallback first, then to the network's own RPC and the
+    /// remaining fallbacks in their listed order (with two fallbacks, as on
+    /// the bundled network, this puts the first fallback last): on the bundled
     /// network, receipts and blocks go to PublicNode first, then ordofi, then
     /// Robinhood's RPC, and log queries to Robinhood's RPC first, then
     /// PublicNode (which refuses ranged ones), then ordofi, which answered
@@ -3767,8 +3769,9 @@ impl ListingChain {
 /// everything, each checked to be on the network's chain; otherwise the
 /// network's own RPC and then the RPCs it falls back to
 /// ([`crate::config::fallback_rpc_urls`]), log queries going to the last
-/// fallback first, then to the network's own RPC and the other fallbacks in
-/// order, so the first fallback comes last.
+/// fallback first, then to the network's own RPC and the remaining
+/// fallbacks in their listed order ([`fallback_logs_order`]; on the bundled
+/// network, with two fallbacks, this puts the first fallback last).
 fn rpc_setup(network: &EvmNetwork, listed: Option<&str>) -> std::result::Result<RpcSetup, String> {
     if let (Some(chain_id), Some(listed)) = (crate::config::chain_id(network), listed) {
         let urls: Vec<String> = listed.split_whitespace().map(str::to_string).collect();
@@ -3795,16 +3798,24 @@ fn rpc_setup(network: &EvmNetwork, listed: Option<&str>) -> std::result::Result<
     }
     let mut urls = vec![network.rpc_url().to_string()];
     urls.extend(crate::config::fallback_rpc_urls(network));
-    let logs_order = (urls.len() > 1).then(|| {
-        let last = urls.len() - 1;
-        let mut order = vec![last];
-        order.extend(0..last);
-        order
-    });
+    let logs_order = fallback_logs_order(urls.len());
     Ok(RpcSetup {
         urls,
         logs_order,
         chain_id: None,
+    })
+}
+
+/// The order of log queries over `len` RPCs (a network's own RPC and then
+/// its fallbacks), as indexes: the last fallback first, then the network's
+/// own RPC and the remaining fallbacks in their listed order; `None` when
+/// there is no fallback.
+fn fallback_logs_order(len: usize) -> Option<Vec<usize>> {
+    (len > 1).then(|| {
+        let last = len - 1;
+        let mut order = vec![last];
+        order.extend(0..last);
+        order
     })
 }
 
@@ -7368,6 +7379,20 @@ mod tests {
         assert_eq!(rpc.order(Kind::Chain), vec![0, 1, 2]);
         // Log queries: Robinhood's RPC, PublicNode, ordofi last.
         assert_eq!(rpc.order(Kind::Logs), vec![2, 0, 1]);
+    }
+
+    #[test]
+    fn log_queries_go_to_the_last_fallback_first_then_the_rest_in_listed_order() {
+        // No fallback: the same order as everything else.
+        assert_eq!(fallback_logs_order(0), None);
+        assert_eq!(fallback_logs_order(1), None);
+        // One fallback: it comes first.
+        assert_eq!(fallback_logs_order(2), Some(vec![1, 0]));
+        // Two (the bundled network): the first fallback comes last.
+        assert_eq!(fallback_logs_order(3), Some(vec![2, 0, 1]));
+        // Three: the last fallback first, then the network's own RPC and
+        // the first two fallbacks in their listed order.
+        assert_eq!(fallback_logs_order(4), Some(vec![3, 0, 1, 2]));
     }
 
     #[test]
