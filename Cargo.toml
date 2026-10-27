@@ -32,4 +32,4 @@ ant-protocol = { path = "vendor/ant-protocol" }
 # types, without it. The lock lists saorsa-transport -> webrtc because it is
 # resolved with every feature, `devnet` included. A project that enables
 # ant-core's `devnet` repeats this entry too (README, "Rust Library API").
-webrtc = { git = "https://github.com/Project-DSpace/darwin-node.git", rev = "ef5c5d0ac8463dc3bcfe4de00dbf06d7c6c854b3" }
+webrtc = { git = "https://github.com/Project-DSpace/darwin-node.git", rev = "1315dccffef2ee924325712d59f831a761ed4b70" }

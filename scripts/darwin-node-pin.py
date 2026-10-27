@@ -21,9 +21,7 @@ from darwin-node's would never show in a build.
 With --release, which release.yml runs before a client is published, it also
 checks that the revision is on darwin-node's main (a released node, never an
 unmerged branch commit) and has NODE_RELEASE_1A, node release 1a's commit on
-that main, as an ancestor or is that commit. While NODE_RELEASE_1A is unset
-no revision passes: every revision on darwin-node's main is from before node
-release 1a.
+that main, as an ancestor or is that commit.
 
     darwin-node-pin.py             check that the pins agree
     darwin-node-pin.py --vendored  and that vendor/ant-protocol is darwin-node's
@@ -50,10 +48,9 @@ VENDORED = "vendor/ant-protocol"
 # browser session while busy, which node release 1a brings: it has to have
 # run against those nodes before it is released. Every revision on main
 # before that commit fails, whichever it is, not only main's head of today.
-# Node release 1a has no commit on darwin-node's main yet, so this is None
-# and --release passes no revision. Set it, in the commit that moves the pin
-# to that release, to its 40-character commit.
-NODE_RELEASE_1A = None
+# It is set: node release 1a landed on darwin-node's main as this commit,
+# released as v0.23.0+ds.16.
+NODE_RELEASE_1A = "1315dccffef2ee924325712d59f831a761ed4b70"
 
 
 class Mismatch(Exception):
