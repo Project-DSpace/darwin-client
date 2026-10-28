@@ -145,6 +145,27 @@ const PRICE_BASELINE = 3_906_250_000_000_000n;
 const PRICE_MULTIPLIER = 32n;
 assert.equal(BigInt(test_storage_price(0)), PRICE_MULTIPLIER * PRICE_BASELINE);
 
+// Settlement version 2 pays each record by its size class, as the vendored
+// pricing::record_weight and weighted_amount have it: 3 × the median price ×
+// (1/4 + 3/4 × the class top / 4 MiB), rounded up, the class top being 16 KiB
+// at most, then the next power of two, then 4 MiB. Written out here, so a
+// change to the classes fails on purpose.
+const FULL_RECORD_BYTES = 4n * 1024n * 1024n;
+const SMALLEST_CLASS_BYTES = 16n * 1024n;
+const classTop = length => {
+  const len = BigInt(length);
+  if (len <= SMALLEST_CLASS_BYTES) return SMALLEST_CLASS_BYTES;
+  if (len >= FULL_RECORD_BYTES) return FULL_RECORD_BYTES;
+  let top = SMALLEST_CLASS_BYTES;
+  while (top < len) top *= 2n;
+  return top;
+};
+const weightedAmount = (fullAmount, length) => {
+  const numerator = FULL_RECORD_BYTES + 3n * classTop(length);
+  const denominator = 4n * FULL_RECORD_BYTES;
+  return (fullAmount * numerator + denominator - 1n) / denominator;
+};
+
 const priceCases = [
   { name: "expensive closest peer", nodes: Array.from({ length: 7 }, () => ({})), closestCount: 1_000_000, expectedCount: 0 },
   { name: "cheap closest peer", nodes: Array.from({ length: 7 }, () => ({ keyCount: 6000 })), closestCount: 0, expectedCount: 6000 },
@@ -193,12 +214,20 @@ for (const scenario of priceCases) {
         // Fixed native price curve, scaled by the vendored multiplier,
         // independent of the implementation's selected amount and reported total.
         const count = BigInt(scenario.expectedCount);
-        const expectedAmount = 3n * (PRICE_BASELINE * PRICE_MULTIPLIER
+        const fullAmount = 3n * (PRICE_BASELINE * PRICE_MULTIPLIER
           + count * count * 35_156_250_000_000_000n * PRICE_MULTIPLIER / 36_000_000n);
-        assert.equal(result.storageCostAtto, (expectedAmount * BigInt(result.records)).toString());
+        const recordLength = new Map(encrypted.records.map(record => [record.address.toLowerCase(), record.content.length]));
+        const amountFor = address => weightedAmount(fullAmount, recordLength.get(address.toLowerCase()));
+        assert.equal(
+          result.storageCostAtto,
+          quotes.reduce((total, paid) => total + amountFor(paid.quote.content), 0n).toString(),
+        );
         for (const paid of quotes) {
           assert.equal(paid.quote.committed_key_count, scenario.expectedCount);
-          assert.equal(paid.amount, expectedAmount.toString());
+          // These records are under 16 KiB: a quarter of a full chunk's
+          // amount and a little more, never the full amount.
+          assert.ok(amountFor(paid.quote.content) < fullAmount);
+          assert.equal(paid.amount, amountFor(paid.quote.content).toString());
           if (scenario.tied) {
             assert.equal(paid.quote.peer_id, peerIds[closestFirst(paid.quote.content).filter(peer => !options[peer.index].invalidQuote)[2].index]);
           }
