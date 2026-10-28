@@ -56,8 +56,8 @@ pins the node: darwin-node's repository, then the revision. It is the revision
 native suites run the same nodes (the native suite's nodes dial in upstream's order;
 the workspace `Cargo.toml` says why, beside its `webrtc` patch);
 `scripts/darwin-node-pin.py`, which CI runs, checks that the pins agree. It is
-currently `a80b4ff`: darwin-node's branch `node-root`, the root release for
-nodes, which prices records by size as node release 2 does and accepts root
+currently `62b7a0d`: darwin-node's branch `node-ds20`, the root release for
+nodes (0.23.0+ds.20) on its main, which prices records by size and accepts root
 payment proofs (tag `0x03`) beside single-node ones, quoting a client that asks
 settlement version 3 only where it knows a root vault (`CURRENT_SETTLEMENT_VERSION`
 is 3 in its vendored ant-protocol, which this repository's copy matches).
