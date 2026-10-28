@@ -18,7 +18,7 @@ opt-level = 2
 
 
 [patch.crates-io]
-# Autonomi's protocol crate with our price multiplier; see vendor/ant-protocol/VENDORED.md.
+# Autonomi's protocol crate with our price curve; see vendor/ant-protocol/VENDORED.md.
 # A project that takes ant-core by git repeats this entry, from the same tag
 # (README, "Rust Library API"): a [patch] applies only in the top-level workspace.
 ant-protocol = { path = "vendor/ant-protocol" }

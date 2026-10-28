@@ -68,7 +68,7 @@ tower-http = { version = "0.6.8", features = ["cors"], optional = true }
 # those three deps — do not add direct evmlib/saorsa-core/saorsa-pqc
 # deps here or the version can skew between ant-client and ant-node.
 # Exactly 5.0.0: the version of vendor/ant-protocol, the copy with this
-# network's price multiplier, which `[patch.crates-io]` puts in place of the
+# network's price curve, which `[patch.crates-io]` puts in place of the
 # crates.io release. A patch applies only to a requirement it can meet before
 # a newer release, so "5.0.0" would let a fresh resolve take crates.io's 5.0.1
 # instead. A project that takes ant-core by git repeats the patch (README,

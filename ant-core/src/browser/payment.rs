@@ -289,6 +289,11 @@ mod tests {
     use ant_protocol::pqc::api::ml_dsa_65;
 
     fn baseline_quote() -> (BrowserQuoteArtifact, String, String) {
+        baseline_quote_at(calculate_price_wei(0))
+    }
+
+    /// A signed quote with no commitment, priced at `price_wei`.
+    fn baseline_quote_at(price_wei: u128) -> (BrowserQuoteArtifact, String, String) {
         let content = [0x31; 32];
         let rewards = [0x44; 20];
         let timestamp = 1_775_000_000;
@@ -299,7 +304,7 @@ mod tests {
             peer_id: peer_id.clone(),
             content: hex::encode(content),
             timestamp_secs: timestamp,
-            price: calculate_price_wei(0).to_string(),
+            price: price_wei.to_string(),
             rewards_address: hex::encode(rewards),
             public_key: hex::encode(&public_key),
             signature: String::new(),
@@ -309,8 +314,7 @@ mod tests {
             commitment: None,
         };
         let payload =
-            canonical_quote_bytes(&quote, calculate_price_wei(0), &hex::encode(rewards), None)
-                .expect("payload");
+            canonical_quote_bytes(&quote, price_wei, &hex::encode(rewards), None).expect("payload");
         let signature = ml_dsa_65()
             .sign(&secret_key, &payload)
             .expect("signature")
@@ -441,6 +445,21 @@ mod tests {
         let mut tampered = quote;
         tampered.price = (calculate_price_wei(0) + 1).to_string();
         assert!(verify_storage_quote(tampered, &content, &peer_id, RecordWeight::FULL).is_err());
+    }
+
+    /// Dan, 2026-10-28 decision: 100 DARWIN per GB, divisor 2,000. A quote on
+    /// the legacy curve, as ds.19 nodes and ds.20 nodes before their switch
+    /// price, verifies in the browser too; one on neither curve doesn't.
+    #[test]
+    fn browser_verifies_a_legacy_curve_quote_and_refuses_one_on_neither() {
+        let legacy = ant_protocol::payment::calculate_price_legacy(0).to::<u128>();
+        let (quote, content, peer_id) = baseline_quote_at(legacy);
+        let verified = verify_storage_quote(quote, &content, &peer_id, RecordWeight::FULL)
+            .expect("a legacy-curve quote verifies");
+        assert_eq!(verified.amount, (legacy * 3).to_string());
+
+        let (quote, content, peer_id) = baseline_quote_at(130_000_000_000_000_000);
+        assert!(verify_storage_quote(quote, &content, &peer_id, RecordWeight::FULL).is_err());
     }
 
     #[test]

@@ -43,7 +43,7 @@ fn the_lock_keeps_saorsa_transport_with_its_reader_task_fix() {
     );
 }
 
-/// One ant-protocol, the vendored copy with this network's price multiplier:
+/// One ant-protocol, the vendored copy with this network's price curve:
 /// `[patch.crates-io]` puts vendor/ant-protocol in place of crates.io's, so the
 /// lock holds it as a path package, without a `source`. ant-core requires
 /// exactly that copy's version, so a fresh resolve, here or in a project that

@@ -108,8 +108,8 @@ fn quote_binding_is_valid(peer_id: &PeerId, quote: &PaymentQuote) -> bool {
 ///    commitment could never legitimately attest is rejected before pricing.
 /// 3. **Price band.** `calculate_price(floor(w_min × committed_key_count)) <=
 ///    price <= calculate_price(committed_key_count)`, `w_min` being the
-///    smallest record weight: two forward computations with the shared
-///    `calculate_price`, never inverted.
+///    smallest record weight, or the same band on `calculate_price_legacy`:
+///    forward computations with the shared curves, never inverted.
 /// 4. **Resolution (bound quotes).** The shipped commitment must: parse as a
 ///    `StorageCommitment`, be bound to the quoting peer
 ///    (`BLAKE3(sender_public_key) == sender_peer_id`), have a valid ML-DSA-65
@@ -2759,6 +2759,27 @@ mod tests {
         // Priced for a count inside the band, it passes the band check and
         // fails later, at resolution of the unparseable commitment.
         let q = quote_with_binding(500, Some([9u8; 32]), calculate_price(126));
+        let error =
+            quote_commitment_binding_is_valid(&any_peer(), &q, &Some(vec![1u8; 16])).unwrap_err();
+        assert!(!error.contains("outside the band"), "{error}");
+    }
+
+    /// Dan, 2026-10-28 decision: 100 DARWIN per GB, divisor 2,000. A quote
+    /// priced on the legacy curve, as ds.19 nodes and ds.20 nodes before their
+    /// switch price, passes the band check like one on the current curve.
+    #[test]
+    fn binding_accepts_a_legacy_curve_quote() {
+        use ant_protocol::payment::calculate_price_legacy;
+        let q = quote_with_binding(0, None, calculate_price_legacy(0));
+        assert!(quote_commitment_binding_is_valid(&any_peer(), &q, &None).is_ok());
+
+        let q = quote_with_binding(0, None, calculate_price_legacy(0) + Amount::from(1u64));
+        let error = quote_commitment_binding_is_valid(&any_peer(), &q, &None).unwrap_err();
+        assert!(error.contains("outside the band"), "{error}");
+
+        // Priced for a count inside the legacy band, it passes the band check
+        // and fails later, at resolution of the unparseable commitment.
+        let q = quote_with_binding(500, Some([9u8; 32]), calculate_price_legacy(126));
         let error =
             quote_commitment_binding_is_valid(&any_peer(), &q, &Some(vec![1u8; 16])).unwrap_err();
         assert!(!error.contains("outside the band"), "{error}");

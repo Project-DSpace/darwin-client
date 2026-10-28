@@ -9,15 +9,20 @@ pub(crate) const ML_DSA_PUB_KEY_LEN: usize =
     ant_protocol::pqc::api::MlDsaVariant::MlDsa65.public_key_size();
 
 pub(crate) trait QuotePrice: Copy + Ord + Display {
+    /// The current curve's price for `count` records, `calculate_price`.
     fn for_key_count(count: u32) -> Self;
+    /// The legacy curve's price for `count` records,
+    /// `calculate_price_legacy`, still accepted.
+    fn legacy_for_key_count(count: u32) -> Self;
 }
 
 /// The lowest count of a node's price band: `floor(w_min × count)`, where
 /// `w_min` is the smallest record weight, a node of `count` records all in the
 /// smallest size class. A node prices at its weight total, which lies between
 /// this and `count` and isn't proven, so a quote's price is checked against
-/// the band from `calculate_price` of this count to `calculate_price(count)`.
-/// Both ends are computed forward; the price is never inverted.
+/// the band from `calculate_price` of this count to `calculate_price(count)`,
+/// or the same band on `calculate_price_legacy`. Both ends are computed
+/// forward; the price is never inverted.
 pub(crate) fn band_floor_count(count: u32) -> u32 {
     use ant_protocol::payment::pricing::{record_weight, WEIGHT_DENOMINATOR};
     let smallest = record_weight(ant_protocol::DATA_TYPE_CHUNK, 0).numerator();
@@ -26,23 +31,40 @@ pub(crate) fn band_floor_count(count: u32) -> u32 {
 }
 
 /// Whether `price` is in the band a node with `count` committed keys may
-/// quote ([`band_floor_count`]), or why not.
+/// quote ([`band_floor_count`]) on either curve, or why not.
+///
+/// The current curve (`calculate_price`) and the legacy curve
+/// (`calculate_price_legacy`) are both accepted, each band checked whole with
+/// the same rules: nodes switch from the legacy curve to the current one at a
+/// fixed time, and older nodes keep quoting the legacy curve (Dan, 2026-10-28
+/// decision: 100 DARWIN per GB, divisor 2,000).
 pub(crate) fn check_price_band<P: QuotePrice>(price: P, count: u32) -> Result<(), String> {
     let lowest = band_floor_count(count);
     let bottom = P::for_key_count(lowest);
     let top = P::for_key_count(count);
-    if price < bottom || price > top {
-        return Err(format!(
-            "price {price} is outside the band from calculate_price({lowest}) = {bottom} to \
-             calculate_price(committed_key_count={count}) = {top}"
-        ));
+    if bottom <= price && price <= top {
+        return Ok(());
     }
-    Ok(())
+    let legacy_bottom = P::legacy_for_key_count(lowest);
+    let legacy_top = P::legacy_for_key_count(count);
+    if legacy_bottom <= price && price <= legacy_top {
+        return Ok(());
+    }
+    Err(format!(
+        "price {price} is outside the band from calculate_price({lowest}) = {bottom} to \
+         calculate_price(committed_key_count={count}) = {top}, and the legacy band from \
+         calculate_price_legacy({lowest}) = {legacy_bottom} to \
+         calculate_price_legacy({count}) = {legacy_top}"
+    ))
 }
 
 impl QuotePrice for ant_protocol::evm::Amount {
     fn for_key_count(count: u32) -> Self {
         ant_protocol::payment::calculate_price(count as usize)
+    }
+
+    fn legacy_for_key_count(count: u32) -> Self {
+        ant_protocol::payment::calculate_price_legacy(count as usize)
     }
 }
 
@@ -234,16 +256,24 @@ mod tests {
     /// price adds to the baseline at the curve's divisor of 6,000 records.
     const UPSTREAM_COEFFICIENT_WEI: u128 = 35_156_250_000_000_000;
 
-    /// This network's multiplier over upstream's prices, set in
+    /// The legacy curve's multiplier over upstream's prices, set in
     /// `vendor/ant-protocol/src/payment/pricing.rs`, which `[patch.crates-io]`
-    /// puts in place of the crates.io release. Clients and nodes must carry
-    /// the same multiplier, or the forced-price check drops the nodes' quotes.
-    const PRICE_MULTIPLIER: u128 = 32;
+    /// puts in place of the crates.io release. The legacy curve, the curve to
+    /// ds.19, stays accepted beside the current curve of 100 DARWIN per GB
+    /// (Dan, 2026-10-28 decision: 100 DARWIN per GB, divisor 2,000). Clients
+    /// and nodes must carry the same curves, or the forced-price check drops
+    /// the nodes' quotes.
+    const LEGACY_PRICE_MULTIPLIER: u128 = 32;
 
-    /// A quote priced as Autonomi's nodes price it, without this network's
-    /// multiplier, fails the forced-price check, so nothing is paid to a node
-    /// of Autonomi's network a client reaches. The same quote at 32 times the
-    /// price passes.
+    /// The current curve's price for a node storing nothing, in wei
+    /// (0.1396736 DARWIN; Dan, 2026-10-28 decision: 100 DARWIN per GB,
+    /// divisor 2,000).
+    const BASELINE_WEI: u128 = 139_673_600_000_000_000;
+
+    /// A quote priced as Autonomi's nodes price it fails the forced-price
+    /// check, so nothing is paid to a node of Autonomi's network a client
+    /// reaches. The same quote on the legacy curve (32 times upstream's price)
+    /// or on the current curve passes, and one on neither curve fails.
     #[test]
     fn quotes_priced_at_upstreams_rate_are_rejected() {
         let public_key = vec![7u8; ML_DSA_PUB_KEY_LEN];
@@ -270,19 +300,64 @@ mod tests {
             error.contains("is outside the band from calculate_price(0)"),
             "{error}"
         );
-        assert!(quote_at(UPSTREAM_BASELINE_WEI * PRICE_MULTIPLIER).is_ok());
+        assert!(quote_at(UPSTREAM_BASELINE_WEI * LEGACY_PRICE_MULTIPLIER).is_ok());
+        assert!(quote_at(BASELINE_WEI).is_ok());
+        assert!(quote_at(130_000_000_000_000_000).is_err());
     }
 
+    /// Dan, 2026-10-28 decision: 100 DARWIN per GB, divisor 2,000. A full
+    /// chunk pays 3 × the median quote, so on empty nodes 10^9 bytes of full
+    /// chunks cost exactly 100 DARWIN, and the price is 10 times that at
+    /// 2,000 records. The legacy curve, upstream's × 32, stays accepted.
     #[test]
-    fn forced_prices_carry_the_networks_multiplier() {
-        let baseline = Amount::from(UPSTREAM_BASELINE_WEI * PRICE_MULTIPLIER);
+    fn forced_prices_are_100_darwin_per_gb_with_the_legacy_curve_accepted() {
+        let baseline = Amount::from(BASELINE_WEI);
         assert_eq!(ant_protocol::payment::calculate_price(0), baseline);
         // The price `validate_commitment_binding` holds a quote to.
         assert_eq!(Amount::for_key_count(0), baseline);
         assert_eq!(
-            Amount::for_key_count(6_000),
-            Amount::from((UPSTREAM_BASELINE_WEI + UPSTREAM_COEFFICIENT_WEI) * PRICE_MULTIPLIER)
+            Amount::for_key_count(2_000),
+            Amount::from(1_396_736_000_000_000_000u128)
         );
+        assert_eq!(self_encryption::MAX_CHUNK_SIZE, 4_190_208);
+        assert_eq!(
+            Amount::from(3u64) * Amount::for_key_count(0) * Amount::from(1_000_000_000u64),
+            Amount::from(100_000_000_000_000_000_000u128)
+                * Amount::from(self_encryption::MAX_CHUNK_SIZE as u64)
+        );
+        assert_eq!(
+            Amount::legacy_for_key_count(0),
+            Amount::from(UPSTREAM_BASELINE_WEI * LEGACY_PRICE_MULTIPLIER)
+        );
+        assert_eq!(
+            Amount::legacy_for_key_count(6_000),
+            Amount::from(
+                (UPSTREAM_BASELINE_WEI + UPSTREAM_COEFFICIENT_WEI) * LEGACY_PRICE_MULTIPLIER
+            )
+        );
+    }
+
+    /// Dan, 2026-10-28 decision: 100 DARWIN per GB, divisor 2,000. A price in
+    /// either curve's band passes; one between the bands, or past both, fails.
+    #[test]
+    fn a_price_on_either_curve_passes_and_one_on_neither_is_refused() {
+        let current = |count: u32| Amount::for_key_count(count);
+        let legacy = |count: u32| Amount::legacy_for_key_count(count);
+        for price in [current(1_024), current(259), legacy(1_024), legacy(259)] {
+            assert!(check_price_band(price, 1_024).is_ok(), "{price}");
+        }
+        // Above the legacy band's top, below the current band's bottom.
+        let error = check_price_band(Amount::from(159_000_000_000_000_000u128), 1_024).unwrap_err();
+        assert!(
+            error.contains("and the legacy band from calculate_price_legacy(259)"),
+            "{error}"
+        );
+        assert!(check_price_band(legacy(259) - Amount::from(1u64), 1_024).is_err());
+        assert!(check_price_band(current(1_024) + Amount::from(1u64), 1_024).is_err());
+        // K = 0: each curve's baseline alone.
+        assert!(check_price_band(current(0), 0).is_ok());
+        assert!(check_price_band(legacy(0), 0).is_ok());
+        assert!(check_price_band(Amount::from(130_000_000_000_000_000u128), 0).is_err());
     }
 
     /// The band's ends at φ = 1/4: the smallest weight is 259/1,024 of a full
@@ -312,9 +387,10 @@ mod tests {
         assert!(check_price_band(price(1_025), 1_024).is_err());
     }
 
-    /// The band never reaches down to upstream's price: at every count, the
-    /// price of the band's lowest count is above a thirty-second of the top,
-    /// so a quote at upstream's rate is still dropped.
+    /// Neither band reaches down to upstream's price: at every count, the
+    /// price of the legacy band's lowest count is above a thirty-second of its
+    /// top, and the current curve is above the legacy curve, so a quote at
+    /// upstream's rate is still dropped.
     #[test]
     fn upstreams_rate_stays_below_the_band() {
         for count in [
@@ -328,8 +404,8 @@ mod tests {
             1_000_000,
             ant_protocol::payment::commitment::MAX_COMMITMENT_KEY_COUNT,
         ] {
-            let top = Amount::for_key_count(count);
-            let upstream = top / Amount::from(PRICE_MULTIPLIER);
+            let upstream =
+                Amount::legacy_for_key_count(count) / Amount::from(LEGACY_PRICE_MULTIPLIER);
             assert!(
                 check_price_band(upstream, count).is_err(),
                 "upstream's rate passed the band at count {count}"

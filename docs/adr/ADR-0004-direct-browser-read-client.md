@@ -86,7 +86,9 @@ The Rust/WASM implementation owns:
 Native client behavior is the reference for shared client policy:
 
 - `quote_validation.rs` owns the resolve-before-pay checks for peer binding,
-  signatures, commitment shape, forced pricing, sidecar limits, and commitment
+  signatures, commitment shape, forced pricing (a price in the band of the
+  current curve or of the legacy curve, the same check for both), sidecar
+  limits, and commitment
   resolution. Both targets use ant-protocol verifiers, commitments, and U256
   amounts; browser adapters decode their JSON envelope into these same types. Baseline quotes have no pin to
   resolve, so an unsolicited sidecar does not affect their admission.

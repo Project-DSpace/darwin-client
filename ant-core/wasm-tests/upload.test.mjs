@@ -138,12 +138,14 @@ test("an unsupported peer is excluded when enough witness PUT targets remain", a
   } finally { client.close(); }
 });
 
-// Our vendored ant-protocol scales Autonomi's price curve by the production
-// multiplier, 32. It is pinned here, so a pricing change fails on purpose:
-// the baseline price (zero records) this build carries must match it.
-const PRICE_BASELINE = 3_906_250_000_000_000n;
-const PRICE_MULTIPLIER = 32n;
-assert.equal(BigInt(test_storage_price(0)), PRICE_MULTIPLIER * PRICE_BASELINE);
+// Our vendored ant-protocol prices on the curve of 100 DARWIN per GB of full
+// chunks on empty nodes, with divisor 2,000 (Dan, 2026-10-28 decision: 100
+// DARWIN per GB, divisor 2,000). It is pinned here, so a pricing change fails
+// on purpose: the baseline price (zero records) this build carries must match.
+const PRICE_BASELINE = 139_673_600_000_000_000n;
+const PRICE_COEFFICIENT = 9n * PRICE_BASELINE;
+const PRICE_DIVISOR_SQUARED = 4_000_000n;
+assert.equal(BigInt(test_storage_price(0)), PRICE_BASELINE);
 
 // Settlement version 2 pays each record by its size class, as the vendored
 // pricing::record_weight and weighted_amount have it: 3 × the median price ×
@@ -211,11 +213,11 @@ for (const scenario of priceCases) {
         assert.equal(result.file.replicas, 4);
         const quotes = signer.calls[0].quotes;
         assert.equal(quotes.length, result.records);
-        // Fixed native price curve, scaled by the vendored multiplier,
+        // Fixed native price curve, the vendored one,
         // independent of the implementation's selected amount and reported total.
         const count = BigInt(scenario.expectedCount);
-        const fullAmount = 3n * (PRICE_BASELINE * PRICE_MULTIPLIER
-          + count * count * 35_156_250_000_000_000n * PRICE_MULTIPLIER / 36_000_000n);
+        const fullAmount = 3n * (PRICE_BASELINE
+          + count * count * PRICE_COEFFICIENT / PRICE_DIVISOR_SQUARED);
         const recordLength = new Map(encrypted.records.map(record => [record.address.toLowerCase(), record.content.length]));
         const amountFor = address => weightedAmount(fullAmount, recordLength.get(address.toLowerCase()));
         assert.equal(
