@@ -110,11 +110,11 @@ note = "its THIRD_PARTY file covers documentation adapted from Apple's Security 
 
 [remark.ant-protocol]
 version = "5.0.0"
-note = "a modified copy of the crates.io release, kept in vendor/ant-protocol of the repository this build is made from; its Source above is that copy. The changes are the price curve in src/payment/pricing.rs (100 DARWIN per GB at divisor 2,000, with the earlier ×32 curve still accepted) and payment by record size (see vendor/ant-protocol/VENDORED.md)."
+note = "a modified copy of the crates.io release, kept in vendor/ant-protocol of the repository this build is made from; its Source above is that copy. The changes are the price curve in src/payment/pricing.rs (100 DARWIN per GB at divisor 2,000, with the earlier ×32 curve still accepted), payment by record size, root payment proofs (proof tag 0x03) and settlement version 3, under which they are accepted (see vendor/ant-protocol/VENDORED.md)."
 
 [remark.ant-listings]
-version = "0.3.1"
-note = "a copy of Project-DSpace/darwin-listings v0.3.1 (commit 84787fea433c43d20786c912ca5ab2e0010ff345), which is not published on crates.io, kept in vendor/ant-listings of the repository this build is made from; its Source above is that copy. Its files are those of that commit, without the .github folder, plus a VENDORED.md saying where they come from."
+version = "0.4.0"
+note = "a copy of Project-DSpace/darwin-listings v0.4.0 (commit a58de649e66584c0ed7d6e3868d79f37f3aeac40), which is not published on crates.io, kept in vendor/ant-listings of the repository this build is made from; its Source above is that copy. Its files are those of that commit, without the .github folder, plus a VENDORED.md saying where they come from."
 
 # Crates whose published files and repository contain no text of any licence
 # they are offered under. Each entry is for one reviewed version; it supplies
