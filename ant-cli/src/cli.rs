@@ -104,6 +104,15 @@ pub struct Cli {
     #[arg(long, value_name = "BASE_UNITS", value_parser = parse_base_units)]
     pub max_chunk_price: Option<U256>,
 
+    /// Pay through the root vault: each payment's records as one wave, with
+    /// one record kept by the vault for the whole wave, and each record's
+    /// proof showing its place in the wave (proof tag 0x03). A record whose
+    /// close group holds a node that can't check a root proof is paid
+    /// through the payment vault instead. Needs the bundled network, whose
+    /// root vault this build names.
+    #[arg(long)]
+    pub root_payments: bool,
+
     #[command(subcommand)]
     pub command: Commands,
 }
@@ -414,6 +423,15 @@ mod bootstrap_tests {
             "address"
         ])
         .is_err());
+    }
+
+    #[test]
+    fn root_payments_are_asked_for() {
+        let cli = Cli::try_parse_from(["darwin", "wallet", "address"]).unwrap();
+        assert!(!cli.root_payments, "the payment vault unless asked");
+        let cli =
+            Cli::try_parse_from(["darwin", "--root-payments", "file", "upload", "a"]).unwrap();
+        assert!(cli.root_payments);
     }
 
     #[test]

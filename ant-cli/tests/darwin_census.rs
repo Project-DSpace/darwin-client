@@ -1201,6 +1201,13 @@ const VAULT_READ_SITES: &[Site] = &[
     ),
     (
         "ant-cli/src/main.rs",
+        "create_root_wallet",
+        "root_vault_address",
+        1,
+        ROOT_PAYER,
+    ),
+    (
+        "ant-cli/src/main.rs",
         "run",
         "ListingChain::new",
         2,
