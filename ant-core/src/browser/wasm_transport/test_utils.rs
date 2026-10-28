@@ -1395,6 +1395,26 @@ pub async fn test_redial_after_local_close(endpoint: &str) {
     client.close();
 }
 
+/// The error a `quote_chunk` at the next browser protocol version ends in when
+/// the node closes the channel on it, as darwin-node 0.23.0+ds.17 and older
+/// do: read as a node that predates size pricing, with no quote.
+#[wasm_bindgen]
+pub async fn test_size_priced_quote_closed(endpoint: &str) -> String {
+    let client = BrowserNodeClientCore::new(parse_webrtc_direct_multiaddr(endpoint).unwrap());
+    client.hello().await.unwrap();
+    let content = b"size-priced quote to a node that predates size pricing";
+    let address = super::super::content_address(content);
+    let error = client
+        .authenticated()
+        .await
+        .unwrap()
+        .quote_chunk(&address, content.len())
+        .await
+        .unwrap_err();
+    client.close();
+    error
+}
+
 /// Report the error a pooled RPC sees when its session closes after admission.
 #[wasm_bindgen]
 pub async fn test_closed_session_error(endpoint: &str) -> String {

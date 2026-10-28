@@ -710,8 +710,10 @@ mod wasm {
     /// quote obtained by a `quote_chunk` at the next browser protocol version
     /// (`BROWSER_QUOTE_PROTOCOL_VERSION`), sent only to a node that advertises
     /// `size_priced_quote` in hello: a node that doesn't closes the channel on
-    /// such a frame, and a node quoting a `quote_chunk` at the current version
-    /// expects the full amount, which every node accepts. (This core's own
+    /// such a frame (the core reports that as `unsupported_version`, with no
+    /// quote, and the node is skipped), and a node quoting a `quote_chunk` at
+    /// the current version expects the full amount, which every node accepts.
+    /// (This core's own
     /// quotes are `chunk_protocol` requests declaring settlement version 2,
     /// which every node parses at the current version.)
     #[wasm_bindgen(js_name = verifyStorageQuote)]

@@ -26,7 +26,9 @@ pub use saorsa_transport::webrtc::{
 /// for `quote_chunk` alone, with no content after the header, and advertises
 /// it in hello ([`SIZE_PRICED_QUOTE_CAPABILITY`]). A storer that predates
 /// size pricing can't parse a frame at this version and closes the channel,
-/// so a frame at this version goes only to a storer that advertises it.
+/// so a frame at this version goes only to a storer that advertises it, and
+/// a closed channel after one reads as that storer refusing it
+/// ([`read_quote_failure`]).
 ///
 /// Every other request stays at [`BROWSER_PROTOCOL_VERSION`], `chunk_protocol`
 /// quote requests included: their `QuoteRequestV2` carries the settlement
@@ -58,6 +60,51 @@ pub fn request_version(body: &BrowserRequestBody, size_priced: bool) -> u16 {
         BROWSER_QUOTE_PROTOCOL_VERSION
     } else {
         BROWSER_PROTOCOL_VERSION
+    }
+}
+
+/// The error code a storer that predates size pricing is read as giving
+/// when it refuses a `quote_chunk` at [`BROWSER_QUOTE_PROTOCOL_VERSION`]. The
+/// browser skips that storer for the record, as the native client skips one
+/// that answers `StorerUpdateRequired`, so it never pays on a quote that
+/// storer didn't give at the next version.
+pub const UNSUPPORTED_VERSION: &str = "unsupported_version";
+
+/// How a request that failed at `version` reads. At
+/// [`BROWSER_QUOTE_PROTOCOL_VERSION`], which only a `quote_chunk` is sent at,
+/// a closed channel or an `invalid_request` answer is read as a storer that
+/// predates size pricing: [`UNSUPPORTED_VERSION`], with no quote. Such a
+/// storer (darwin-node 0.23.0+ds.17 and older) can't parse a frame at that
+/// version, answers `invalid_request` on request 0 and closes the channel,
+/// before it would look at the version. It is sent one only when its hello
+/// advertises [`SIZE_PRICED_QUOTE_CAPABILITY`], so this reading covers a
+/// storer whose hello says otherwise. A timeout stays a timeout, and every
+/// failure at [`BROWSER_PROTOCOL_VERSION`] is unchanged.
+#[cfg(any(target_arch = "wasm32", test))]
+pub(crate) fn read_quote_failure(
+    version: u16,
+    error: crate::transfer_policy::RpcError,
+) -> crate::transfer_policy::RpcError {
+    use crate::transfer_policy::RpcError;
+    if version != BROWSER_QUOTE_PROTOCOL_VERSION {
+        return error;
+    }
+    match error {
+        RpcError::Transport(reason) => RpcError::Remote {
+            code: UNSUPPORTED_VERSION.into(),
+            message: format!(
+                "the node closed the channel on a size-priced quote request ({reason}); \
+                 read as a node that predates size pricing, which gave no quote"
+            ),
+        },
+        RpcError::Remote { code, message } if code == "invalid_request" => RpcError::Remote {
+            code: UNSUPPORTED_VERSION.into(),
+            message: format!(
+                "the node refused a size-priced quote request as invalid ({message}); \
+                 read as a node that predates size pricing, which gave no quote"
+            ),
+        },
+        other => other,
     }
 }
 
@@ -213,6 +260,53 @@ mod tests {
         assert!(
             encode_request_frame_at(&quote, &quote_content, BROWSER_PROTOCOL_VERSION + 2).is_err()
         );
+    }
+
+    /// A closed channel or an `invalid_request` answer after a `quote_chunk`
+    /// at the next version reads as a storer that predates size pricing,
+    /// as darwin-node 0.23.0+ds.17 refuses one, so the browser skips that
+    /// storer. A timeout, any other answer, and every failure at the current
+    /// version are unchanged.
+    #[test]
+    fn a_closed_channel_after_a_size_priced_quote_reads_as_an_older_storer() {
+        use crate::transfer_policy::RpcError;
+        let closed = || RpcError::Transport("WebRTC session closed".into());
+        let invalid = || RpcError::Remote {
+            code: "invalid_request".into(),
+            message: "unsupported browser protocol version 6".into(),
+        };
+        for error in [closed(), invalid()] {
+            match read_quote_failure(BROWSER_QUOTE_PROTOCOL_VERSION, error) {
+                RpcError::Remote { code, message } => {
+                    assert_eq!(code, UNSUPPORTED_VERSION);
+                    assert!(message.contains("predates size pricing"), "{message}");
+                }
+                other => panic!("expected {UNSUPPORTED_VERSION}, got {other:?}"),
+            }
+        }
+
+        let timeout = read_quote_failure(
+            BROWSER_QUOTE_PROTOCOL_VERSION,
+            RpcError::Timeout("no answer".into()),
+        );
+        assert!(matches!(timeout, RpcError::Timeout(_)));
+        let refused = read_quote_failure(
+            BROWSER_QUOTE_PROTOCOL_VERSION,
+            RpcError::Remote {
+                code: "quote_failed".into(),
+                message: "storage full".into(),
+            },
+        );
+        assert!(matches!(refused, RpcError::Remote { ref code, .. } if code == "quote_failed"));
+
+        assert!(matches!(
+            read_quote_failure(BROWSER_PROTOCOL_VERSION, closed()),
+            RpcError::Transport(_)
+        ));
+        assert!(matches!(
+            read_quote_failure(BROWSER_PROTOCOL_VERSION, invalid()),
+            RpcError::Remote { ref code, .. } if code == "invalid_request"
+        ));
     }
 
     /// A storer that prices by size takes the next version for a

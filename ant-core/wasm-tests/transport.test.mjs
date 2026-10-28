@@ -176,3 +176,24 @@ test("legacy browser lookup still accepts unsigned discovery hints", async () =>
     assert.equal(nodes[0].address_record, undefined);
   } finally { client.close(); }
 });
+
+// darwin-node 0.23.0+ds.17 and older can't parse a frame at the next browser
+// protocol version: they answer invalid_request on request 0 and close the
+// channel. A quote_chunk sent at that version and met by a closed channel is
+// read as such a node, unsupported_version with no quote, so the browser
+// skips it and never pays the weighted amount on its quote.
+test("a closed channel after a size-priced quote_chunk reads as a node that predates size pricing", async () => {
+  const { test_size_priced_quote_closed } = await import("./pkg/ant_core.js");
+  const rtc = mockWebRtc([{
+    respond: (channel, method) => {
+      if (method !== "quote_chunk") return true;
+      channel.close();
+      return false;
+    },
+  }]);
+  const error = await test_size_priced_quote_closed(rtc.endpoints[0]);
+  assert.match(error, /^unsupported_version: /);
+  assert.match(error, /predates size pricing/);
+  assert.equal(rtc.requests.filter(({ method }) => method === "quote_chunk").length, 1);
+  await closesSettled();
+});

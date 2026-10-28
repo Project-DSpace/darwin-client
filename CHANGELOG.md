@@ -90,7 +90,12 @@ prints. Upstream's entries follow.
   with no content alone, sent only to a node that advertises `size_priced_quote` in hello
   (`SIZE_PRICED_QUOTE_CAPABILITY`): a node that doesn't can't parse such a frame and closes the
   channel, dropping any requests in flight on it. JavaScript passes `chunk_length` to
-  `verifyStorageQuote` only for a quote obtained by such a `quote_chunk`.
+  `verifyStorageQuote` only for a quote obtained by such a `quote_chunk`. A `quote_chunk` at that
+  version that ends in a closed channel or an `invalid_request` answer (how darwin-node
+  0.23.0+ds.17 and older refuse a version they can't parse) fails as `unsupported_version`, with
+  no quote, so the node is skipped, as a native client skips `StorerUpdateRequired`.
+- The tests run darwin-node 0.23.0+ds.18 (`81dbac7`), node release 2, which prices records by
+  size; `vendor/ant-protocol` is its copy, the same tree.
 - `pay_for_storage` and `pay_for_storage_split` quote and plan a pointer at its wire length,
   whatever size is declared, so an interrupted payment's journal restores.
 - Upload checkpoints have a format of their own (`DSCK` and a version byte, then msgpack). The

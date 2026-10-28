@@ -1528,7 +1528,10 @@ impl LockedBrowserClient<'_> {
                 slot,
                 exclusive,
             )
-            .await?;
+            .await
+            // A storer that predates size pricing closes the channel on a
+            // quote_chunk at the next version: skipped, with no quote.
+            .map_err(|error| super::protocol::read_quote_failure(version, error))?;
         self.response_processing.set(processing);
         if response.header.status == BrowserResponseStatus::Error {
             let (code, message) = match &response.header.body {
@@ -1541,7 +1544,10 @@ impl LockedBrowserClient<'_> {
             if code == "authentication_required" {
                 rpc.close("authenticated session closed".into());
             }
-            return Err(RpcError::Remote { code, message });
+            return Err(super::protocol::read_quote_failure(
+                version,
+                RpcError::Remote { code, message },
+            ));
         }
 
         Ok((response, read_permit))
