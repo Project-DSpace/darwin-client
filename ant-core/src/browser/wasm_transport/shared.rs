@@ -240,6 +240,16 @@ impl BrowserNetwork for SharedNetworkAdapter {
             .collect()
     }
 
+    fn refused_peers(&self) -> Vec<(PeerId, Duration)> {
+        self.inner
+            .pool
+            .dial_failures
+            .borrow()
+            .refusals()
+            .filter_map(|(peer, remaining)| Some((PeerId::from_hex(peer).ok()?, remaining)))
+            .collect()
+    }
+
     /// The configured seeds, each carrying its peer ID, except those whose node
     /// the seed policy rejected: every request to one fails at once.
     fn bootstrap_peers(&self) -> Vec<MultiAddr> {

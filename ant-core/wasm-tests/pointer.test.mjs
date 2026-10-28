@@ -152,23 +152,19 @@ test("a seed the seed policy rejected is not counted among the bootstrap peers",
     writer.close();
   }
   // On another, the seven nodes nearest the pointer, its close group, hold
-  // none. The four farthest are the seeds: one is on another network, one
-  // fails every pointer GET and two hold the pointer. Two answers are a
-  // quorum of the three seeds left once the rejected one is left out, but not
-  // of all four, and the read would then fail.
-  const nodes = Array.from({ length: 11 }, () => ({}));
+  // none. The three farthest are the seeds: the nearest of them is on another
+  // network, and the two others hold the pointer. Left out, the rejected seed
+  // leaves the other two among the nine nearest of what the read knows, and
+  // both are asked: a quorum of two. Counted, it would have taken one of
+  // those places and failed, and the one holder left would be too few.
+  const nodes = Array.from({ length: 10 }, () => ({}));
   const rtc = mockWebRtc(nodes);
   const address = pointerAddress(seed);
   const distance = (index) =>
     BigInt(`0x${parseWebRtcDirectMultiaddr(rtc.endpoints[index]).peerId}`) ^ BigInt(`0x${address}`);
   const seeds = nodes.map((_, index) => index).sort((a, b) => (distance(a) < distance(b) ? -1 : 1)).slice(7);
-  const [rejected, failing, ...holders] = seeds;
+  const [rejected, ...holders] = seeds;
   nodes[rejected].payment = { ...paymentNetwork, chain_id: 1 };
-  nodes[failing].respond = (channel, method) => {
-    if (method !== "get_pointer") return;
-    channel.emit(new ArrayBuffer(0));
-    return false;
-  };
   for (const index of holders) rtc.stores[index].set(`pointer:${address}`, record);
   const client = new BrowserNetworkClient(seeds.map((index) => rtc.endpoints[index]));
   try {
@@ -215,21 +211,22 @@ async function readWithTwelveSeeds(holding) {
   }
 }
 
-test("a pointer the eighth and ninth nearest of twelve seeds hold is read from them", async () => {
-  // Two of the five answers the nine nearest seeds need name it. The three
-  // farther seeds are not asked.
-  const { read, seeds } = await readWithTwelveSeeds([7, 8]);
+test("a pointer the two seeds nearest past its close group hold is read from them", async () => {
+  // The close group's lookup leaves the two nearest seeds among the nine
+  // nearest of what the read knows: both are asked, and both name the state.
+  // The ten farther seeds are not asked.
+  const { read, seeds } = await readWithTwelveSeeds([0, 1]);
   assert.equal(read?.target, target(1));
-  assert.deepEqual(seeds.slice(9), [false, false, false]);
+  assert.deepEqual(seeds, [true, true, ...Array(10).fill(false)]);
 });
 
-test("a pointer only seeds outside the nine nearest it hold is not looked for there", async () => {
-  // The nine nearest of twelve seeds all answer that they hold none before
-  // the pointer reads as absent, and the three farther ones, which hold it,
-  // are not asked.
-  const { read, seeds } = await readWithTwelveSeeds([9, 10, 11]);
+test("a pointer only seeds past the nine nearest of what the read knows hold is not looked for there", async () => {
+  // The two seeds the lookup leaves among the nine nearest answer that they
+  // hold none before the pointer reads as absent, and the farther seeds, which
+  // hold it, are not asked.
+  const { read, seeds } = await readWithTwelveSeeds([2, 3, 4]);
   assert.equal(read, null);
-  assert.deepEqual(seeds, [...Array(9).fill(true), false, false, false]);
+  assert.deepEqual(seeds, [true, true, ...Array(10).fill(false)]);
 });
 
 test("a node that does not advertise pointers is never sent one", async () => {

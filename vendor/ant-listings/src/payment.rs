@@ -4,8 +4,19 @@
 //! is storing with [`find_payment`]. Anyone checking a listing asks
 //! [`payment_lookup`] what to fetch, fetches it from its own RPC provider,
 //! fetches the envelope at the listing's address from the network, and
-//! passes both to [`verify_listing_receipts`] along with the payment vault's
-//! address.
+//! passes both to [`verify_listing_receipts`] along with the vaults it takes
+//! payments from ([`VaultSet`]).
+//!
+//! A [`VaultSet`] holds the per-quote vault (upstream's `PaymentVaultV2`) and,
+//! where the network has one, a root vault, which records each wave of
+//! payments under one key ([`root`](crate::root)). Both log each paid quote
+//! as the same `DataPaymentMade` event, so a payment is found the same way in
+//! either, each by its own address. A root vault's log counts only if the
+//! receipt shows its wave whole, transfers included
+//! ([`recorded_wave`](crate::root::recorded_wave)); otherwise it reads as
+//! unpaid ([`PaymentError::UnpaidWave`]). A log of that shape from any other
+//! contract is never a payment ([`PaymentError::UnknownVault`]): any
+//! contract can emit one.
 //!
 //! A paid quote proves that its address was paid for by the block it was
 //! paid in, not that this was the upload's payment. Nothing on chain ties a
@@ -26,6 +37,7 @@
 
 use crate::envelope::Envelope;
 use crate::listing::{Listing, ListingError, MergedListing, Payment, CLOCK_MARGIN};
+use crate::root::{RecordedWaves, WaveLogError};
 use ant_protocol::evm::PaymentQuote;
 use ant_protocol::{verify_quote_content, verify_quote_signature, XorName};
 use serde::{Deserialize, Serialize};
@@ -60,6 +72,64 @@ pub const fn quorum_needed(asked: usize) -> usize {
     }
 }
 
+/// The vaults whose payments a reader takes, each by its own address.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct VaultSet {
+    /// The vault that records each paid quote on its own: upstream's
+    /// `PaymentVaultV2`.
+    pub v2: [u8; 20],
+    /// The root vault, which records each wave of payments under one key
+    /// ([`root`](crate::root)), if the network has one.
+    pub root: Option<RootVault>,
+}
+
+/// A root vault, and the token it pays in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct RootVault {
+    /// The vault's address.
+    pub address: [u8; 20],
+    /// The token its payments move, fixed when the vault was deployed. A
+    /// wave's transfers are this token's logs.
+    pub token: [u8; 20],
+}
+
+impl VaultSet {
+    /// A set of the per-quote vault alone, for a network with no root vault.
+    #[must_use]
+    pub const fn v2_only(v2: [u8; 20]) -> Self {
+        Self { v2, root: None }
+    }
+
+    /// A set of the per-quote vault and a root vault.
+    #[must_use]
+    pub const fn with_root(v2: [u8; 20], root: RootVault) -> Self {
+        Self {
+            v2,
+            root: Some(root),
+        }
+    }
+
+    /// The vaults' addresses, the per-quote vault's first. To search their
+    /// logs, send one `eth_getLogs` per vault, each naming that vault's
+    /// address alone, together in one JSON-RPC batch, and merge the logs in
+    /// chain order (block number, then log index). Some providers allow a far
+    /// shorter block range when a filter names several addresses than when
+    /// it names one, so a single query with every address can fail over a
+    /// range that single-address queries cover.
+    #[must_use]
+    pub fn addresses(&self) -> Vec<[u8; 20]> {
+        std::iter::once(self.v2)
+            .chain(self.root.map(|root| root.address))
+            .collect()
+    }
+
+    /// Whether `address` is one of the vaults.
+    #[must_use]
+    pub fn contains(&self, address: &[u8; 20]) -> bool {
+        self.v2 == *address || self.root.is_some_and(|root| root.address == *address)
+    }
+}
+
 /// One event log from a transaction receipt.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PaymentLog {
@@ -67,6 +137,10 @@ pub struct PaymentLog {
     pub address: [u8; 20],
     /// Its topics, the event signature first.
     pub topics: Vec<[u8; 32]>,
+    /// Its data: the event's fields that are not topics. Empty for
+    /// `DataPaymentMade`, whose fields are all topics; a root vault's wave is
+    /// read from the data of its `RootPaid` log and of its token's transfers.
+    pub data: Vec<u8>,
     /// Its position in the block.
     pub log_index: u64,
 }
@@ -126,52 +200,92 @@ pub enum PaymentError {
     /// without its quote, none at the shown log index.
     #[error("no payment to the vault for this quote in the transaction")]
     NotPaid,
+    /// The only log that would be the payment (one paying the quote, or
+    /// without the quote, a payment at the shown log index) comes from a
+    /// contract outside the [`VaultSet`]. Any contract can emit a log of that
+    /// shape, so it is never a payment; but a vault newer than this version
+    /// knows would log the same.
+    #[error(
+        "a payment log from a contract this version doesn't recognise as a vault; \
+         if a newer vault exists, update this tool"
+    )]
+    UnknownVault,
+    /// The root vault's log would be the payment, but the receipt doesn't show
+    /// its wave whole: its payments, its `RootPaid` log and its token
+    /// transfers, one to each payee of the sum of its payments
+    /// ([`recorded_wave`](crate::root::recorded_wave)). It reads as unpaid.
+    #[error("the root vault's payment log is not backed by its wave: {0}")]
+    UnpaidWave(WaveLogError),
+}
+
+impl PaymentError {
+    /// How much a reason a payment isn't in a receipt says: a vault's log
+    /// that doesn't check out says the most, then a log from outside the
+    /// vault set, then no log at all.
+    fn weight(&self) -> u8 {
+        match self {
+            Self::UnpaidWave(_) => 2,
+            Self::UnknownVault => 1,
+            _ => 0,
+        }
+    }
 }
 
 /// Find the full payment for an envelope chunk, as a node does when it stores
 /// one.
 ///
 /// `quotes` are the quotes in the chunk's payment proof. Exactly one of them,
-/// the one the uploader paid, has a `DataPaymentMade` event in the receipt.
-/// The node then records [`Listing::new`], which keeps only the fields the
-/// envelope shows. The payment's quote is encoded with its timestamp in whole
-/// seconds (see [`ListingPayment::quote`](crate::ListingPayment::quote)).
+/// the one the uploader paid, has a `DataPaymentMade` event from a vault in
+/// `vaults` in the receipt: the per-quote vault's, or a root vault's in a
+/// wave the receipt shows whole. The node then records [`Listing::new`],
+/// which keeps only the fields the envelope shows. The payment's quote is
+/// encoded with its timestamp in whole seconds (see
+/// [`ListingPayment::quote`](crate::ListingPayment::quote)), and its log
+/// index is its own `DataPaymentMade` log's, whichever vault paid it.
 ///
 /// # Errors
 ///
 /// Returns an error if the transaction failed, no quote for `address` was
-/// paid to `vault` in it, or the paid quote's signature is invalid.
+/// paid in it to a vault in `vaults` ([`PaymentError::NotPaid`], or
+/// [`PaymentError::UnknownVault`] or [`PaymentError::UnpaidWave`] where a
+/// log would have been the payment), or the paid quote's signature is
+/// invalid.
 pub fn find_payment(
     address: &XorName,
     quotes: &[PaymentQuote],
     receipt: &PaymentReceipt,
     block_timestamp: u64,
-    vault: &[u8; 20],
+    vaults: &VaultSet,
 ) -> Result<Payment, PaymentError> {
     if !receipt.success {
         return Err(PaymentError::Failed);
     }
-    let (quote, log) = quotes
+    let mut unpaid = PaymentError::NotPaid;
+    for quote in quotes
         .iter()
         .filter(|quote| verify_quote_content(quote, address))
-        .find_map(|quote| {
-            receipt
-                .logs
-                .iter()
-                .find(|log| pays(log, vault, quote))
-                .map(|log| (quote, log))
-        })
-        .ok_or(PaymentError::NotPaid)?;
-    if !verify_quote_signature(quote) {
-        return Err(PaymentError::BadSignature);
+    {
+        let log = match paying_log(receipt, vaults, |log, vault| pays(log, vault, quote)) {
+            Ok(log) => log,
+            Err(error) => {
+                if error.weight() > unpaid.weight() {
+                    unpaid = error;
+                }
+                continue;
+            }
+        };
+        if !verify_quote_signature(quote) {
+            return Err(PaymentError::BadSignature);
+        }
+        return Ok(Payment {
+            tx_hash: receipt.tx_hash,
+            block_number: receipt.block_number,
+            block_timestamp,
+            log_index: log.log_index,
+            quote: encode_quote(quote)?,
+        });
     }
-    Ok(Payment {
-        tx_hash: receipt.tx_hash,
-        block_number: receipt.block_number,
-        block_timestamp,
-        log_index: log.log_index,
-        quote: encode_quote(quote)?,
-    })
+    Err(unpaid)
 }
 
 /// What to fetch from the chain to check a listing, from [`payment_lookup`].
@@ -191,18 +305,21 @@ pub enum Lookup {
         /// The listing's tx hash.
         tx_hash: [u8; 32],
     },
-    /// The quote is shown but the tx hash is hidden: find the vault's
-    /// `DataPaymentMade` logs whose topic 3 is `quote_hash` (`eth_getLogs` on
-    /// the vault, topics `[DATA_PAYMENT_MADE_TOPIC, *, *, quote_hash]`), then
-    /// fetch the receipt of the transaction that emitted each.
+    /// The quote is shown but the tx hash is hidden: find the vaults'
+    /// `DataPaymentMade` logs whose topic 3 is `quote_hash` (one `eth_getLogs`
+    /// per address in the [`VaultSet`], each with topics
+    /// `[DATA_PAYMENT_MADE_TOPIC, *, *, quote_hash]`, sent in one batch and
+    /// merged in chain order, as [`VaultSet::addresses`] says), then fetch the
+    /// receipt of the transaction that emitted each.
     ///
     /// Search `block_number` alone if given. Otherwise search backwards from
     /// the block at `not_after` (or the latest block) to the block at
-    /// `search_from`, and, if that finds nothing, on back to the vault's
-    /// first block: `search_from` is only a hint.
+    /// `search_from`, and, if that finds nothing, on back to the first block
+    /// of the earliest vault: `search_from` is only a hint.
     ///
-    /// A vault can emit more than one such log if the quote is paid again,
-    /// as upstream's `PaymentVaultV2` allows. Pass every receipt found to
+    /// The vaults can emit more than one such log if the quote is paid again:
+    /// upstream's `PaymentVaultV2` allows it, and a root vault records a
+    /// quote again in another wave. Pass every receipt found to
     /// [`verify_listing_receipts`].
     Quote {
         /// The paid quote's hash, as the vault event carries it.
@@ -225,9 +342,11 @@ pub enum Lookup {
         not_after: Option<u64>,
     },
     /// The block number and log index are shown, but neither the tx hash nor
-    /// the quote: find the vault's `DataPaymentMade` log at `log_index` in
-    /// block `block_number` (`eth_getLogs` on the vault for that block), then
-    /// fetch the receipt of the transaction that emitted it.
+    /// the quote: find the vaults' `DataPaymentMade` log at `log_index` in
+    /// block `block_number` (one `eth_getLogs` per address in the
+    /// [`VaultSet`] for that block, sent in one batch and merged in chain
+    /// order, as [`VaultSet::addresses`] says), then fetch the receipt of the
+    /// transaction that emitted it.
     BlockLog {
         /// The listing's block number.
         block_number: u64,
@@ -445,9 +564,9 @@ pub fn payment_lookup(listing: &Listing) -> Result<Lookup, PaymentError> {
 pub fn check_offline(
     listing: &Listing,
     envelope: &Envelope,
-    vault: &[u8; 20],
+    vaults: &VaultSet,
 ) -> Result<(), PaymentError> {
-    match verify_listing(listing, envelope, None, None, vault, u64::MAX) {
+    match verify_listing(listing, envelope, None, None, vaults, u64::MAX) {
         // Nothing to look up, or something to look up that was not given.
         Ok(_) | Err(PaymentError::NotFound) => Ok(()),
         Err(e) => Err(e),
@@ -471,15 +590,19 @@ pub fn check_offline(
 ///
 /// - Quote shown: the quote names the address and is signed, the receipt is
 ///   the shown tx (if shown), succeeded, is in the shown block (if shown), at
-///   the shown time (if shown), and pays the quote to `vault` at the shown log
-///   index (or anywhere, if hidden): [`CheckLevel::Verified`], with where the
-///   quote was paid.
+///   the shown time (if shown), and pays the quote to a vault in `vaults` at
+///   the shown log index (or anywhere, if hidden): [`CheckLevel::Verified`],
+///   with where the quote was paid.
 /// - Quote hidden: each shown field is checked against what was fetched: the
-///   tx, its success, the block, the time, and a vault `DataPaymentMade` log
-///   with a non-zero amount at the shown log index (or anywhere in the tx):
-///   [`CheckLevel::Reported`].
+///   tx, its success, the block, the time, and a vault's `DataPaymentMade`
+///   log with a non-zero amount at the shown log index (or anywhere in the
+///   tx): [`CheckLevel::Reported`].
 /// - Quote, tx hash and block number all hidden: nothing can be fetched, so
 ///   a shown timestamp or log index is not checked: [`CheckLevel::Reported`].
+///
+/// A root vault's log is a payment only if the receipt shows its wave whole,
+/// transfers included ([`recorded_wave`](crate::root::recorded_wave)), and a
+/// log from a contract outside `vaults` never is.
 ///
 /// Wherever the payment's block is known and the listing has `first_seen`,
 /// the block's timestamp is needed and must be no later than
@@ -491,12 +614,16 @@ pub fn check_offline(
 /// Returns the first check that fails: [`PaymentError::Malformed`] if the
 /// listing doesn't fit its flags or its envelope or its time is in the
 /// future, and otherwise for any shown field that disagrees with the chain.
+/// Where the receipt has no payment for the listing,
+/// [`PaymentError::UnpaidWave`] if a root vault's log would have been it,
+/// [`PaymentError::UnknownVault`] if only a log from outside `vaults` would
+/// have, and [`PaymentError::NotPaid`] if none would.
 pub fn verify_listing(
     listing: &Listing,
     envelope: &Envelope,
     receipt: Option<&PaymentReceipt>,
     block_timestamp: Option<u64>,
-    vault: &[u8; 20],
+    vaults: &VaultSet,
     now: u64,
 ) -> Result<ListingCheck, PaymentError> {
     let lookup = payment_lookup(listing)?;
@@ -510,12 +637,9 @@ pub fn verify_listing(
         check_quote(&quote, &listing.address)?;
         let receipt = receipt.ok_or(PaymentError::NotFound)?;
         check_receipt(listing, receipt, block_timestamp)?;
-        let log = receipt
-            .logs
-            .iter()
-            .filter(|log| at_index(log, payment.log_index) && pays(log, vault, &quote))
-            .min_by_key(|log| log.log_index)
-            .ok_or(PaymentError::NotPaid)?;
+        let log = paying_log(receipt, vaults, |log, vault| {
+            at_index(log, payment.log_index) && pays(log, vault, &quote)
+        })?;
         return Ok(ListingCheck {
             level: CheckLevel::Verified,
             paid_at: Some(PaidAt {
@@ -528,13 +652,9 @@ pub fn verify_listing(
         Lookup::Transaction { .. } | Lookup::BlockLog { .. } => {
             let receipt = receipt.ok_or(PaymentError::NotFound)?;
             check_receipt(listing, receipt, block_timestamp)?;
-            let paid = receipt
-                .logs
-                .iter()
-                .any(|log| at_index(log, payment.log_index) && is_vault_payment(log, vault));
-            if !paid {
-                return Err(PaymentError::NotPaid);
-            }
+            paying_log(receipt, vaults, |log, vault| {
+                at_index(log, payment.log_index) && is_vault_payment(log, vault)
+            })?;
         }
         Lookup::Block { .. } => {
             let timestamp = block_timestamp.ok_or(PaymentError::NotFound)?;
@@ -560,7 +680,7 @@ pub fn verify_listing(
 /// [`PaymentError::NotFound`]. `now` is the caller's clock, in Unix seconds.
 ///
 /// Several receipts come from a [`Lookup::Quote`] when the quote was paid
-/// more than once, which the vault allows. The answer is then:
+/// more than once, which the vaults allow. The answer is then:
 ///
 /// 1. the [`CheckLevel::Verified`] result with the earliest
 ///    [`ListingCheck::paid_at`], whatever order the receipts came in, so a
@@ -581,7 +701,7 @@ pub fn verify_listing_receipts(
     listing: &Listing,
     envelope: &Envelope,
     fetched: &[(Option<PaymentReceipt>, Option<u64>)],
-    vault: &[u8; 20],
+    vaults: &VaultSet,
     now: u64,
 ) -> Result<ListingCheck, PaymentError> {
     let nothing = [(None, None)];
@@ -593,7 +713,7 @@ pub fn verify_listing_receipts(
     let mut passed = Vec::new();
     let mut error = None;
     for (receipt, timestamp) in fetched {
-        match verify_listing(listing, envelope, receipt.as_ref(), *timestamp, vault, now) {
+        match verify_listing(listing, envelope, receipt.as_ref(), *timestamp, vaults, now) {
             Ok(check) => passed.push(check),
             Err(PaymentError::NotFound) => {}
             Err(other) => {
@@ -712,7 +832,9 @@ fn at_index(log: &PaymentLog, log_index: Option<u64>) -> bool {
     log_index.is_none_or(|index| log.log_index == index)
 }
 
-/// Whether `log` is a vault `DataPaymentMade` event with a non-zero amount.
+/// Whether `log` is a `DataPaymentMade` event with a non-zero amount from the
+/// one address `vault`. A vault set's logs are found through
+/// [`paying_log`], which asks this of each vault in turn.
 fn is_vault_payment(log: &PaymentLog, vault: &[u8; 20]) -> bool {
     log.address == *vault
         && log.topics.len() == 4
@@ -720,7 +842,8 @@ fn is_vault_payment(log: &PaymentLog, vault: &[u8; 20]) -> bool {
         && log.topics[2] != [0u8; 32]
 }
 
-/// Whether `log` is the vault's payment, of a non-zero amount, for `quote`.
+/// Whether `log` is the one address `vault`'s payment, of a non-zero amount,
+/// for `quote`.
 pub(crate) fn pays(log: &PaymentLog, vault: &[u8; 20], quote: &PaymentQuote) -> bool {
     let mut rewards_topic = [0u8; 32];
     rewards_topic[12..].copy_from_slice(quote.rewards_address.as_slice());
@@ -728,6 +851,50 @@ pub(crate) fn pays(log: &PaymentLog, vault: &[u8; 20], quote: &PaymentQuote) -> 
         && log.topics[1] == rewards_topic
         && log.topics[3] == quote.hash().0
 }
+
+/// The receipt's earliest log that is a payment from a vault in `vaults`:
+/// one that `is_payment(log, vault)` accepts for the per-quote vault, or for
+/// the root vault in a wave the receipt shows whole
+/// ([`recorded_wave`](crate::root::recorded_wave)). Each of the root vault's
+/// waves is checked as a whole once, however many of its logs `is_payment`
+/// accepts.
+///
+/// # Errors
+///
+/// Where there is none: [`PaymentError::UnpaidWave`] if a root vault's log
+/// would have been one, else [`PaymentError::UnknownVault`] if a log from a
+/// contract outside `vaults` would have been one were that contract a vault,
+/// else [`PaymentError::NotPaid`].
+pub(crate) fn paying_log<'r>(
+    receipt: &'r PaymentReceipt,
+    vaults: &VaultSet,
+    is_payment: impl Fn(&PaymentLog, &[u8; 20]) -> bool,
+) -> Result<&'r PaymentLog, PaymentError> {
+    let mut logs: Vec<&PaymentLog> = receipt.logs.iter().collect();
+    logs.sort_by_key(|log| log.log_index);
+    let mut unpaid = PaymentError::NotPaid;
+    // The root vault's waves, read once one of its logs would be the payment.
+    let mut waves = None;
+    for log in logs {
+        if is_payment(log, &vaults.v2) {
+            return Ok(log);
+        }
+        if let Some(root) = vaults.root.filter(|root| is_payment(log, &root.address)) {
+            let waves = waves.get_or_insert_with(|| RecordedWaves::new(receipt, root));
+            match waves.check(log.log_index) {
+                Ok(()) => return Ok(log),
+                Err(error) if unpaid.weight() < 2 => unpaid = PaymentError::UnpaidWave(error),
+                Err(_) => {}
+            }
+        } else if is_payment(log, &log.address) && unpaid.weight() < 1 {
+            unpaid = PaymentError::UnknownVault;
+        }
+    }
+    Err(unpaid)
+}
+
+#[cfg(test)]
+mod root_tests;
 
 #[cfg(test)]
 mod tests {
@@ -739,7 +906,7 @@ mod tests {
     use crate::proof::{check_proof, EnvelopeProof};
     use crate::test_support::{
         data_map, metadata, payment_log, receipt, self_issued_quote, signed_quote, signed_quote_at,
-        with_nanos, BLOCK_TIME, VAULT,
+        with_nanos, BLOCK_TIME, VAULTS,
     };
     use ant_protocol::evm::Amount;
     use sha3::{Digest, Keccak256};
@@ -781,9 +948,9 @@ mod tests {
         envelope: &Envelope,
         receipt: Option<&PaymentReceipt>,
         block_timestamp: Option<u64>,
-        vault: &[u8; 20],
+        vaults: &VaultSet,
     ) -> Result<CheckLevel, PaymentError> {
-        verify_listing(listing, envelope, receipt, block_timestamp, vault, NOW)
+        verify_listing(listing, envelope, receipt, block_timestamp, vaults, NOW)
             .map(|check| check.level)
     }
 
@@ -799,7 +966,7 @@ mod tests {
         /// alone, its timestamp; nothing when nothing is found.
         fn fetch(&self, lookup: Lookup) -> Vec<Fetched> {
             let vault_log = |log: &PaymentLog| {
-                log.address == VAULT
+                VAULTS.contains(&log.address)
                     && log.topics.len() == 4
                     && log.topics[0] == DATA_PAYMENT_MADE_TOPIC
             };
@@ -858,7 +1025,7 @@ mod tests {
             now: u64,
         ) -> Result<ListingCheck, PaymentError> {
             let fetched = self.fetch(payment_lookup(listing)?);
-            verify_listing_receipts(listing, envelope, &fetched, &VAULT, now)
+            verify_listing_receipts(listing, envelope, &fetched, &VAULTS, now)
         }
 
         /// [`check`](Self::check) at [`NOW`], giving only the level.
@@ -907,7 +1074,7 @@ mod tests {
                 None => Vec::new(),
             };
             group.checked_listing_among(nearest, |listing| {
-                verify_listing_receipts(listing, &self.envelope, &fetched, &VAULT, NOW)
+                verify_listing_receipts(listing, &self.envelope, &fetched, &VAULTS, NOW)
             })
         }
 
@@ -926,7 +1093,7 @@ mod tests {
                 None => Vec::new(),
             };
             check_copies(group, nearest, needed, |listing| {
-                verify_listing_receipts(listing, &self.envelope, &fetched, &VAULT, NOW)
+                verify_listing_receipts(listing, &self.envelope, &fetched, &VAULTS, NOW)
             })
         }
     }
@@ -991,7 +1158,7 @@ mod tests {
             &[other, unpaid.clone(), paid],
             &chain.receipts[0],
             block_time(BLOCK).unwrap(),
-            &VAULT,
+            &VAULTS,
         )
         .unwrap();
         Fixture {
@@ -1064,14 +1231,14 @@ mod tests {
         let unpaid = decode_quote(&fixture.unpaid_quote).unwrap();
         let receipt = &fixture.chain.receipts[0];
         assert_eq!(
-            find_payment(&address, &[unpaid], receipt, BLOCK_TIME, &VAULT),
+            find_payment(&address, &[unpaid], receipt, BLOCK_TIME, &VAULTS),
             Err(PaymentError::NotPaid)
         );
         let mut failed = receipt.clone();
         failed.success = false;
         let paid = decode_quote(&fixture.payment.quote).unwrap();
         assert_eq!(
-            find_payment(&address, &[paid], &failed, BLOCK_TIME, &VAULT),
+            find_payment(&address, &[paid], &failed, BLOCK_TIME, &VAULTS),
             Err(PaymentError::Failed)
         );
     }
@@ -1301,28 +1468,28 @@ mod tests {
         let listing = fixture.listing();
         let receipt = &fixture.chain.receipts[0];
         let time = block_time(BLOCK);
-        let verify = |listing: &Listing, vault: &[u8; 20]| {
-            verify_now(listing, &fixture.envelope, Some(receipt), time, vault)
+        let verify = |listing: &Listing, vaults: &VaultSet| {
+            verify_now(listing, &fixture.envelope, Some(receipt), time, vaults)
         };
-        assert_eq!(verify(&listing, &VAULT), Ok(CheckLevel::Verified));
+        assert_eq!(verify(&listing, &VAULTS), Ok(CheckLevel::Verified));
 
         let mut elsewhere = listing.clone();
         elsewhere.payment.quote = Some(encode_quote(&signed_quote([5; 32])).unwrap());
-        assert_eq!(verify(&elsewhere, &VAULT), Err(PaymentError::WrongContent));
+        assert_eq!(verify(&elsewhere, &VAULTS), Err(PaymentError::WrongContent));
 
         let mut forged = decode_quote(&fixture.payment.quote).unwrap();
         forged.price = Amount::from(1u64);
         let mut forged_listing = listing.clone();
         forged_listing.payment.quote = Some(encode_quote(&forged).unwrap());
         assert_eq!(
-            verify(&forged_listing, &VAULT),
+            verify(&forged_listing, &VAULTS),
             Err(PaymentError::BadSignature)
         );
 
         let mut garbled = listing.clone();
         garbled.payment.quote = Some(vec![0xc1]);
         assert!(matches!(
-            verify(&garbled, &VAULT),
+            verify(&garbled, &VAULTS),
             Err(PaymentError::BadQuote(_))
         ));
         assert!(matches!(
@@ -1335,7 +1502,12 @@ mod tests {
             Err(PaymentError::BadQuote(_))
         ));
 
-        assert_eq!(verify(&listing, &[0x11; 20]), Err(PaymentError::NotPaid));
+        // Read with a set that doesn't hold the vault that paid it, the
+        // payment's log is from an unknown contract.
+        assert_eq!(
+            verify(&listing, &VaultSet::v2_only([0x11; 20])),
+            Err(PaymentError::UnknownVault)
+        );
     }
 
     #[test]
@@ -1380,7 +1552,7 @@ mod tests {
             let fixture = fixture(shown, true);
             let listing = fixture.listing();
             let check = |receipt: &PaymentReceipt, time| {
-                verify_now(&listing, &fixture.envelope, Some(receipt), time, &VAULT)
+                verify_now(&listing, &fixture.envelope, Some(receipt), time, &VAULTS)
             };
             let good = &fixture.chain.receipts[0];
             assert!(check(good, time).is_ok());
@@ -1397,11 +1569,13 @@ mod tests {
                 "{shown:?}"
             );
 
+            // The same log from a contract outside the vault set: never a
+            // payment, and said so.
             let mut elsewhere = good.clone();
             elsewhere.logs[1].address = [0x12; 20];
             assert_eq!(
                 check(&elsewhere, time),
-                Err(PaymentError::NotPaid),
+                Err(PaymentError::UnknownVault),
                 "{shown:?}"
             );
 
@@ -1414,7 +1588,7 @@ mod tests {
             );
 
             assert_eq!(
-                verify_now(&listing, &fixture.envelope, None, time, &VAULT),
+                verify_now(&listing, &fixture.envelope, None, time, &VAULTS),
                 Err(PaymentError::NotFound),
                 "{shown:?}"
             );
@@ -1428,8 +1602,8 @@ mod tests {
             let fixture = fixture(hidden, in_index);
             let listing = fixture.listing();
             let receipt = &fixture.chain.receipts[0];
-            let without = verify_now(&listing, &fixture.envelope, Some(receipt), None, &VAULT);
-            let with = verify_now(&listing, &fixture.envelope, Some(receipt), time, &VAULT);
+            let without = verify_now(&listing, &fixture.envelope, Some(receipt), None, &VAULTS);
+            let with = verify_now(&listing, &fixture.envelope, Some(receipt), time, &VAULTS);
             assert_eq!(with, Ok(CheckLevel::Verified));
             if in_index {
                 assert_eq!(without, Err(PaymentError::NotFound));
@@ -1443,11 +1617,11 @@ mod tests {
             let fixture = fixture(ShownFields::NONE.with(PaymentField::BlockNumber), in_index);
             let block_only = fixture.listing();
             assert_eq!(
-                verify_now(&block_only, &fixture.envelope, None, None, &VAULT),
+                verify_now(&block_only, &fixture.envelope, None, None, &VAULTS),
                 Err(PaymentError::NotFound)
             );
             assert_eq!(
-                verify_now(&block_only, &fixture.envelope, None, Some(1), &VAULT),
+                verify_now(&block_only, &fixture.envelope, None, Some(1), &VAULTS),
                 Ok(CheckLevel::Reported)
             );
         }
@@ -1485,7 +1659,7 @@ mod tests {
                     &fixture.envelope,
                     receipt.as_ref(),
                     timestamp,
-                    &VAULT,
+                    &VAULTS,
                     now,
                 )
                 .map(|check| check.level)
@@ -1542,7 +1716,13 @@ mod tests {
         let results: Vec<_> = found
             .iter()
             .map(|(receipt, time)| {
-                verify_now(&listing, &fixture.envelope, receipt.as_ref(), *time, &VAULT)
+                verify_now(
+                    &listing,
+                    &fixture.envelope,
+                    receipt.as_ref(),
+                    *time,
+                    &VAULTS,
+                )
             })
             .collect();
         assert_eq!(
@@ -1587,7 +1767,7 @@ mod tests {
                 &fixture.envelope,
                 Some(&fixture.chain.receipts[0]),
                 None,
-                &VAULT
+                &VAULTS
             ),
             Err(error)
         );
@@ -1606,7 +1786,7 @@ mod tests {
             let listing = fixture.listing();
             assert_eq!(payment_lookup(&listing), Ok(Lookup::Nothing));
             assert_eq!(
-                verify_now(&listing, &fixture.envelope, None, None, &VAULT),
+                verify_now(&listing, &fixture.envelope, None, None, &VAULTS),
                 Ok(CheckLevel::Reported)
             );
         }
@@ -1705,7 +1885,7 @@ mod tests {
             std::slice::from_ref(&own),
             &theirs,
             block_time(block).unwrap(),
-            &VAULT,
+            &VAULTS,
         )
         .unwrap();
         let listing = Listing::new(&fixture.envelope, &payment, NOW);
@@ -1843,7 +2023,7 @@ mod tests {
                         &forged_proof,
                         &forged_receipt,
                         block_time(forged_block).unwrap(),
-                        &VAULT,
+                        &VAULTS,
                     )
                     .unwrap();
                     assert_eq!(proven.paid_at(), forged_paid);
@@ -2055,7 +2235,7 @@ mod tests {
                     &fixture.envelope,
                     receipt.as_ref(),
                     *time,
-                    &VAULT,
+                    &VAULTS,
                     NOW,
                 )
                 .is_ok_and(|check| check.level == CheckLevel::Verified)
@@ -2069,7 +2249,7 @@ mod tests {
             });
             for _ in 0..2 {
                 assert_eq!(
-                    verify_listing_receipts(&listing, &fixture.envelope, &found, &VAULT, NOW),
+                    verify_listing_receipts(&listing, &fixture.envelope, &found, &VAULTS, NOW),
                     first
                 );
                 // A backwards search finds the later one first.
@@ -2081,7 +2261,7 @@ mod tests {
     #[test]
     fn checks_against_everything_a_lookup_found() {
         let verify = |fixture: &Fixture, listing: &Listing, fetched: &[Fetched]| {
-            verify_listing_receipts(listing, &fixture.envelope, fetched, &VAULT, NOW)
+            verify_listing_receipts(listing, &fixture.envelope, fetched, &VAULTS, NOW)
                 .map(|check| check.level)
         };
 
@@ -2186,7 +2366,7 @@ mod tests {
             std::slice::from_ref(&fraction),
             receipt,
             BLOCK_TIME,
-            &VAULT,
+            &VAULTS,
         )
         .unwrap();
         assert_eq!(found.quote, fixture.payment.quote);
@@ -2200,11 +2380,11 @@ mod tests {
         assert_eq!(fixture.verify(&copy), Err(not_canonical.clone()));
         let proof = EnvelopeProof::new(&fixture.envelope, TX, &fraction).unwrap();
         assert_eq!(proof.quote, fixture.payment.quote);
-        assert!(check_proof(&proof, receipt, BLOCK_TIME, &VAULT).is_ok());
+        assert!(check_proof(&proof, receipt, BLOCK_TIME, &VAULTS).is_ok());
         let mut fraction_proof = proof;
         fraction_proof.quote = fraction_bytes.clone();
         assert_eq!(
-            check_proof(&fraction_proof, receipt, BLOCK_TIME, &VAULT).unwrap_err(),
+            check_proof(&fraction_proof, receipt, BLOCK_TIME, &VAULTS).unwrap_err(),
             crate::ProofError::Payment(not_canonical)
         );
 
@@ -2644,7 +2824,7 @@ mod tests {
             let proof = EnvelopeProof::new(envelope, TX, &quote).unwrap();
             assert_eq!(proof.envelope, envelope.to_bytes());
             let proven =
-                check_proof(&proof, &fixture.chain.receipts[0], BLOCK_TIME, &VAULT).unwrap();
+                check_proof(&proof, &fixture.chain.receipts[0], BLOCK_TIME, &VAULTS).unwrap();
             assert_eq!(proven.payment, fixture.payment);
             assert_eq!(proven.envelope.version(), crate::ENVELOPE_VERSION_1);
             assert_eq!(proven.data_map, envelope.data_map().cloned());

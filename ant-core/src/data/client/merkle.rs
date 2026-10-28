@@ -8,6 +8,8 @@ use crate::data::client::adaptive::{observe_op, Outcome};
 use crate::data::client::classify_error;
 use crate::data::client::file::UploadEvent;
 use crate::data::client::quote::settlement_refusal_error;
+#[cfg(test)]
+use crate::data::client::quote::update_required_message;
 use crate::data::client::Client;
 use crate::data::error::{Error, Result};
 use crate::data::network::send_and_await_chunk_response;
@@ -3872,7 +3874,8 @@ mod tests {
             CURRENT_SETTLEMENT_VERSION.saturating_add(1),
         ) {
             Some(Err(Error::ClientUpdateRequired(msg))) => {
-                assert!(msg.contains("ant update"), "{msg}");
+                assert!(msg.contains("Build a new darwin"), "{msg}");
+                assert!(!msg.contains("ant update"), "{msg}");
             }
             other => panic!("expected ClientUpdateRequired, got {other:?}"),
         }
@@ -3884,7 +3887,7 @@ mod tests {
     /// another payment path and spending.
     #[test]
     fn a_refusal_outranks_an_ordinary_pool_failure() {
-        let refusal = || Error::ClientUpdateRequired("run ant update".to_string());
+        let refusal = || Error::ClientUpdateRequired(update_required_message(1, 2));
         let ordinary = || Error::InsufficientPeers("need 16, got 2".to_string());
 
         // Ordinary failure first, refusal second.
@@ -3927,7 +3930,7 @@ mod tests {
     fn a_batch_refusal_outranks_an_ordinary_failure_and_not_a_settlement_refusal() {
         let batch = || Error::BatchPaymentsRefused(BATCH_PAYMENTS_REFUSED.to_string());
         let timeout = || Error::Timeout("Timeout waiting for merkle candidate".to_string());
-        let settlement = || Error::ClientUpdateRequired("run ant update".to_string());
+        let settlement = || Error::ClientUpdateRequired(update_required_message(1, 2));
 
         // An ordinary failure first, the batch refusal after it.
         let mut verdict = PoolVerdict::default();

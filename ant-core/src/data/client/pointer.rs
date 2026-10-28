@@ -138,6 +138,10 @@ struct Answered {
     refusal: Option<Error>,
     /// How many peers refused.
     refusals: usize,
+    /// How many of the peers that failed were busy: held off for having
+    /// declined a browser session while busy
+    /// ([`crate::data::network::Network::refused_peers`]).
+    busy: usize,
 }
 
 impl Answered {
@@ -389,8 +393,10 @@ pub enum FinalityStatus {
     /// the pointer off it.
     Final(FinalState),
     /// One final state, held by a majority of the group, and no other among
-    /// the peers that answered, but not every peer of the group answered. A
-    /// rival held by one that did not would not show, so this is not yet
+    /// the peers that answered, but not every peer of the group answered,
+    /// or a peer of the group was held off as busy and so left out of the
+    /// lookup, a farther peer answering in its place. A rival held by a peer
+    /// that was not asked would not show, so this is not yet
     /// [`Self::Final`]; ask again once the whole group can answer.
     Unconfirmed(FinalState),
     /// The owner signed two or more different final states. `majority` is
@@ -662,25 +668,47 @@ fn finality_status(replies: &Replies, group: usize, answered: usize) -> Finality
 /// of the check an update or a transfer makes before paying, which asks no
 /// bootstrap peer. Unlike a read it does not stop once it has an answer, so a
 /// second final state held by even one peer is seen. Its quorum is counted
-/// over the configured close group ([`quorum_width`]).
+/// over the configured close group ([`quorum_width`]). It also says which
+/// peers it asked and which answered ([`Contacted`]), whether it gives an
+/// answer or fails.
+///
+/// `held_off` lists the peers held off as busy when it began, which the
+/// lookup left out. When one of them would rank among the close group beside
+/// the peers asked ([`displaces_the_group`]), a member of the true group was
+/// never asked and a rival final state it holds would not show, so a state
+/// every peer asked holds is [`FinalityStatus::Unconfirmed`], not
+/// [`FinalityStatus::Final`].
 async fn close_group_census<L, G, GF>(
     address: &XorName,
     close_group: L,
     close_group_size: usize,
     get: G,
-) -> Result<(PointerFinality, Replies)>
+    held_off: &[PeerId],
+) -> (Result<(PointerFinality, Replies)>, Contacted)
 where
     L: Future<Output = Result<Vec<(PeerId, Vec<MultiAddr>)>>>,
     G: Fn(PeerId, Vec<MultiAddr>) -> GF,
     GF: Future<Output = Result<Option<Pointer>>>,
 {
-    let peers = close_group.await?;
+    let peers = match close_group.await {
+        Ok(peers) => peers,
+        Err(failure) => return (Err(failure), Contacted::default()),
+    };
     let in_flight: FuturesUnordered<_> = peers
         .iter()
-        .map(|(peer, addrs)| get(*peer, addrs.clone()))
+        .map(|(peer, addrs)| {
+            let peer = *peer;
+            let reply = get(peer, addrs.clone());
+            async move { reply.await.map(|found| (peer, found)) }
+        })
         .collect();
     let mut replies = Replies::default();
-    let answered = ask_the_group(in_flight, peers.len(), |found| {
+    let mut contacted = Contacted {
+        asked: peers.iter().map(|(peer, _)| *peer).collect(),
+        answered: HashSet::new(),
+    };
+    let answered = ask_the_group(in_flight, peers.len(), |(peer, found)| {
+        contacted.answered.insert(peer);
         replies.add(found);
         false
     })
@@ -693,7 +721,7 @@ where
     let wanted = read_quorum(width);
     if answered.count < wanted {
         let count = answered.count;
-        return Err(answered
+        let failure = answered
             .failure()
             .filter(|_| count == 0)
             .unwrap_or_else(|| {
@@ -701,16 +729,25 @@ where
                     "only {count} of the close group answered for pointer {}",
                     hex::encode(address)
                 ))
-            }));
+            });
+        return (Err(failure), contacted);
     }
+    let status = match finality_status(&replies, width, answered.count) {
+        FinalityStatus::Final(state)
+            if displaces_the_group(address, close_group_size, &contacted.asked, held_off) =>
+        {
+            FinalityStatus::Unconfirmed(state)
+        }
+        status => status,
+    };
     let finality = PointerFinality {
         address: *address,
         group: width,
         answered: answered.count,
-        status: finality_status(&replies, width, answered.count),
+        status,
         seeds: None,
     };
-    Ok((finality, replies))
+    (Ok((finality, replies)), contacted)
 }
 
 /// What a census of the close group that shows the pointer open (`census`,
@@ -745,31 +782,253 @@ fn with_the_read(
     })
 }
 
-/// [`Client::pointer_finality`] on a network given as functions: the close
-/// group's census (`close_group` looks the group up, `get` asks one peer),
-/// and, while it shows the pointer open, the read [`Client::pointer_get`]
-/// makes, which also asks `bootstrap` ([`with_the_read`]).
+/// One round of [`Client::pointer_finality`] on a network given as
+/// functions: the close group's census (`close_group` looks the group up,
+/// `get` asks one peer), and, while it shows the pointer open, the read
+/// [`Client::pointer_get`] makes, which also asks `bootstrap`
+/// ([`with_the_read`]); with the peers the two asked ([`Contacted`]), which
+/// [`past_refusals`] weighs before taking the answer. `busy` and `held_off`
+/// are the read's ([`read_pointer_with_seeds`]).
 async fn pointer_finality_from<L, LF, G, GF>(
     address: &XorName,
     close_group: L,
     close_group_size: usize,
     bootstrap: &[(PeerId, Vec<MultiAddr>)],
     get: G,
-) -> Result<PointerFinality>
+    busy: impl Fn(&PeerId) -> bool,
+    held_off: &[PeerId],
+) -> (Result<PointerFinality>, Contacted)
 where
     L: Fn() -> LF,
     LF: Future<Output = Result<Vec<(PeerId, Vec<MultiAddr>)>>>,
     G: Fn(PeerId, Vec<MultiAddr>) -> GF,
     GF: Future<Output = Result<Option<Pointer>>>,
 {
-    let (census, replies) =
-        close_group_census(address, close_group(), close_group_size, &get).await?;
-    if !matches!(census.status, FinalityStatus::Open { .. }) {
-        return Ok(census);
+    let (census, contacted) =
+        close_group_census(address, close_group(), close_group_size, &get, held_off).await;
+    let (census, replies) = match census {
+        Ok(census) => census,
+        Err(failure) => return (Err(failure), contacted),
+    };
+    if !finality_is_open(&census) {
+        return (Ok(census), contacted);
     }
-    let read =
-        read_pointer_with_seeds(address, close_group(), close_group_size, bootstrap, &get).await;
-    with_the_read(census, &replies, read)
+    let mut read = read_pointer_with_seeds(
+        address,
+        close_group(),
+        close_group_size,
+        bootstrap,
+        &get,
+        busy,
+        held_off,
+    )
+    .await;
+    let contacted = contacted.join(std::mem::take(&mut read.contacted));
+    (with_the_read(census, &replies, read), contacted)
+}
+
+/// The peers one round of a pointer read or census asked, and those of them
+/// that answered, bootstrap peers included.
+#[derive(Default)]
+struct Contacted {
+    asked: HashSet<PeerId>,
+    answered: HashSet<PeerId>,
+}
+
+impl Contacted {
+    /// Both rounds' peers, as one.
+    fn join(mut self, other: Self) -> Self {
+        self.asked.extend(other.asked);
+        self.answered.extend(other.answered);
+        self
+    }
+}
+
+/// The error a pointer read gives when the peers that may hold the pointer
+/// are held off for having declined a session while busy: the words a chunk
+/// read uses.
+fn pointer_holders_busy(address: &XorName) -> Error {
+    Error::Network(format!(
+        "the nodes that may hold pointer {} are busy; try again shortly",
+        hex::encode(address)
+    ))
+}
+
+/// How long to wait before reading `address` again, because peers held off
+/// for having declined a session while busy may hold a state the round that
+/// `contacted` its peers missed; `None` when its answer stands.
+///
+/// A held-off peer is left out of the lookup before it is asked, so the
+/// round asks farther peers in its place, and their answers fill the quorum
+/// counted over the close group. Ranked against the peers the round asked,
+/// `refused_at_start` (held off when it began) and `refused_now` (held off
+/// now, with the time until each is tried again) give the close group the
+/// round should have asked: the `close_group_size` nearest the address. When
+/// a held-off peer is among them and fewer than a read quorum of them
+/// answered, the answer stands on peers outside the group: a write quorum of
+/// the group can hold a newer state none of them was asked for. With a read
+/// quorum of that group answering, two of any write quorum answered, as a
+/// read with no peer held off needs ([`write_quorum`]), so the answer stands.
+///
+/// The wait lasts until the first such hold-off ends, and at least
+/// [`CLOSE_GROUP_RETRY_DELAY`](crate::client_engine::read::CLOSE_GROUP_RETRY_DELAY)
+/// when one ended during the round, as a chunk read waits.
+fn held_off_wait(
+    address: &XorName,
+    close_group_size: usize,
+    contacted: &Contacted,
+    refused_at_start: &[(PeerId, Duration)],
+    refused_now: &[(PeerId, Duration)],
+) -> Option<Duration> {
+    let held_off: HashSet<PeerId> = refused_at_start
+        .iter()
+        .chain(refused_now)
+        .map(|(peer, _)| *peer)
+        .filter(|peer| !contacted.answered.contains(peer))
+        .collect();
+    if held_off.is_empty() {
+        return None;
+    }
+    let mut group: Vec<PeerId> = contacted.asked.union(&held_off).copied().collect();
+    group.sort_by_key(|peer| ant_protocol::transport::xor_distance(peer.as_bytes(), address));
+    group.truncate(close_group_size);
+    let answered = group
+        .iter()
+        .filter(|peer| contacted.answered.contains(*peer))
+        .count();
+    if answered >= read_quorum(close_group_size) {
+        return None;
+    }
+    group
+        .iter()
+        .filter(|peer| held_off.contains(*peer))
+        .map(|peer| {
+            refused_now
+                .iter()
+                .find(|(refused, _)| refused == peer)
+                .map_or(Duration::ZERO, |(_, remaining)| *remaining)
+        })
+        .min()
+        .map(|remaining| remaining.max(crate::client_engine::read::CLOSE_GROUP_RETRY_DELAY))
+}
+
+/// Whether any of `held_off`, peers held off for having declined a session
+/// while busy, would rank among the `close_group_size` nearest `address`
+/// beside `group`, a lookup that left it out.
+fn displaces_the_group(
+    address: &XorName,
+    close_group_size: usize,
+    group: &HashSet<PeerId>,
+    held_off: &[PeerId],
+) -> bool {
+    held_off.iter().any(|peer| {
+        let distance = ant_protocol::transport::xor_distance(peer.as_bytes(), address);
+        !group.contains(peer)
+            && group
+                .iter()
+                .filter(|member| {
+                    ant_protocol::transport::xor_distance(member.as_bytes(), address) < distance
+                })
+                .count()
+                < close_group_size
+    })
+}
+
+/// Run `round`, a pointer read or census, until no peer held off for having
+/// declined a session while busy may change its answer ([`held_off_wait`]).
+///
+/// `refused` lists the peers held off now, each with the time until it is
+/// tried again ([`crate::data::network::Network::refused_peers`]), and `open`
+/// says whether an answer is one such a peer could change: absence, or a
+/// state a newer one replaces. An error those peers can explain is weighed
+/// the same way ([`held_off_may_explain`]): too few of the group answering
+/// or naming one state, a lookup that found nobody, the group's members
+/// declining as busy during the round, or two final states no majority of
+/// those asked holds. A final state, or any other error, is returned as it
+/// is. Each wait lasts until the first hold-off that may hide a holder
+/// ends, up to
+/// [`MAX_REFUSAL_WAITS`](crate::client_engine::read::MAX_REFUSAL_WAITS)
+/// times, as a chunk read waits, and then the read fails with
+/// [`pointer_holders_busy`] rather than give an answer those peers may
+/// replace. Each round looks the close group up again. A native client
+/// holds no peer off, so its round runs once.
+async fn past_refusals<T, R, RF>(
+    address: &XorName,
+    close_group_size: usize,
+    refused: impl Fn() -> Vec<(PeerId, Duration)>,
+    open: impl Fn(&T) -> bool,
+    round: R,
+) -> Result<T>
+where
+    R: Fn() -> RF,
+    RF: Future<Output = (Result<T>, Contacted)>,
+{
+    let mut waits = 0;
+    loop {
+        let refused_at_start = refused();
+        let (found, contacted) = round().await;
+        let weighed = match &found {
+            Ok(answer) => open(answer),
+            Err(failure) => held_off_may_explain(address, failure),
+        };
+        let wait = if weighed {
+            held_off_wait(
+                address,
+                close_group_size,
+                &contacted,
+                &refused_at_start,
+                &refused(),
+            )
+        } else {
+            None
+        };
+        match wait {
+            None => return found,
+            Some(_) if waits == crate::client_engine::read::MAX_REFUSAL_WAITS => {
+                return Err(pointer_holders_busy(address));
+            }
+            Some(remaining) => {
+                waits += 1;
+                debug!(
+                    "pointer {}: peers held off as busy may hold a newer state; reading again \
+                     in {remaining:?} ({waits}/{})",
+                    hex::encode(address),
+                    crate::client_engine::read::MAX_REFUSAL_WAITS
+                );
+                sleep(remaining).await;
+            }
+        }
+    }
+}
+
+/// Whether a pointer read or census that failed with `failure` may have
+/// failed only because peers held off as busy were left out of its lookup or
+/// declined it during the round ([`past_refusals`]): a shortfall (too few of
+/// the group answered, too few named one state, or the lookup found nobody),
+/// the group's peers busy ([`pointer_holders_busy`]), or two final states no
+/// majority of those asked holds, which the group's other members may
+/// settle. Any other failure is the read's answer.
+fn held_off_may_explain(address: &XorName, failure: &Error) -> bool {
+    match failure {
+        Error::CloseGroupShortfall(_) | Error::PointerForked(_) => true,
+        Error::Network(message) => {
+            matches!(pointer_holders_busy(address), Error::Network(busy) if *message == busy)
+        }
+        _ => false,
+    }
+}
+
+/// Whether a read's answer is one a peer held off as busy could change
+/// ([`past_refusals`]): absence, or a state a newer one replaces. No state
+/// replaces a final one.
+fn read_is_open(found: &Option<Pointer>) -> bool {
+    !found.as_ref().is_some_and(Pointer::is_terminal)
+}
+
+/// Whether a finality check's answer is one a peer held off as busy could
+/// change ([`past_refusals`]): the pointer open, with a state or none.
+fn finality_is_open(finality: &PointerFinality) -> bool {
+    matches!(finality.status, FinalityStatus::Open { .. })
 }
 
 /// What one peer's acknowledgement of a pointer PUT says.
@@ -888,6 +1147,16 @@ impl ReadTally {
         self.replies.add(found);
     }
 
+    /// One peer's failure. `busy` says the peer is held off for having
+    /// declined a session while busy, which makes a shortfall it causes a
+    /// busy network rather than too few holders.
+    fn fail(&mut self, e: Error, busy: bool) {
+        if busy {
+            self.answered.busy += 1;
+        }
+        self.answered.fail(e);
+    }
+
     /// Whether [`read_quorum`] of the set has answered.
     fn has_quorum(&self) -> bool {
         self.answered.count >= read_quorum(self.peers)
@@ -962,6 +1231,16 @@ impl ReadTally {
     fn outcome(self, address: &XorName, asked: Asked) -> Result<Option<Pointer>> {
         let needed = corroboration(self.peers);
         let majority = read_quorum(self.peers);
+        // Too few answered and some of those that did not were busy: asked
+        // again once their hold-off ends they may answer, so say so, in the
+        // words a chunk read uses, rather than report too few holders. A
+        // refusal still comes first when no peer answered, since it says why.
+        let busy = !self.has_quorum()
+            && self.answered.busy > 0
+            && (self.answered.count > 0 || self.answered.refusal.is_none());
+        if busy {
+            return Err(pointer_holders_busy(address));
+        }
         if self.answered.count == 0 {
             return Err(self.answered.failure().unwrap_or_else(|| {
                 Error::Protocol(format!("no {} answered for the pointer", asked.member()))
@@ -1020,29 +1299,99 @@ struct SetRead {
 }
 
 /// Read the pointer at `address` from one set of peers, all asked at once:
-/// `in_flight` holds their verified replies, and `peers` is how many there are.
+/// `in_flight` holds their verified replies, each with the peer that gave it,
+/// `peers` is how many there are, and `busy` says whether a peer that failed
+/// is held off for having declined a session while busy. Each peer that
+/// answers is added to `answered`.
 /// It stops as soon as the set's answer is settled, and the requests still in
 /// flight are dropped, so one slow peer cannot stall the read behind the store
-/// timeout.
+/// timeout; with `ask_all`, only once every peer has answered or failed.
 async fn read_pointer_from(
-    mut in_flight: FuturesUnordered<impl Future<Output = Result<Option<Pointer>>>>,
+    mut in_flight: FuturesUnordered<impl Future<Output = (PeerId, Result<Option<Pointer>>)>>,
     peers: usize,
     address: &XorName,
     asked: Asked,
+    busy: impl Fn(&PeerId) -> bool,
+    ask_all: bool,
+    answered: &mut HashSet<PeerId>,
 ) -> SetRead {
     let mut tally = ReadTally::new(peers);
-    while let Some(result) = in_flight.next().await {
+    while let Some((peer, result)) = in_flight.next().await {
         match result {
             Ok(found) => {
+                answered.insert(peer);
                 tally.answer(found);
-                if tally.settled() {
+                if tally.settled() && !ask_all {
                     break;
                 }
             }
-            Err(e) => tally.answered.fail(e),
+            Err(e) => tally.fail(e, busy(&peer)),
         }
     }
     tally.finish(address, asked)
+}
+
+/// [`read_pointer_with_seeds`]'s answer alone, as the tests read it.
+#[cfg(test)]
+async fn read_pointer<L, G, GF>(
+    address: &XorName,
+    close_group: L,
+    close_group_size: usize,
+    bootstrap: &[(PeerId, Vec<MultiAddr>)],
+    get: G,
+    busy: impl Fn(&PeerId) -> bool,
+) -> Result<Option<Pointer>>
+where
+    L: Future<Output = Result<Vec<(PeerId, Vec<MultiAddr>)>>>,
+    G: Fn(PeerId, Vec<MultiAddr>) -> GF,
+    GF: Future<Output = Result<Option<Pointer>>>,
+{
+    read_pointer_with_seeds(
+        address,
+        close_group,
+        close_group_size,
+        bootstrap,
+        get,
+        busy,
+        &[],
+    )
+    .await
+    .found
+}
+
+/// The bootstrap peers a pointer read asks beside the close group: of `seeds`,
+/// the nine nearest `address` of those the client knows by peer ID
+/// ([`crate::data::network::bootstrap_read_peers`]), those the close group's
+/// lookup, `group`, leaves among the nine nearest, and never fewer than
+/// [`crate::data::network::MIN_POINTER_READ_SEEDS`] (the nearest of the rest
+/// make up the number), or every one when the lookup failed or found nobody
+/// ([`crate::data::network::seeds_for_read`]).
+fn seeds_beside(
+    group: Option<&[(PeerId, Vec<MultiAddr>)]>,
+    seeds: Vec<(PeerId, Vec<MultiAddr>)>,
+    address: &XorName,
+) -> Vec<(PeerId, Vec<MultiAddr>)> {
+    match group {
+        Some(group) => crate::data::network::seeds_for_read(
+            &seeds,
+            group.iter().map(|(peer, _)| *peer.as_bytes()),
+            address,
+            |(peer, _)| *peer.as_bytes(),
+            crate::data::network::MIN_POINTER_READ_SEEDS,
+        ),
+        None => seeds,
+    }
+}
+
+/// A pointer read, and what the bootstrap peers asked beside the close group
+/// said.
+struct PointerRead {
+    /// The read's answer.
+    found: Result<Option<Pointer>>,
+    /// The bootstrap peers' part, or `None` when there were none to ask.
+    seeds: Option<SeedsView>,
+    /// The peers the read asked, of both sets, and those that answered.
+    contacted: Contacted,
 }
 
 /// Read the pointer at `address` from its close group and from `bootstrap`,
@@ -1067,45 +1416,39 @@ async fn read_pointer_from(
 /// `close_group_size`, or more peers if the lookup returned more, so a lookup
 /// that comes back short is a shortfall rather than a smaller group. The
 /// bootstrap peers' are counted over the peers asked.
-async fn read_pointer<L, G, GF>(
-    address: &XorName,
-    close_group: L,
-    close_group_size: usize,
-    bootstrap: &[(PeerId, Vec<MultiAddr>)],
-    get: G,
-) -> Result<Option<Pointer>>
-where
-    L: Future<Output = Result<Vec<(PeerId, Vec<MultiAddr>)>>>,
-    G: Fn(PeerId, Vec<MultiAddr>) -> GF,
-    GF: Future<Output = Result<Option<Pointer>>>,
-{
-    read_pointer_with_seeds(address, close_group, close_group_size, bootstrap, get)
-        .await
-        .found
-}
-
-/// A pointer read, and what the bootstrap peers asked beside the close group
-/// said.
-struct PointerRead {
-    /// The read's answer, as [`read_pointer`] gives it.
-    found: Result<Option<Pointer>>,
-    /// The bootstrap peers' part, or `None` when there were none to ask.
-    seeds: Option<SeedsView>,
-}
-
-/// [`read_pointer`], also reporting what the bootstrap peers said.
+///
+/// `busy` says whether a peer that failed is held off for having declined a
+/// session while busy ([`crate::data::network::Network::refused_peers`]). A
+/// close group too few of which answered, some of the rest busy, fails with
+/// "busy; try again shortly" rather than a shortfall ([`ReadTally::outcome`]).
+/// `held_off` lists the peers held off so when the read began. A lookup
+/// leaves them out, so when one of them would rank among the close group the
+/// lookup returned ([`displaces_the_group`]), the close group is not settled
+/// early: every member is waited for, so that as many of the true group
+/// answer as can ([`held_off_wait`]).
+///
+/// It also reports what the bootstrap peers said ([`PointerRead::seeds`]),
+/// and which peers it asked and which answered ([`Contacted`]), from which
+/// [`past_refusals`] tells whether peers held off as busy, and so left out
+/// of the lookup, may hold a state it missed.
 async fn read_pointer_with_seeds<L, G, GF>(
     address: &XorName,
     close_group: L,
     close_group_size: usize,
     bootstrap: &[(PeerId, Vec<MultiAddr>)],
     get: G,
+    busy: impl Fn(&PeerId) -> bool,
+    held_off: &[PeerId],
 ) -> PointerRead
 where
     L: Future<Output = Result<Vec<(PeerId, Vec<MultiAddr>)>>>,
     G: Fn(PeerId, Vec<MultiAddr>) -> GF,
     GF: Future<Output = Result<Option<Pointer>>>,
 {
+    let ask = |peer: PeerId, addrs: Vec<MultiAddr>| {
+        let reply = get(peer, addrs);
+        async move { (peer, reply.await) }
+    };
     if bootstrap.is_empty() {
         let peers = match close_group.await {
             Ok(peers) => peers,
@@ -1113,29 +1456,43 @@ where
                 return PointerRead {
                     found: Err(failure),
                     seeds: None,
+                    contacted: Contacted::default(),
                 }
             }
         };
+        let mut contacted = Contacted {
+            asked: peers.iter().map(|(peer, _)| *peer).collect(),
+            answered: HashSet::new(),
+        };
         let in_flight = peers
             .iter()
-            .map(|(peer, addrs)| get(*peer, addrs.clone()))
+            .map(|(peer, addrs)| ask(*peer, addrs.clone()))
             .collect();
         let width = quorum_width(peers.len(), close_group_size);
+        let ask_all = displaces_the_group(address, close_group_size, &contacted.asked, held_off);
+        let found = read_pointer_from(
+            in_flight,
+            width,
+            address,
+            Asked::CloseGroup,
+            busy,
+            ask_all,
+            &mut contacted.answered,
+        )
+        .await
+        .outcome;
         return PointerRead {
-            found: read_pointer_from(in_flight, width, address, Asked::CloseGroup)
-                .await
-                .outcome,
+            found,
             seeds: None,
+            contacted,
         };
     }
-    let ask = |peer: PeerId, addrs: Vec<MultiAddr>| {
-        let reply = get(peer, addrs);
-        async move { (peer, reply.await) }
-    };
+    let mut contacted = Contacted::default();
     let mut seeds = HashSet::new();
     let mut in_flight = FuturesUnordered::new();
     for (peer, addrs) in bootstrap {
         if seeds.insert(*peer) {
+            contacted.asked.insert(*peer);
             in_flight.push(ask(*peer, addrs.clone()));
         }
     }
@@ -1145,6 +1502,9 @@ where
     let mut members = HashSet::new();
     let mut close_waiting = 0usize;
     let mut close_done = false;
+    // Whether the close group is read to the end, since peers held off may
+    // be among it.
+    let mut ask_all = false;
     let mut boot = ReadTally::new(seeds.len());
     let mut boot_waiting = seeds.len();
     let mut boot_done = false;
@@ -1154,7 +1514,7 @@ where
     loop {
         if !close_done {
             close_done = match &close {
-                Some(Ok(tally)) => tally.settled() || close_waiting == 0,
+                Some(Ok(tally)) => (tally.settled() && !ask_all) || close_waiting == 0,
                 Some(Err(_)) => true,
                 None => false,
             };
@@ -1195,6 +1555,7 @@ where
                 lookup = None;
                 close = Some(found.map(|peers| {
                     members = peers.iter().map(|(peer, _)| *peer).collect();
+                    ask_all = displaces_the_group(address, close_group_size, &members, held_off);
                     let mut tally = ReadTally::new(quorum_width(members.len(), close_group_size));
                     close_waiting = members.len();
                     for (peer, reply) in early.drain(..) {
@@ -1202,14 +1563,13 @@ where
                             close_waiting = close_waiting.saturating_sub(1);
                             match reply {
                                 Ok(found) => tally.answer(found),
-                                Err(e) => tally.answered.fail(e),
+                                Err(e) => tally.fail(e, busy(&peer)),
                             }
                         }
                     }
-                    if !tally.settled() {
-                        let mut asking = HashSet::new();
+                    if ask_all || !tally.settled() {
                         for (peer, addrs) in peers {
-                            if !seeds.contains(&peer) && asking.insert(peer) {
+                            if !seeds.contains(&peer) && contacted.asked.insert(peer) {
                                 in_flight.push(ask(peer, addrs));
                             }
                         }
@@ -1218,6 +1578,9 @@ where
                 }));
             }
             Either::Right((peer, reply)) => {
+                if reply.is_ok() {
+                    contacted.answered.insert(peer);
+                }
                 let seed = seeds.contains(&peer);
                 if seed {
                     boot_waiting = boot_waiting.saturating_sub(1);
@@ -1240,7 +1603,7 @@ where
                         if !close_done {
                             match reply {
                                 Ok(found) => tally.answer(found),
-                                Err(e) => tally.answered.fail(e),
+                                Err(e) => tally.fail(e, busy(&peer)),
                             }
                         }
                     }
@@ -1266,6 +1629,7 @@ where
     PointerRead {
         found: newest_pointer(close, boot.finish(address, Asked::Bootstrap)),
         seeds: Some(seeds),
+        contacted,
     }
 }
 
@@ -1853,25 +2217,61 @@ impl Client {
     ///
     /// When no peer of the close group that answered holds a final state,
     /// the pointer is then read as [`Self::pointer_get`] reads it, from the
-    /// close group and the bootstrap peers nearest it, so a state only they
-    /// hold is not missed: the pointer is reported open at the counter of the
+    /// close group and the bootstrap peers its lookup leaves among the nine
+    /// nearest, so a state only they hold is not missed: the census and the
+    /// read share one lookup. The pointer is reported open at the counter of the
     /// state that read returns, settling on a final state only the bootstrap
     /// peers hold, and open with no state only when neither set holds one,
     /// once every bootstrap peer asked has answered or failed
     /// ([`PointerFinality::seeds`] says what they hold).
     ///
+    /// A browser leaves peers held off for having declined a session while
+    /// busy out of the lookup, so farther peers answer in their place. While
+    /// such peers may be the close group and the check shows the pointer
+    /// open, or fails in a way they explain (too few answering or naming one
+    /// state, or busy), it is made again once their hold-off ends, as a read
+    /// is ([`past_refusals`]). A final state every peer asked holds, while
+    /// such a peer ranks in the group unasked, is
+    /// [`FinalityStatus::Unconfirmed`].
+    ///
     /// # Errors
     ///
     /// Returns an error if no peer is responsible for the address, if too
     /// few of the group answer to speak for it, or, when the pointer is open,
-    /// with the error that read gives.
+    /// with the error that read gives; and that the nodes that may hold the
+    /// pointer are busy when peers held off may still hold it after the
+    /// waits.
     pub async fn pointer_finality(&self, address: &XorName) -> Result<PointerFinality> {
-        pointer_finality_from(
+        let close_group_size = self.config().close_group_size;
+        past_refusals(
             address,
-            || self.pointer_group(address),
-            self.config().close_group_size,
-            &self.network().bootstrap_peers_near(address),
-            |peer, addrs| self.send_pointer_get(*address, peer, addrs),
+            close_group_size,
+            || self.network().refused_peers(),
+            finality_is_open,
+            || async move {
+                let held_off = self.held_off_peers();
+                // One lookup serves the census and the read after it, and
+                // decides which bootstrap peers that read asks.
+                let group = match self.pointer_group(address).await {
+                    Ok(group) => group,
+                    Err(failure) => return (Err(failure), Contacted::default()),
+                };
+                let bootstrap = seeds_beside(
+                    Some(&group),
+                    self.network().bootstrap_peers_near(address),
+                    address,
+                );
+                pointer_finality_from(
+                    address,
+                    || std::future::ready(Ok(group.clone())),
+                    close_group_size,
+                    &bootstrap,
+                    |peer, addrs| self.send_pointer_get(*address, peer, addrs),
+                    |peer| self.held_off_busy(peer),
+                    &held_off,
+                )
+                .await
+            },
         )
         .await
     }
@@ -1879,21 +2279,39 @@ impl Client {
     /// Ask the whole close group where `address` stands with respect to
     /// finality, and no bootstrap peer: [`Self::pointer_finality`]'s census
     /// on its own, which the checks an update and a transfer make before
-    /// paying use, as does a transfer whose write reported failure.
+    /// paying use, as does a transfer whose write reported failure. While
+    /// peers held off as busy may be the close group and it shows the
+    /// pointer open, or too few of the group answered, it is taken again
+    /// once their hold-off ends ([`past_refusals`]). A final state every peer
+    /// asked holds, while such a peer ranks in the group unasked, is
+    /// [`FinalityStatus::Unconfirmed`].
     ///
     /// # Errors
     ///
-    /// Returns an error if no peer is responsible for the address, or if too
-    /// few of the group answer to speak for it.
+    /// Returns an error if no peer is responsible for the address, if too
+    /// few of the group answer to speak for it, or that the nodes that may
+    /// hold the pointer are busy.
     pub(crate) async fn close_group_finality(&self, address: &XorName) -> Result<PointerFinality> {
-        close_group_census(
+        let close_group_size = self.config().close_group_size;
+        past_refusals(
             address,
-            self.pointer_group(address),
-            self.config().close_group_size,
-            |peer, addrs| self.send_pointer_get(*address, peer, addrs),
+            close_group_size,
+            || self.network().refused_peers(),
+            finality_is_open,
+            || async move {
+                let held_off = self.held_off_peers();
+                let (census, contacted) = close_group_census(
+                    address,
+                    self.pointer_group(address),
+                    close_group_size,
+                    |peer, addrs| self.send_pointer_get(*address, peer, addrs),
+                    &held_off,
+                )
+                .await;
+                (census.map(|(finality, _)| finality), contacted)
+            },
         )
         .await
-        .map(|(finality, _)| finality)
     }
 
     /// Follow `address` through every transfer to the pointer whose owner now
@@ -2275,21 +2693,30 @@ impl Client {
     /// state a majority of it holds; two final states and no majority holding
     /// either are a fork, with no state to return.
     ///
-    /// The close group is asked, and at the same time so are the bootstrap
-    /// peers nearest the address, nine at most of those the client knows by
-    /// peer ID, as a second set with its own quorum and corroboration (five
-    /// answers and two naming the state, of nine); a peer in both is asked
-    /// once. The close group's quorums are counted over the configured
+    /// The close group is looked up, then asked, and at the same time so are
+    /// the bootstrap peers that lookup leaves among the nine nearest the
+    /// address, of the nine nearest of those the client knows by peer ID, or
+    /// all nine when the lookup fails ([`seeds_beside`]), as a second set with
+    /// its own quorum and corroboration (five answers and two naming the
+    /// state, of nine); a peer in both is asked once. The close group's quorums are counted over the configured
     /// close-group size, or more peers if its lookup returned more. Its read
     /// does not stop on a state while a newer one has been named by too few
     /// peers to corroborate it, or on a final state too few hold to be a
     /// majority: it asks the rest of the group first. The answer is the newer
     /// state of the two sets, and a state the bootstrap peers name is returned
     /// even when the close group holds none or does not answer; see
-    /// `read_pointer` and `newest_pointer`. The read then takes as long as the
+    /// `read_pointer_with_seeds` and `newest_pointer`. The read then takes as long as the
     /// slower of the two sets, and reports the pointer absent only once each of
     /// those bootstrap peers has answered or failed. Without such bootstrap
     /// peers only the close group is asked.
+    ///
+    /// A browser leaves peers held off for having declined a session while
+    /// busy out of the lookup, so farther peers answer in their place. While
+    /// such peers may be the close group and too few of it answered, absence,
+    /// a state that is not final, or a failure they explain (too few
+    /// answering or naming one state, busy, or a fork no majority settles) is
+    /// not the answer: the read is made again once their hold-off ends
+    /// ([`past_refusals`]).
     ///
     /// # Errors
     ///
@@ -2300,15 +2727,57 @@ impl Client {
     /// name a newer state than the read would otherwise return, and with
     /// [`Error::PointerForked`] when the close group names a fork, or the
     /// bootstrap peers do and the close group answered without a final state.
+    /// It fails saying the nodes that may hold the pointer are busy when they
+    /// are still held off after the waits.
     pub async fn pointer_get(&self, address: &XorName) -> Result<Option<Pointer>> {
-        read_pointer(
+        let close_group_size = self.config().close_group_size;
+        past_refusals(
             address,
-            self.pointer_group(address),
-            self.config().close_group_size,
-            &self.network().bootstrap_peers_near(address),
-            |peer, addrs| self.send_pointer_get(*address, peer, addrs),
+            close_group_size,
+            || self.network().refused_peers(),
+            read_is_open,
+            || async move {
+                let held_off = self.held_off_peers();
+                let group = self.pointer_group(address).await;
+                let bootstrap = seeds_beside(
+                    group.as_deref().ok(),
+                    self.network().bootstrap_peers_near(address),
+                    address,
+                );
+                let read = read_pointer_with_seeds(
+                    address,
+                    std::future::ready(group),
+                    close_group_size,
+                    &bootstrap,
+                    |peer, addrs| self.send_pointer_get(*address, peer, addrs),
+                    |peer| self.held_off_busy(peer),
+                    &held_off,
+                )
+                .await;
+                (read.found, read.contacted)
+            },
         )
         .await
+    }
+
+    /// Whether `peer` is held off for having declined a browser session while
+    /// busy ([`crate::data::network::Network::refused_peers`]); a native
+    /// client has none.
+    fn held_off_busy(&self, peer: &PeerId) -> bool {
+        self.network()
+            .refused_peers()
+            .iter()
+            .any(|(refused, _)| refused == peer)
+    }
+
+    /// The peers held off now for having declined a browser session while
+    /// busy ([`Self::held_off_busy`]).
+    fn held_off_peers(&self) -> Vec<PeerId> {
+        self.network()
+            .refused_peers()
+            .into_iter()
+            .map(|(peer, _)| peer)
+            .collect()
     }
 
     /// Follow a pointer chain to the chunk it ends at.
@@ -2647,6 +3116,7 @@ mod tests {
             last_error: None,
             refusal,
             refusals,
+            busy: 0,
         }
     }
 
@@ -3019,6 +3489,23 @@ mod tests {
         Duration,
         std::collections::HashMap<u8, usize>,
     ) {
+        simulated_busy_read(address, lookup, close_group, bootstrap, answers, &[]).await
+    }
+
+    /// [`simulated_read`], with the peers in `busy` held off for having
+    /// declined a session while busy.
+    async fn simulated_busy_read(
+        address: XorName,
+        lookup: u64,
+        close_group: impl IntoIterator<Item = u8>,
+        bootstrap: impl IntoIterator<Item = u8>,
+        answers: Answers,
+        busy: &[u8],
+    ) -> (
+        Result<Option<Pointer>>,
+        Duration,
+        std::collections::HashMap<u8, usize>,
+    ) {
         let close_group: Vec<(PeerId, Vec<MultiAddr>)> = close_group
             .into_iter()
             .map(|n| (id(n), Vec::new()))
@@ -3052,6 +3539,7 @@ mod tests {
                     reply
                 }
             },
+            |peer| busy.contains(&peer.as_bytes()[0]),
         )
         .await;
         (read, started.elapsed(), asked.into_inner())
@@ -3059,6 +3547,556 @@ mod tests {
 
     fn read_state_id(read: Result<Option<Pointer>>) -> XorName {
         read.expect("a read").expect("a state").state_id()
+    }
+
+    /// A pointer read most of whose close group is held off for having
+    /// declined a session while busy says the nodes are busy, in the words a
+    /// chunk read uses, rather than that too few answered; with the bootstrap
+    /// peers asked beside it too. Busy peers that are not needed for the
+    /// quorum change nothing, and a shortfall with no busy peer is still a
+    /// shortfall.
+    #[tokio::test(start_paused = true)]
+    async fn busy_holders_make_a_pointer_read_busy_not_short() {
+        let address = [9u8; 32];
+        let busy_failure = || {
+            Err(Error::Network(
+                "pointer GET send failed: refused".to_string(),
+            ))
+        };
+        // Three of seven answer that they hold nothing; four fail at once.
+        let answers = || {
+            joined([
+                answering(1..=3, 5, || Ok(None)),
+                answering(4..=7, 1, busy_failure),
+            ])
+        };
+        let busy = [4, 5, 6, 7];
+        let is_busy = |found: &Result<Option<Pointer>>| {
+            matches!(found, Err(Error::Network(message))
+                if message.contains("are busy; try again shortly")
+                    && message.contains(&hex::encode(address)))
+        };
+
+        let (found, _, _) =
+            simulated_busy_read(address, 0, 1..=7, std::iter::empty(), answers(), &busy).await;
+        assert!(is_busy(&found), "{found:?}");
+        let (found, _, _) = simulated_busy_read(
+            address,
+            0,
+            1..=7,
+            101..=102,
+            joined([answers(), answering(101..=102, 5, || Ok(None))]),
+            &busy,
+        )
+        .await;
+        assert!(is_busy(&found), "{found:?}");
+
+        // The same failures from peers not held off: a shortfall.
+        let (found, _, _) = simulated_read(address, 0, 1..=7, std::iter::empty(), answers()).await;
+        assert!(
+            matches!(found, Err(Error::CloseGroupShortfall(_))),
+            "{found:?}"
+        );
+
+        // Four answer, a quorum of seven: one busy peer is no failure.
+        let answers = joined([
+            answering(1..=4, 5, || Ok(None)),
+            answering(5..=7, 1, busy_failure),
+        ]);
+        let (found, _, _) =
+            simulated_busy_read(address, 0, 1..=7, std::iter::empty(), answers, &[5]).await;
+        assert!(matches!(found, Ok(None)), "{found:?}");
+    }
+
+    /// The browser's refusal hold-off.
+    const HOLD_OFF: Duration = Duration::from_secs(15);
+
+    /// The peer `n` steps from `address`: it differs from the address in its
+    /// last byte alone, by `n`, so a lower `n` is nearer.
+    fn near(address: &XorName, n: u8) -> PeerId {
+        let mut bytes = *address;
+        bytes[31] ^= n;
+        PeerId::from_bytes(bytes)
+    }
+
+    /// A network in paused time on which peers 1 to 20 ([`near`] `address`)
+    /// answer a pointer GET after 50 ms (or the delay [`Self::answering_after`]
+    /// gives them) with the state `holds` gives them, or none, and those in
+    /// `held_off` are held off as busy from the start, for the browser's
+    /// hold-off or for good. Peers [`Self::declining`] names decline the first
+    /// GET they are sent as busy, and are held off for the browser's hold-off
+    /// from then. A lookup returns the seven nearest not held off, as a
+    /// browser's lookup leaves held-off peers out.
+    struct HeldOffNetwork {
+        address: XorName,
+        holds: HashMap<u8, Pointer>,
+        held_off: Vec<u8>,
+        /// When the hold-off ends; `None` when it never does.
+        until: Option<tokio::time::Instant>,
+        lookups: std::cell::Cell<usize>,
+        /// Peers that decline the first GET they are sent as busy.
+        declines: Vec<u8>,
+        /// When the hold-off of each peer that declined ends.
+        declined: std::cell::RefCell<HashMap<u8, tokio::time::Instant>>,
+        /// Reply delays other than 50 ms.
+        delays: HashMap<u8, Duration>,
+    }
+
+    impl HeldOffNetwork {
+        fn new(
+            address: XorName,
+            holds: impl IntoIterator<Item = (u8, Pointer)>,
+            held_off: impl IntoIterator<Item = u8>,
+            for_good: bool,
+        ) -> Self {
+            Self {
+                address,
+                holds: holds.into_iter().collect(),
+                held_off: held_off.into_iter().collect(),
+                until: (!for_good).then(|| tokio::time::Instant::now() + HOLD_OFF),
+                lookups: std::cell::Cell::new(0),
+                declines: Vec::new(),
+                declined: std::cell::RefCell::new(HashMap::new()),
+                delays: HashMap::new(),
+            }
+        }
+
+        /// `peers` decline the first GET they are sent as busy.
+        fn declining(mut self, peers: impl IntoIterator<Item = u8>) -> Self {
+            self.declines.extend(peers);
+            self
+        }
+
+        /// `peers` answer after `delay` rather than 50 ms.
+        fn answering_after(mut self, peers: impl IntoIterator<Item = u8>, delay: Duration) -> Self {
+            self.delays.extend(peers.into_iter().map(|n| (n, delay)));
+            self
+        }
+
+        /// The peers held off now, with the time until each is tried again.
+        fn refused(&self) -> Vec<(PeerId, Duration)> {
+            let now = tokio::time::Instant::now();
+            let remaining = match self.until {
+                Some(until) => until
+                    .checked_duration_since(now)
+                    .filter(|remaining| !remaining.is_zero()),
+                None => Some(HOLD_OFF),
+            };
+            let mut refused: Vec<(PeerId, Duration)> =
+                remaining.map_or_else(Vec::new, |remaining| {
+                    self.held_off
+                        .iter()
+                        .map(|n| (near(&self.address, *n), remaining))
+                        .collect()
+                });
+            refused.extend(self.declined.borrow().iter().filter_map(|(n, until)| {
+                until
+                    .checked_duration_since(now)
+                    .filter(|remaining| !remaining.is_zero())
+                    .map(|remaining| (near(&self.address, *n), remaining))
+            }));
+            refused
+        }
+
+        fn is_refused(&self, peer: &PeerId) -> bool {
+            self.refused().iter().any(|(refused, _)| refused == peer)
+        }
+
+        fn held_off_now(&self) -> Vec<PeerId> {
+            self.refused().into_iter().map(|(peer, _)| peer).collect()
+        }
+
+        async fn lookup(&self) -> Result<Vec<(PeerId, Vec<MultiAddr>)>> {
+            self.lookups.set(self.lookups.get() + 1);
+            Ok((1..=20)
+                .map(|n| near(&self.address, n))
+                .filter(|peer| !self.is_refused(peer))
+                .take(ant_protocol::CLOSE_GROUP_SIZE)
+                .map(|peer| (peer, Vec::new()))
+                .collect())
+        }
+
+        async fn get(&self, peer: PeerId) -> Result<Option<Pointer>> {
+            let n = peer.as_bytes()[31] ^ self.address[31];
+            let delay = self
+                .delays
+                .get(&n)
+                .copied()
+                .unwrap_or(Duration::from_millis(50));
+            tokio::time::sleep(delay).await;
+            if self.declines.contains(&n) && !self.declined.borrow().contains_key(&n) {
+                self.declined
+                    .borrow_mut()
+                    .insert(n, tokio::time::Instant::now() + HOLD_OFF);
+                return Err(Error::Network(format!("peer {n} declined: busy")));
+            }
+            Ok(self.holds.get(&n).cloned())
+        }
+
+        /// A read as `pointer_get` makes one, with no bootstrap peer.
+        async fn read(&self) -> Result<Option<Pointer>> {
+            past_refusals(
+                &self.address,
+                ant_protocol::CLOSE_GROUP_SIZE,
+                || self.refused(),
+                read_is_open,
+                || async move {
+                    let held_off = self.held_off_now();
+                    let read = read_pointer_with_seeds(
+                        &self.address,
+                        self.lookup(),
+                        ant_protocol::CLOSE_GROUP_SIZE,
+                        &[],
+                        |peer, _| self.get(peer),
+                        |peer| self.is_refused(peer),
+                        &held_off,
+                    )
+                    .await;
+                    (read.found, read.contacted)
+                },
+            )
+            .await
+        }
+
+        /// A finality check as `pointer_finality` makes one, with no
+        /// bootstrap peer.
+        async fn finality(&self) -> Result<PointerFinality> {
+            past_refusals(
+                &self.address,
+                ant_protocol::CLOSE_GROUP_SIZE,
+                || self.refused(),
+                finality_is_open,
+                || async move {
+                    let held_off = self.held_off_now();
+                    pointer_finality_from(
+                        &self.address,
+                        || self.lookup(),
+                        ant_protocol::CLOSE_GROUP_SIZE,
+                        &[],
+                        |peer, _| self.get(peer),
+                        |peer| self.is_refused(peer),
+                        &held_off,
+                    )
+                    .await
+                },
+            )
+            .await
+        }
+
+        /// A census as `close_group_finality` takes one, before an update or
+        /// a transfer pays.
+        async fn census(&self) -> Result<PointerFinality> {
+            past_refusals(
+                &self.address,
+                ant_protocol::CLOSE_GROUP_SIZE,
+                || self.refused(),
+                finality_is_open,
+                || async move {
+                    let held_off = self.held_off_now();
+                    let (census, contacted) = close_group_census(
+                        &self.address,
+                        self.lookup(),
+                        ant_protocol::CLOSE_GROUP_SIZE,
+                        |peer, _| self.get(peer),
+                        &held_off,
+                    )
+                    .await;
+                    (census.map(|(finality, _)| finality), contacted)
+                },
+            )
+            .await
+        }
+    }
+
+    /// The whole close group is held off as busy, so the lookup leaves it out
+    /// and seven farther peers answer that they hold nothing: a read quorum
+    /// of seven. The pointer is not reported absent, nor open with no state:
+    /// the read is made again once the hold-off ends, and finds the state.
+    #[tokio::test(start_paused = true)]
+    async fn a_held_off_close_group_is_read_after_its_hold_off_rather_than_reported_absent() {
+        let (pk, sk) = keypair(60);
+        let held = Pointer::create(&sk, &pk, chunk_target(1))
+            .expect("create")
+            .update(&sk, chunk_target(2))
+            .expect("update");
+        let holds = || (1..=7).map(|n| (n, held.clone()));
+
+        let start = tokio::time::Instant::now();
+        let network = HeldOffNetwork::new(held.address(), holds(), 1..=7, false);
+        let read = network.read().await;
+        assert_eq!(read_state_id(read), held.state_id());
+        assert_eq!(network.lookups.get(), 2);
+        assert_eq!(start.elapsed(), HOLD_OFF + Duration::from_millis(50));
+
+        // The finality check, census and read alike.
+        let start = tokio::time::Instant::now();
+        let network = HeldOffNetwork::new(held.address(), holds(), 1..=7, false);
+        let finality = network.finality().await.expect("a check");
+        assert_eq!(finality.status, FinalityStatus::Open { counter: Some(1) });
+        assert_eq!((finality.group, finality.answered), (7, 7));
+        assert_eq!(start.elapsed(), HOLD_OFF + Duration::from_millis(100));
+    }
+
+    /// The five peers of the close group holding the newest state, a write
+    /// quorum, are held off as busy, and the two holding an older one are
+    /// not. Corroborated by those two at a read quorum, the older state is
+    /// not the answer: the read is made again once the hold-off ends, and
+    /// finds the newer.
+    #[tokio::test(start_paused = true)]
+    async fn a_held_off_write_quorum_is_read_after_its_hold_off_rather_than_an_older_state() {
+        let (pk, sk) = keypair(61);
+        let older = Pointer::create(&sk, &pk, chunk_target(1)).expect("create");
+        let newer = older.update(&sk, chunk_target(2)).expect("update");
+        let holds = || {
+            (1..=5)
+                .map(|n| (n, newer.clone()))
+                .chain((6..=7).map(|n| (n, older.clone())))
+        };
+
+        let start = tokio::time::Instant::now();
+        let network = HeldOffNetwork::new(older.address(), holds(), 1..=5, false);
+        let read = network.read().await;
+        assert_eq!(read_state_id(read), newer.state_id());
+        assert_eq!(start.elapsed(), HOLD_OFF + Duration::from_millis(50));
+
+        let network = HeldOffNetwork::new(older.address(), holds(), 1..=5, false);
+        let finality = network.finality().await.expect("a check");
+        assert_eq!(finality.status, FinalityStatus::Open { counter: Some(1) });
+    }
+
+    /// A close group held off for good: the read waits out the hold-off
+    /// three times, then says the nodes are busy rather than that the
+    /// pointer is absent.
+    #[tokio::test(start_paused = true)]
+    async fn a_close_group_held_off_for_good_makes_a_pointer_read_busy_not_absent() {
+        let (pk, sk) = keypair(62);
+        let held = Pointer::create(&sk, &pk, chunk_target(1)).expect("create");
+        let start = tokio::time::Instant::now();
+        let network = HeldOffNetwork::new(
+            held.address(),
+            (1..=7).map(|n| (n, held.clone())),
+            1..=7,
+            true,
+        );
+        let read = network.read().await;
+        assert!(
+            matches!(&read, Err(Error::Network(message))
+                if message.contains("are busy; try again shortly")),
+            "{read:?}"
+        );
+        let waits = crate::client_engine::read::MAX_REFUSAL_WAITS;
+        assert_eq!(network.lookups.get(), waits + 1);
+        assert_eq!(
+            start.elapsed(),
+            HOLD_OFF * u32::try_from(waits).unwrap()
+                + Duration::from_millis(50) * u32::try_from(waits + 1).unwrap()
+        );
+    }
+
+    /// One peer of the close group held off for good: the rest of the group
+    /// is read to the end, a read quorum of it answers, and its answer, a
+    /// state or none, stands with no wait.
+    #[tokio::test(start_paused = true)]
+    async fn one_held_off_peer_of_the_close_group_does_not_hold_up_a_pointer_read() {
+        let (pk, sk) = keypair(63);
+        let held = Pointer::create(&sk, &pk, chunk_target(1)).expect("create");
+        for holds in [
+            (1..=7).map(|n| (n, held.clone())).collect::<Vec<_>>(),
+            vec![],
+        ] {
+            let found = !holds.is_empty();
+            let start = tokio::time::Instant::now();
+            let network = HeldOffNetwork::new(held.address(), holds, [3], true);
+            let read = network.read().await.expect("a read");
+            assert_eq!(
+                read.map(|state| state.state_id()),
+                found.then(|| held.state_id())
+            );
+            assert_eq!(network.lookups.get(), 1);
+            assert_eq!(start.elapsed(), Duration::from_millis(50));
+        }
+    }
+
+    /// Six of the close group are held off as busy, so the lookup asks the
+    /// seventh and six farther peers. Only the seventh names the state, short
+    /// of the two that corroborate one; or the one of two not held off names
+    /// the newest state and the other an older one, neither by two. The
+    /// shortfall is one the held-off peers explain: the read, and the
+    /// finality check, are made again once the hold-off ends, and find the
+    /// newest state.
+    #[tokio::test(start_paused = true)]
+    async fn a_shortfall_held_off_peers_explain_is_read_again_after_their_hold_off() {
+        let (pk, sk) = keypair(64);
+        let older = Pointer::create(&sk, &pk, chunk_target(1)).expect("create");
+        let newer = older.update(&sk, chunk_target(2)).expect("update");
+        let cases = [
+            (
+                (1..=7).map(|n| (n, newer.clone())).collect::<Vec<_>>(),
+                (1..=6).collect::<Vec<u8>>(),
+            ),
+            (
+                (1..=6)
+                    .map(|n| (n, newer.clone()))
+                    .chain([(7, older.clone())])
+                    .collect(),
+                (1..=5).collect(),
+            ),
+        ];
+        for (holds, held_off) in cases {
+            let start = tokio::time::Instant::now();
+            let network =
+                HeldOffNetwork::new(newer.address(), holds.clone(), held_off.clone(), false);
+            let read = network.read().await;
+            assert_eq!(read_state_id(read), newer.state_id());
+            assert_eq!(network.lookups.get(), 2);
+            assert_eq!(start.elapsed(), HOLD_OFF + Duration::from_millis(50));
+
+            let start = tokio::time::Instant::now();
+            let network = HeldOffNetwork::new(newer.address(), holds, held_off, false);
+            let finality = network.finality().await.expect("a check");
+            assert_eq!(finality.status, FinalityStatus::Open { counter: Some(1) });
+            assert_eq!(start.elapsed(), HOLD_OFF + Duration::from_millis(100));
+        }
+    }
+
+    /// Four of the close group decline the read as busy during the round,
+    /// and are held off from then: the three that answer are short of a read
+    /// quorum. That is not the answer, nor is "busy" at once: the read, the
+    /// census and the finality check wait out the hold-off, as a chunk read
+    /// does, and find the state.
+    #[tokio::test(start_paused = true)]
+    async fn a_close_group_that_declines_as_busy_during_the_round_is_read_after_its_hold_off() {
+        let (pk, sk) = keypair(65);
+        let held = Pointer::create(&sk, &pk, chunk_target(1))
+            .expect("create")
+            .update(&sk, chunk_target(2))
+            .expect("update");
+        let network = || {
+            HeldOffNetwork::new(
+                held.address(),
+                (1..=7).map(|n| (n, held.clone())),
+                [],
+                false,
+            )
+            .declining(1..=4)
+        };
+
+        let start = tokio::time::Instant::now();
+        let read_network = network();
+        let read = read_network.read().await;
+        assert_eq!(read_state_id(read), held.state_id());
+        assert_eq!(read_network.lookups.get(), 2);
+        assert_eq!(start.elapsed(), HOLD_OFF + Duration::from_millis(100));
+
+        let start = tokio::time::Instant::now();
+        let census = network().census().await.expect("a census");
+        assert_eq!(census.status, FinalityStatus::Open { counter: Some(1) });
+        assert_eq!((census.group, census.answered), (7, 7));
+        assert_eq!(start.elapsed(), HOLD_OFF + Duration::from_millis(100));
+
+        let start = tokio::time::Instant::now();
+        let finality = network().finality().await.expect("a check");
+        assert_eq!(finality.status, FinalityStatus::Open { counter: Some(1) });
+        assert_eq!(start.elapsed(), HOLD_OFF + Duration::from_millis(150));
+    }
+
+    /// The census an update or a transfer takes before paying, of a close
+    /// group held off as busy: seven farther peers answer that they hold
+    /// nothing, and the census is taken again once the hold-off ends, and
+    /// finds the state, rather than reporting the pointer open with none.
+    #[tokio::test(start_paused = true)]
+    async fn a_census_of_a_held_off_close_group_is_taken_after_its_hold_off() {
+        let (pk, sk) = keypair(66);
+        let held = Pointer::create(&sk, &pk, chunk_target(1))
+            .expect("create")
+            .update(&sk, chunk_target(2))
+            .expect("update");
+        let start = tokio::time::Instant::now();
+        let network = HeldOffNetwork::new(
+            held.address(),
+            (1..=7).map(|n| (n, held.clone())),
+            1..=7,
+            false,
+        );
+        let census = network.census().await.expect("a census");
+        assert_eq!(census.status, FinalityStatus::Open { counter: Some(1) });
+        assert_eq!((census.group, census.answered), (7, 7));
+        assert_eq!(network.lookups.get(), 2);
+        assert_eq!(start.elapsed(), HOLD_OFF + Duration::from_millis(50));
+    }
+
+    /// The nearest peer of the close group is held off as busy and holds a
+    /// rival final state; the six others and the farther peer the lookup
+    /// asks in its place hold the majority one. Seven of seven asked answer,
+    /// but a member of the true group was not asked, so the state is
+    /// unconfirmed, not final, in the census and the finality check alike. A
+    /// peer held off outside the group leaves it final.
+    #[tokio::test(start_paused = true)]
+    async fn a_final_state_is_unconfirmed_while_a_held_off_group_member_was_not_asked() {
+        let (pk, sk) = keypair(67);
+        let created = Pointer::create(&sk, &pk, chunk_target(1)).expect("create");
+        let majority = created.finalize(&sk, chunk_target(5)).expect("finalize");
+        let rival = created.finalize(&sk, chunk_target(6)).expect("finalize");
+        let holds = || {
+            [(1, rival.clone())]
+                .into_iter()
+                .chain((2..=8).map(|n| (n, majority.clone())))
+        };
+        let network = HeldOffNetwork::new(majority.address(), holds(), [1], true);
+        for finality in [
+            network.census().await.expect("a census"),
+            network.finality().await.expect("a check"),
+        ] {
+            assert_eq!((finality.group, finality.answered), (7, 7));
+            match finality.status {
+                FinalityStatus::Unconfirmed(state) => {
+                    assert_eq!(state.state_id, majority.state_id());
+                    assert_eq!(state.holders, 7);
+                }
+                other => panic!("expected Unconfirmed, got {other:?}"),
+            }
+        }
+
+        let holds = (1..=9).map(|n| (n, majority.clone()));
+        let network = HeldOffNetwork::new(majority.address(), holds, [9], true);
+        let finality = network.census().await.expect("a census");
+        assert!(
+            matches!(&finality.status, FinalityStatus::Final(state)
+                if state.state_id == majority.state_id()),
+            "{finality:?}"
+        );
+    }
+
+    /// One peer of the close group is held off for good and the farther peer
+    /// the lookup asks in its place answers first. A read that settled on the
+    /// first four answers would count three of the true group and wait out
+    /// the hold-off; the group is read to the end instead, six of the true
+    /// group answer, and the read and the finality check stand with no wait.
+    #[tokio::test(start_paused = true)]
+    async fn a_held_off_group_member_has_the_rest_of_the_group_read_to_the_end() {
+        let (pk, sk) = keypair(68);
+        let held = Pointer::create(&sk, &pk, chunk_target(1)).expect("create");
+        let network = || {
+            HeldOffNetwork::new(
+                held.address(),
+                (1..=8).map(|n| (n, held.clone())),
+                [1],
+                true,
+            )
+            .answering_after([8], Duration::from_millis(10))
+        };
+
+        let start = tokio::time::Instant::now();
+        let read_network = network();
+        let read = read_network.read().await;
+        assert_eq!(read_state_id(read), held.state_id());
+        assert_eq!(read_network.lookups.get(), 1);
+        assert_eq!(start.elapsed(), Duration::from_millis(50));
+
+        let start = tokio::time::Instant::now();
+        let finality = network().finality().await.expect("a check");
+        assert_eq!(finality.status, FinalityStatus::Open { counter: Some(0) });
+        assert_eq!(start.elapsed(), Duration::from_millis(100));
     }
 
     /// A state the bootstrap peers corroborate is the answer when the close
@@ -3296,8 +4334,41 @@ mod tests {
         assert!(found.expect("a read").is_none());
     }
 
+    /// `pointer_get` and `pointer_finality` give a read the bootstrap peers
+    /// their lookup leaves among the nine nearest the pointer, and all of the
+    /// nine nearest when the lookup failed.
+    #[test]
+    fn a_pointer_read_asks_the_seeds_its_lookup_leaves_among_the_nine_nearest() {
+        let id = |n: u8| PeerId::from_bytes([n; 32]);
+        let seeds: Vec<(PeerId, Vec<MultiAddr>)> =
+            (101..=109).map(|n| (id(n), Vec::new())).collect();
+        let group: Vec<(PeerId, Vec<MultiAddr>)> = (1..=7).map(|n| (id(n), Vec::new())).collect();
+        let asked = |group: Option<&[(PeerId, Vec<MultiAddr>)]>| {
+            seeds_beside(group, seeds.clone(), &[0; 32])
+                .into_iter()
+                .map(|(peer, _)| peer.as_bytes()[0])
+                .collect::<Vec<u8>>()
+        };
+        // Seven peers nearer than every seed: the two nearest seeds complete
+        // the nine nearest, and only they are asked.
+        assert_eq!(asked(Some(&group)), vec![101, 102]);
+        // Nine peers nearer than every seed: the floor of two still asks the
+        // two nearest seeds, so two can corroborate a state.
+        let nine: Vec<(PeerId, Vec<MultiAddr>)> = (1..=9).map(|n| (id(n), Vec::new())).collect();
+        assert_eq!(asked(Some(&nine)), vec![101, 102]);
+        // Eight nearer: the nearest seed passes the filter and the floor adds
+        // the next one.
+        assert_eq!(asked(Some(&nine[..8])), vec![101, 102]);
+        assert_eq!(crate::data::network::MIN_POINTER_READ_SEEDS, 2);
+        // A thin lookup leaves more of them among the nearest.
+        assert_eq!(asked(Some(&group[..2])), (101..=107).collect::<Vec<u8>>());
+        // No lookup, or an empty one: all nine.
+        assert_eq!(asked(None), (101..=109).collect::<Vec<u8>>());
+        assert_eq!(asked(Some(&[])), (101..=109).collect::<Vec<u8>>());
+    }
+
     /// A read given the bootstrap peers `bootstrap_read_peers` chooses from
-    /// sixteen seeds, as `pointer_get` is, asks the nine nearest the pointer
+    /// sixteen seeds, the most `pointer_get` gives one, asks the nine nearest the pointer
     /// and never the seven farther ones: two of the nine naming the state are
     /// enough on five answers, and a state only the farther seeds hold is not
     /// looked for there.
@@ -4305,8 +5376,11 @@ mod tests {
                     reply
                 }
             },
+            |_| false,
+            &[],
         )
-        .await;
+        .await
+        .0;
         (finality, asked.into_inner())
     }
 

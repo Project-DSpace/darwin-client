@@ -78,9 +78,7 @@ test("a newly discovered holder is readable before a slow lookup round finishes"
 });
 
 test("early misses do not exhaust the fallback allowance before a later holder", async () => {
-  const nodes = Array.from({ length: 12 }, () => ({
-    respond: (_channel, method) => method === "find_node" ? false : undefined,
-  }));
+  const nodes = Array.from({ length: 12 }, () => ({}));
   const rtc = mockWebRtc(nodes);
   const target = BigInt(`0x${datamap.address}`);
   const ordered = rtc.endpoints.map((endpoint, index) => ({index,
@@ -93,6 +91,11 @@ test("early misses do not exhaust the fallback allowance before a later holder",
   const client = new BrowserNetworkClient(rtc.endpoints);
   let reader, deadline;
   try {
+    // A lookup connects the client to every node, which a browser that
+    // dials three seeds is not at its start; then discovery stops answering,
+    // and the connected nodes are the read's only candidates.
+    await client.findClosest(datamap.address);
+    for (const node of nodes) node.respond = (_channel, method) => method === "find_node" ? false : undefined;
     reader = await Promise.race([
       client.openPublicFile(datamap.address),
       new Promise((_, reject) => deadline = setTimeout(() => reject(new Error("speculation exhausted before holder")), 1500)),
@@ -149,14 +152,19 @@ test("nodes serving corrupt content are passed over for one that serves the reco
   const corrupt = ordered.slice(0, 3);
   for (const i of corrupt) nodes[i].chunk = new Uint8Array([1, 2, 3]);
   nodes[ordered[3]].chunk = datamap.content;
-  const client = new BrowserNetworkClient(rtc.endpoints);
+  // A read asks the connected seeds before discovery answers, and a browser
+  // connects to three seeds at random. With every node a seed, the holder can
+  // be among them and the corrupt nodes not, and then it is rightly asked
+  // first. The corrupt nodes are the only seeds here, so a corrupt node is
+  // asked first and the holder is reached through discovery.
+  const client = new BrowserNetworkClient(corrupt.map(i => rtc.endpoints[i]));
   let reader;
   try {
     reader = await client.openPublicFile(datamap.address);
     assert.equal(reader.size, content.length);
     const gets = rtc.requests.filter(request => request.method === "get_chunk");
-    assert.ok(gets.some(request => corrupt.includes(request.node)), "a corrupt node was asked first");
-    assert.ok(gets.some(request => request.node === ordered[3]));
+    assert.ok(corrupt.includes(gets[0]?.node), "a corrupt node was asked first");
+    assert.ok(gets.some(request => request.node === ordered[3]), "the holder served the record");
   } finally { reader?.close(); client.close(); }
 });
 
@@ -168,10 +176,12 @@ function nearestFirst(rtc) {
   return rtc.endpoints.map((_, i) => i).sort((a, b) => distance(a) < distance(b) ? -1 : 1);
 }
 
-test("a record only the farthest of eight seeds holds is read", async () => {
-  // Fewer than nine seeds: a read asks every one. The eight farthest of forty
-  // nodes are the seeds, so the farthest is beyond the seven nearest that
-  // discovery finds and the known peers a read falls back to.
+test("a record only the farthest of eight far seeds holds is read among the known peers", async () => {
+  // The eight farthest of forty nodes are the seeds. Discovery finds the seven
+  // nearest, so no seed is among the nine nearest of what the read knows, and
+  // none is asked as a bootstrap peer. A browser knows its seeds, though, and
+  // with fewer than twenty known peers past the close group the read reaches
+  // the farthest among those it falls back to.
   const nodes = Array.from({ length: 40 }, () => ({}));
   const rtc = mockWebRtc(nodes);
   const seeds = nearestFirst(rtc).slice(-8);
@@ -185,12 +195,34 @@ test("a record only the farthest of eight seeds holds is read", async () => {
   } finally { reader?.close(); client.close(); }
 });
 
+test("a record only a seed holds is read when discovery finds no node", async () => {
+  // The seed holds it, the other node is its only peer, and no node answers
+  // discovery: the read asks the seeds nearest the record.
+  const rtc = mockWebRtc([{ chunk: datamap.content, respond: failDiscovery }, { respond: failDiscovery }]);
+  const client = new BrowserNetworkClient(rtc.endpoints.slice(0, 1));
+  let reader;
+  try {
+    reader = await client.openPublicFile(datamap.address);
+    assert.equal(reader.size, content.length);
+  } finally { reader?.close(); client.close(); }
+});
+
+// Thirty seeds, of which the farthest takes five seconds to open a session:
+// a read that dials it among its three random seeds can't read it early as a
+// connected peer, before the read is decided.
+function thirtySeeds() {
+  const nodes = Array.from({ length: 30 }, () => ({}));
+  const rtc = mockWebRtc(nodes);
+  const ordered = nearestFirst(rtc);
+  nodes[ordered.at(-1)].connectDelay = 5_000;
+  return { nodes, rtc, ordered };
+}
+
 test("a record only a seed outside the nine nearest it holds is not looked for there", async () => {
   // Of thirty seeds, the farthest: beyond the nine nearest the record that a
   // read asks, and beyond the twenty more known peers it falls back to.
-  const nodes = Array.from({ length: 30 }, () => ({}));
-  const rtc = mockWebRtc(nodes);
-  const farthest = nearestFirst(rtc).at(-1);
+  const { nodes, rtc, ordered } = thirtySeeds();
+  const farthest = ordered.at(-1);
   nodes[farthest].chunk = datamap.content;
   const client = new BrowserNetworkClient(rtc.endpoints);
   try {
@@ -200,8 +232,7 @@ test("a record only a seed outside the nine nearest it holds is not looked for t
 });
 
 test("a missing record is reported once the nine seeds nearest it and the usual candidates have answered", async () => {
-  const rtc = mockWebRtc(Array.from({ length: 30 }, () => ({})));
-  const ordered = nearestFirst(rtc);
+  const { rtc, ordered } = thirtySeeds();
   const client = new BrowserNetworkClient(rtc.endpoints);
   try {
     await assert.rejects(client.openPublicFile(datamap.address), /not found/);

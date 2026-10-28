@@ -1,0 +1,23 @@
+{
+ "leafCount": "0x1",
+ "quoteHashes": [
+  "0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+ ],
+ "payees": [
+  "0xffffffffffffffffffffffffffffffffffffffff"
+ ],
+ "amounts": [
+  "0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+ ],
+ "leaves": [
+  "0xd93df4bd07ada28ec0785f794f055a009b461d5edb8020ecc9495f55e4727703"
+ ],
+ "root": "0xd93df4bd07ada28ec0785f794f055a009b461d5edb8020ecc9495f55e4727703",
+ "key": "0xe05dd99c4b5337d389020fba9f311745d96e182f90bbffaf75c8ceff253193ea",
+ "pathIndices": [
+  "0x0"
+ ],
+ "paths": [
+  []
+ ]
+}

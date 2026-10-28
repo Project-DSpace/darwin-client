@@ -36,13 +36,18 @@ pub const DATA_TYPE_CHUNK: u32 = 0;
 /// conflating them is what made this constant necessary.
 ///
 /// Version 1 is the ADR-0008 rule set: a merkle batch settles at
-/// `3 x median16(price) x 2^depth`, matching the single-node path.
+/// `3 x median16(price) x 2^depth`, matching the single-node path. Version 2
+/// pays a single-node record by its size class: `3 x median(price) x w`, with
+/// `w` the weight of the class (`payment::pricing::weighted_amount`), and its
+/// quotes are priced at the node's weight total.
 ///
 /// **Bump this whenever a change makes an older client pay an amount storers
-/// will refuse.** The multiplier moving, the median rule changing, the payable
-/// field being redefined: all of those. A change that only alters *how much* a
-/// node quotes does not qualify, because the client pays whatever it is
-/// quoted; a change to the arithmetic *applied* to that quote does.
+/// will refuse, or quotes an older client a price it will refuse.** The
+/// multiplier moving, the median rule changing, the payable field being
+/// redefined, the weight applied to the quote: all of those. A change to how
+/// much a node quotes can qualify too, because a client checks each quote's
+/// price against the curve before it pays, so a price outside what an older
+/// client accepts goes only to clients that declare the newer version.
 ///
 /// # Why this exists
 ///

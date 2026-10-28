@@ -827,7 +827,7 @@ dependencies = [
 
 [[package]]
 name = "ant-cli"
-version = "0.3.11"
+version = "0.3.11+ds.3"
 dependencies = [
  "ant-core",
  "anyhow",
@@ -854,7 +854,7 @@ name = "ant-core"
 version = "0.13.0"
 dependencies = [
  "alloy",
- "ant-listings 0.3.1",
+ "ant-listings 0.4.0",
  "ant-node",
  "ant-protocol",
  "anyhow",
@@ -919,6 +919,19 @@ dependencies = [
 [[package]]
 name = "ant-listings"
 version = "0.3.1"
+source = "git+https://github.com/Project-DSpace/darwin-node.git?rev=81dbac76f1c6fccc6cbe0ab2ab725b6fda90ba90#81dbac76f1c6fccc6cbe0ab2ab725b6fda90ba90"
+dependencies = [
+ "ant-protocol",
+ "postcard",
+ "rmp-serde",
+ "self_encryption",
+ "serde",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "ant-listings"
+version = "0.4.0"
 dependencies = [
  "ant-protocol",
  "postcard",
@@ -933,19 +946,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "ant-listings"
-version = "0.3.1"
-source = "git+https://github.com/Project-DSpace/darwin-node.git?rev=19d38d58fd3f760fedf1c83729108529ed48d232#19d38d58fd3f760fedf1c83729108529ed48d232"
-dependencies = [
- "ant-protocol",
- "postcard",
- "rmp-serde",
- "self_encryption",
- "serde",
- "thiserror 2.0.18",
-]
-
-[[package]]
 name = "ant-merkle"
 version = "1.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -956,10 +956,10 @@ dependencies = [
 
 [[package]]
 name = "ant-node"
-version = "0.23.0+ds.15"
-source = "git+https://github.com/Project-DSpace/darwin-node.git?rev=19d38d58fd3f760fedf1c83729108529ed48d232#19d38d58fd3f760fedf1c83729108529ed48d232"
+version = "0.23.0+ds.18"
+source = "git+https://github.com/Project-DSpace/darwin-node.git?rev=81dbac76f1c6fccc6cbe0ab2ab725b6fda90ba90#81dbac76f1c6fccc6cbe0ab2ab725b6fda90ba90"
 dependencies = [
- "ant-listings 0.3.1 (git+https://github.com/Project-DSpace/darwin-node.git?rev=19d38d58fd3f760fedf1c83729108529ed48d232)",
+ "ant-listings 0.3.1",
  "ant-protocol",
  "bao",
  "blake3",
@@ -7347,7 +7347,7 @@ dependencies = [
 [[package]]
 name = "webrtc"
 version = "0.14.0"
-source = "git+https://github.com/Project-DSpace/darwin-node.git?rev=19d38d58fd3f760fedf1c83729108529ed48d232#19d38d58fd3f760fedf1c83729108529ed48d232"
+source = "git+https://github.com/Project-DSpace/darwin-node.git?rev=81dbac76f1c6fccc6cbe0ab2ab725b6fda90ba90#81dbac76f1c6fccc6cbe0ab2ab725b6fda90ba90"
 dependencies = [
  "arc-swap",
  "async-trait",

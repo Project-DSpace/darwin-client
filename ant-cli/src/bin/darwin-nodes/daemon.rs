@@ -2,18 +2,16 @@ use std::net::IpAddr;
 
 use clap::{Args, Subcommand};
 use colored::Colorize;
-use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
 use ant_core::node::daemon::client;
 use ant_core::node::types::DaemonConfig;
 
+use crate::log_file::LogFile;
+
 /// The words, after the executable, that run this manager's daemon in the foreground: what
 /// `daemon start` spawns.
 pub const DAEMON_RUN: &[&str] = &["daemon", "run"];
-
-/// How many daily log files the daemon keeps: a month, as `ant` 0.3.9's daemon does.
-const DAEMON_LOG_FILES_KEPT: usize = 30;
 
 /// Overrides shared by `daemon start` and `daemon run`.
 #[derive(Args, Clone, Debug, Default)]
@@ -21,10 +19,11 @@ pub struct BindArgs {
     /// Write the daemon's own log to this path.
     ///
     /// Unset by default, in which case the daemon logs nothing. The path names the log family
-    /// rather than a single file: it rotates daily and keeps a month, so `--log-path
-    /// /data/logs/manager` writes `/data/logs/manager.2026-10-24.log`. A relative path is resolved
-    /// against the current directory before being handed to the detached daemon, which does not
-    /// share it.
+    /// rather than a single file: a new file every 10 MiB or hour and on every start, at most
+    /// 50 MiB in all and a month old, so `--log-path /data/logs/manager` writes files such as
+    /// `/data/logs/manager.2026-10-25T09-30-00.log`. With 1 GiB free or less on its disk, it
+    /// writes only warnings and errors. A relative path is resolved against the current directory
+    /// before being handed to the detached daemon, which does not share it.
     #[arg(long, value_name = "PATH")]
     pub log_path: Option<std::path::PathBuf>,
 
@@ -85,11 +84,11 @@ fn absolute_path(path: &std::path::Path) -> std::path::PathBuf {
     }
 }
 
-/// Start writing the daemon's log to a rotating file, returning the guard that must outlive it.
+/// Start writing the daemon's log to its capped file family ([`LogFile`]).
 ///
 /// `RUST_LOG` still wins if set; otherwise INFO, the level the supervisor's restart decisions are
-/// logged at.
-fn init_daemon_file_logging(log_path: &std::path::Path) -> anyhow::Result<WorkerGuard> {
+/// logged at. Each line is written as it is logged, so nothing is left to flush on exit.
+fn init_daemon_file_logging(log_path: &std::path::Path) -> anyhow::Result<()> {
     let directory = log_path
         .parent()
         .unwrap_or_else(|| std::path::Path::new("."));
@@ -97,15 +96,7 @@ fn init_daemon_file_logging(log_path: &std::path::Path) -> anyhow::Result<Worker
         .file_stem()
         .and_then(|s| s.to_str())
         .unwrap_or("daemon");
-    std::fs::create_dir_all(directory)?;
-
-    let appender = tracing_appender::rolling::Builder::new()
-        .rotation(tracing_appender::rolling::Rotation::DAILY)
-        .filename_prefix(prefix)
-        .filename_suffix("log")
-        .max_log_files(DAEMON_LOG_FILES_KEPT)
-        .build(directory)?;
-    let (writer, guard) = tracing_appender::non_blocking(appender);
+    let writer = LogFile::open(directory, prefix)?;
 
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
     tracing_subscriber::registry()
@@ -113,7 +104,7 @@ fn init_daemon_file_logging(log_path: &std::path::Path) -> anyhow::Result<Worker
         .with(filter)
         .init();
 
-    Ok(guard)
+    Ok(())
 }
 
 fn format_uptime(secs: u64) -> String {
@@ -282,9 +273,8 @@ impl DaemonCommand {
                 }
             }
             DaemonCommand::Run(_) => {
-                // Held for the whole run: dropping the guard stops the writer flushing.
-                let _log_guard = if let Some(ref log_path) = config.log_path {
-                    let guard = init_daemon_file_logging(log_path)?;
+                if let Some(ref log_path) = config.log_path {
+                    init_daemon_file_logging(log_path)?;
                     // A first line on every start, so the file is never silently empty and the
                     // supervisor's later entries can be tied to a particular daemon instance.
                     tracing::info!(
@@ -293,10 +283,7 @@ impl DaemonCommand {
                         env!("DARWIN_GIT_COMMIT"),
                         std::process::id()
                     );
-                    Some(guard)
-                } else {
-                    None
-                };
+                }
                 client::run_image_manager(config).await?;
             }
         }

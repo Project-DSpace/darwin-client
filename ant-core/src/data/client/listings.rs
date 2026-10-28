@@ -43,7 +43,9 @@
 //! stopped early carries on in the next read ([`WalkState`]), and a read
 //! never says a listing it didn't decide is gone ([`ListingsIndex::carry`]).
 
-use crate::data::client::listings_facts::{Facts, Keep, Known, VaultLog, FINALIZED_REFRESH};
+use crate::data::client::listings_facts::{
+    receipt_keeps, Facts, Keep, Known, VaultLog, FINALIZED_REFRESH,
+};
 use crate::data::client::listings_rpc::{Answer, Call, Kind, Rpc};
 use crate::data::client::listings_store::ListingsStore;
 use crate::data::client::listings_v1::RpcCalls;
@@ -58,9 +60,9 @@ use ant_listings::{
     push_request_id, quorum_needed, verify_listing_receipts, AddressWalk, ChangesResponse,
     CheckLevel, Envelope, EnvelopeProof, IndexWalk, Listing, ListingCheck, ListingKey,
     ListingPayment, ListingsBody, ListingsMessage, Lookup, MergedListing, NodeReport, PaidAt,
-    PaymentError, PaymentLog, PaymentReceipt, ProvenUpload, WalkOutcome, WalkResult, CLOCK_MARGIN,
-    DATA_PAYMENT_MADE_TOPIC, FIRST_SEEN_ROUNDING, MAX_LIST_LIMIT, QUORUM_THRESHOLD, TOPIC,
-    WALK_FREE_LISTINGS, WATCH_LEASE,
+    PaymentError, PaymentLog, PaymentReceipt, ProvenUpload, RootVault, VaultSet, WalkOutcome,
+    WalkResult, CLOCK_MARGIN, DATA_PAYMENT_MADE_TOPIC, FIRST_SEEN_ROUNDING, MAX_LIST_LIMIT,
+    QUORUM_THRESHOLD, TOPIC, WALK_FREE_LISTINGS, WATCH_LEASE,
 };
 use ant_protocol::evm::{Amount, Network as EvmNetwork, QuoteHash};
 use ant_protocol::transport::{MultiAddr, P2PEvent, P2PNode, PeerId};
@@ -128,7 +130,10 @@ pub const NEAREST_NODES: usize = CLOSE_GROUP_SIZE;
 /// refuses a wider range.
 const MIN_LOG_RANGE: u64 = 64;
 
-/// The most `eth_getLogs` calls one search for a quote's payment makes.
+/// The most rounds of log queries one search for a quote's payment makes.
+/// A round is one `eth_getLogs` call for a reader of the per-quote vault
+/// alone, and a batch of two, one per vault, for a reader with a root vault
+/// ([`ListingChain::vault_logs`]): at most 64 or 128 calls.
 const MAX_LOG_CALLS: usize = 64;
 
 /// The fewest blocks each `eth_getLogs` call covers when a search for a
@@ -2197,7 +2202,7 @@ pub(crate) async fn check_quorum_group(
     let listing = listing_to_check(group, nearest, needed).ok_or_else(|| {
         GroupProblem::Invalid("none of the nodes nearest its address gives it a first_seen".into())
     })?;
-    check_offline(&listing, envelope, chain.vault())
+    check_offline(&listing, envelope, chain.vaults())
         .map_err(|e| GroupProblem::Invalid(e.to_string()))?;
     check_vault_deployment(group, nearest, needed, chain).map_err(GroupProblem::Invalid)?;
     let lookup = payment_lookup(&listing).map_err(|e| GroupProblem::Invalid(e.to_string()))?;
@@ -2206,7 +2211,7 @@ pub(crate) async fn check_quorum_group(
         .await
         .map_err(|e| GroupProblem::Again(CheckProblem::ChainUnread(e).to_string()))?;
     check_copies(group, nearest, needed, |listing| {
-        verify_listing_receipts(listing, envelope, &fetched, chain.vault(), now)
+        verify_listing_receipts(listing, envelope, &fetched, chain.vaults(), now)
     })
     .map_err(|e| match e {
         PaymentError::NotFound => {
@@ -2318,7 +2323,7 @@ pub(crate) async fn check_group<P: PartialEq>(
         CheckProblem::Invalid("none of the nodes nearest its address gives it a first_seen".into())
     })?;
     // A copy that can't check out is never looked up.
-    check_offline(&listing, envelope, chain.vault())?;
+    check_offline(&listing, envelope, chain.vaults())?;
     check_vault_deployment(group, nearest, needed, chain).map_err(CheckProblem::Invalid)?;
     let lookup = payment_lookup(&listing)?;
     let fetched = chain
@@ -2326,7 +2331,7 @@ pub(crate) async fn check_group<P: PartialEq>(
         .await
         .map_err(CheckProblem::ChainUnread)?;
     Ok(check_copies(group, nearest, needed, |listing| {
-        verify_listing_receipts(listing, envelope, &fetched, chain.vault(), now)
+        verify_listing_receipts(listing, envelope, &fetched, chain.vaults(), now)
     })?)
 }
 
@@ -2428,6 +2433,47 @@ fn check_vault_deployment<P: PartialEq>(
 /// through their own RPC alone.
 pub const RPC_URLS_ENV: &str = "RPC_URLS";
 
+/// `records(bytes32)`: the root vault's view of the record under a wave's
+/// key.
+const ROOT_RECORDS_SELECTOR: [u8; 4] = [0x01, 0xe6, 0x47, 0x25];
+
+/// A root vault's record of a wave ([`ListingChain::root_record`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RootRecord {
+    /// The block time it was recorded at, in Unix seconds.
+    pub time: u64,
+    /// How many payments the wave holds.
+    pub leaf_count: u32,
+    /// The account that paid it.
+    pub payer: [u8; 20],
+}
+
+impl RootRecord {
+    /// The record `records(bytes32)` answers with: three words, the time,
+    /// the leaf count and the payer; `None` if all are zero.
+    fn from_words(bytes: &[u8]) -> std::result::Result<Option<Self>, String> {
+        let malformed = || "the root vault's record is not three words".to_string();
+        let [time, leaf_count, payer]: [&[u8]; 3] = [
+            bytes.get(..32).ok_or_else(malformed)?,
+            bytes.get(32..64).ok_or_else(malformed)?,
+            bytes.get(64..96).ok_or_else(malformed)?,
+        ];
+        if bytes.len() != 96
+            || time[..24].iter().any(|b| *b != 0)
+            || leaf_count[..28].iter().any(|b| *b != 0)
+            || payer[..12].iter().any(|b| *b != 0)
+        {
+            return Err(malformed());
+        }
+        let record = Self {
+            time: u64::from_be_bytes(time[24..].try_into().map_err(|_| malformed())?),
+            leaf_count: u32::from_be_bytes(leaf_count[28..].try_into().map_err(|_| malformed())?),
+            payer: payer[12..].try_into().map_err(|_| malformed())?,
+        };
+        Ok((record != Self::default()).then_some(record))
+    }
+}
+
 /// The most block timestamps kept to narrow later searches for the block at
 /// a time. When full, every other one is dropped. darwin-node's number for
 /// the same search.
@@ -2449,6 +2495,9 @@ const MAX_KNOWN_BLOCKS: usize = 4_096;
 pub struct ListingChain {
     rpc: Rpc,
     vault: [u8; 20],
+    /// The vaults whose payments this reader reads: `vault`, and the root
+    /// vault where the reader knows one ([`Self::with_root_vault`]).
+    vaults: VaultSet,
     /// The block the vault was deployed in, where known.
     vault_deployment_block: Option<u64>,
     /// That block's timestamp (Unix seconds), where known.
@@ -2469,10 +2518,14 @@ pub struct ListingChain {
     searched: Mutex<HashMap<SearchKey, Searched>>,
 }
 
-/// What a search for a quote's payments looks through: the quote's hash,
-/// and the search's `search_from`, `not_after` and shown block timestamp
-/// ([`ListingChain::fetch`]).
-type SearchKey = ([u8; 32], u64, Option<u64>, Option<u64>);
+/// What a search for a quote's payments looks for and through: the
+/// quote's hash, the search's `search_from` and `not_after`, and the shown
+/// block timestamp and log index ([`ListingChain::fetch`]). With the log
+/// index in it, how far a search went says only that no payment at that
+/// index is in the blocks searched, whatever happened since to the other
+/// payments it came across: a listing showing another index searches on
+/// its own.
+type SearchKey = ([u8; 32], u64, Option<u64>, Option<u64>, Option<u64>);
 
 /// How far a search for a quote's payments that found none went
 /// ([`ListingChain::search_quote_logs`]).
@@ -2480,7 +2533,8 @@ type SearchKey = ([u8; 32], u64, Option<u64>, Option<u64>);
 struct Searched {
     /// The last block searched forwards from the quote's time, with every
     /// block before it from there: none of them holds a payment of the
-    /// quote. Final blocks only, once kept: a final block can't gain one.
+    /// quote at the key's log index (any, where it has none). Final blocks
+    /// only, once kept: a final block can't gain one.
     through: Option<u64>,
     /// Whether the search back from the quote's time was made.
     back: bool,
@@ -2517,11 +2571,11 @@ impl Unconfirmed {
     }
 
     /// Whether `answer`, to [`Self::call`], says the same.
-    fn agrees(&self, answer: &Value, vault: &[u8; 20]) -> bool {
+    fn agrees(&self, answer: &Value, vaults: &VaultSet) -> bool {
         match self {
             Self::Receipt(receipt, _) => {
                 !answer.is_null()
-                    && parse_receipt(receipt.tx_hash, answer, vault)
+                    && parse_receipt(receipt.tx_hash, answer, vaults)
                         .is_ok_and(|read| read == *receipt)
             }
             Self::Block(_, timestamp, _) => {
@@ -2556,10 +2610,14 @@ impl ListingChain {
     ///
     /// It reads through `network`'s RPC and then the RPCs it falls back to
     /// ([`crate::config::fallback_rpc_urls`]), except that log queries go to
-    /// the first fallback first: on the bundled network, receipts and blocks
-    /// go to PublicNode first and log queries to ordofi first, which
-    /// PublicNode refuses, and Robinhood's RPC comes last for both. On the
-    /// bundled network, [`RPC_URLS_ENV`] replaces them when set.
+    /// the last fallback first, then to the network's own RPC and the
+    /// remaining fallbacks in their listed order (with two fallbacks, as on
+    /// the bundled network, this puts the first fallback last): on the bundled
+    /// network, receipts and blocks go to PublicNode first, then ordofi, then
+    /// Robinhood's RPC, and log queries to Robinhood's RPC first, then
+    /// PublicNode (which refuses ranged ones), then ordofi, which answered
+    /// payment reads "busy" or too late in October 2026. On the bundled
+    /// network, [`RPC_URLS_ENV`] replaces them when set.
     ///
     /// # Errors
     ///
@@ -2567,14 +2625,16 @@ impl ListingChain {
     /// URLs, or the HTTP client can't be built.
     pub fn new(network: &EvmNetwork) -> Result<Self> {
         let listed = std::env::var(RPC_URLS_ENV).ok();
-        let RpcSetup {
-            urls,
-            logs_order,
-            chain_id,
-        } = rpc_setup(network, listed.as_deref()).map_err(Error::Network)?;
+        let setup = rpc_setup(network, listed.as_deref()).map_err(Error::Network)?;
         let mut vault = [0u8; 20];
         vault.copy_from_slice(network.payment_vault_address().as_slice());
-        let mut reader = Self::with_rpc_setup(urls, logs_order, chain_id, vault)?;
+        let mut reader = Self::with_rpc_setup(setup, vault)?;
+        if let Some(root) = crate::config::root_vault_address(network) {
+            reader = reader.with_root_vault(RootVault {
+                address: root.into_array(),
+                token: network.payment_token_address().into_array(),
+            });
+        }
         if let Some(block) = crate::config::vault_deployment_block(network) {
             reader = reader.with_vault_deployment_block(block);
         }
@@ -2618,19 +2678,30 @@ impl ListingChain {
     /// Returns an error if `rpc_urls` is empty or the HTTP client can't be
     /// built.
     pub fn with_rpcs(rpc_urls: Vec<String>, vault: [u8; 20]) -> Result<Self> {
-        Self::with_rpc_setup(rpc_urls, None, None, vault)
+        let span_answers = span_answers(&rpc_urls);
+        Self::with_rpc_setup(
+            RpcSetup {
+                urls: rpc_urls,
+                logs_order: None,
+                span_answers,
+                chain_id: None,
+            },
+            vault,
+        )
     }
 
-    fn with_rpc_setup(
-        urls: Vec<String>,
-        logs_order: Option<Vec<usize>>,
-        chain_id: Option<u64>,
-        vault: [u8; 20],
-    ) -> Result<Self> {
-        let rpc = Rpc::new(urls, logs_order, chain_id).map_err(Error::Network)?;
+    fn with_rpc_setup(setup: RpcSetup, vault: [u8; 20]) -> Result<Self> {
+        let RpcSetup {
+            urls,
+            logs_order,
+            span_answers,
+            chain_id,
+        } = setup;
+        let rpc = Rpc::new(urls, logs_order, &span_answers, chain_id).map_err(Error::Network)?;
         Ok(Self {
             rpc,
             vault,
+            vaults: VaultSet::v2_only(vault),
             vault_deployment_block: None,
             vault_deployment_time: None,
             vault_first_payment_time: None,
@@ -2652,7 +2723,7 @@ impl ListingChain {
     ///
     /// If the store's databases can't be opened.
     pub fn with_store(mut self, store: &ListingsStore) -> Result<Self> {
-        let facts = Facts::open(store, self.vault)?;
+        let facts = Facts::open(store, self.vaults)?;
         for (number, timestamp) in facts.kept_blocks() {
             self.remember_block(number, timestamp);
         }
@@ -2732,6 +2803,21 @@ impl ListingChain {
         self
     }
 
+    /// This reader, reading the payments of the root vault `root` beside
+    /// the per-quote vault's: each vault is asked in its own `eth_getLogs`,
+    /// both in one batch ([`Self::vault_logs`]), and a payment is checked by
+    /// the vault whose log it is
+    /// (`ant_listings::VaultSet`). Payments to the root vault are recorded
+    /// a wave at a time; its token's transfers show what each payee got.
+    #[must_use]
+    pub fn with_root_vault(mut self, root: RootVault) -> Self {
+        self.vaults = VaultSet::with_root(self.vault, root);
+        if let Some(facts) = self.facts.as_mut() {
+            facts.set_vaults(self.vaults);
+        }
+        self
+    }
+
     /// This reader, knowing that the block the vault was deployed in is
     /// timed `time` (Unix seconds): block timestamps never go back, so no
     /// payment to the vault is in a block timed earlier. A listing showing
@@ -2767,6 +2853,12 @@ impl ListingChain {
     #[must_use]
     pub fn vault(&self) -> &[u8; 20] {
         &self.vault
+    }
+
+    /// The vaults whose payments this reader reads.
+    #[must_use]
+    pub fn vaults(&self) -> &VaultSet {
+        &self.vaults
     }
 
     /// The block the payment vault was deployed in, where known.
@@ -2828,7 +2920,7 @@ impl ListingChain {
             .transaction(&proof.tx_hash)
             .await?
             .ok_or("the payment transaction is not on chain")?;
-        ant_listings::check_proof(proof, &receipt, timestamp, &self.vault)
+        ant_listings::check_proof(proof, &receipt, timestamp, &self.vaults)
             .map_err(|e| e.to_string())
     }
 
@@ -2876,6 +2968,42 @@ impl ListingChain {
         })
     }
 
+    /// The root vault `vault`'s record under the wave key `key`
+    /// (`records(bytes32)`): the block time it was recorded at, its leaf
+    /// count and its payer, or `None` for a key never recorded, which the
+    /// vault answers with zeros.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the call fails or the answer is not three words.
+    pub async fn root_record(
+        &self,
+        vault: &[u8; 20],
+        key: &[u8; 32],
+    ) -> std::result::Result<Option<RootRecord>, String> {
+        let mut data = ROOT_RECORDS_SELECTOR.to_vec();
+        data.extend_from_slice(key);
+        let answer = self
+            .rpc
+            .call(
+                "eth_call",
+                json!([
+                    {
+                        "to": format!("0x{}", hex::encode(vault)),
+                        "data": format!("0x{}", hex::encode(data)),
+                    },
+                    "latest",
+                ]),
+            )
+            .await?
+            .value;
+        let bytes = answer
+            .as_str()
+            .and_then(|hex| hex::decode(hex.trim_start_matches("0x")).ok())
+            .ok_or("payment chain eth_call: the answer is not hex")?;
+        RootRecord::from_words(&bytes)
+    }
+
     /// The receipt of `tx_hash` (as little of it as a check reads: whether
     /// it succeeded, its block, and the vault's logs in it) and its block's
     /// timestamp, or `None` if the chain doesn't know the transaction (yet).
@@ -2904,18 +3032,30 @@ impl ListingChain {
     /// range with such a payment, since the earliest payment is the one that
     /// counts; if that finds nothing, it runs backwards from `search_from`.
     /// A shown timestamp narrows the search to the blocks of that second
-    /// instead. Either way it makes at most 64 log queries. The blocks at a
+    /// instead. Either way it makes at most 64 rounds of log queries
+    /// ([`MAX_LOG_CALLS`]): 64 queries for a reader of the per-quote vault
+    /// alone, 128 for one with a root vault, which asks each vault in its
+    /// own query of a round. The blocks at a
     /// time are found as darwin-node finds them: between the nearest blocks
     /// already read, guessed from their timestamps. A quote's payments, once
-    /// found and final, are kept with a store, and the search is not made
-    /// again: the vault records a quote's payment once. With a store, a
-    /// search that found none is kept, for this reader's life, as far as it
+    /// found and final, are kept with a store. A reader of the per-quote
+    /// vault alone doesn't search again, since that vault records a quote's
+    /// payment once. A root vault can record a quote again in a later wave,
+    /// so a reader with one searches again where none of the kept payments
+    /// is the one the listing shows, and keeps what it finds beside them.
+    /// With a store, a search that found none the listing shows is kept,
+    /// for this reader's life, as far as it
     /// went through final blocks, which can't gain a payment: searched
     /// again, as each time a listing whose payment isn't on the chain yet is
     /// decided again, it goes on forwards from there through the blocks
     /// since, and doesn't look back from the quote's time again. So a
     /// payment that lands later is found as soon as it does, and a quote
-    /// paid nowhere costs a log query or two a time, not a search.
+    /// paid nowhere costs a round or two of log queries a time (one or two
+    /// queries, or two to four with a root vault), not a search. A reader
+    /// that also reads the root vault keys the kept search by the listing's
+    /// log index too, so it only ever skips blocks holding no payment at that
+    /// index; a reader of the per-quote vault alone keeps a search only when
+    /// it saw no payment at all, so one kept search holds for every index.
     ///
     /// # Errors
     ///
@@ -2941,11 +3081,21 @@ impl ListingChain {
                     .facts
                     .as_ref()
                     .and_then(|facts| facts.quote(&quote_hash));
-                let logs = match known {
+                let from_known = match &known {
                     Some(payments) => {
-                        self.payments_shown(&payments.value, block_number, not_after, shown)
-                            .await?
+                        let logs = self
+                            .payments_shown(&payments.value, block_number, not_after, shown)
+                            .await?;
+                        // The per-quote vault records a quote once, so its
+                        // kept payments are all it has. A root vault can
+                        // record it again in a later wave: where none kept
+                        // is the one shown, search again.
+                        (!logs.is_empty() || self.vaults.root.is_none()).then_some(logs)
                     }
+                    None => None,
+                };
+                let logs = match from_known {
+                    Some(logs) => logs,
                     None => {
                         let topics = [Some(DATA_PAYMENT_MADE_TOPIC), None, None, Some(quote_hash)];
                         let (logs, seen) = match block_number {
@@ -2956,8 +3106,17 @@ impl ListingChain {
                                 (at_log_index(seen.clone(), shown.log_index), seen)
                             }
                             None => {
-                                let key =
-                                    (quote_hash, search_from, not_after, shown.block_timestamp);
+                                // Only a root reader keys by the log index: a reader of
+                                // the per-quote vault alone keeps a search only when it
+                                // saw no payment at all, so its search holds for every
+                                // index and is shared as before.
+                                let key = (
+                                    quote_hash,
+                                    search_from,
+                                    not_after,
+                                    shown.block_timestamp,
+                                    self.vaults.root.and(shown.log_index),
+                                );
                                 let before = self.searched_before(&key);
                                 let (logs, seen, searched) = self
                                     .search_quote_logs(
@@ -2968,7 +3127,27 @@ impl ListingChain {
                                         before,
                                     )
                                     .await?;
-                                if seen.is_empty() {
+                                // A reader of the per-quote vault alone
+                                // keeps how far a search went while it found
+                                // none of the quote's payments: once it
+                                // finds any, they are all the quote has. A
+                                // reader with a root vault searches again
+                                // while none found is the one the listing
+                                // shows, so it keeps how far it went until
+                                // then. That is all it says: the blocks it
+                                // went through hold no payment at the
+                                // listing's log index, which is in the key.
+                                // The payments it came across at others are
+                                // held below, but may be dropped before they
+                                // are kept (a receipt no second provider
+                                // confirms, a failed write); a listing
+                                // showing one of them has its own key, and
+                                // searches from the quote's time.
+                                let found_none = match self.vaults.root {
+                                    Some(_) => logs.is_empty(),
+                                    None => seen.is_empty(),
+                                };
+                                if found_none {
                                     self.keep_searched(key, searched).await;
                                 } else {
                                     self.forget_searched(&key);
@@ -2977,8 +3156,14 @@ impl ListingChain {
                             }
                         };
                         if let Some(facts) = &self.facts {
-                            if !seen.is_empty() {
-                                let payments: BTreeSet<VaultLog> = seen.into_iter().collect();
+                            let mut payments: BTreeSet<VaultLog> = known
+                                .map(|known| known.value.into_iter().collect())
+                                .unwrap_or_default();
+                            let before = payments.len();
+                            payments.extend(seen);
+                            // Held beside those found before, so a search
+                            // again never loses one.
+                            if payments.len() > before {
                                 facts.hold_quote(quote_hash, payments.into_iter().collect());
                             }
                         }
@@ -3030,8 +3215,10 @@ impl ListingChain {
         }
     }
 
-    /// Of a quote's payments (all it has: the vault records a quote's
-    /// payment once), those its search would find for a listing showing
+    /// Of a quote's payments found before (all it has for a reader of the
+    /// per-quote vault alone, which records a quote's payment once; with a
+    /// root vault, those found so far), those its search would find for a
+    /// listing showing
     /// `shown`: at its log index; in block `block_number` if given; else in
     /// a block of its timestamp, where it shows one, or timed no later than
     /// `not_after`, where given.
@@ -3142,7 +3329,7 @@ impl ListingChain {
             if value.is_null() {
                 continue;
             }
-            let receipt = parse_receipt(tx_hashes[i], &value, &self.vault)?;
+            let receipt = parse_receipt(tx_hashes[i], &value, &self.vaults)?;
             found[i] = Some(Known::read(receipt, provider));
         }
         Ok(found)
@@ -3294,7 +3481,7 @@ impl ListingChain {
                 let answers = self.rpc.batch_to(provider, Kind::Chain, &calls).await;
                 for ((fact, mut others), answer) in facts_asked.into_iter().zip(answers) {
                     match answer {
-                        Ok(value) if fact.agrees(&value, &self.vault) => match fact {
+                        Ok(value) if fact.agrees(&value, &self.vaults) => match fact {
                             Unconfirmed::Receipt(receipt, _) => keep.receipts.push(receipt),
                             Unconfirmed::Block(number, timestamp, _) => {
                                 keep.blocks.push((number, timestamp));
@@ -3711,8 +3898,15 @@ impl ListingChain {
             .remove(key);
     }
 
-    /// The vault's logs matching `topics` (`None` = any) in blocks
-    /// `from..=to`.
+    /// The vaults' logs matching `topics` (`None` = any) in blocks
+    /// `from..=to`, in the chain's order. Each vault is asked in its own
+    /// `eth_getLogs`, naming its one address, and the queries are sent
+    /// together in one batch. Providers allow a much narrower block range
+    /// when any position of the filter is a list: Robinhood's RPC allows
+    /// 100,000 blocks for such a query and 10,000,000 for one with a single
+    /// value in each position. Asking each vault on its own keeps a search's
+    /// ranges as wide with a root vault as without one. A reader of the
+    /// per-quote vault alone sends the one query it always did.
     async fn vault_logs(
         &self,
         topics: &[Option<[u8; 32]>; 4],
@@ -3726,18 +3920,34 @@ impl ListingChain {
                 None => Value::Null,
             })
             .collect();
-        let filter = json!({
-            "address": format!("0x{}", hex::encode(self.vault)),
-            "fromBlock": quantity(from),
-            "toBlock": quantity(to),
-            "topics": topics,
-        });
-        let logs = self.rpc.call("eth_getLogs", json!([filter])).await?.value;
-        logs.as_array()
-            .ok_or("logs are not a list")?
+        let addresses: Vec<[u8; 20]> = std::iter::once(self.vault)
+            .chain(self.vaults.root.map(|root| root.address))
+            .collect();
+        let calls: Vec<Call> = addresses
             .iter()
-            .map(|log| parse_vault_log(log).ok_or_else(|| "a log is incomplete".to_string()))
-            .collect()
+            .map(|address| {
+                let filter = json!({
+                    "address": format!("0x{}", hex::encode(address)),
+                    "fromBlock": quantity(from),
+                    "toBlock": quantity(to),
+                    "topics": topics,
+                });
+                Call::new("eth_getLogs", json!([filter]))
+            })
+            .collect();
+        let mut found = Vec::new();
+        for answer in self.rpc.batch(&calls).await {
+            let logs = answer?.value;
+            for log in logs.as_array().ok_or("logs are not a list")? {
+                found.push(parse_vault_log(log).ok_or("a log is incomplete")?);
+            }
+        }
+        if addresses.len() > 1 {
+            // Each vault's logs come in the chain's order; merged, so do
+            // both vaults' together.
+            found.sort_by_key(|log| (log.block_number, log.log_index));
+        }
+        Ok(found)
     }
 
     /// The receipt of each transaction among `logs`, once, with its block's
@@ -3760,13 +3970,16 @@ impl ListingChain {
 }
 
 /// The RPCs a reader of `network` reads through, the order of its log
-/// queries (indexes into them; `None` for the same order), and the chain
-/// each must say it is on, where checked: on the bundled network with
+/// queries (indexes into them; `None` for the same order), those that give
+/// span answers ([`span_answers`]), and the chain each must say it is on,
+/// where checked: on the bundled network with
 /// `listed` (the value of [`RPC_URLS_ENV`]), those listed, in that order for
 /// everything, each checked to be on the network's chain; otherwise the
 /// network's own RPC and then the RPCs it falls back to
-/// ([`crate::config::fallback_rpc_urls`]), log queries going to the first
-/// fallback first.
+/// ([`crate::config::fallback_rpc_urls`]), log queries going to the last
+/// fallback first, then to the network's own RPC and the remaining
+/// fallbacks in their listed order ([`fallback_logs_order`]; on the bundled
+/// network, with two fallbacks, this puts the first fallback last).
 fn rpc_setup(network: &EvmNetwork, listed: Option<&str>) -> std::result::Result<RpcSetup, String> {
     if let (Some(chain_id), Some(listed)) = (crate::config::chain_id(network), listed) {
         let urls: Vec<String> = listed.split_whitespace().map(str::to_string).collect();
@@ -3785,23 +3998,64 @@ fn rpc_setup(network: &EvmNetwork, listed: Option<&str>) -> std::result::Result<
                 }
             }
             return Ok(RpcSetup {
+                span_answers: span_answers(&urls),
                 urls,
                 logs_order: None,
                 chain_id: Some(chain_id),
             });
         }
     }
+    let urls = network_rpc_urls(network);
+    Ok(RpcSetup {
+        span_answers: span_answers(&urls),
+        logs_order: fallback_logs_order(urls.len()),
+        urls,
+        chain_id: None,
+    })
+}
+
+/// `network`'s own RPC and then the RPCs it falls back to.
+fn network_rpc_urls(network: &EvmNetwork) -> Vec<String> {
     let mut urls = vec![network.rpc_url().to_string()];
     urls.extend(crate::config::fallback_rpc_urls(network));
-    let logs_order = (urls.len() > 1).then(|| {
-        let mut order = vec![1, 0];
-        order.extend(2..urls.len());
+    urls
+}
+
+/// The host of the RPC that gives
+/// [`BUSY_CODE`](super::listings_rpc::BUSY_CODE) in answer to a log query
+/// over a wider span than it serves: ordofi's, the RPC the bundled
+/// network's log queries ask last ([`fallback_logs_order`]). `None` if the
+/// bundled network has no fallback.
+fn span_answer_host() -> Option<String> {
+    let bundled = crate::config::bundled_payment_network().ok()?;
+    let urls = network_rpc_urls(&bundled);
+    let last = *fallback_logs_order(urls.len())?.last()?;
+    Some(super::listings_rpc::rpc_host(&urls[last]))
+}
+
+/// The RPCs among `urls` (indexes into them) that give span answers: those
+/// at [`span_answer_host`], wherever they are listed.
+fn span_answers(urls: &[String]) -> Vec<usize> {
+    let Some(host) = span_answer_host() else {
+        return Vec::new();
+    };
+    urls.iter()
+        .enumerate()
+        .filter(|(_, url)| super::listings_rpc::rpc_host(url) == host)
+        .map(|(index, _)| index)
+        .collect()
+}
+
+/// The order of log queries over `len` RPCs (a network's own RPC and then
+/// its fallbacks), as indexes: the last fallback first, then the network's
+/// own RPC and the remaining fallbacks in their listed order; `None` when
+/// there is no fallback.
+fn fallback_logs_order(len: usize) -> Option<Vec<usize>> {
+    (len > 1).then(|| {
+        let last = len - 1;
+        let mut order = vec![last];
+        order.extend(0..last);
         order
-    });
-    Ok(RpcSetup {
-        urls,
-        logs_order,
-        chain_id: None,
     })
 }
 
@@ -3813,17 +4067,22 @@ struct RpcSetup {
     /// The order of log queries, as indexes into `urls`; `None` for the
     /// same order.
     logs_order: Option<Vec<usize>>,
+    /// Those whose busy answer to a log query is a span answer
+    /// ([`span_answers`]), as indexes into `urls`.
+    span_answers: Vec<usize>,
     /// The chain each must say it is on before it is used, where checked.
     chain_id: Option<u64>,
 }
 
 /// The receipt in `answer`, an `eth_getTransactionReceipt` answer for
 /// `tx_hash`, as little of it as a check reads: whether it succeeded, its
-/// block, and `vault`'s logs in it.
+/// block, and the logs in it of `vaults` and of the root vault's token, each
+/// with its data ([`receipt_keeps`]): a root vault's payment is checked from
+/// its wave's `RootPaid` log and the token's transfers after it.
 fn parse_receipt(
     tx_hash: [u8; 32],
     answer: &Value,
-    vault: &[u8; 20],
+    vaults: &VaultSet,
 ) -> std::result::Result<PaymentReceipt, String> {
     let block_number = answer["blockNumber"]
         .as_str()
@@ -3838,7 +4097,7 @@ fn parse_receipt(
             .map(|logs| {
                 logs.iter()
                     .filter_map(parse_log)
-                    .filter(|log| log.address == *vault)
+                    .filter(|log| receipt_keeps(vaults, &log.address))
                     .collect()
             })
             .unwrap_or_default(),
@@ -3847,7 +4106,8 @@ fn parse_receipt(
 
 /// Whether `receipt` shows `payment`: it is the payment's transaction, in
 /// its block, with the vault's `DataPaymentMade` log at its log index, of
-/// `quote_hash` where given. `receipt` holds only the vault's logs.
+/// `quote_hash` where given. `receipt` holds only the vaults' logs and the
+/// root vault's token's, which never log `DataPaymentMade`.
 fn shows_payment(
     receipt: &PaymentReceipt,
     payment: &VaultLog,
@@ -3894,6 +4154,13 @@ fn parse_log(log: &Value) -> Option<PaymentLog> {
             .iter()
             .map(|topic| topic.as_str().and_then(parse_bytes))
             .collect::<Option<Vec<[u8; 32]>>>()?,
+        data: hex::decode(
+            log["data"]
+                .as_str()
+                .unwrap_or("0x")
+                .trim_start_matches("0x"),
+        )
+        .ok()?,
         log_index: parse_u64(log["logIndex"].as_str()?)?,
     })
 }
@@ -3935,6 +4202,9 @@ pub(crate) mod test_chain {
     /// The vault the tests pay into.
     pub(crate) const VAULT: [u8; 20] = [0x69; 20];
 
+    /// The vaults the tests read: the per-quote vault alone.
+    pub(crate) const VAULTS: VaultSet = VaultSet::v2_only(VAULT);
+
     /// Receipts (each with the block it is in), and block timestamps.
     #[derive(Default)]
     pub(crate) struct MockChain {
@@ -3943,6 +4213,13 @@ pub(crate) mod test_chain {
         /// The widest block range `eth_getLogs` answers, as providers cap
         /// it; wider ones get a JSON-RPC error.
         pub(crate) max_log_range: Option<u64>,
+        /// The widest block range `eth_getLogs` answers when any position
+        /// of its filter (the address or a topic) is a list, as Robinhood's
+        /// RPC caps it at 100,000 blocks against 10,000,000 for single
+        /// values; wider ones get its JSON-RPC error.
+        pub(crate) max_list_log_range: Option<u64>,
+        /// The filter of each `eth_getLogs` call, in order.
+        pub(crate) log_filters: Vec<Value>,
         /// Methods answered with HTTP 403, as PublicNode answers
         /// `eth_getLogs`.
         pub(crate) refused: Vec<&'static str>,
@@ -3986,13 +4263,27 @@ pub(crate) mod test_chain {
         }
 
         /// The result of a call, or a JSON-RPC error message.
-        fn answer(&self, method: &str, params: &Value) -> std::result::Result<Value, String> {
+        pub(crate) fn answer(
+            &self,
+            method: &str,
+            params: &Value,
+        ) -> std::result::Result<Value, String> {
             if method == "eth_getLogs" {
                 let filter = &params[0];
                 let bound = |key: &str| filter[key].as_str().and_then(parse_u64).unwrap_or(0);
                 let blocks = bound("toBlock").saturating_sub(bound("fromBlock")) + 1;
                 if self.max_log_range.is_some_and(|max| blocks > max) {
                     return Err(format!("block range too wide: {blocks}"));
+                }
+                let lists = filter["address"].is_array()
+                    || filter["topics"]
+                        .as_array()
+                        .is_some_and(|topics| topics.iter().any(Value::is_array));
+                if let Some(max) = self.max_list_log_range.filter(|max| lists && blocks > *max) {
+                    return Err(format!(
+                        "query spans {blocks} blocks, but only {max} are allowed for this \
+                         request; narrow the block range, or send one value per position"
+                    ));
                 }
             }
             Ok(self.result(method, params))
@@ -4034,8 +4325,17 @@ pub(crate) mod test_chain {
                         .and_then(parse_u64)
                         .unwrap_or(0);
                     let to = filter["toBlock"].as_str().and_then(parse_u64).unwrap_or(0);
-                    // Only the contract asked about, as a chain answers.
-                    let address = filter["address"].as_str().and_then(parse_bytes::<20>);
+                    // Only the contracts asked about, as a chain answers: one
+                    // address, or a list of them.
+                    let address: Option<Vec<[u8; 20]>> = match &filter["address"] {
+                        Value::String(one) => parse_bytes::<20>(one).map(|one| vec![one]),
+                        Value::Array(many) => Some(
+                            many.iter()
+                                .filter_map(|one| one.as_str().and_then(parse_bytes::<20>))
+                                .collect(),
+                        ),
+                        _ => None,
+                    };
                     let topics: Vec<Option<[u8; 32]>> = filter["topics"]
                         .as_array()
                         .map(|topics| {
@@ -4051,7 +4351,9 @@ pub(crate) mod test_chain {
                             continue;
                         }
                         for log in &receipt.logs {
-                            let matches = address.is_none_or(|address| log.address == address)
+                            let matches = address
+                                .as_ref()
+                                .is_none_or(|addresses| addresses.contains(&log.address))
                                 && topics.iter().enumerate().all(|(i, topic)| {
                                     topic.is_none_or(|topic| log.topics.get(i) == Some(&topic))
                                 });
@@ -4101,6 +4403,7 @@ pub(crate) mod test_chain {
             "logs": receipt.logs.iter().map(|log| json!({
                 "address": format!("0x{}", hex::encode(log.address)),
                 "topics": log.topics.iter().map(|t| format!("0x{}", hex::encode(t))).collect::<Vec<_>>(),
+                "data": format!("0x{}", hex::encode(&log.data)),
                 "logIndex": quantity(log.log_index),
             })).collect::<Vec<_>>(),
         })
@@ -4136,6 +4439,9 @@ pub(crate) mod test_chain {
                                 chain.ids.push(id);
                             }
                             chain.calls.push(method.clone());
+                            if method == "eth_getLogs" {
+                                chain.log_filters.push(call["params"][0].clone());
+                            }
                             refused |= chain.refused.iter().any(|refused| *refused == method);
                             let answer =
                                 match chain.failing.iter().find(|(name, _)| *name == method) {
@@ -4225,6 +4531,7 @@ pub(crate) mod test_chain {
         PaymentLog {
             address: VAULT,
             topics: vec![DATA_PAYMENT_MADE_TOPIC, rewards, amount, quote.hash().0],
+            data: Vec::new(),
             log_index,
         }
     }
@@ -4259,8 +4566,114 @@ pub(crate) mod test_chain {
 
 #[cfg(test)]
 mod tests {
-    use super::test_chain::{paying_log, reader, serve, signed_quote, MockChain, VAULT};
+    use super::test_chain::{paying_log, reader, serve, signed_quote, MockChain, VAULT, VAULTS};
     use super::*;
+
+    /// The root vault's record is read through `records(bytes32)`, the view
+    /// the frozen vault's interface fixes.
+    #[test]
+    fn the_root_record_selector_is_records_bytes32() {
+        assert_eq!(
+            ROOT_RECORDS_SELECTOR,
+            alloy::primitives::keccak256(b"records(bytes32)")[..4]
+        );
+    }
+
+    /// A root vault's record reads as its three words; all zeros, a key
+    /// never recorded, as none; anything but three clean words as an error.
+    #[test]
+    fn a_root_record_is_three_words() {
+        let mut words = [0u8; 96];
+        assert_eq!(RootRecord::from_words(&words), Ok(None));
+        words[24..32].copy_from_slice(&1_800_000_000u64.to_be_bytes());
+        words[60..64].copy_from_slice(&64u32.to_be_bytes());
+        words[76..96].copy_from_slice(&[0x9a; 20]);
+        assert_eq!(
+            RootRecord::from_words(&words),
+            Ok(Some(RootRecord {
+                time: 1_800_000_000,
+                leaf_count: 64,
+                payer: [0x9a; 20],
+            }))
+        );
+        assert!(RootRecord::from_words(&words[..64]).is_err());
+        let mut dirty = words;
+        dirty[64] = 1;
+        assert!(RootRecord::from_words(&dirty).is_err());
+        assert!(RootRecord::from_words(&[words.as_slice(), &[0; 32]].concat()).is_err());
+    }
+
+    /// A reader that knows a root vault asks both vaults' logs in one
+    /// batch, an `eth_getLogs` for each, and finds a payment the root
+    /// vault's log records, which a reader of the per-quote vault alone
+    /// doesn't see. Its vault set names both, so each payment is checked by
+    /// the vault that emitted its log.
+    #[tokio::test]
+    async fn a_reader_with_a_root_vault_reads_both_vaults_logs_in_one_batch() {
+        const ROOT: [u8; 20] = [0x7a; 20];
+        let quote = signed_quote([0x31; 32], 30);
+        let mut log = paying_log(&quote, 4);
+        log.address = ROOT;
+        let mut chain = MockChain::with_blocks(10, 1_700_000_000);
+        chain.add_receipt(PaymentReceipt {
+            tx_hash: [0x41; 32],
+            success: true,
+            block_number: 5,
+            logs: vec![log],
+        });
+        let mock = Arc::new(Mutex::new(chain));
+        let url = serve(Arc::clone(&mock)).await;
+        let topics = [
+            Some(DATA_PAYMENT_MADE_TOPIC),
+            None,
+            None,
+            Some(quote.hash().0),
+        ];
+
+        let v2_only = reader(url.clone());
+        assert!(v2_only.vault_logs(&topics, 0, 9).await.unwrap().is_empty());
+        assert_eq!(v2_only.vaults(), &VAULTS);
+
+        let root = RootVault {
+            address: ROOT,
+            token: [0x11; 20],
+        };
+        let both = reader(url).with_root_vault(root);
+        let (before, requests) = {
+            let mock = mock.lock().unwrap();
+            (mock.calls_to("eth_getLogs"), mock.requests)
+        };
+        let found = both.vault_logs(&topics, 0, 9).await.unwrap();
+        {
+            let mock = mock.lock().unwrap();
+            assert_eq!(mock.calls_to("eth_getLogs"), before + 2);
+            assert_eq!(mock.requests, requests + 1, "both in one batch");
+        }
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].tx_hash, [0x41; 32]);
+        assert_eq!(both.vaults(), &VaultSet::with_root(VAULT, root));
+        assert_eq!(
+            both.vault(),
+            &VAULT,
+            "the per-quote vault stays the reader's own"
+        );
+    }
+
+    /// The bundled network's reader reads the root vault the network
+    /// config names, paying the network's token.
+    #[test]
+    fn the_bundled_networks_reader_reads_its_root_vault() {
+        let bundled = crate::config::bundled_payment_network().unwrap();
+        let chain = ListingChain::new(&bundled).unwrap();
+        let root = crate::config::root_vault_address(&bundled).unwrap();
+        assert_eq!(
+            chain.vaults().root,
+            Some(RootVault {
+                address: root.into_array(),
+                token: bundled.payment_token_address().into_array(),
+            })
+        );
+    }
     use ant_listings::{
         first_seen_at, Flags, ListingError, Metadata, Payment, PaymentField, ShownFields,
     };
@@ -4819,7 +5232,7 @@ mod tests {
         let h = FIRST_SEEN_ROUNDING;
         let now = hour + 3 * h;
         let check =
-            |listing: &Listing| verify_listing_receipts(listing, &envelope, &[], &VAULT, now);
+            |listing: &Listing| verify_listing_receipts(listing, &envelope, &[], &VAULTS, now);
         let dated_by = |dates: &[u64]| {
             let (chosen, _) = decide(dated_copies(&listing, &NEAREST, dates), check);
             chosen.map(|(listing, ..)| listing.first_seen.expect("dated"))
@@ -4860,7 +5273,7 @@ mod tests {
         let listing = Listing::new(&envelope, &upload_payment(&envelope), BLOCK_TIME);
         let hour = first_seen_at(BLOCK_TIME);
         let check =
-            |listing: &Listing| verify_listing_receipts(listing, &envelope, &[], &VAULT, hour);
+            |listing: &Listing| verify_listing_receipts(listing, &envelope, &[], &VAULTS, hour);
         // Four of the nearest date it at `hour`; ten other nodes dating it
         // in 1970 neither count nor move it.
         let mut copies = dated_copies(&listing, &NEAREST[..4], &[hour; 4]);
@@ -7204,7 +7617,8 @@ mod tests {
             .unwrap();
         assert_eq!(chain.fetch(&lookup, &shown).await.unwrap(), expected);
         // A listing showing another log index finds nothing, still with no
-        // call: the vault records a quote's payment once.
+        // call: the per-quote vault, all this reader reads, records a
+        // quote's payment once.
         let elsewhere = ListingPayment {
             log_index: Some(5),
             ..ListingPayment::default()
@@ -7212,6 +7626,334 @@ mod tests {
         assert_eq!(chain.fetch(&lookup, &elsewhere).await.unwrap(), Vec::new());
         assert_eq!(calls(&first), before_first);
         assert_eq!(calls(&second), before_second);
+    }
+
+    /// The root vault of the root-reader tests below, and its token.
+    const ROOT_VAULT: RootVault = RootVault {
+        address: [0x7a; 20],
+        token: [0x11; 20],
+    };
+
+    /// A payment of `quote` at `log_index` in block `block`, in transaction
+    /// `tx`, recorded by the vault at `vault`.
+    fn payment_in(
+        quote: &ant_protocol::evm::PaymentQuote,
+        vault: [u8; 20],
+        tx: u8,
+        block: u64,
+        log_index: u64,
+    ) -> PaymentReceipt {
+        let mut log = paying_log(quote, log_index);
+        log.address = vault;
+        PaymentReceipt {
+            tx_hash: [tx; 32],
+            success: true,
+            block_number: block,
+            logs: vec![log],
+        }
+    }
+
+    /// A chain capping log queries as Robinhood's RPC does: 10,000,000
+    /// blocks with one value in each filter position, 100,000 when any
+    /// position is a list. It holds payments of `quote` by today's vault
+    /// (block 20, log index 7) and by the root vault (block 20, log index
+    /// 3, and block 140,000).
+    fn capped_chain(quote: &ant_protocol::evm::PaymentQuote) -> MockChain {
+        let mut chain = MockChain {
+            max_log_range: Some(10_000_000),
+            max_list_log_range: Some(100_000),
+            ..MockChain::default()
+        };
+        chain.add_receipt(payment_in(quote, VAULT, 0x52, 20, 7));
+        chain.add_receipt(payment_in(quote, ROOT_VAULT.address, 0x53, 20, 3));
+        chain.add_receipt(payment_in(quote, ROOT_VAULT.address, 0x51, 140_000, 4));
+        chain
+    }
+
+    /// Fault injection: Robinhood's RPC refuses a log query over more than
+    /// 100,000 blocks when any filter position is a list, and a quote's
+    /// search spans at least about 105,000. A reader with a root vault asks
+    /// each vault in its own query naming one address, so 150,001 blocks
+    /// are answered in one round, as for today's vault alone, and the
+    /// vaults' logs come back merged in the chain's order.
+    #[tokio::test]
+    async fn a_root_readers_log_queries_name_one_address_each_so_keep_the_wide_range() {
+        let quote = signed_quote([0x32; 32], 30);
+        let mock = Arc::new(Mutex::new(capped_chain(&quote)));
+        let hex_of = |address: &[u8; 20]| format!("0x{}", hex::encode(address));
+        // The mock refuses a list over the limit, as Robinhood does.
+        let listed = json!([{
+            "address": [hex_of(&VAULT), hex_of(&ROOT_VAULT.address)],
+            "fromBlock": quantity(0),
+            "toBlock": quantity(150_000),
+            "topics": [],
+        }]);
+        let refused = mock.lock().unwrap().answer("eth_getLogs", &listed);
+        assert!(refused.unwrap_err().contains("only 100000 are allowed"));
+
+        let url = serve(Arc::clone(&mock)).await;
+        let topics = [
+            Some(DATA_PAYMENT_MADE_TOPIC),
+            None,
+            None,
+            Some(quote.hash().0),
+        ];
+        let both = reader(url).with_root_vault(ROOT_VAULT);
+        let found = both.vault_logs(&topics, 0, 150_000).await.unwrap();
+        assert_eq!(
+            found
+                .iter()
+                .map(|log| (log.block_number, log.log_index, log.tx_hash[0]))
+                .collect::<Vec<_>>(),
+            vec![(20, 3, 0x53), (20, 7, 0x52), (140_000, 4, 0x51)]
+        );
+        let filters = mock.lock().unwrap().log_filters.clone();
+        assert_eq!(
+            filters
+                .iter()
+                .map(|filter| filter["address"].clone())
+                .collect::<Vec<_>>(),
+            vec![json!(hex_of(&VAULT)), json!(hex_of(&ROOT_VAULT.address))],
+            "one query per vault, each naming one address"
+        );
+        for filter in &filters {
+            assert!(filter["topics"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|topic| !topic.is_array()));
+        }
+    }
+
+    /// Today's vault is read as before: a reader of it alone sends the one
+    /// query it always did, naming the vault as a single value, and a
+    /// reader with a root vault sends that same query for it and finds the
+    /// same logs of it, beside the root vault's.
+    #[tokio::test]
+    async fn todays_vaults_log_query_and_logs_are_unchanged_with_a_root_vault() {
+        let quote = signed_quote([0x33; 32], 30);
+        let mock = Arc::new(Mutex::new(capped_chain(&quote)));
+        let url = serve(Arc::clone(&mock)).await;
+        let topics = [
+            Some(DATA_PAYMENT_MADE_TOPIC),
+            None,
+            None,
+            Some(quote.hash().0),
+        ];
+        let alone = reader(url.clone())
+            .vault_logs(&topics, 0, 150_000)
+            .await
+            .unwrap();
+        let first = mock.lock().unwrap().log_filters.clone();
+        assert_eq!(
+            first,
+            vec![json!({
+                "address": format!("0x{}", hex::encode(VAULT)),
+                "fromBlock": quantity(0),
+                "toBlock": quantity(150_000),
+                "topics": [
+                    format!("0x{}", hex::encode(DATA_PAYMENT_MADE_TOPIC)),
+                    null,
+                    null,
+                    format!("0x{}", hex::encode(quote.hash().0)),
+                ],
+            })]
+        );
+        assert_eq!(
+            alone
+                .iter()
+                .map(|log| (log.block_number, log.log_index, log.tx_hash[0]))
+                .collect::<Vec<_>>(),
+            vec![(20, 7, 0x52)]
+        );
+
+        let both = reader(url)
+            .with_root_vault(ROOT_VAULT)
+            .vault_logs(&topics, 0, 150_000)
+            .await
+            .unwrap();
+        let filters = mock.lock().unwrap().log_filters.clone();
+        assert_eq!(filters[1], first[0], "today's vault's query is the same");
+        let todays: Vec<VaultLog> = both
+            .into_iter()
+            .filter(|log| log.tx_hash == [0x52; 32])
+            .collect();
+        assert_eq!(todays, alone);
+    }
+
+    /// A quote's search spans more than 100,000 blocks; a reader with a root
+    /// vault finds its root payment in one round of log queries, one per
+    /// vault, each over the whole span, where a list of both addresses
+    /// would have been refused and narrowed again and again.
+    #[tokio::test]
+    async fn a_root_readers_quote_search_over_a_wide_span_takes_one_round() {
+        let quote = signed_quote([0x34; 32], 30);
+        let paid = payment_in(&quote, ROOT_VAULT.address, 0x61, 250_000, 2);
+        let mut chain = MockChain::with_blocks(300_000, PAST);
+        chain.max_log_range = Some(10_000_000);
+        chain.max_list_log_range = Some(100_000);
+        chain.add_receipt(paid.clone());
+        let mock = Arc::new(Mutex::new(chain));
+        let url = serve(Arc::clone(&mock)).await;
+        let both = reader(url).with_root_vault(ROOT_VAULT);
+        let lookup = Lookup::Quote {
+            quote_hash: quote.hash().0,
+            block_number: None,
+            search_from: PAST + 2 * 50_000,
+            not_after: None,
+        };
+        let shown = ListingPayment {
+            log_index: Some(2),
+            ..ListingPayment::default()
+        };
+        let fetched = both.fetch(&lookup, &shown).await.unwrap();
+        assert_eq!(fetched.len(), 1);
+        assert_eq!(fetched[0].0.as_ref().map(|r| r.tx_hash), Some(paid.tx_hash));
+        assert_eq!(fetched[0].1, Some(PAST + 2 * 250_000));
+        let filters = mock.lock().unwrap().log_filters.clone();
+        assert_eq!(filters.len(), 2, "one round: a query per vault");
+        for filter in &filters {
+            assert!(filter["address"].is_string());
+            let bound = |key: &str| filter[key].as_str().and_then(parse_u64).unwrap();
+            assert!(bound("toBlock") - bound("fromBlock") + 1 > 100_000);
+        }
+    }
+
+    /// Fault injection: with a root vault a quote can be recorded again in
+    /// a later wave. A reader that kept the quote's first payment, and then
+    /// meets a listing showing the later one, searches again rather than
+    /// taking what it kept as all the quote has, finds the later payment,
+    /// and keeps both. A reader opened on the same store afterwards finds
+    /// either with no log query. Both kinds of listing are tried: one
+    /// showing the block's timestamp, and one showing its block.
+    #[tokio::test]
+    async fn a_root_reader_searches_again_for_a_quote_paid_again_in_a_later_wave() {
+        let quote = signed_quote([0x35; 32], 30);
+        let first_paid = payment_in(&quote, VAULT, 0xaa, 100, 4);
+        let again = payment_in(&quote, ROOT_VAULT.address, 0xab, 160, 2);
+        let mock = || {
+            let mut chain = MockChain::with_blocks(200, PAST);
+            chain.add_receipt(first_paid.clone());
+            chain.add_receipt(again.clone());
+            chain.finalized = Some(199);
+            Arc::new(Mutex::new(chain))
+        };
+        let quote_hash = quote.hash().0;
+        let first_shown = ListingPayment {
+            log_index: Some(4),
+            block_timestamp: Some(PAST + 200),
+            ..ListingPayment::default()
+        };
+        let first_lookup = Lookup::Quote {
+            quote_hash,
+            block_number: None,
+            search_from: PAST + 100,
+            not_after: None,
+        };
+        let by_time = (
+            Lookup::Quote {
+                quote_hash,
+                block_number: None,
+                search_from: PAST + 100,
+                not_after: None,
+            },
+            ListingPayment {
+                log_index: Some(2),
+                block_timestamp: Some(PAST + 320),
+                ..ListingPayment::default()
+            },
+        );
+        let by_block = (
+            Lookup::Quote {
+                quote_hash,
+                block_number: Some(160),
+                search_from: PAST + 100,
+                not_after: None,
+            },
+            ListingPayment {
+                log_index: Some(2),
+                ..ListingPayment::default()
+            },
+        );
+        let as_found = |fetched: Vec<(Option<PaymentReceipt>, Option<u64>)>| {
+            fetched
+                .into_iter()
+                .map(|(receipt, time)| (receipt.map(|r| r.tx_hash), time))
+                .collect::<Vec<_>>()
+        };
+        for (lookup, shown) in [by_time, by_block] {
+            let (first, second) = (mock(), mock());
+            let urls = two_providers(&first, &second).await;
+            let dir = tempfile::tempdir().unwrap();
+            let store = test_store(dir.path());
+            {
+                let chain = ListingChain::with_rpcs(urls.clone(), VAULT)
+                    .unwrap()
+                    .with_store(&store)
+                    .unwrap()
+                    .with_root_vault(ROOT_VAULT);
+                assert_eq!(
+                    as_found(chain.fetch(&first_lookup, &first_shown).await.unwrap()),
+                    vec![(Some([0xaa; 32]), Some(PAST + 200))]
+                );
+                let facts = chain.facts.as_ref().unwrap();
+                assert_eq!(
+                    facts.kept_quote(&quote_hash),
+                    Some(vec![VaultLog {
+                        tx_hash: [0xaa; 32],
+                        block_number: 100,
+                        log_index: 4,
+                    }])
+                );
+                // The later payment: not among those kept, so searched for.
+                let before = first.lock().unwrap().calls_to("eth_getLogs");
+                assert_eq!(
+                    as_found(chain.fetch(&lookup, &shown).await.unwrap()),
+                    vec![(Some([0xab; 32]), Some(PAST + 320))]
+                );
+                assert!(first.lock().unwrap().calls_to("eth_getLogs") > before);
+                let mut kept = facts.kept_quote(&quote_hash).unwrap();
+                kept.sort_by_key(|log| log.block_number);
+                assert_eq!(
+                    kept,
+                    vec![
+                        VaultLog {
+                            tx_hash: [0xaa; 32],
+                            block_number: 100,
+                            log_index: 4,
+                        },
+                        VaultLog {
+                            tx_hash: [0xab; 32],
+                            block_number: 160,
+                            log_index: 2,
+                        },
+                    ]
+                );
+            }
+            // After a restart, both payments come from the store.
+            let (before_first, before_second) = (
+                first.lock().unwrap().calls_to("eth_getLogs"),
+                second.lock().unwrap().calls_to("eth_getLogs"),
+            );
+            let chain = ListingChain::with_rpcs(urls, VAULT)
+                .unwrap()
+                .with_store(&store)
+                .unwrap()
+                .with_root_vault(ROOT_VAULT);
+            assert_eq!(
+                as_found(chain.fetch(&first_lookup, &first_shown).await.unwrap()),
+                vec![(Some([0xaa; 32]), Some(PAST + 200))]
+            );
+            assert_eq!(
+                as_found(chain.fetch(&lookup, &shown).await.unwrap()),
+                vec![(Some([0xab; 32]), Some(PAST + 320))]
+            );
+            assert_eq!(first.lock().unwrap().calls_to("eth_getLogs"), before_first);
+            assert_eq!(
+                second.lock().unwrap().calls_to("eth_getLogs"),
+                before_second
+            );
+        }
     }
 
     #[tokio::test]
@@ -7284,6 +8026,161 @@ mod tests {
         }
     }
 
+    /// Fault injection: a reader with a root vault searches for a quote
+    /// whose only payment on the chain is one the listing doesn't show (at
+    /// another log index). The search found none the listing shows, so it
+    /// keeps how far it went through final blocks, as a search that found
+    /// nothing does. Decided again, with the same key, the search goes on
+    /// from the block after the last final one it went through, not from the
+    /// quote's time, and finds the payment the listing shows, which landed
+    /// since.
+    #[tokio::test]
+    async fn a_root_readers_search_that_finds_only_another_payment_goes_on_where_it_stopped() {
+        let quote = signed_quote([0x36; 32], 30);
+        let quote_hash = quote.hash().0;
+        let mut chain = MockChain::with_blocks(1_000, PAST);
+        chain.finalized = Some(900);
+        chain.add_receipt(payment_in(&quote, ROOT_VAULT.address, 0xb1, 300, 7));
+        let mock = Arc::new(Mutex::new(chain));
+        let dir = tempfile::tempdir().unwrap();
+        let store = test_store(dir.path());
+        let chain = reader(serve(Arc::clone(&mock)).await)
+            .unpaced()
+            .with_store(&store)
+            .unwrap()
+            .with_root_vault(ROOT_VAULT);
+        let lookup = Lookup::Quote {
+            quote_hash,
+            block_number: None,
+            search_from: PAST + 400,
+            not_after: None,
+        };
+        let shown = ListingPayment {
+            log_index: Some(4),
+            ..ListingPayment::default()
+        };
+        let key: SearchKey = (quote_hash, PAST + 400, None, None, Some(4));
+        let log_queries = || mock.lock().unwrap().calls_to("eth_getLogs");
+
+        assert_eq!(chain.fetch(&lookup, &shown).await.unwrap(), Vec::new());
+        // Forwards from the quote's time, then back from it: a query per
+        // vault each time.
+        assert_eq!(log_queries(), 4);
+        // Kept as far as the finalized block, with the search back made.
+        assert_eq!(
+            chain.searched_before(&key),
+            Some(Searched {
+                through: Some(900),
+                back: true,
+            })
+        );
+
+        // The payment the listing shows lands after the blocks searched.
+        let paid = payment_in(&quote, ROOT_VAULT.address, 0xb2, 950, 4);
+        mock.lock().unwrap().add_receipt(paid.clone());
+        let filters_before = mock.lock().unwrap().log_filters.len();
+        assert_eq!(
+            chain.fetch(&lookup, &shown).await.unwrap(),
+            vec![(Some(paid), Some(PAST + 1_900))]
+        );
+        let filters = mock.lock().unwrap().log_filters[filters_before..].to_vec();
+        assert_eq!(filters.len(), 2, "one round: a query per vault");
+        for filter in &filters {
+            assert_eq!(filter["fromBlock"], json!(quantity(901)));
+            assert_eq!(filter["toBlock"], json!(quantity(999)));
+        }
+        // Found: the search is forgotten, and the payment is held with the
+        // quote's facts.
+        assert_eq!(chain.searched_before(&key), None);
+        let facts = chain.facts.as_ref().unwrap();
+        assert!(facts.quote(&quote_hash).unwrap().value.contains(&VaultLog {
+            tx_hash: [0xb2; 32],
+            block_number: 950,
+            log_index: 4,
+        }));
+    }
+
+    /// Fault injection: a reader with a root vault and one RPC searches for
+    /// a quote for a listing showing log index 4, and comes across only the
+    /// quote's payment at log index 7, which it holds. The search found none
+    /// the listing shows, so how far it went is kept. No second provider
+    /// confirms that payment's receipt, so the held payment is dropped once
+    /// final, not kept. A listing copy with the same quote, `search_from`
+    /// and timestamp showing log index 7 then searches from the quote's
+    /// time, not from where the first search stopped, and finds the payment
+    /// at block 300: the kept search said only that no payment at index 4
+    /// is in the blocks it went through.
+    #[tokio::test]
+    async fn a_root_readers_kept_search_never_skips_a_payment_it_passed_that_was_dropped() {
+        let quote = signed_quote([0x37; 32], 30);
+        let quote_hash = quote.hash().0;
+        let mut chain = MockChain::with_blocks(1_000, PAST);
+        chain.finalized = Some(900);
+        let passed = payment_in(&quote, ROOT_VAULT.address, 0xb3, 300, 7);
+        chain.add_receipt(passed.clone());
+        let mock = Arc::new(Mutex::new(chain));
+        let dir = tempfile::tempdir().unwrap();
+        let store = test_store(dir.path());
+        let chain = reader(serve(Arc::clone(&mock)).await)
+            .unpaced()
+            .with_store(&store)
+            .unwrap()
+            .with_root_vault(ROOT_VAULT);
+        let lookup = Lookup::Quote {
+            quote_hash,
+            block_number: None,
+            search_from: PAST + 400,
+            not_after: None,
+        };
+        let shown_other = ListingPayment {
+            log_index: Some(4),
+            ..ListingPayment::default()
+        };
+        assert_eq!(
+            chain.fetch(&lookup, &shown_other).await.unwrap(),
+            Vec::new()
+        );
+        assert_eq!(
+            chain.searched_before(&(quote_hash, PAST + 400, None, None, Some(4))),
+            Some(Searched {
+                through: Some(900),
+                back: true,
+            })
+        );
+        // One RPC: no second provider confirms the passed payment's receipt,
+        // so the quote's held payments were dropped once final, not kept.
+        let facts = chain.facts.as_ref().unwrap();
+        assert!(facts.quote(&quote_hash).is_none());
+
+        let shown_passed = ListingPayment {
+            log_index: Some(7),
+            ..ListingPayment::default()
+        };
+        assert_eq!(
+            chain.searched_before(&(quote_hash, PAST + 400, None, None, Some(7))),
+            None
+        );
+        let filters_before = mock.lock().unwrap().log_filters.len();
+        assert_eq!(
+            chain.fetch(&lookup, &shown_passed).await.unwrap(),
+            vec![(Some(passed), Some(PAST + 600))]
+        );
+        // Searched from the quote's time (block 200), through block 300.
+        let filters = mock.lock().unwrap().log_filters[filters_before..].to_vec();
+        assert!(!filters.is_empty());
+        for filter in &filters {
+            assert_eq!(filter["fromBlock"], json!(quantity(200)));
+        }
+        // The kept search for log index 4 is untouched: it still holds.
+        assert_eq!(
+            chain.searched_before(&(quote_hash, PAST + 400, None, None, Some(4))),
+            Some(Searched {
+                through: Some(900),
+                back: true,
+            })
+        );
+    }
+
     #[tokio::test]
     async fn every_call_has_its_own_id_and_calls_known_together_go_in_batches_of_100() {
         let mut mock = MockChain::with_blocks(200, PAST);
@@ -7350,7 +8247,7 @@ mod tests {
     }
 
     #[test]
-    fn the_bundled_network_reads_through_publicnode_ordofi_for_logs_and_robinhood_last() {
+    fn the_bundled_network_reads_through_publicnode_robinhood_for_logs_and_ordofi_last() {
         let bundled = crate::config::bundled_payment_network().unwrap();
         let setup = rpc_setup(&bundled, None).unwrap();
         let host = |index: usize| crate::data::client::listings_rpc::rpc_host(&setup.urls[index]);
@@ -7358,11 +8255,54 @@ mod tests {
         assert_eq!(host(0), "robinhood-rpc.publicnode.com");
         assert_eq!(host(1), "rpc.ordofi.network");
         assert_eq!(host(2), "rpc.mainnet.chain.robinhood.com");
-        assert_eq!(setup.logs_order, Some(vec![1, 0, 2]));
+        assert_eq!(setup.logs_order, Some(vec![2, 0, 1]));
+        // ordofi's busy answers to log queries are span answers.
+        assert_eq!(setup.span_answers, vec![1]);
         assert_eq!(setup.chain_id, None);
-        let rpc = Rpc::new(setup.urls, setup.logs_order, None).unwrap();
+        let rpc = Rpc::new(setup.urls, setup.logs_order, &setup.span_answers, None).unwrap();
+        // Calls: PublicNode, ordofi, Robinhood's RPC.
         assert_eq!(rpc.order(Kind::Chain), vec![0, 1, 2]);
-        assert_eq!(rpc.order(Kind::Logs), vec![1, 0, 2]);
+        // Log queries: Robinhood's RPC, PublicNode, ordofi last.
+        assert_eq!(rpc.order(Kind::Logs), vec![2, 0, 1]);
+    }
+
+    #[test]
+    fn ordofi_gives_span_answers_wherever_it_is_listed() {
+        assert_eq!(span_answer_host().as_deref(), Some("rpc.ordofi.network"));
+        let bundled = crate::config::bundled_payment_network().unwrap();
+        // Listed as the gateway's README gives them: ordofi first, so the
+        // RPC asked last for log queries is PublicNode's, not ordofi's.
+        let listed = "https://rpc.ordofi.network https://rpc.mainnet.chain.robinhood.com \
+                      https://robinhood-rpc.publicnode.com";
+        let setup = rpc_setup(&bundled, Some(listed)).unwrap();
+        assert_eq!(setup.logs_order, None);
+        assert_eq!(setup.span_answers, vec![0]);
+        // Robinhood's RPC listed last: ordofi's, with a key in its path, is
+        // still the one.
+        let listed = "https://robinhood-rpc.publicnode.com https://rpc.ordofi.network/a-key \
+                      https://rpc.mainnet.chain.robinhood.com";
+        assert_eq!(
+            rpc_setup(&bundled, Some(listed)).unwrap().span_answers,
+            vec![1]
+        );
+        // A reader through RPCs of its own: the same.
+        let own = ["http://127.0.0.1:8545", "https://rpc.ordofi.network"].map(String::from);
+        assert_eq!(span_answers(&own), vec![1]);
+        assert!(span_answers(&own[..1]).is_empty());
+    }
+
+    #[test]
+    fn log_queries_go_to_the_last_fallback_first_then_the_rest_in_listed_order() {
+        // No fallback: the same order as everything else.
+        assert_eq!(fallback_logs_order(0), None);
+        assert_eq!(fallback_logs_order(1), None);
+        // One fallback: it comes first.
+        assert_eq!(fallback_logs_order(2), Some(vec![1, 0]));
+        // Two (the bundled network): the first fallback comes last.
+        assert_eq!(fallback_logs_order(3), Some(vec![2, 0, 1]));
+        // Three: the last fallback first, then the network's own RPC and
+        // the first two fallbacks in their listed order.
+        assert_eq!(fallback_logs_order(4), Some(vec![3, 0, 1, 2]));
     }
 
     #[test]
@@ -7374,6 +8314,7 @@ mod tests {
             RpcSetup {
                 urls: vec!["https://a.example/k1".into(), "http://b.example".into()],
                 logs_order: None,
+                span_answers: Vec::new(),
                 chain_id: crate::config::chain_id(&bundled),
             }
         );
@@ -7405,7 +8346,13 @@ mod tests {
             serve(Arc::clone(&other)).await,
             serve(Arc::clone(&right)).await,
         ];
-        let chain = ListingChain::with_rpc_setup(urls, None, Some(4_663), VAULT).unwrap();
+        let setup = RpcSetup {
+            urls,
+            logs_order: None,
+            span_answers: Vec::new(),
+            chain_id: Some(4_663),
+        };
+        let chain = ListingChain::with_rpc_setup(setup, VAULT).unwrap();
         assert_eq!(chain.latest_block().await.unwrap(), 19);
         assert_eq!(chain.latest_block().await.unwrap(), 19);
         let other = other.lock().unwrap();

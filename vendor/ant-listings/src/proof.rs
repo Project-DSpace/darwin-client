@@ -31,7 +31,8 @@
 use crate::envelope::{Envelope, EnvelopeError, Salt};
 use crate::listing::Payment;
 use crate::payment::{
-    check_quote, decode_quote, encode_quote, pays, PaidAt, PaymentError, PaymentReceipt,
+    check_quote, decode_quote, encode_quote, paying_log, pays, PaidAt, PaymentError,
+    PaymentReceipt, VaultSet,
 };
 use ant_protocol::evm::PaymentQuote;
 use ant_protocol::XorName;
@@ -306,7 +307,10 @@ pub(crate) fn decode_hex(text: &str) -> Option<Vec<u8>> {
 /// 2. If it withholds its data map and the proof reveals it, the data map and
 ///    salt give its salted hash.
 /// 3. The quote names the address and is signed by the key it carries.
-/// 4. The transaction succeeded and paid the quote to `vault`.
+/// 4. The transaction succeeded and paid the quote to a vault in `vaults`: to
+///    the per-quote vault, or to the root vault in a wave the receipt shows
+///    whole, transfers included
+///    ([`recorded_wave`](crate::root::recorded_wave)).
 ///
 /// Returns the envelope, the data map and the full payment. That shows the
 /// address was paid for by the payment's block. Other payments for it, earlier
@@ -320,7 +324,7 @@ pub fn check_proof(
     proof: &EnvelopeProof,
     receipt: &PaymentReceipt,
     block_timestamp: u64,
-    vault: &[u8; 20],
+    vaults: &VaultSet,
 ) -> Result<ProvenUpload, ProofError> {
     let envelope = Envelope::from_bytes(&proof.envelope)?;
     let address = envelope.address();
@@ -348,12 +352,7 @@ pub fn check_proof(
     if !receipt.success {
         return Err(PaymentError::Failed.into());
     }
-    let log = receipt
-        .logs
-        .iter()
-        .filter(|log| pays(log, vault, &quote))
-        .min_by_key(|log| log.log_index)
-        .ok_or(PaymentError::NotPaid)?;
+    let log = paying_log(receipt, vaults, |log, vault| pays(log, vault, &quote))?;
     Ok(ProvenUpload {
         address,
         envelope,
@@ -378,7 +377,7 @@ mod tests {
         find_payment, payment_lookup, verify_listing_receipts, CheckLevel, ListingCheck, Lookup,
     };
     use crate::test_support::{
-        data_map, metadata, payment_log, receipt, signed_quote, BLOCK_TIME, VAULT,
+        data_map, metadata, payment_log, receipt, signed_quote, BLOCK_TIME, VAULTS,
     };
     use ant_protocol::evm::Amount;
 
@@ -444,7 +443,7 @@ mod tests {
         for byte in 0..Flags::RESERVED {
             let flags = Flags::from_byte(byte).unwrap();
             let upload = upload_with(flags);
-            let proven = check_proof(&upload.proof, &upload.receipt, BLOCK_TIME, &VAULT).unwrap();
+            let proven = check_proof(&upload.proof, &upload.receipt, BLOCK_TIME, &VAULTS).unwrap();
             assert_eq!(proven.address, upload.proof.address);
             assert_eq!(proven.envelope.to_bytes(), upload.proof.envelope);
             assert_eq!(proven.envelope.flags(), flags);
@@ -470,7 +469,7 @@ mod tests {
                 &[upload.content.clone(), upload.quote.clone()],
                 &upload.receipt,
                 BLOCK_TIME,
-                &VAULT,
+                &VAULTS,
             )
             .unwrap();
             assert_eq!(proven.payment, found);
@@ -497,7 +496,7 @@ mod tests {
                 Lookup::Block { .. } => vec![(None, Some(BLOCK_TIME))],
                 Lookup::Nothing => Vec::new(),
             };
-            let check = verify_listing_receipts(&listing, &proven.envelope, &fetched, &VAULT, now);
+            let check = verify_listing_receipts(&listing, &proven.envelope, &fetched, &VAULTS, now);
             let expected = if flags.shown.contains(PaymentField::Quote) {
                 ListingCheck {
                     level: CheckLevel::Verified,
@@ -544,7 +543,7 @@ mod tests {
                 std::slice::from_ref(&upload.content),
                 &upload.receipt,
                 BLOCK_TIME,
-                &VAULT,
+                &VAULTS,
             )
             .unwrap();
             assert_eq!(
@@ -616,7 +615,7 @@ mod tests {
         let mut upload = upload(true);
         upload.proof.data_map = None;
         upload.proof.salt = None;
-        let proven = check_proof(&upload.proof, &upload.receipt, BLOCK_TIME, &VAULT).unwrap();
+        let proven = check_proof(&upload.proof, &upload.receipt, BLOCK_TIME, &VAULTS).unwrap();
         assert_eq!(proven.data_map, None);
         assert_eq!(proven.payment.log_index, 2);
     }
@@ -624,7 +623,7 @@ mod tests {
     #[test]
     fn rejects_tampered_proofs() {
         let check = |proof: &EnvelopeProof, receipt: &PaymentReceipt| {
-            check_proof(proof, receipt, BLOCK_TIME, &VAULT)
+            check_proof(proof, receipt, BLOCK_TIME, &VAULTS)
         };
         for withheld in [false, true] {
             let upload = upload(withheld);
@@ -695,8 +694,8 @@ mod tests {
             ));
 
             assert_eq!(
-                check_proof(good, receipt, BLOCK_TIME, &[0x11; 20]).unwrap_err(),
-                ProofError::Payment(PaymentError::NotPaid)
+                check_proof(good, receipt, BLOCK_TIME, &VaultSet::v2_only([0x11; 20])).unwrap_err(),
+                ProofError::Payment(PaymentError::UnknownVault)
             );
         }
     }
@@ -704,7 +703,7 @@ mod tests {
     #[test]
     fn rejects_bad_reveals() {
         let check = |proof: &EnvelopeProof, receipt: &PaymentReceipt| {
-            check_proof(proof, receipt, BLOCK_TIME, &VAULT)
+            check_proof(proof, receipt, BLOCK_TIME, &VAULTS)
         };
         let upload = upload(true);
         let good = &upload.proof;
@@ -809,7 +808,7 @@ mod tests {
             }
             // Read from its text, it checks out.
             let read = EnvelopeProof::from_hex(&hex).unwrap();
-            assert!(check_proof(&read, &upload.receipt, BLOCK_TIME, &VAULT).is_ok());
+            assert!(check_proof(&read, &upload.receipt, BLOCK_TIME, &VAULTS).is_ok());
         }
         assert_eq!(decode_hex(""), Some(Vec::new()));
         assert_eq!(decode_hex("00ff7fA0"), Some(vec![0, 0xff, 0x7f, 0xa0]));
@@ -901,7 +900,7 @@ mod tests {
         let mut trailing = upload.proof.clone();
         trailing.quote.push(0);
         assert_eq!(
-            check_proof(&trailing, &upload.receipt, BLOCK_TIME, &VAULT).unwrap_err(),
+            check_proof(&trailing, &upload.receipt, BLOCK_TIME, &VAULTS).unwrap_err(),
             ProofError::Payment(PaymentError::BadQuote("not canonical".into()))
         );
     }

@@ -650,7 +650,7 @@ pub(crate) async fn complete_upload_envelope(
             }
         };
         let checked =
-            ant_listings::find_payment(&address, &quotes, &receipt, timestamp, chain.vault())
+            ant_listings::find_payment(&address, &quotes, &receipt, timestamp, chain.vaults())
                 .map_err(|e| e.to_string())
                 .and_then(|payment| {
                     EnvelopeProof::from_payment(&envelope.envelope, &payment)
@@ -658,7 +658,7 @@ pub(crate) async fn complete_upload_envelope(
                 })
                 .and_then(reveal)
                 .and_then(|record| {
-                    ant_listings::check_proof(&record, &receipt, timestamp, chain.vault())
+                    ant_listings::check_proof(&record, &receipt, timestamp, chain.vaults())
                         .map(|_| record)
                         .map_err(|e| e.to_string())
                 });
@@ -1250,7 +1250,7 @@ mod tests {
             &record,
             &receipt,
             1_800_000_240,
-            &super::super::listings::test_chain::VAULT,
+            &ant_listings::VaultSet::v2_only(super::super::listings::test_chain::VAULT),
         )
         .unwrap();
         assert_eq!(proven.payment.log_index, 1);

@@ -461,7 +461,13 @@ def generate(args, config, github):
     by_name_version = {}
     for package in metadata["packages"]:
         by_name_version.setdefault((package["name"], package["version"]), []).append(package)
-    workspace = set(metadata["workspace_members"])
+    # First-party crates: the workspace's members, apart from the copies kept in
+    # vendor/ (vendor/ant-listings is a member so its tests run under this
+    # repository's lock), which are third-party code and listed like any other.
+    vendor = os.path.join(os.path.realpath(metadata["workspace_root"]), "vendor")
+    workspace = {package["id"] for package in metadata["packages"]
+                 if package["id"] in set(metadata["workspace_members"])
+                 and os.path.commonpath([vendor, os.path.realpath(package["manifest_path"])]) != vendor}
 
     gaps, index, notes, texts = [], [], [], {}
     for name, version, annotation in sorted(release_graph(args)):

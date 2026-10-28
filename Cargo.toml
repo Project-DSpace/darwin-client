@@ -19,10 +19,22 @@ opt-level = 2
 
 [patch.crates-io]
 # Autonomi's protocol crate with our price multiplier; see vendor/ant-protocol/VENDORED.md.
+# A project that takes ant-core by git repeats this entry, from the same tag
+# (README, "Rust Library API"): a [patch] applies only in the top-level workspace.
 ant-protocol = { path = "vendor/ant-protocol" }
 # darwin-node's patched webrtc (its vendor/webrtc/VENDORED.md: closing a browser
 # session cancels a DTLS handshake still in progress), from the darwin-node
 # revision ant-core's tests and devnet run, so the in-process nodes are built
 # as darwin-node builds them. Only builds that link darwin-node (the tests and
-# the `devnet` feature) use webrtc; the `darwin` binary doesn't.
-webrtc = { git = "https://github.com/Project-DSpace/darwin-node.git", rev = "19d38d58fd3f760fedf1c83729108529ed48d232" }
+# the `devnet` feature) use webrtc; the `darwin` binary doesn't. The webrtc
+# crate comes in through saorsa-transport's `webrtc-direct` feature, which only
+# darwin-node turns on; ant-core's own `webrtc` feature is the browser protocol
+# types, without it. The lock lists saorsa-transport -> webrtc because it is
+# resolved with every feature, `devnet` included. A project that enables
+# ant-core's `devnet` repeats this entry too (README, "Rust Library API").
+# darwin-node also patches saorsa-core, so its nodes dial a verified direct
+# address before a relay. That patch isn't repeated here, as it would change
+# this client's own dial order too: the in-process nodes dial in upstream's
+# order, as the client does, while the browser tests' devnet, built in
+# darwin-node's own workspace, has it. The dial order changes no message.
+webrtc = { git = "https://github.com/Project-DSpace/darwin-node.git", rev = "81dbac76f1c6fccc6cbe0ab2ab725b6fda90ba90" }

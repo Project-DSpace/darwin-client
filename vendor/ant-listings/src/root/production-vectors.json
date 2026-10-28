@@ -1,0 +1,24 @@
+{
+ "about": "DarwinRootVault's keys under the production vault's address (`productionVault`): the root vault's fixed address, the CREATE2 address of the pinned build. Each entry names a wave in vectors/ and gives its root, leaf count and key = keccak256(0x02 || productionVault || root || leafCount). The leaf counts are 0x-prefixed hex strings, as in vectors/. A reader's built-in root-vault address must equal `productionVault`, and its key function must give these keys.",
+ "productionVault": "0xf6675722f443132b045857546e57e35360bb03b9",
+ "keyVectors": [
+  {
+   "wave": "wave-001-001.json",
+   "root": "0xd95a4441ced3b9e7c1bee15966e5063d4129c1a4d59d9ba17e9be883a5914da0",
+   "leafCount": "0x1",
+   "key": "0xf6359e60279cc25b543b94f5eebfe4c2dbdce8cf9d0add45eb4857624504975e"
+  },
+  {
+   "wave": "wave-005-002.json",
+   "root": "0x2e12f7852efb4bdbd1cce26d57b4a12e835316e6af4f736701a3fbc77845dbc5",
+   "leafCount": "0x5",
+   "key": "0x21c12f6f87723d3dad3751b173094be62b720b44862997e97fd721fb436be176"
+  },
+  {
+   "wave": "wave-512-512.json",
+   "root": "0xa647bcb09d7c4d204f5e63ee2881e2bece5350cc09f99b2c32ad34cc3450a29d",
+   "leafCount": "0x200",
+   "key": "0x97fc2c636e9af95e60014e3f54f0a732cfa4a51a6adbf8f058f8b0764c7b5967"
+  }
+ ]
+}

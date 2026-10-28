@@ -67,6 +67,11 @@ jobs:
       - name: Test the release gate's check
         run: bash scripts/test_check_workflows.sh
 
+      # darwin-node-pin.py --release, which release.yml runs: a revision from
+      # before node release 1a, or off darwin-node's main, fails.
+      - name: Test the darwin-node revision release check
+        run: python3 scripts/test_darwin_node_pin.py
+
   # One job per target, in parallel. Every target reports, whether or not
   # another fails. The `e2e` target runs every end-to-end case on one shared
   # network (tests/e2e.rs). The nodes are darwin-node's, at the revision

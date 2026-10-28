@@ -113,23 +113,29 @@ async fn port_and_pid_files_written() {
 #[tokio::test]
 async fn server_binds_to_pinned_port() {
     // Reserve a free port by binding to 0, then drop the listener so the
-    // server can claim it. A tiny TOCTOU race is acceptable in tests.
-    let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let pinned_port = probe.local_addr().unwrap().port();
-    drop(probe);
-
+    // server can claim it. Another test binding port 0 in that gap can take
+    // the port first, so a port found in use is replaced by a fresh one.
     let dir = tempfile::tempdir().unwrap();
-    let config = DaemonConfig {
-        port: Some(pinned_port),
-        ..test_config(&dir)
-    };
-    let port_file = config.port_file_path.clone();
-    let registry = NodeRegistry::load(&config.registry_path).unwrap();
-    let shutdown = tokio_util::sync::CancellationToken::new();
+    let mut attempts = 0;
+    let (addr, pinned_port, port_file, shutdown) = loop {
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let pinned_port = probe.local_addr().unwrap().port();
+        drop(probe);
 
-    let addr = server::start(config, registry, shutdown.clone())
-        .await
-        .unwrap();
+        let config = DaemonConfig {
+            port: Some(pinned_port),
+            ..test_config(&dir)
+        };
+        let port_file = config.port_file_path.clone();
+        let registry = NodeRegistry::load(&config.registry_path).unwrap();
+        let shutdown = tokio_util::sync::CancellationToken::new();
+
+        match server::start(config, registry, shutdown.clone()).await {
+            Ok(addr) => break (addr, pinned_port, port_file, shutdown),
+            Err(e) if attempts < 10 && e.to_string().contains("in use") => attempts += 1,
+            Err(e) => panic!("server failed to bind the pinned port: {e:?}"),
+        }
+    };
 
     assert_eq!(addr.port(), pinned_port, "server bound to the wrong port");
 
@@ -183,6 +189,22 @@ fn create_fake_binary(dir: &std::path::Path) -> std::path::PathBuf {
         std::fs::write(&binary_path, "#!/bin/sh\necho \"antnode 0.1.0-test\"\n").unwrap();
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&binary_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // Another test thread forking at the same moment can briefly hold a copy of
+        // the write descriptor, which makes executing the file fail with ETXTBSY
+        // ("Text file busy"). Wait until the file can be run before handing it out.
+        let mut attempts = 0;
+        loop {
+            match std::process::Command::new(&binary_path)
+                .arg("--version")
+                .output()
+            {
+                Err(e) if e.raw_os_error() == Some(26) && attempts < 500 => {
+                    attempts += 1;
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                _ => break,
+            }
+        }
         binary_path
     }
     #[cfg(windows)]

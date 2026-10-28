@@ -18,8 +18,14 @@ every file is byte for byte the same, as committed. The workspace's `[patch]`
 builds darwin-node against this repository's copy, so a copy that drifted
 from darwin-node's would never show in a build.
 
+With --release, which release.yml runs before a client is published, it also
+checks that the revision is on darwin-node's main (a released node, never an
+unmerged branch commit) and has NODE_RELEASE_1A, node release 1a's commit on
+that main, as an ancestor or is that commit.
+
     darwin-node-pin.py             check that the pins agree
     darwin-node-pin.py --vendored  and that vendor/ant-protocol is darwin-node's
+    darwin-node-pin.py --release   and that the revision may be released against
 
 Needs Python 3.11+ (tomllib), and git for --vendored.
 """
@@ -34,6 +40,17 @@ import tomllib
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 NODE_REVISION = ROOT / "ant-core" / "browser-tests" / "node-revision"
 VENDORED = "vendor/ant-protocol"
+
+# The oldest darwin-node revision a client release may be tested against:
+# node release 1a's commit on darwin-node's main. Client release 1a's busy
+# handling (a dial refused within REFUSAL_DETECTION_WINDOW, reads waiting on
+# refused peers at most MAX_REFUSAL_WAITS times) needs nodes that refuse a
+# browser session while busy, which node release 1a brings: it has to have
+# run against those nodes before it is released. Every revision on main
+# before that commit fails, whichever it is, not only main's head of today.
+# It is set: node release 1a landed on darwin-node's main as this commit,
+# released as v0.23.0+ds.16.
+NODE_RELEASE_1A = "1315dccffef2ee924325712d59f831a761ed4b70"
 
 
 class Mismatch(Exception):
@@ -134,17 +151,56 @@ def check_vendored(repository, revision):
     raise Mismatch("\n".join(lines))
 
 
+def check_release(repository, revision, oldest=NODE_RELEASE_1A):
+    """`revision` is on darwin-node's main and is `oldest` or descends from it."""
+    with tempfile.TemporaryDirectory() as scratch:
+        git("init", "--quiet", "--bare", scratch, cwd=scratch)
+        git(
+            "fetch", "--quiet", "--filter=blob:none", "--no-tags", repository,
+            "+refs/heads/main:refs/heads/main", cwd=scratch,
+        )
+        on_main = subprocess.run(
+            ["git", "merge-base", "--is-ancestor", revision, "refs/heads/main"],
+            cwd=scratch, capture_output=True, text=True,
+        )
+        if on_main.returncode != 0:
+            raise Mismatch(
+                f"{revision} is not on darwin-node's main: a client release is "
+                "tested against a released node, never an unmerged branch commit"
+            )
+        if oldest is None:
+            raise Mismatch(
+                f"{revision} can't be released against: node release 1a has no commit "
+                "on darwin-node's main yet, so every revision there is from before it, "
+                "and client release 1a's busy handling has never run against a node "
+                "that refuses a session while busy. Move the pin to node release 1a's "
+                "commit on darwin-node's main and set NODE_RELEASE_1A to it first"
+            )
+        from_it = subprocess.run(
+            ["git", "merge-base", "--is-ancestor", oldest, revision],
+            cwd=scratch, capture_output=True, text=True,
+        )
+        if from_it.returncode != 0:
+            raise Mismatch(
+                f"{revision} can't be released against: it is from before node release "
+                f"1a ({oldest}), which client release 1a's busy handling needs"
+            )
+
+
 def main(argv):
-    if argv[1:] not in ([], ["--vendored"]):
+    if argv[1:] not in ([], ["--vendored"], ["--release"]):
         print(__doc__, file=sys.stderr)
         return 2
     try:
         repository, revision = pinned()
         packages = check_pins(repository, revision)
         print(f"darwin-node {revision} ({repository}): {', '.join(packages)}")
-        if argv[1:] == ["--vendored"]:
+        if argv[1:] in (["--vendored"], ["--release"]):
             tree = check_vendored(repository, revision)
             print(f"{VENDORED} is darwin-node's at {revision} (tree {tree})")
+        if argv[1:] == ["--release"]:
+            check_release(repository, revision)
+            print(f"darwin-node {revision} is on its main, and may be released against")
     except Mismatch as mismatch:
         print(f"darwin-node-pin: {mismatch}", file=sys.stderr)
         return 1

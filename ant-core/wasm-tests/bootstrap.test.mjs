@@ -7,8 +7,8 @@ const content = new TextEncoder().encode("Pooled bootstrap and progressive disco
 const map = encryptPublicFile(content).records.at(-1);
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 
-// Reads also ask the seeds, nearest to the record first, from the start. Of
-// the first two mock nodes, the second is the nearer to `map`.
+// A read asks a connected seed as soon as it is offered, nearest to the
+// record first. Of the first two mock nodes, the second is the nearer to `map`.
 for (const slowSeedIsNearer of [false, true]) {
   test(`network connect returns a fast seed and retains its authenticated association (slow seed ${slowSeedIsNearer ? "nearer to" : "farther from"} the record)`, async () => {
     const [slow, holder] = slowSeedIsNearer ? [1, 0] : [0, 1];
@@ -59,20 +59,87 @@ test("an exhausted fast seed still falls back through a later seed", async () =>
   } finally { reader?.close(); reader?.free(); client.close(); client.free(); }
 });
 
-test("bootstrap admits at most four pending connections and close cancels them", async () => {
+test("bootstrap dials three seeds and close cancels them", async () => {
   const rtc = mockWebRtc(Array.from({ length: 9 }, () => ({ connectDelay: 500 })));
   const client = new BrowserNetworkClient(rtc.endpoints);
   const connecting = client.connect();
   const rejected = assert.rejects(connecting, /closed/);
   await sleep(50);
-  assert.equal(rtc.connections.length, 4);
+  assert.equal(rtc.connections.length, 3);
   client.close();
   await rejected;
   client.free();
   await closesSettled();
   assert.ok(rtc.connections.every(c => c.closed));
   await sleep(550);
-  assert.equal(rtc.connections.length, 4, "closing must stop queued seeds from dialing");
+  assert.equal(rtc.connections.length, 3, "closing must stop queued seeds from dialing");
+});
+
+test("a browser keeps sessions with three of its seeds, chosen at random", async () => {
+  const rtc = mockWebRtc(Array.from({ length: 9 }, () => ({})));
+  const dialled = new Set();
+  for (let round = 0; round < 12; round++) {
+    const from = rtc.connections.length;
+    const client = new BrowserNetworkClient(rtc.endpoints);
+    try {
+      await client.connect(paymentNetwork);
+      await sleep(50);
+      const seeds = rtc.connections.slice(from).map(c => c.remoteSeed);
+      assert.equal(seeds.length, 3, "three seeds, not all nine");
+      assert.equal(new Set(seeds).size, 3);
+      for (const seed of seeds) dialled.add(seed);
+    } finally { client.close(); client.free(); }
+  }
+  await closesSettled();
+  // Twelve browsers in a fixed order would all dial the same three.
+  assert.ok(dialled.size > 3, `dialled only seeds ${[...dialled]}`);
+});
+
+test("a seed that declines a session is replaced by the next, and held off", async () => {
+  // Two of five seeds refuse every session, as full nodes do. Three sessions
+  // are wanted, so the three others are all needed: each refusing seed the
+  // random order reaches first is replaced by the next.
+  const rtc = mockWebRtc([{ refuseDials: Infinity }, { refuseDials: Infinity }, {}, {}, {}]);
+  const client = new BrowserNetworkClient(rtc.endpoints);
+  try {
+    const hello = await client.connect(paymentNetwork);
+    const refusing = [0, 1].map(i => parseWebRtcDirectMultiaddr(rtc.endpoints[i]).peerId);
+    assert.ok(!refusing.includes(hello.peer_id), "a refusing seed is never the one connected");
+    await sleep(200);
+    const dialsTo = seed => rtc.connections.filter(c => c.remoteSeed === seed).length;
+    assert.deepEqual([3, 4, 5].map(dialsTo), [1, 1, 1], "every seed that takes a session, once");
+    const refused = [1, 2].map(dialsTo);
+    assert.ok(refused.every(dials => dials <= 1), `refusing seeds dialled ${refused}`);
+    // Within their 15 s hold-off the refusing seeds are not dialled again.
+    await client.connect(paymentNetwork);
+    await sleep(100);
+    assert.deepEqual([1, 2].map(dialsTo), refused);
+  } finally { client.close(); client.free(); await closesSettled(); }
+});
+
+test("declining seeds are replaced until the seeds run out", async () => {
+  // Three of four seeds refuse: however the random order runs, each refusal is
+  // replaced by the next seed until all four are dialled, once each, and the
+  // one that takes a session is the one connected.
+  const rtc = mockWebRtc([{ refuseDials: Infinity }, { refuseDials: Infinity }, { refuseDials: Infinity }, {}]);
+  const client = new BrowserNetworkClient(rtc.endpoints);
+  try {
+    const hello = await client.connect(paymentNetwork);
+    assert.equal(hello.peer_id, parseWebRtcDirectMultiaddr(rtc.endpoints[3]).peerId);
+    await sleep(200);
+    const dialsTo = seed => rtc.connections.filter(c => c.remoteSeed === seed).length;
+    assert.deepEqual([1, 2, 3, 4].map(dialsTo), [1, 1, 1, 1]);
+  } finally { client.close(); client.free(); await closesSettled(); }
+});
+
+test("when every seed is held off for a refusal, connect says they are busy", async () => {
+  const rtc = mockWebRtc([{ refuseDials: Infinity }, { refuseDials: Infinity }]);
+  const client = new BrowserNetworkClient(rtc.endpoints);
+  try {
+    await assert.rejects(client.connect(paymentNetwork));
+    await assert.rejects(client.connect(paymentNetwork), /busy/);
+    assert.equal(rtc.connections.length, 2, "held off, not dialled again");
+  } finally { client.close(); client.free(); await closesSettled(); }
 });
 
 test("bootstrap rejects the wrong network and cannot change trust policy after startup", async () => {

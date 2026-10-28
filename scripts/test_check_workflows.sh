@@ -132,6 +132,10 @@ edit "${RELEASE}" 'if [[ ",$rules," != *",required_reviewers,"* ]]; then' 'if fa
 expect "the release environment's approval not checked" "no longer makes sure the release environment asks for approval"
 
 fresh
+edit "${RELEASE}" 'run: python3 scripts/darwin-node-pin.py --release' 'run: python3 scripts/darwin-node-pin.py'
+expect "the darwin-node revision not checked for release" "no longer checks the darwin-node revision may be released against"
+
+fresh
 edit "${RELEASE}" 'actions/workflows/test.yml/runs' 'actions/workflows/build.yml/runs'
 expect "no Test run looked for" "missing: actions/workflows/test.yml/runs"
 
@@ -197,6 +201,33 @@ expect "publish without the checked package" "publish job must need package"
 fresh
 edit "${RELEASE}" $'    needs: [checks, package]\n' $'    needs: [checks, package]\n    if: ${{ always() }}\n'
 expect "publish after a failed need" "release.yml must have no if:"
+
+# A release's own notes reach its notes, after the fixed text.
+fresh
+edit "${RELEASE}" 'if [[ -s "release-notes/$TAG.md" ]]; then' 'if [[ -s notes.md ]]; then'
+expect "the notes added whatever they hold" "publish job must add the tagged commit's release-notes/<tag>.md to the notes when it has any text"
+
+fresh
+edit "${RELEASE}" $'      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0\n        with:\n          persist-credentials: false\n\n      - uses: actions/download-artifact' $'      - uses: actions/download-artifact'
+expect "the tagged commit not checked out" "publish job must add the tagged commit's release-notes/<tag>.md to the notes when it has any text"
+
+fresh
+edit "${RELEASE}" 'cat "release-notes/$TAG.md" >> notes.md' 'cat "release-notes/$TAG.md"'
+expect "the notes left out" "publish job must write the fixed text to notes.md once, then add release-notes/<tag>.md once"
+
+fresh
+edit "${RELEASE}" 'cat "release-notes/$TAG.md" >> notes.md' 'cat "release-notes/latest.md" >> notes.md'
+expect "another file's notes taken" "publish job must write the fixed text to notes.md once, then add release-notes/<tag>.md once"
+
+fresh
+edit "${RELEASE}" $'            cat "release-notes/$TAG.md" >> notes.md\n' ''
+edit "${RELEASE}" $'          printf \'%s\\n\' \\\n            "The darwin client $TAG' \
+    $'          cat "release-notes/$TAG.md" >> notes.md\n          printf \'%s\\n\' \\\n            "The darwin client $TAG'
+expect "the notes overwritten by the fixed text" "publish job must write the fixed text to notes.md once, then add release-notes/<tag>.md once"
+
+fresh
+edit "${RELEASE}" $'            > notes.md\n' $'            >> notes.md\n'
+expect "the fixed text not written first" "publish job must write the fixed text to notes.md once, then add release-notes/<tag>.md once"
 
 WAIT_TEST="      - name: Wait for the Test workflow's run of this commit"
 fresh

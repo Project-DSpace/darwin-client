@@ -1,8 +1,14 @@
 //! Bootstrap authentication belongs to the network pool. A single bounded
 //! worker retains healthy sessions and publishes each result without waiting
 //! for slower seeds. Pool closure also cancels pending handshakes.
+//!
+//! The worker authenticates [`BOOTSTRAP_SEEDS`] seeds, not every one
+//! configured: it takes the seeds in a random order, leaves out those the
+//! browser holds off after a failure or a busy refusal, and replaces each dial
+//! that fails with the next seed. Only when lookups through the seeds it has
+//! fall short does it take [`BOOTSTRAP_SEEDS`] more ([`Bootstrap::widen`]).
 use super::*;
-use futures_util::{stream, StreamExt};
+use futures_util::StreamExt;
 
 #[derive(Clone, Default)]
 pub(super) struct State {
@@ -18,6 +24,9 @@ pub(super) struct Bootstrap {
     expected: RefCell<Option<BrowserPaymentNetwork>>,
     state: watch::Sender<State>,
     retry_at: Cell<Option<web_time::Instant>>,
+    /// How many seeds the worker keeps sessions with: [`BOOTSTRAP_SEEDS`], and
+    /// more once lookups through them fell short.
+    target: Cell<usize>,
 }
 
 impl Bootstrap {
@@ -28,7 +37,29 @@ impl Bootstrap {
             expected: RefCell::new(None),
             state,
             retry_at: Cell::new(None),
+            target: Cell::new(BOOTSTRAP_SEEDS),
         }
+    }
+
+    /// A lookup through the seeds the worker has found fewer nodes than it
+    /// needs, as when the seeds know few of the others: take
+    /// [`BOOTSTRAP_SEEDS`] more seeds, at once. Returns whether any is being
+    /// dialled, so the lookup can wait for them; none is when every seed is
+    /// already taken or held off.
+    pub fn widen(&self, core: &BrowserNetworkCore) -> Result<bool, String> {
+        if self.state.borrow().pending != 0 {
+            return Ok(true);
+        }
+        let target = self.target.get();
+        if target >= core.seeds.len() {
+            return Ok(false);
+        }
+        self.target
+            .set(target.saturating_add(BOOTSTRAP_SEEDS).min(core.seeds.len()));
+        // These seeds are new to the worker, not a retry: no backoff.
+        self.retry_at.set(None);
+        drop(self.subscribe(core, None)?);
+        Ok(self.state.borrow().pending != 0)
     }
 
     pub fn subscribe(
@@ -66,6 +97,20 @@ impl Bootstrap {
         if self.state.borrow().pending != 0 {
             return Ok(self.state.subscribe());
         }
+        // A few seeds, not all of them: lookups find every other node through
+        // them. Sessions on seeds already ready are kept until the node closes
+        // them for idleness, so reads reuse them, and only the shortfall is
+        // dialled.
+        let needed = self
+            .target
+            .get()
+            .saturating_sub(self.state.borrow().ready.len());
+        if needed == 0 {
+            return Ok(self.state.subscribe());
+        }
+        // Seeds the browser holds off, after a refusal or a failure, are left
+        // for others; each try takes the seeds in a new random order.
+        let mut held_off = 0;
         let seeds: Vec<_> = core
             .seeds
             .iter()
@@ -81,11 +126,36 @@ impl Bootstrap {
                         .iter()
                         .any(|hello| hello.endpoint == **endpoint)
             })
+            .filter(|endpoint| {
+                let held = core.pool.is_held_off(endpoint);
+                held_off += usize::from(held);
+                !held
+            })
             .cloned()
             .collect();
         if seeds.is_empty() {
+            if held_off > 0 && self.state.borrow().ready.is_empty() {
+                let busy = core.pool.busy_seeds(&core.seeds);
+                let failed = held_off.saturating_sub(busy);
+                self.state.send_modify(|state| {
+                    state.failures = vec![BrowserLookupFailure {
+                        peer_id: String::new(),
+                        message: match (busy, failed) {
+                            (0, _) => "every seed failed recently and is held off".to_string(),
+                            (_, 0) => "every seed is busy and declined a session; try again \
+                                       shortly"
+                                .to_string(),
+                            _ => format!(
+                                "every seed is held off: {busy} busy, which declined a session, \
+                                 and {failed} that failed recently; try again shortly"
+                            ),
+                        },
+                    }];
+                });
+            }
             return Ok(self.state.subscribe());
         }
+        let seeds = crate::data::network::in_random_order(seeds, &mut rand::thread_rng());
         // A caller may start one new bounded batch after transient failures.
         // Concurrent callers share it; there is no autonomous retry loop.
         let now = web_time::Instant::now();
@@ -95,11 +165,15 @@ impl Bootstrap {
             .map_or(Duration::ZERO, |at| at.saturating_duration_since(now));
         self.retry_at
             .set(Some(now + delay + Duration::from_secs(1)));
+        let first = needed.min(seeds.len());
         self.state.send_modify(|state| {
-            state.pending = seeds.len();
-            state
-                .failures
-                .retain(|failure| !seeds.iter().any(|seed| seed.multiaddr == failure.peer_id));
+            state.pending = first;
+            // A seed's earlier failure goes once it is dialled again, and an
+            // earlier "every seed is held off" once any seed is.
+            state.failures.retain(|failure| {
+                !failure.peer_id.is_empty()
+                    && !seeds.iter().any(|seed| seed.multiaddr == failure.peer_id)
+            });
         });
         let state = self.state.clone();
         let pool = Rc::clone(&core.pool);
@@ -108,7 +182,7 @@ impl Bootstrap {
                 if !delay.is_zero() {
                     crate::runtime::sleep(delay).await;
                 }
-                let attempts = seeds.into_iter().map(|endpoint| {
+                let attempt = |endpoint: BrowserEndpoint| {
                     let pool = Rc::clone(&pool);
                     async move {
                         let result = async {
@@ -121,12 +195,22 @@ impl Bootstrap {
                         .await;
                         (endpoint, result)
                     }
-                });
-                let mut attempts =
-                    stream::iter(attempts).buffer_unordered(MAX_BOOTSTRAP_CONNECTIONS);
+                };
+                let mut queue = seeds.into_iter();
+                let mut attempts = queue
+                    .by_ref()
+                    .take(first)
+                    .map(attempt)
+                    .collect::<futures_util::stream::FuturesUnordered<_>>();
                 while let Some((endpoint, result)) = attempts.next().await {
+                    // A seed that failed, or declined while busy, is replaced
+                    // by the next one: at most `needed` dials are in flight.
+                    let next = result.is_err().then(|| queue.next()).flatten();
+                    let busy = result.is_err() && pool.is_busy(&endpoint);
                     state.send_modify(|state| {
-                        state.pending -= 1;
+                        if next.is_none() {
+                            state.pending -= 1;
+                        }
                         match result {
                             Ok(hello) => {
                                 state.ready.push(hello);
@@ -134,10 +218,17 @@ impl Bootstrap {
                             }
                             Err(message) => state.failures.push(BrowserLookupFailure {
                                 peer_id: endpoint.multiaddr,
-                                message,
+                                message: if busy {
+                                    format!("busy, it declined the session: {message}")
+                                } else {
+                                    message
+                                },
                             }),
                         }
                     });
+                    if let Some(next) = next {
+                        attempts.push(attempt(next));
+                    }
                 }
             };
             let _ = select(Box::pin(connect), Box::pin(pool.availability.wait_closed())).await;
