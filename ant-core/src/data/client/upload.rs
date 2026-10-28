@@ -36,6 +36,10 @@ pub struct UploadPayment {
     pub amount: Amount,
     /// Gas spend, when the adapter can report it.
     pub gas: u128,
+    /// The wave a root payment paid, for its records' root proofs; `None`
+    /// for a payment to the per-quote vault, whose proofs name the
+    /// transaction of each paid quote in `transactions`.
+    pub root: Option<super::root_payment::RootWavePayment>,
 }
 
 /// Confirmed Merkle settlement; Rust constructs all record proofs.
@@ -118,6 +122,14 @@ pub trait UploadAdapter: AdapterBounds {
     }
     /// Initialize adapter-owned recovery evidence before persisting an attempt.
     fn initialize_payment_attempt(&self, _attempt: &mut super::upload_state::PaymentAttempt) {}
+    /// Whether this adapter pays root waves: whether its payments go through
+    /// the client's own wallets ([`Client::with_root_payments`]). One that
+    /// pays elsewhere, through an external payer or signer, pays quotes one
+    /// by one and so the per-quote vault alone, and the records it uploads
+    /// are quoted for that vault ([`Client::upload_vault`]).
+    fn pays_root_waves(&self) -> bool {
+        false
+    }
     /// Submit while updating the shared journal. Existing adapters may keep their callback journal.
     async fn submit_payment(
         &self,
@@ -220,6 +232,21 @@ pub struct UploadOutcome {
 }
 
 impl Client {
+    /// The vault the records `adapter` uploads are quoted for: the client's
+    /// ([`Client::payment_vault`]) when the adapter pays root waves, else
+    /// the per-quote vault, which an external payer's quote-by-quote
+    /// payment pays ([`UploadAdapter::pays_root_waves`]).
+    pub(crate) fn upload_vault<A: UploadAdapter>(
+        &self,
+        adapter: &A,
+    ) -> crate::data::client::root_payment::PaymentVault {
+        if adapter.pays_root_waves() {
+            self.payment_vault()
+        } else {
+            crate::data::client::root_payment::PaymentVault::V2
+        }
+    }
+
     fn ensure_upload_payment_allowed(&self) -> Result<()> {
         match self.corroborated_settlement_refusal() {
             Some(refusal) => Err(Error::ClientUpdateRequired(refusal)),
@@ -513,17 +540,32 @@ impl Client {
                 }
                 drop_to_pay_again(state, adapter, &outside).await?;
             }
-            let mut payable = Vec::new();
+            let mut unpaid = HashSet::new();
             for (record, plan) in &plans {
                 if let Some(plan) = plan {
                     if !state.is_paid(&plan.address, crate::runtime::system_time()) {
-                        state.prepare(plan.clone());
-                        payable.push(plan.clone());
+                        unpaid.insert(plan.address);
                     }
                 } else {
                     outcome.addresses.push(record.address);
                     adapter.stored(outcome.addresses.len(), total);
                 }
+            }
+            // Each plan's vault is settled before any plan is kept.
+            split_upload_vaults(
+                &mut plans,
+                &unpaid,
+                state,
+                last.as_ref().map(|record| &record.address),
+            );
+            let mut payable = Vec::new();
+            for plan in plans
+                .iter()
+                .filter_map(|(_, plan)| plan.as_ref())
+                .filter(|plan| unpaid.contains(&plan.address))
+            {
+                state.prepare(plan.clone());
+                payable.push(plan.clone());
             }
             if last.is_some() {
                 // The envelope's log must not be the last of its payment.
@@ -531,15 +573,18 @@ impl Client {
             }
             adapter.checkpoint(state, None).await?;
             state.add_paid_this_run(payable.iter().map(|plan| plan.address));
-            let (payment, found_stored, unpaid) = self
-                .pay_wave(payable, &mut plans, state, adapter, last.is_some(), total)
+            let (_, found_stored, unpaid) = self
+                .pay_wave(
+                    payable,
+                    &mut plans,
+                    state,
+                    adapter,
+                    last.is_some(),
+                    total,
+                    outcome,
+                )
                 .await?;
             failed.extend(unpaid);
-            outcome.amount = outcome
-                .amount
-                .checked_add(payment.amount)
-                .ok_or_else(|| Error::Payment("payment total overflow".into()))?;
-            outcome.gas = outcome.gas.saturating_add(payment.gas);
             for address in found_stored {
                 outcome.addresses.push(address);
                 adapter.stored(outcome.addresses.len(), total);
@@ -587,7 +632,7 @@ impl Client {
                     &records,
                     state,
                     adapter,
-                    last.is_some(),
+                    last.as_ref().map(|record| record.address),
                     total,
                     outcome,
                     &mut failed,
@@ -615,7 +660,15 @@ impl Client {
             if !refused.is_empty() {
                 state.add_paid_this_run(refused);
                 let plans = self
-                    .pay_again(&[record], state, adapter, true, total, outcome, &mut failed)
+                    .pay_again(
+                        &[record],
+                        state,
+                        adapter,
+                        Some(record.address),
+                        total,
+                        outcome,
+                        &mut failed,
+                    )
                     .await?;
                 let stored = outcome.addresses.len();
                 let results = self
@@ -717,11 +770,12 @@ impl Client {
         records: &[UploadRecord],
         state: &mut UploadState,
         adapter: &A,
-        envelope: bool,
+        envelope_address: Option<[u8; 32]>,
         total: usize,
         outcome: &mut UploadOutcome,
         failed: &mut Vec<([u8; 32], String)>,
     ) -> Result<Vec<(UploadRecord, ChunkPaymentPlan)>> {
+        let envelope = envelope_address.is_some();
         for record in records {
             tracing::warn!(
                 "every storer that failed to store {} refused the proof an earlier run \
@@ -737,6 +791,11 @@ impl Client {
         let mut plans = self
             .prepare_upload_wave(records, state, adapter, total)
             .await?;
+        let unpaid = plans
+            .iter()
+            .filter_map(|(_, plan)| plan.as_ref().map(|plan| plan.address))
+            .collect::<HashSet<_>>();
+        split_upload_vaults(&mut plans, &unpaid, state, envelope_address.as_ref());
         let mut payable = Vec::new();
         for (record, plan) in &plans {
             match plan {
@@ -754,15 +813,12 @@ impl Client {
             order_by_quote_hash(&mut payable);
         }
         adapter.checkpoint(state, None).await?;
-        let (payment, found_stored, unpaid) = self
-            .pay_wave(payable, &mut plans, state, adapter, envelope, total)
+        let (_, found_stored, unpaid) = self
+            .pay_wave(
+                payable, &mut plans, state, adapter, envelope, total, outcome,
+            )
             .await?;
         failed.extend(unpaid);
-        outcome.amount = outcome
-            .amount
-            .checked_add(payment.amount)
-            .ok_or_else(|| Error::Payment("payment total overflow".into()))?;
-        outcome.gas = outcome.gas.saturating_add(payment.gas);
         for address in found_stored {
             outcome.addresses.push(address);
             adapter.stored(outcome.addresses.len(), total);
@@ -805,11 +861,7 @@ impl Client {
                     .copied()
                     .filter(|address| !released.contains(address))
                     .collect::<Vec<_>>();
-                state.confirm(
-                    &confirmed,
-                    &payment.transactions,
-                    crate::runtime::system_time(),
-                )?;
+                state.confirm_payment(&confirmed, &payment, crate::runtime::system_time())?;
             }
             // Recovered receipts are previous spend, not new payments by this invocation.
             adapter.checkpoint(state, None).await?;
@@ -867,7 +919,55 @@ impl Client {
     /// payments, which moved no tokens), the records found already stored when
     /// quoted again, and the records left unpaid because their quotes were
     /// occupied every time, with why (their plans in `plans` become `None`).
+    ///
+    /// Each plan is paid through the vault it records: a wave holding plans
+    /// for both ([`split_upload_vaults`]) pays each vault's plans in a
+    /// payment of their own, one after the other: the root vault's first,
+    /// and the per-quote vault's only once that one is final, so one
+    /// transaction is in flight per wallet. Both are final before any of
+    /// the wave's records is stored.
+    ///
+    /// Each payment's spend is added to `outcome` as soon as it is
+    /// confirmed, so a payment that fails after another was made still
+    /// reports the tokens and gas the earlier one spent.
+    #[allow(clippy::too_many_arguments)]
     async fn pay_wave<A: UploadAdapter>(
+        &self,
+        payable: Vec<ChunkPaymentPlan>,
+        plans: &mut [(UploadRecord, Option<ChunkPaymentPlan>)],
+        state: &mut UploadState,
+        adapter: &A,
+        envelope: bool,
+        total: usize,
+        outcome: &mut UploadOutcome,
+    ) -> Result<(UploadPayment, Vec<[u8; 32]>, Vec<([u8; 32], String)>)> {
+        let (v2, root): (Vec<_>, Vec<_>) = payable.into_iter().partition(|plan| plan.vault.is_v2());
+        if v2.is_empty() || root.is_empty() {
+            let payable = if v2.is_empty() { root } else { v2 };
+            return self
+                .pay_wave_to_one_vault(payable, plans, state, adapter, envelope, total, outcome)
+                .await;
+        }
+        let (mut spent, mut found_stored, mut unpaid) = self
+            .pay_wave_to_one_vault(root, plans, state, adapter, envelope, total, outcome)
+            .await?;
+        let (more, stored, left) = self
+            .pay_wave_to_one_vault(v2, plans, state, adapter, envelope, total, outcome)
+            .await?;
+        spent.amount = spent
+            .amount
+            .checked_add(more.amount)
+            .ok_or_else(|| Error::Payment("payment total overflow".into()))?;
+        spent.gas = spent.gas.saturating_add(more.gas);
+        spent.transactions.extend(more.transactions);
+        found_stored.extend(stored);
+        unpaid.extend(left);
+        Ok((spent, found_stored, unpaid))
+    }
+
+    /// [`Self::pay_wave`] for `payable` plans that all pay one vault.
+    #[allow(clippy::too_many_arguments)]
+    async fn pay_wave_to_one_vault<A: UploadAdapter>(
         &self,
         mut payable: Vec<ChunkPaymentPlan>,
         plans: &mut [(UploadRecord, Option<ChunkPaymentPlan>)],
@@ -875,10 +975,18 @@ impl Client {
         adapter: &A,
         envelope: bool,
         total: usize,
+        outcome: &mut UploadOutcome,
     ) -> Result<(UploadPayment, Vec<[u8; 32]>, Vec<([u8; 32], String)>)> {
         let mut spent = UploadPayment::default();
         let mut found_stored = Vec::new();
         let mut history: Vec<OccupiedQuote> = Vec::new();
+        // A record quoted again is quoted for the vault this payment pays.
+        // Only the per-quote vault's quotes can be occupied: a root wave is
+        // recorded whole or not at all.
+        let vault = payable.first().map_or(
+            crate::data::client::root_payment::PaymentVault::V2,
+            |plan| plan.vault,
+        );
         if payable.is_empty() {
             adapter.checkpoint(state, Some(&spent)).await?;
         }
@@ -901,13 +1009,13 @@ impl Client {
             validate_payment_total(&payable, &payment)?;
             let occupied = self.occupied_quotes(&payable).await;
             let released = state.release_occupied(&occupied);
-            state.confirm(
+            state.confirm_payment(
                 &payable
                     .iter()
                     .map(|plan| plan.address)
                     .filter(|address| !released.contains(address))
                     .collect::<Vec<_>>(),
-                &payment.transactions,
+                &payment,
                 crate::runtime::system_time(),
             )?;
             let paid = UploadPayment {
@@ -917,7 +1025,13 @@ impl Client {
                     .ok_or_else(|| Error::Payment("payment total underflow".into()))?,
                 gas: payment.gas,
                 transactions: payment.transactions,
+                root: payment.root,
             };
+            outcome.amount = outcome
+                .amount
+                .checked_add(paid.amount)
+                .ok_or_else(|| Error::Payment("payment total overflow".into()))?;
+            outcome.gas = outcome.gas.saturating_add(paid.gas);
             adapter.checkpoint(state, Some(&paid)).await?;
             spent.amount = spent
                 .amount
@@ -925,6 +1039,7 @@ impl Client {
                 .ok_or_else(|| Error::Payment("payment total overflow".into()))?;
             spent.gas = spent.gas.saturating_add(paid.gas);
             spent.transactions.extend(paid.transactions);
+            spent.root = paid.root;
             if occupied.is_empty() {
                 break;
             }
@@ -959,7 +1074,7 @@ impl Client {
             {
                 let mut fresh = observe_op(
                     &self.controller().quote,
-                    || self.prepare_chunk_payment_plan(record.address, record.size),
+                    || self.prepare_chunk_payment_plan_in(record.address, record.size, vault),
                     classify_error,
                 )
                 .await?;
@@ -994,6 +1109,7 @@ impl Client {
     ) -> Result<Vec<(UploadRecord, Option<ChunkPaymentPlan>)>> {
         adapter.preparing("Collecting record payment quotes and checking storage peers");
         let recovery = state;
+        let vault = self.upload_vault(adapter);
         let plans = crate::client_engine::rolling_unordered(
             wave.iter().copied(),
             |record| async move {
@@ -1009,18 +1125,24 @@ impl Client {
                         payment: super::batch::SingleNodeQuotePayment { quotes: Vec::new() },
                         peer_quotes: Vec::new(),
                         commitment_sidecars: Vec::new(),
+                        vault: crate::data::client::root_payment::PaymentVault::V2,
                     })
                 } else {
-                    match recovery.retained_plan(
-                        &record.address,
-                        record.size,
-                        crate::runtime::system_time(),
-                    ) {
+                    match recovery
+                        .retained_plan(&record.address, record.size, crate::runtime::system_time())
+                        .filter(|plan| keeps_retained_plan(recovery, plan, vault))
+                    {
                         Some(plan) => Some(plan),
                         None => {
                             observe_op(
                                 &self.controller().quote,
-                                || self.prepare_chunk_payment_plan(record.address, record.size),
+                                || {
+                                    self.prepare_chunk_payment_plan_in(
+                                        record.address,
+                                        record.size,
+                                        vault,
+                                    )
+                                },
                                 classify_error,
                             )
                             .await?
@@ -1609,6 +1731,64 @@ pub(crate) fn release_last<T>(
     }
 }
 
+/// Whether an upload quoting for `vault` ([`Client::upload_vault`]) pays a
+/// `plan` kept from an earlier attempt as it is. A plan that pays the root
+/// vault is kept, whatever `vault` is, only while a payment journaled in
+/// `state` holds its record: that payment may already have sent its
+/// transaction, and is reconciled through the root vault's wallet. With
+/// none, nothing was sent for it, so an upload quoting for the per-quote
+/// vault (a client without a root vault's wallet, or an external payer)
+/// quotes the record again for that vault rather than stop on a root
+/// payment it can't make.
+pub(crate) fn keeps_retained_plan(
+    state: &UploadState,
+    plan: &ChunkPaymentPlan,
+    vault: crate::data::client::root_payment::PaymentVault,
+) -> bool {
+    plan.vault.is_v2()
+        || vault == plan.vault
+        || state
+            .pending_payment
+            .as_ref()
+            .is_some_and(|attempt| attempt.addresses.contains(&plan.address))
+}
+
+/// Settle the vault each of a wave's `unpaid` plans pays
+/// ([`root_payment::split_vaults`](super::root_payment::split_vaults)),
+/// before any of them is kept: a split only when it saves gas, and never
+/// with the `envelope` alone in its payment. A plan kept from an earlier
+/// attempt pays the vault it recorded, since an interrupted payment may
+/// already have sent its transaction. This client approves each vault
+/// without limit (`Client::approve_token_spend`), so a split costs no
+/// second approval.
+pub(crate) fn split_upload_vaults(
+    plans: &mut [(UploadRecord, Option<ChunkPaymentPlan>)],
+    unpaid: &HashSet<[u8; 32]>,
+    state: &UploadState,
+    envelope: Option<&[u8; 32]>,
+) {
+    let now = crate::runtime::system_time();
+    let moved = super::root_payment::split_vaults(
+        plans
+            .iter_mut()
+            .filter_map(|(_, plan)| plan.as_mut())
+            .filter(|plan| unpaid.contains(&plan.address)),
+        |plan| {
+            state
+                .retained_plan(&plan.address, plan.data_size, now)
+                .is_some()
+        },
+        envelope,
+        false,
+    );
+    if moved > 0 {
+        tracing::info!(
+            "{moved} record(s) quoted for the root vault pay the per-quote vault with the rest \
+             of their payment, which a second transaction wouldn't save"
+        );
+    }
+}
+
 /// Put a payment's plans in the order of the quote hashes they pay. The
 /// vault emits one `DataPaymentMade` log per paid quote, in the order paid,
 /// so a record always paid last (an envelope) would have the last log of its
@@ -1630,6 +1810,11 @@ pub(super) fn validate_payment_total(
     plans: &[ChunkPaymentPlan],
     payment: &UploadPayment,
 ) -> Result<()> {
+    // A root wave whose own transaction didn't pay it, recorded by the vault
+    // as paid by another, moved no tokens of this payment's.
+    if payment.root.is_some() && payment.amount.is_zero() {
+        return Ok(());
+    }
     let expected = plans.iter().try_fold(Amount::ZERO, |sum, plan| {
         sum.checked_add(plan.payment.total_amount())
             .ok_or_else(|| Error::Payment("payment total overflow".into()))
@@ -1678,6 +1863,9 @@ impl UploadAdapter for MemoryUploadAdapter<'_> {
     #[cfg(feature = "native")]
     fn initialize_payment_attempt(&self, attempt: &mut super::upload_state::PaymentAttempt) {
         super::native_payment::initialize(attempt);
+    }
+    fn pays_root_waves(&self) -> bool {
+        cfg!(feature = "native")
     }
     #[cfg(feature = "native")]
     async fn submit_payment(
@@ -1728,6 +1916,8 @@ impl UploadAdapter for MemoryUploadAdapter<'_> {
                     .map(|q| (q.quote_hash, q.rewards_address, q.amount))
             })
             .collect::<Vec<_>>();
+        // One transaction in flight per signing key, whichever vault.
+        let _signing = self.client.lock_signing().await?;
         let (transactions, gas) = wallet.pay_for_quotes(payments).await.map_err(
             |ant_protocol::evm::PayForQuotesError(error, _)| Error::Payment(error.to_string()),
         )?;
@@ -1739,6 +1929,7 @@ impl UploadAdapter for MemoryUploadAdapter<'_> {
             transactions: transactions.into_iter().collect(),
             amount,
             gas: gas.gas_cost_wei,
+            root: None,
         })
     }
     async fn pay_merkle(
@@ -1862,6 +2053,7 @@ mod tests {
             },
             peer_quotes: Vec::new(),
             commitment_sidecars: Vec::new(),
+            vault: crate::data::client::root_payment::PaymentVault::V2,
         }
     }
 
@@ -2516,7 +2708,7 @@ mod tests {
                     &[record],
                     &mut state,
                     &adapter,
-                    false,
+                    None,
                     1,
                     &mut UploadOutcome::default(),
                     &mut Vec::new(),
@@ -2525,6 +2717,319 @@ mod tests {
             assert!(result.is_err());
             assert_eq!(*adapter.saved.lock().unwrap(), expected);
         }
+    }
+
+    /// A wave holding plans for both vaults pays the root vault's first, and
+    /// the per-quote vault's only once that payment is final: one
+    /// transaction in flight at a time, both before any record is stored.
+    /// Each record's proof is the one of the vault it paid.
+    #[cfg(feature = "native")]
+    #[tokio::test]
+    async fn a_split_wave_pays_the_root_vault_first_then_the_per_quote_vault() {
+        use crate::data::client::root_payment::{self, PaymentVault, RootWavePayment};
+        use crate::data::client::upload_state::test_state::plan_priced;
+        use std::sync::Mutex;
+
+        /// Pays each payment at once, noting which vault it paid and how
+        /// many records, and refuses any to the vault `fails`.
+        struct Pays {
+            paid: Mutex<Vec<(PaymentVault, usize)>>,
+            fails: Option<PaymentVault>,
+        }
+        #[async_trait::async_trait]
+        impl UploadAdapter for Pays {
+            async fn load(&self, _: UploadRecord) -> Result<Bytes> {
+                Err(Error::InvalidData("no bytes".into()))
+            }
+            async fn pay(&self, plans: &[ChunkPaymentPlan]) -> Result<UploadPayment> {
+                let vault = root_payment::vault_of(plans)?;
+                if self.fails == Some(vault) {
+                    return Err(Error::Payment("insufficient funds".into()));
+                }
+                self.paid.lock().unwrap().push((vault, plans.len()));
+                let transaction = TxHash::from([9; 32]);
+                let transactions = plans
+                    .iter()
+                    .flat_map(|plan| plan.payment.quotes.iter())
+                    .filter(|quote| !quote.amount.is_zero())
+                    .map(|quote| (quote.quote_hash, transaction))
+                    .collect();
+                let amount = plans.iter().fold(Amount::ZERO, |sum, plan| {
+                    sum.checked_add(plan.payment.total_amount()).unwrap()
+                });
+                let root = match vault {
+                    PaymentVault::Root => Some(RootWavePayment {
+                        transaction,
+                        wave: root_payment::wave_of(plans)?,
+                    }),
+                    PaymentVault::V2 => None,
+                };
+                Ok(UploadPayment {
+                    transactions,
+                    amount,
+                    gas: 0,
+                    root,
+                })
+            }
+        }
+
+        let now = std::time::SystemTime::now();
+        let mut plans = (0u8..4)
+            .map(|n| plan_priced(&[n, 0x2b], now, &[10, 20, 30]))
+            .collect::<Vec<_>>();
+        for plan in &mut plans[1..] {
+            plan.vault = PaymentVault::Root;
+        }
+        let mut state = UploadState::default();
+        for plan in &plans {
+            state.prepare(plan.clone());
+        }
+        let mut wave = plans
+            .iter()
+            .enumerate()
+            .map(|(index, plan)| {
+                let record = UploadRecord {
+                    address: plan.address,
+                    size: plan.data_size,
+                    index,
+                };
+                (record, Some(plan.clone()))
+            })
+            .collect::<Vec<_>>();
+        let node = crate::data::Network::unstarted(&[], true, false)
+            .await
+            .unwrap();
+        let client = Client::from_node(std::sync::Arc::clone(node.node()), Default::default());
+        let adapter = Pays {
+            paid: Mutex::new(Vec::new()),
+            fails: None,
+        };
+        let mut outcome = UploadOutcome::default();
+        let (spent, stored, unpaid) = client
+            .pay_wave(
+                plans.clone(),
+                &mut wave,
+                &mut state,
+                &adapter,
+                false,
+                4,
+                &mut outcome,
+            )
+            .await
+            .unwrap();
+        assert_eq!(outcome.amount, spent.amount);
+        assert_eq!(
+            *adapter.paid.lock().unwrap(),
+            vec![(PaymentVault::Root, 3), (PaymentVault::V2, 1)]
+        );
+        assert!(stored.is_empty() && unpaid.is_empty());
+        assert!(spent.root.is_some(), "the root wave is kept with the spend");
+        for plan in &plans {
+            let tag = state.proof(&plan.address).unwrap()[0];
+            let expected = match plan.vault {
+                PaymentVault::Root => ant_protocol::PROOF_TAG_ROOT,
+                PaymentVault::V2 => ant_protocol::PROOF_TAG_SINGLE_NODE,
+            };
+            assert_eq!(tag, expected);
+        }
+
+        // The per-quote vault's payment fails after the root vault's was
+        // made: the root payment's spend is still reported, and its
+        // records keep their proofs.
+        let mut state = UploadState::default();
+        for plan in &plans {
+            state.prepare(plan.clone());
+        }
+        let mut wave = wave
+            .into_iter()
+            .zip(&plans)
+            .map(|((record, _), plan)| (record, Some(plan.clone())))
+            .collect::<Vec<_>>();
+        let adapter = Pays {
+            paid: Mutex::new(Vec::new()),
+            fails: Some(PaymentVault::V2),
+        };
+        let mut outcome = UploadOutcome::default();
+        let error = client
+            .pay_wave(
+                plans.clone(),
+                &mut wave,
+                &mut state,
+                &adapter,
+                false,
+                4,
+                &mut outcome,
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("insufficient funds"), "{error}");
+        assert_eq!(*adapter.paid.lock().unwrap(), vec![(PaymentVault::Root, 3)]);
+        let root_total = plans[1..].iter().fold(Amount::ZERO, |sum, plan| {
+            sum.checked_add(plan.payment.total_amount()).unwrap()
+        });
+        assert!(!root_total.is_zero());
+        assert_eq!(outcome.amount, root_total);
+        for plan in &plans[1..] {
+            assert_eq!(
+                state.proof(&plan.address).unwrap()[0],
+                ant_protocol::PROOF_TAG_ROOT
+            );
+        }
+        assert!(state.proof(&plans[0].address).is_none());
+    }
+
+    /// An upload whose payments don't go through the client's own wallets
+    /// (an external payer or signer) is quoted for the per-quote vault even
+    /// on a client that pays the root vault; one through its wallets is
+    /// quoted for the client's vault.
+    #[cfg(feature = "native")]
+    #[tokio::test]
+    async fn only_an_upload_through_the_clients_wallets_is_quoted_for_the_root_vault() {
+        use crate::data::client::native_payment::test_plans::network;
+        use crate::data::client::root_payment::PaymentVault;
+        const KEY: &str = "0x4c0883a69102937d6231471b5dbb6204fe5129617082792ae468d01a3f362318";
+
+        /// Pays through some outside signer: the trait's default.
+        struct Outside;
+        #[async_trait::async_trait]
+        impl UploadAdapter for Outside {
+            async fn load(&self, _: UploadRecord) -> Result<Bytes> {
+                Err(Error::InvalidData("no bytes".into()))
+            }
+            async fn pay(&self, _: &[ChunkPaymentPlan]) -> Result<UploadPayment> {
+                Err(Error::Payment("not here".into()))
+            }
+        }
+
+        let net = network(1);
+        let node = crate::data::Network::unstarted(&[], true, false)
+            .await
+            .unwrap();
+        let root_wallet = ant_protocol::evm::Wallet::new_from_private_key(
+            crate::config::network_paying(&net, ant_protocol::evm::Address::from([0x33; 20])),
+            KEY,
+        )
+        .unwrap();
+        let rooted = Client::from_node(std::sync::Arc::clone(node.node()), Default::default())
+            .with_wallet(ant_protocol::evm::Wallet::new_from_private_key(net, KEY).unwrap())
+            .with_root_payments(root_wallet)
+            .unwrap();
+        let own = MemoryUploadAdapter {
+            client: &rooted,
+            chunks: &[],
+            progress: None,
+            stored_offset: 0,
+            file_total: 0,
+            resume_key: None,
+        };
+        assert_eq!(rooted.payment_vault(), PaymentVault::Root);
+        assert_eq!(rooted.upload_vault(&own), PaymentVault::Root);
+        assert_eq!(rooted.upload_vault(&Outside), PaymentVault::V2);
+        let unrooted = Client::from_node(std::sync::Arc::clone(node.node()), Default::default());
+        assert_eq!(unrooted.upload_vault(&own), PaymentVault::V2);
+    }
+
+    /// A root plan kept from an earlier attempt is paid as it is while a
+    /// journaled payment holds its record, or the upload quotes for the
+    /// root vault; with neither, nothing was sent for it, and an upload
+    /// quoting for the per-quote vault quotes its record again for that
+    /// vault rather than stop on a root payment it can't make.
+    #[test]
+    fn a_kept_root_plan_without_a_journal_is_quoted_again_for_the_per_quote_vault() {
+        use crate::data::client::root_payment::PaymentVault;
+        use crate::data::client::upload_state::test_state::plan_priced;
+        let now = std::time::SystemTime::now();
+        let mut root = plan_priced(&[1, 0x4d], now, &[10, 20, 30]);
+        root.vault = PaymentVault::Root;
+        let v2 = plan_priced(&[2, 0x4d], now, &[10, 20, 30]);
+        let mut state = UploadState::default();
+        state.prepare(root.clone());
+        state.prepare(v2.clone());
+        let restored = UploadState::restore(&state.checkpoint().unwrap()).unwrap();
+        let kept = restored
+            .retained_plan(&root.address, root.data_size, now)
+            .unwrap();
+        assert_eq!(kept.vault, PaymentVault::Root);
+        assert!(!keeps_retained_plan(&restored, &kept, PaymentVault::V2));
+        assert!(keeps_retained_plan(&restored, &kept, PaymentVault::Root));
+        assert!(keeps_retained_plan(&restored, &v2, PaymentVault::V2));
+        assert!(keeps_retained_plan(&restored, &v2, PaymentVault::Root));
+        // A payment journaled for its record may have sent its transaction:
+        // the plan is kept, and reconciled through the root vault's wallet.
+        let mut journaled = restored.clone();
+        journaled.start_payment(false, vec![root.address]).unwrap();
+        assert!(keeps_retained_plan(&journaled, &kept, PaymentVault::V2));
+        let mut other = restored;
+        other.start_payment(false, vec![v2.address]).unwrap();
+        assert!(!keeps_retained_plan(&other, &kept, PaymentVault::V2));
+    }
+
+    /// A root wave the vault recorded by another transaction than the
+    /// payment's own moved no tokens of the payment's, and its total is
+    /// taken as it is; any other payment must report its plans' total.
+    #[test]
+    fn a_root_wave_recorded_elsewhere_reports_no_tokens() {
+        use crate::data::client::root_payment::{self, PaymentVault, RootWavePayment};
+        use crate::data::client::upload_state::test_state::plan_priced;
+        let now = std::time::SystemTime::now();
+        let mut plan = plan_priced(&[3, 0x4d], now, &[10, 20, 30]);
+        plan.vault = PaymentVault::Root;
+        let plans = vec![plan];
+        let elsewhere = UploadPayment {
+            transactions: HashMap::new(),
+            amount: Amount::ZERO,
+            gas: 0,
+            root: Some(RootWavePayment {
+                transaction: TxHash::from([9; 32]),
+                wave: root_payment::wave_of(&plans).unwrap(),
+            }),
+        };
+        validate_payment_total(&plans, &elsewhere).unwrap();
+        let unpaid = UploadPayment {
+            root: None,
+            ..elsewhere
+        };
+        assert!(validate_payment_total(&plans, &unpaid).is_err());
+    }
+
+    /// A wave's plans are split before any is kept: a root plan kept from an
+    /// earlier attempt stays root, and the fresh ones follow the threshold
+    /// and the envelope rule.
+    #[test]
+    fn a_waves_vaults_are_split_before_any_plan_is_kept() {
+        use crate::data::client::root_payment::PaymentVault;
+        use crate::data::client::upload_state::test_state::plan_priced;
+        let now = std::time::SystemTime::now();
+        let mut wave = (0u8..3)
+            .map(|n| {
+                let mut plan = plan_priced(&[n, 0x3c], now, &[10, 20, 30]);
+                if n > 0 {
+                    plan.vault = PaymentVault::Root;
+                }
+                let record = UploadRecord {
+                    address: plan.address,
+                    size: plan.data_size,
+                    index: usize::from(n),
+                };
+                (record, Some(plan))
+            })
+            .collect::<Vec<_>>();
+        let mut state = UploadState::default();
+        let kept = wave[1].1.clone().unwrap();
+        state.prepare(kept.clone());
+        let unpaid = wave
+            .iter()
+            .filter_map(|(_, plan)| plan.as_ref().map(|plan| plan.address))
+            .collect::<HashSet<_>>();
+        split_upload_vaults(&mut wave, &unpaid, &state, None);
+        let vaults = wave
+            .iter()
+            .map(|(_, plan)| plan.as_ref().unwrap().vault)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            vaults,
+            vec![PaymentVault::V2, PaymentVault::Root, PaymentVault::V2]
+        );
     }
 
     /// The mark that a record was paid again is saved with the checkpoint

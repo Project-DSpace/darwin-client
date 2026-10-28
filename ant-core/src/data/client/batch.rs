@@ -11,6 +11,7 @@ use crate::data::client::payment::peer_id_to_encoded;
 #[cfg(test)]
 use crate::data::client::payment::SINGLE_NODE_PAYMENT_MULTIPLIER;
 use crate::data::client::quote::StoreQuotePlan;
+use crate::data::client::root_payment::PaymentVault;
 use crate::data::client::Client;
 use crate::data::error::{Error, Result};
 use ant_protocol::evm::{
@@ -183,6 +184,12 @@ pub struct ChunkPaymentPlan {
     pub peer_quotes: Vec<(EncodedPeerId, PaymentQuote)>,
     /// Verified commitment evidence carried to storers.
     pub commitment_sidecars: Vec<Vec<u8>>,
+    /// The vault this plan pays, recorded with it: a kept plan is paid,
+    /// and its payment reconciled, through this vault only. Left out of a
+    /// checkpoint for the per-quote vault, as plans saved before the field
+    /// existed were, so those read as paying it.
+    #[serde(default, skip_serializing_if = "PaymentVault::is_v2")]
+    pub vault: PaymentVault,
 }
 
 impl ChunkPaymentPlan {
@@ -420,6 +427,9 @@ fn payment_plan_from_quotes(
             ant_protocol::payment::pricing::WEIGHT_DENOMINATOR
         )));
     }
+    // The vault the quotes were asked for, which may be the per-quote vault
+    // for a client paying the root vault (`StoreQuotePlan::vault`).
+    let vault = quote_plan.vault;
     let quotes_with_peers = quote_plan.quotes;
 
     // Capture the ordered PUT target set for replication. This can be
@@ -453,6 +463,7 @@ fn payment_plan_from_quotes(
         payment,
         peer_quotes,
         commitment_sidecars,
+        vault,
     })
 }
 
@@ -510,13 +521,26 @@ impl Client {
         address: XorName,
         data_size: u64,
     ) -> Result<Option<ChunkPaymentPlan>> {
+        self.prepare_chunk_payment_plan_in(address, data_size, self.payment_vault())
+            .await
+    }
+
+    /// [`Self::prepare_chunk_payment_plan`] for `vault`: the plan pays it,
+    /// or the per-quote vault where the record's close group can't check a
+    /// root payment.
+    pub(crate) async fn prepare_chunk_payment_plan_in(
+        &self,
+        address: XorName,
+        data_size: u64,
+        vault: PaymentVault,
+    ) -> Result<Option<ChunkPaymentPlan>> {
         if data_size > ant_protocol::MAX_CHUNK_SIZE as u64 {
             return Err(Error::InvalidData(
                 "chunk exceeds the protocol size limit".into(),
             ));
         }
         let quote_plan = match self
-            .get_store_quote_plan(&address, data_size, DATA_TYPE_CHUNK)
+            .get_store_quote_plan(&address, data_size, DATA_TYPE_CHUNK, vault)
             .await
         {
             Ok(plan) => plan,
@@ -558,7 +582,13 @@ impl Client {
             return Err(Error::ClientUpdateRequired(refusal));
         }
         let quote_plan = self
-            .get_store_quote_plan_split(routing, content, data_size, data_type)
+            .get_store_quote_plan_split(
+                routing,
+                content,
+                data_size,
+                data_type,
+                self.payment_vault(),
+            )
             .await?;
         payment_plan_from_quotes(
             *content,
@@ -622,6 +652,8 @@ impl Client {
             all_payments.len()
         );
 
+        // One transaction in flight per signing key, whichever vault.
+        let _signing = self.lock_signing().await?;
         let (tx_hash_map, gas_info) =
             wallet
                 .pay_for_quotes(all_payments)
@@ -996,7 +1028,9 @@ fn readable_cached_proofs(
     let mut kept: HashMap<XorName, Vec<u8>> = HashMap::with_capacity(proofs.len());
     let mut unreadable: Vec<([u8; 32], Vec<u8>)> = Vec::new();
     for (addr, bytes) in proofs {
-        if deserialize_proof(&bytes).is_ok() {
+        if deserialize_proof(&bytes).is_ok()
+            || ant_protocol::payment::deserialize_root_proof(&bytes).is_ok()
+        {
             kept.insert(addr, bytes);
         } else {
             unreadable.push((addr, bytes));

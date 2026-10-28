@@ -24,8 +24,9 @@ pub use commitment::{
 };
 pub use pricing::{calculate_price, derive_records_stored_from_price};
 pub use proof::{
-    deserialize_merkle_proof, deserialize_proof, detect_proof_type, serialize_merkle_proof,
-    serialize_single_node_proof, PaymentProof, ProofType,
+    deserialize_merkle_proof, deserialize_proof, deserialize_root_proof, detect_proof_type,
+    serialize_merkle_proof, serialize_root_proof, serialize_single_node_proof, PaymentProof,
+    ProofType, RootPaymentProof,
 };
 pub use single_node::{QuotePaymentInfo, SingleNodePayment};
 pub use verify::{verify_merkle_candidate_signature, verify_quote_content, verify_quote_signature};

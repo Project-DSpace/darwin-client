@@ -75,6 +75,9 @@ pub struct OccupiedQuote {
 pub(crate) fn paid_quotes(plans: &[ChunkPaymentPlan]) -> Vec<QuoteHash> {
     plans
         .iter()
+        // A root wave's quotes have no record of their own: its key's
+        // record binds each leaf's payee and amount, and is read instead.
+        .filter(|plan| plan.vault.is_v2())
         .flat_map(|plan| plan.payment.quotes.iter())
         .filter(|quote| !quote.amount.is_zero())
         .map(|quote| quote.quote_hash)
@@ -91,7 +94,7 @@ pub(crate) fn occupied_in(
     records: &HashMap<QuoteHash, VaultRecord>,
 ) -> Vec<OccupiedQuote> {
     let mut occupied = Vec::new();
-    for plan in plans {
+    for plan in plans.iter().filter(|plan| plan.vault.is_v2()) {
         for quote in plan.payment.quotes.iter().filter(|q| !q.amount.is_zero()) {
             let Some(record) = records.get(&quote.quote_hash) else {
                 continue;
@@ -219,6 +222,7 @@ pub(crate) fn plans_of(prepared: &[PreparedChunk]) -> Vec<ChunkPaymentPlan> {
             payment: chunk.payment.clone(),
             peer_quotes: chunk.peer_quotes.clone(),
             commitment_sidecars: Vec::new(),
+            vault: crate::data::client::root_payment::PaymentVault::V2,
         })
         .collect()
 }
@@ -267,7 +271,22 @@ pub(crate) fn plan_of_proof(
     weight: ant_protocol::payment::pricing::RecordWeight,
     proof: &[u8],
 ) -> Result<ChunkPaymentPlan, String> {
-    let (proof, _) = ant_protocol::payment::deserialize_proof(proof)?;
+    use ant_protocol::payment::{detect_proof_type, ProofType};
+    let (proof, vault) = match detect_proof_type(proof) {
+        Some(ProofType::SingleNode) => (
+            ant_protocol::payment::deserialize_proof(proof)?.0,
+            super::root_payment::PaymentVault::V2,
+        ),
+        Some(ProofType::Root) => (
+            ant_protocol::payment::deserialize_root_proof(proof)?
+                .payment
+                .proof_of_payment,
+            super::root_payment::PaymentVault::Root,
+        ),
+        Some(ProofType::Merkle) | None => {
+            return Err("not a single-node or root payment proof".into());
+        }
+    };
     let quotes = proof
         .peer_quotes
         .iter()
@@ -281,6 +300,7 @@ pub(crate) fn plan_of_proof(
         payment,
         peer_quotes: proof.peer_quotes,
         commitment_sidecars: Vec::new(),
+        vault,
     })
 }
 
@@ -332,8 +352,31 @@ impl Client {
     /// every storer refused the proof. Read as [`Self::occupied_quotes`]
     /// reads, through the payment network's RPC and those it falls back to,
     /// up to 3 times 2 seconds apart while no RPC answers.
+    ///
+    /// A root proof's payment can only be in the root vault: the vault's
+    /// record under the key its leaf and path lead to is read, and re-read
+    /// while empty ([`Self::root_wave_recorded`]). It is never judged by the
+    /// per-quote vault's records, nor a single-node proof by the root
+    /// vault's.
     #[cfg(feature = "native")]
     pub(crate) async fn kept_payment(&self, proof: &[u8]) -> KeptPayment {
+        use ant_protocol::payment::{detect_proof_type, ProofType};
+        match detect_proof_type(proof) {
+            Some(ProofType::SingleNode) => {}
+            Some(ProofType::Root) => {
+                let Some(vault) = self.root_vault() else {
+                    return KeptPayment::NotChecked;
+                };
+                let Some(key) = ant_protocol::payment::deserialize_root_proof(proof)
+                    .ok()
+                    .and_then(|proof| super::root_payment::proof_key(&proof, &vault))
+                else {
+                    return KeptPayment::NotChecked;
+                };
+                return self.root_wave_recorded(&vault, &key, 2).await;
+            }
+            Some(ProofType::Merkle) | None => return KeptPayment::NotChecked,
+        }
         let Some(network) = self.evm_network.as_ref() else {
             return KeptPayment::NotChecked;
         };
@@ -394,6 +437,67 @@ impl Client {
     #[cfg(not(feature = "native"))]
     pub(crate) async fn kept_payment(&self, _proof: &[u8]) -> KeptPayment {
         KeptPayment::NotChecked
+    }
+
+    /// The root vault this client's root payments go to and its root proofs
+    /// are read at: its root wallet's vault, else the root vault built in
+    /// for its payment network ([`crate::config::root_vault_address`]).
+    #[cfg(feature = "native")]
+    #[must_use]
+    pub(crate) fn root_vault(&self) -> Option<[u8; 20]> {
+        if let Some(wallet) = self.root_wallet() {
+            return Some(wallet.network().payment_vault_address().0 .0);
+        }
+        let network = self.evm_network.as_ref()?;
+        crate::config::root_vault_address(network).map(|address| address.0 .0)
+    }
+
+    /// Whether the root vault `vault` records a wave under `key`, read
+    /// through the payment network's RPC and those it falls back to, up to
+    /// `reads` times 2 seconds apart while it reads empty or no RPC answers:
+    /// `Recorded` once a record is read, `NotRecorded` if every read
+    /// answered and none showed one, else `Unreadable` (`NotChecked` with
+    /// no EVM network).
+    #[cfg(feature = "native")]
+    pub(crate) async fn root_wave_recorded(
+        &self,
+        vault: &[u8; 20],
+        key: &[u8; 32],
+        reads: usize,
+    ) -> KeptPayment {
+        const PAUSE: std::time::Duration = std::time::Duration::from_secs(2);
+
+        let Some(network) = self.evm_network.as_ref() else {
+            return KeptPayment::NotChecked;
+        };
+        let chain = match read_back_chain(network) {
+            Ok(chain) => chain,
+            Err(error) => {
+                tracing::warn!("cannot read the root vault's record ({error})");
+                return KeptPayment::Unreadable;
+            }
+        };
+        let mut answered = false;
+        for read in 0..reads {
+            if read > 0 {
+                crate::runtime::sleep(PAUSE).await;
+            }
+            match chain.root_record(vault, key).await {
+                Ok(Some(_)) => return KeptPayment::Recorded,
+                Ok(None) => answered = true,
+                Err(error) => {
+                    tracing::debug!(
+                        "reading the root vault's record under {} failed: {error}",
+                        hex::encode(key)
+                    );
+                }
+            }
+        }
+        if answered {
+            KeptPayment::NotRecorded
+        } else {
+            KeptPayment::Unreadable
+        }
     }
 }
 
@@ -569,6 +673,7 @@ mod tests {
                 .map(|q| (EncodedPeerId::new([q.rewards_address.0[0]; 32]), q))
                 .collect(),
             commitment_sidecars: Vec::new(),
+            vault: crate::data::client::root_payment::PaymentVault::V2,
         }
     }
 
@@ -815,6 +920,7 @@ mod outside_payer_tests {
                 .map(|q| (EncodedPeerId::new([q.rewards_address.0[0]; 32]), q))
                 .collect(),
             commitment_sidecars: Vec::new(),
+            vault: crate::data::client::root_payment::PaymentVault::V2,
         }
     }
 

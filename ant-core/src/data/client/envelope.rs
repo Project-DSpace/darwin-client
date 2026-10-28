@@ -10,8 +10,10 @@
 //! envelope unless it is not in the index, hides all five payment fields and
 //! has no metadata ([`EnvelopeOptions::needs_envelope`]); without one it is
 //! stored exactly as an upload without listings support stores it. The
-//! envelope is paid in the same payment as the content and stored after
-//! every content chunk, so a listing never points at missing content.
+//! envelope is paid before, and stored after, every content chunk, so a
+//! listing never points at missing content. Content records are paid
+//! beside it: when its wave pays both vaults (`root_payment::split_vaults`),
+//! it never pays alone in either payment.
 //!
 //! After the upload the client keeps an [`UploadEnvelope`]: the envelope, the
 //! salt of a private one, and the record proving its payment
@@ -471,9 +473,34 @@ struct ProvenPayment {
 }
 
 /// Read the paid quote and its transaction from the payment proof sent with
-/// an envelope's PUT.
+/// an envelope's PUT: a single-node proof's median quote, or the quote a
+/// root proof's leaf pays.
 #[cfg(feature = "native")]
 fn paid_quote(proof_bytes: &[u8]) -> Result<ProvenPayment, String> {
+    use ant_protocol::payment::{detect_proof_type, ProofType};
+    match detect_proof_type(proof_bytes) {
+        Some(ProofType::SingleNode) => {}
+        Some(ProofType::Root) => {
+            let proof = ant_protocol::payment::deserialize_root_proof(proof_bytes)?;
+            let quote = super::root_payment::proof_paid_quote(&proof)
+                .map(|(_, quote)| quote.clone())
+                .ok_or("the paid quote is not in the proof")?;
+            return Ok(ProvenPayment {
+                quotes: proof
+                    .payment
+                    .proof_of_payment
+                    .peer_quotes
+                    .into_iter()
+                    .map(|(_, quote)| quote)
+                    .collect(),
+                tx_hashes: proof.payment.tx_hashes.into_iter().map(|tx| tx.0).collect(),
+                paid: quote,
+            });
+        }
+        Some(ProofType::Merkle) | None => {
+            return Err("the envelope's proof is not a single-node or root payment proof".into());
+        }
+    }
     let (proof, tx_hashes) = ant_protocol::payment::deserialize_proof(proof_bytes)?;
     let quotes: Vec<_> = proof
         .peer_quotes
@@ -527,9 +554,7 @@ impl super::Client {
     ) {
         let chain = network
             .ok_or_else(|| NO_EVM_NETWORK.to_string())
-            .and_then(|network| {
-                super::listings::ListingChain::new(network).map_err(|e| e.to_string())
-            });
+            .and_then(|network| self.listing_chain(network).map_err(|e| e.to_string()));
         match chain {
             Ok(chain) => {
                 complete_upload_envelope(envelope, data_map, proof_bytes, Some(&chain)).await;
@@ -552,13 +577,32 @@ impl super::Client {
         record: EnvelopeProof,
         network: &ant_protocol::evm::Network,
     ) {
-        match super::listings::ListingChain::new(network) {
+        match self.listing_chain(network) {
             Ok(chain) => reuse_upload_record(envelope, record, Some(&chain)).await,
             Err(e) => {
                 reuse_upload_record(envelope, record, None).await;
                 envelope.proof_problem = Some(format!("not checked against the chain: {e}"));
             }
         }
+    }
+
+    /// The reader of `network`'s payments that checks this client's
+    /// envelope records: it reads the root vault this client pays
+    /// ([`super::Client::with_root_payments`]) beside the per-quote vault,
+    /// so the record of an envelope paid in a root wave is checked as one
+    /// paid alone is.
+    fn listing_chain(
+        &self,
+        network: &ant_protocol::evm::Network,
+    ) -> crate::data::error::Result<super::listings::ListingChain> {
+        let chain = super::listings::ListingChain::new(network)?;
+        Ok(match self.root_wallet() {
+            Some(root) => chain.with_root_vault(ant_listings::RootVault {
+                address: root.network().payment_vault_address().into_array(),
+                token: root.network().payment_token_address().into_array(),
+            }),
+            None => chain,
+        })
     }
 
     /// Note on an external-signer upload's envelope, before anything is

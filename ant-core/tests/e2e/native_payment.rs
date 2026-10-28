@@ -326,6 +326,9 @@ fn plan_before_the_switch(
             quote,
         )],
         commitment_sidecars: Vec::new(),
+        // The per-quote vault, as every plan saved before plans recorded
+        // their vault.
+        vault: Default::default(),
     }
 }
 

@@ -56,12 +56,14 @@ pins the node: darwin-node's repository, then the revision. It is the revision
 native suites run the same nodes (the native suite's nodes dial in upstream's order;
 the workspace `Cargo.toml` says why, beside its `webrtc` patch);
 `scripts/darwin-node-pin.py`, which CI runs, checks that the pins agree. It is
-currently `5d97082`: darwin-node's `main` after `v0.23.0+ds.19`, adding only
-the price curve of 0.23.0+ds.20 (100 DARWIN per GB of full chunks on empty
-nodes, divisor 2,000, quoted from its switch time, both curves accepted). Like
-node release 2 it prices records by size, quotes a client settling at version 2
-at its weight total, and settles at version 2 itself (`CURRENT_SETTLEMENT_VERSION`
-in its vendored ant-protocol, which this repository's copy matches).
+currently `363640e`: darwin-node's `main` released as `v0.23.0+ds.20`, which
+brings the price curve (100 DARWIN per GB of full chunks on empty nodes,
+divisor 2,000, quoted from its switch time, both curves accepted) and root
+payments together. It prices records by size as node release 2 does, quotes a
+client settling at version 2 at its weight total, and accepts root payment
+proofs (tag `0x03`) beside single-node ones, quoting a client that asks
+settlement version 3 only where it knows a root vault (`CURRENT_SETTLEMENT_VERSION`
+is 3 in its vendored ant-protocol, which this repository's copy matches).
 
 The devnet runs from a sibling `darwin-node` checkout (beside this repository's
 checkout), or from the one `ANT_NODE_DIR` names. Without `ANT_NODE_DIR`, it

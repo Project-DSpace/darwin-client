@@ -1396,6 +1396,9 @@ impl Client {
         }
 
         let mut candidate_futures = FuturesUnordered::new();
+        // A merkle payment pays the per-quote vault, so its candidates are
+        // asked at that vault's version, never the root vault's.
+        let settlement_version = super::root_payment::PaymentVault::V2.settlement_version()?;
 
         for (peer_id, peer_addrs) in &remote_peers {
             let request_id = self.next_request_id();
@@ -1405,6 +1408,7 @@ impl Client {
             let mut request =
                 MerkleCandidateQuoteRequestV2::new(*address, data_size, merkle_payment_timestamp);
             request.data_type = data_type;
+            request.settlement_version = settlement_version;
             let message = ChunkMessage {
                 request_id,
                 body: ChunkMessageBody::MerkleCandidateQuoteRequestV2(request),
@@ -3834,7 +3838,10 @@ mod tests {
     /// client at all.
     #[test]
     fn a_merkle_refusal_that_does_not_describe_this_client_is_ignored() {
-        use ant_protocol::CURRENT_SETTLEMENT_VERSION;
+        // The version a merkle candidate request asks: the per-quote vault's.
+        let sent = super::super::root_payment::PaymentVault::V2
+            .settlement_version()
+            .unwrap();
 
         let peer_id = PeerId::from_bytes([0x71; 32]);
         let refusal = |client: u32, min: u32| {
@@ -3851,10 +3858,7 @@ mod tests {
 
         // Echoes a version that is not ours: the peer is talking about someone
         // else's request.
-        let wrong_echo = refusal(
-            CURRENT_SETTLEMENT_VERSION.saturating_add(7),
-            CURRENT_SETTLEMENT_VERSION.saturating_add(8),
-        );
+        let wrong_echo = refusal(sent.saturating_add(7), sent.saturating_add(8));
         assert!(
             matches!(wrong_echo, Some(Err(Error::Protocol(_)))),
             "{wrong_echo:?}"
@@ -3862,17 +3866,14 @@ mod tests {
 
         // States a minimum this client already meets, so there is nothing to
         // refuse.
-        let no_gap = refusal(CURRENT_SETTLEMENT_VERSION, CURRENT_SETTLEMENT_VERSION);
+        let no_gap = refusal(sent, sent);
         assert!(
             matches!(no_gap, Some(Err(Error::Protocol(_)))),
             "{no_gap:?}"
         );
 
         // A coherent one is believed, and still carries the upgrade wording.
-        match refusal(
-            CURRENT_SETTLEMENT_VERSION,
-            CURRENT_SETTLEMENT_VERSION.saturating_add(1),
-        ) {
+        match refusal(sent, sent.saturating_add(1)) {
             Some(Err(Error::ClientUpdateRequired(msg))) => {
                 assert!(msg.contains("Build a new darwin"), "{msg}");
                 assert!(!msg.contains("ant update"), "{msg}");

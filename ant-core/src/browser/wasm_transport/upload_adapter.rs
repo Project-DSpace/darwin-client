@@ -276,6 +276,7 @@ impl UploadAdapter for BrowserUploadAdapter<'_> {
                 .parse::<Amount>()
                 .map_err(|e| Error::Payment(e.to_string()))?,
             gas: 0,
+            root: None,
         })
     }
     async fn pay_merkle(

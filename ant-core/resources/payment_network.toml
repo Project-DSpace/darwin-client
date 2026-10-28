@@ -40,10 +40,9 @@ payment_vault_deployment_time = 1791316916
 payment_vault_first_payment_time = 1791321603
 # The root vault (DarwinRootVault), which records each wave of payments under
 # one key: the address its build is deployed to through the standard CREATE2
-# deployer with salt 0, for DARWIN and a leaf limit of 512. Readers of
-# listings and payment records read its payments beside the payment vault's.
-# This client pays only the payment vault above, which stays the network's
-# identity.
+# deployer with salt 0, for DARWIN and a leaf limit of 512. Root payments go
+# here; the payment vault above stays the network's identity and keeps every
+# other payment.
 root_vault_address = "0xf6675722f443132b045857546E57e35360Bb03b9"
 # The symbol costs are shown in.
 token_symbol = "DARWIN"

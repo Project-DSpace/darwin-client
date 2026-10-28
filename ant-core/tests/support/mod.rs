@@ -3,7 +3,9 @@
 //! Spawns a small local testnet of darwin-node's `AntProtocol` handlers (the
 //! revision ant-core/Cargo.toml pins) and an Anvil EVM testnet for real
 //! on-chain payment verification. The payment vault on that chain runs the
-//! DARWIN vault's code, as the network's does.
+//! DARWIN vault's code, as the network's does, and beside it the root vault
+//! runs DarwinRootVault's frozen code, which every node but
+//! [`ROOT_UNAWARE_NODES`] takes root proofs (tag 0x03) in.
 //!
 //! The `e2e` target starts one such testnet and runs every case on it, with
 //! [`runner`]; the targets run by hand start their own.
@@ -116,6 +118,12 @@ pub const DEFAULT_NODE_COUNT: usize = 20;
 /// The node the e2e cases build their clients on. Its own lookups leave it
 /// out, so it is never one of the close group a case addresses.
 pub const CLIENT_NODE: usize = 3;
+
+/// The nodes that know no root vault, as a node on a build before root
+/// payments: each answers a quote request at the root vault's settlement
+/// version `StorerUpdateRequired`, and refuses every root proof. A record
+/// whose close group holds one is paid through the per-quote vault.
+pub const ROOT_UNAWARE_NODES: [usize; 2] = [17, 19];
 
 /// Test rewards address (20 bytes, all 0x01).
 const TEST_REWARDS_ADDRESS: [u8; 20] = [0x01; 20];
@@ -249,6 +257,10 @@ pub struct MiniTestnet {
     _testnet: Testnet,
     wallet: Wallet,
     evm_network: EvmNetwork,
+    /// The root vault on the chain, running DarwinRootVault's frozen code.
+    root_vault: ant_protocol::evm::Address,
+    /// The funded wallet's key, which the root vault's wallet signs with.
+    private_key: String,
 }
 
 /// What [`MiniTestnet::spawn_node`] starts.
@@ -292,6 +304,29 @@ impl MiniTestnet {
         let evm_network = deploy_darwin_vault(&testnet.to_network(), &private_key).await;
         let wallet = Wallet::new_from_private_key(evm_network.clone(), &private_key)
             .expect("create funded wallet");
+        let root_vault = deploy_root_vault(&evm_network, &private_key).await;
+        // The root vault as the nodes take it: given in their network's
+        // config, as `--evm-root-vault` gives it.
+        let root_setting = ant_node::config::EvmNetworkConfig::Custom {
+            rpc_url: evm_network.rpc_url().to_string(),
+            payment_token_address: format!("{:#x}", evm_network.payment_token_address()),
+            payment_vault_address: format!("{:#x}", evm_network.payment_vault_address()),
+            payment_vault_deployment_block: None,
+            root_vault_address: Some(format!("{root_vault:#x}")),
+        }
+        .root_vault()
+        .expect("the root vault setting");
+        assert!(
+            root_setting.vault().is_some(),
+            "the nodes know the root vault"
+        );
+        let root_of = |index: usize| {
+            if ROOT_UNAWARE_NODES.contains(&index) {
+                ant_node::config::RootVaultSetting::None
+            } else {
+                root_setting
+            }
+        };
 
         let bootstrap_count = BOOTSTRAP_COUNT.min(node_count);
         let temp_dirs: Vec<tempfile::TempDir> = (0..node_count)
@@ -307,6 +342,7 @@ impl MiniTestnet {
                 &bootstrap_addrs,
                 temp_dir.path(),
                 &evm_network,
+                root_of(i),
                 i,
                 commitment_key_count,
             )
@@ -322,6 +358,7 @@ impl MiniTestnet {
                 &bootstrap_addrs,
                 temp_dir.path(),
                 &evm_network,
+                root_of(i),
                 i,
                 commitment_key_count,
             )
@@ -408,6 +445,8 @@ impl MiniTestnet {
             _testnet: testnet,
             wallet,
             evm_network,
+            root_vault,
+            private_key,
         }
     }
 
@@ -437,6 +476,35 @@ impl MiniTestnet {
         ant_core::data::Client::from_node(node, config).with_wallet(self.wallet.clone())
     }
 
+    /// A client on [`CLIENT_NODE`] with [`test_client_config`], paying
+    /// through the root vault ([`ant_core::data::Client::with_root_payments`])
+    /// from the funded wallet.
+    pub fn root_client(&self) -> ant_core::data::Client {
+        self.client()
+            .with_root_payments(self.root_wallet())
+            .expect("a root client")
+    }
+
+    /// The funded wallet's key, paying the root vault.
+    pub fn root_wallet(&self) -> Wallet {
+        ant_core::config::root_wallet(&self.evm_network, self.root_vault, &self.private_key, None)
+            .expect("the root vault's wallet")
+    }
+
+    /// The root vault's address.
+    pub fn root_vault(&self) -> ant_protocol::evm::Address {
+        self.root_vault
+    }
+
+    /// The peer ids of the nodes that know no root vault
+    /// ([`ROOT_UNAWARE_NODES`]).
+    pub fn root_unaware_peers(&self) -> Vec<[u8; 32]> {
+        ROOT_UNAWARE_NODES
+            .iter()
+            .map(|&index| *self.nodes[index].p2p_node.peer_id().as_bytes())
+            .collect()
+    }
+
     /// Let every node handle every pointer request again.
     pub fn reset_switches(&self) {
         for node in &self.nodes {
@@ -460,6 +528,7 @@ impl MiniTestnet {
         bootstrap_peers: &[MultiAddr],
         data_dir: &std::path::Path,
         evm_network: &EvmNetwork,
+        root_vault: ant_node::config::RootVaultSetting,
         node_index: usize,
         commitment_key_count: Option<u32>,
     ) -> Spawned {
@@ -514,6 +583,7 @@ impl MiniTestnet {
         let payment_config = PaymentVerifierConfig {
             evm: EvmVerifierConfig {
                 network: evm_network.clone(),
+                root_vault: root_vault.vault(),
             },
             cache_capacity: 1000,
             close_group_size: CLOSE_GROUP_SIZE,
@@ -819,4 +889,51 @@ pub async fn deploy_darwin_vault(network: &EvmNetwork, private_key: &str) -> Evm
         payment_token_address: *network.payment_token_address(),
         payment_vault_address: vault,
     })
+}
+
+/// DarwinRootVault's frozen creation code, without its constructor
+/// arguments: the code deployed on Robinhood Chain at
+/// `0xf6675722f443132b045857546E57e35360Bb03b9`, whose keccak256 is
+/// [`DARWIN_ROOT_VAULT_CREATION_CODE_HASH`].
+pub const DARWIN_ROOT_VAULT_CREATION_CODE: &str =
+    include_str!("../fixtures/darwin-root-vault-creation-code.hex");
+
+/// The keccak256 of [`DARWIN_ROOT_VAULT_CREATION_CODE`]'s bytes.
+pub const DARWIN_ROOT_VAULT_CREATION_CODE_HASH: &str =
+    "0df241a9d350881389969481be85af33dcb4eebde6e577d924675588aa1857c3";
+
+/// Deploy DarwinRootVault's frozen code on `network`'s chain, paid in its
+/// token, with the production leaf limit (512), and return its address.
+pub async fn deploy_root_vault(
+    network: &EvmNetwork,
+    private_key: &str,
+) -> ant_protocol::evm::Address {
+    use alloy::network::{EthereumWallet, TransactionBuilder};
+    use alloy::primitives::U256;
+    use alloy::providers::{Provider, ProviderBuilder};
+    use alloy::rpc::types::TransactionRequest;
+    use alloy::signers::local::PrivateKeySigner;
+    use alloy::sol_types::SolValue;
+
+    let mut code =
+        hex::decode(DARWIN_ROOT_VAULT_CREATION_CODE.trim()).expect("root vault creation code");
+    assert_eq!(
+        hex::encode(alloy::primitives::keccak256(&code)),
+        DARWIN_ROOT_VAULT_CREATION_CODE_HASH,
+        "the frozen creation code"
+    );
+    code.extend((*network.payment_token_address(), U256::from(512u64)).abi_encode_params());
+    let signer: PrivateKeySigner = private_key.parse().expect("wallet key");
+    let provider = ProviderBuilder::new()
+        .wallet(EthereumWallet::from(signer))
+        .connect_http(network.rpc_url().clone());
+    let receipt = provider
+        .send_transaction(TransactionRequest::default().with_deploy_code(code))
+        .await
+        .expect("send root vault deployment")
+        .get_receipt()
+        .await
+        .expect("root vault deployment receipt");
+    assert!(receipt.status(), "root vault deployment reverted");
+    receipt.contract_address.expect("root vault address")
 }
