@@ -98,8 +98,13 @@ Native client behavior is the reference for shared client policy:
   The initial PUT neighbourhood widens to twenty peers when available, with
   a seven-peer fallback. Four successful stores remain the delivery quorum.
 - `payment_policy.rs` preserves stable tie ordering, selects the upper median,
-  and pays that issuer three times its price. The native cost estimate uses
-  the same median rule. Existing-holder quotes are excluded from payment.
+  and pays that issuer three times its price times the weight of the
+  record's size class, rounded up to the next wei (`enhanced_payment_amount`):
+  a full 4 MiB chunk weighs 1, a record of 16 KiB or less 259/1,024. A
+  page's own `quote_chunk` quote that `verifyStorageQuote` checks without a
+  chunk length is paid at a full chunk's weight, which every node accepts.
+  The native cost estimate uses the same median rule. Existing-holder
+  quotes are excluded from payment.
 - `transfer_policy.rs` preserves native failure classification. Structured
   remote PUT rejections and dial churn do not reduce adaptive concurrency;
   a storage shortfall containing a PUT-response timeout does. Browser RPC
