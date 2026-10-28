@@ -210,7 +210,7 @@ needs DARWIN for storage and a little ETH on Robinhood Chain for gas.
 darwin file cost notes.txt
 # Output (an 8 KB file):
 #   Chunks: 4 (3 + 1 envelope)
-#   Cost:   0.3794 DARWIN (gas: 0.000150 ETH)
+#   Cost:   0.4239 DARWIN (gas: 0.000150 ETH)
 
 # Upload (private: the data map is saved locally)
 SECRET_KEY=0x... darwin file upload notes.txt
@@ -219,19 +219,24 @@ SECRET_KEY=0x... darwin file upload notes.txt
 #     Datamap:  notes.txt.datamap
 #     Record:   notes.txt.record
 #     Chunks:   4 (3 + 1 envelope)
-#     Cost:     0.3794 DARWIN (gas: 0.000005 ETH)
+#     Cost:     0.4239 DARWIN (gas: 0.000005 ETH)
 
 # Download using the local data map
 darwin file download --datamap notes.txt.datamap -o notes_copy.txt
 ```
 
 Each chunk costs three times the median quote of the nodes that store it, times the weight of
-its size class. A full 4 MiB chunk weighs 1 and costs about 0.375 DARWIN on today's network; a
-chunk of 16 KiB or less, like each of the four above, weighs 259/1,024, about 0.095 DARWIN. The
+its size class. A full 4 MiB chunk weighs 1 and costs 0.4190208 DARWIN on nodes that store
+nothing, so a GB of full chunks costs 100 DARWIN; a chunk of 16 KiB or less, like each of the four
+above, weighs 259/1,024, about 0.106 DARWIN. The
 classes' tops are the powers of two from 16 KiB to 4 MiB, and a chunk pays for the top of its
 class: weight = 1/4 + 3/4 × (class top ÷ 4 MiB), so 259, 262, 268, 280, 304, 352, 448, 640 and
 1,024 in 1/1,024 of a full chunk. A pointer write pays as a 16 KiB-class record. Quotes rise as
-nodes fill, measured by the weight of what they store. The gas in `darwin file cost` is upstream's fixed
+nodes fill, measured by the weight of what they store, to 10 times the empty price at a weight
+total of 2,000 full chunks (1,000 DARWIN per GB) and 82 times at 6,000. These prices hold from
+29 October 2026, 00:00 UTC, when nodes of darwin-node 0.23.0+ds.20 switch to them; nodes quote
+the earlier curve (0.375 DARWIN a full chunk when empty) until then, and this client accepts both.
+The gas in `darwin file cost` is upstream's fixed
 estimate; an upload's actual gas on Robinhood Chain is far lower.
 
 ### Store and retrieve a file (local devnet)
@@ -300,7 +305,7 @@ Upload complete!
   Record:   my_data.bin.record
   Chunks:   4 (3 + 1 envelope)
   Size:     8.0 KB
-  Cost:     0.3794 DARWIN (gas: 0.000005 ETH)
+  Cost:     0.4239 DARWIN (gas: 0.000005 ETH)
   Time:     6.3s
 
 Anyone can download this file with:
@@ -324,7 +329,7 @@ Upload complete!
   Record:   my_data.bin.record
   Chunks:   4 (3 + 1 envelope)
   Size:     8.0 KB
-  Cost:     0.3794 DARWIN (gas: 0.000005 ETH)
+  Cost:     0.4239 DARWIN (gas: 0.000005 ETH)
   Time:     6.1s
 
 Download this file with:
@@ -779,7 +784,7 @@ ant-protocol = { git = "https://github.com/Project-DSpace/darwin-client", tag = 
 
 `<tag>` is a release's tag, such as `v0.3.11+ds.1`, the same in both lines. The patch puts
 `vendor/ant-protocol`, upstream's protocol crate with this network's pricing (its price
-multiplier, and payment by record size), in place
+curve, the earlier curve it still accepts, and payment by record size), in place
 of the crates.io release. Cargo applies a `[patch]` only in the top-level workspace, so taking
 `ant-core` alone isn't enough, and `ant-core` doesn't compile without it. `ant-core` requires
 exactly `ant-protocol` 5.0.0, the vendored copy's version, so a later crates.io release can't

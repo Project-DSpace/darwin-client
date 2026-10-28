@@ -4,7 +4,7 @@ use crate::add::AddArgs;
 use crate::daemon::DaemonCommand;
 use crate::nodes::{DismissArgs, StartArgs, StatusArgs, StopArgs};
 
-/// `darwin-nodes 0.3.11+ds.4` on line 1, the git commit on line 2 (see build.rs).
+/// `darwin-nodes 0.3.11+ds.5` on line 1, the git commit on line 2 (see build.rs).
 const VERSION: &str = concat!(
     env!("CARGO_PKG_VERSION"),
     "\ncommit ",

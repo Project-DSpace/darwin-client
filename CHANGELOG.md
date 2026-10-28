@@ -11,6 +11,14 @@ Our changes on top of upstream 0.3.11 (ant-core 0.13.0). Releases are tagged `vX
 ant-cli's version set to match; other builds are told apart by the commit `darwin --version`
 prints. Upstream's entries follow.
 
+- `v0.3.11+ds.5`, the price curve: ant-cli's version is 0.3.11+ds.5 (ant-core stays 0.13.0). The
+  vendored `calculate_price` is 100 DARWIN per GB of full chunks on empty nodes (0.1396736 DARWIN a
+  quote) with divisor 2,000 (Dan, 2026-10-28); every quote check (native, merkle and browser)
+  accepts a price in the band of this curve or of the earlier ×32 curve, each with the same rules,
+  so quotes from ds.19 nodes and from ds.20 nodes before and after their switch at
+  2026-10-29T00:00:00Z all pass. Settlement version, size classes, the band, the price ceiling,
+  payment recovery and envelopes are unchanged. v0.3.11+ds.4 and older clients refuse new-curve
+  quotes after the switch. Its notes are `release-notes/v0.3.11+ds.5.md`.
 - `v0.3.11+ds.4`, the pricing switch: ant-cli's version is 0.3.11+ds.4 (ant-core stays 0.13.0).
   The client settles at version 2 and pays each record by its size class (below): a record's paid
   quote receives 3 × the median quote × the record's weight, from 259/1,024 for a record of 16 KiB
