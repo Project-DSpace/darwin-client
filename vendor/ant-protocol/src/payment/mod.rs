@@ -22,7 +22,10 @@ pub mod verify;
 pub use commitment::{
     commitment_hash, verify_commitment_signature, StorageCommitment, MAX_COMMITMENT_KEY_COUNT,
 };
-pub use pricing::{calculate_price, derive_records_stored_from_price};
+pub use pricing::{
+    calculate_price, calculate_price_legacy, derive_records_stored_from_price,
+    derive_records_stored_from_price_legacy,
+};
 pub use proof::{
     deserialize_merkle_proof, deserialize_proof, detect_proof_type, serialize_merkle_proof,
     serialize_single_node_proof, PaymentProof, ProofType,
