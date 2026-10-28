@@ -298,6 +298,14 @@ async fn pay_with<A: UploadAdapter>(
 /// read-back reads; an empty read never pays again, since an RPC can lag
 /// the chain. The key binds every leaf's payee and amount, so that one read
 /// stands for the read-back of every paid quote.
+///
+/// The proofs, and so the envelope's payment record, name the transaction
+/// that recorded the wave ([`Client::root_wave_transaction`]): the payment's
+/// own when its receipt holds the vault's `RootPaid` log naming the key,
+/// else the one that sent the same leaves first, found by that log. Storers
+/// check an envelope's payment in the transaction its proof names. If it
+/// can't be found, the payment fails with its journal kept, and a retry
+/// looks again without paying again.
 async fn pay_root<A: UploadAdapter>(
     client: &Client,
     adapter: &A,
@@ -357,23 +365,74 @@ async fn pay_root<A: UploadAdapter>(
         KeptPayment::Recorded => {}
         read => tracing::warn!(
             "the root vault's record of the wave {} read {read:?} after its payment was \
-             confirmed; storing its records as paid, and the nodes decide",
+             confirmed; its recording transaction is looked for by its RootPaid log",
             hex::encode(key)
         ),
     }
+    // A receipt of no tokens is one whose own transaction reverted or was
+    // replaced, with the wave recorded by another (`recorded_elsewhere`).
+    let own_confirmed = !receipt.amount.is_zero();
+    let own = receipt.transaction_hash;
+    let recording = ant_protocol::evm::TxHash::from(
+        client
+            .root_wave_transaction(&vault, &key, &own.0, own_confirmed, earliest_quote(plans))
+            .await?,
+    );
     let share = super::shared_wave::share_of(&receipt, &quotes, quotes.len())?;
-    Ok(UploadPayment {
-        transactions: quotes
-            .iter()
-            .map(|q| (q.0, receipt.transaction_hash))
-            .collect(),
-        amount: share.amount,
-        gas: share.gas,
+    Ok(root_wave_payment(
+        &quotes,
+        own,
+        recording,
+        wave,
+        share.amount,
+        share.gas,
+    ))
+}
+
+/// A root wave's payment, recorded by transaction `recording`: every
+/// record's proof, and so its envelope's payment record, names it. When
+/// that isn't the payment's own transaction (`own`), another recorded the
+/// same leaves first, and this payment moved no tokens: its `amount` is
+/// none, and only its `gas` was spent.
+fn root_wave_payment(
+    quotes: &[QuoteTuple],
+    own: ant_protocol::evm::TxHash,
+    recording: ant_protocol::evm::TxHash,
+    wave: ant_listings::root::Wave,
+    amount: ant_protocol::evm::Amount,
+    gas: u128,
+) -> UploadPayment {
+    let amount = if recording == own {
+        amount
+    } else {
+        tracing::warn!(
+            "the root wave was recorded by transaction {recording}, not by this payment's own \
+             {own}, which moved no tokens: its records' proofs and its envelope's payment record \
+             name the recording transaction"
+        );
+        ant_protocol::evm::Amount::ZERO
+    };
+    UploadPayment {
+        transactions: quotes.iter().map(|q| (q.0, recording)).collect(),
+        amount,
+        gas,
         root: Some(RootWavePayment {
-            transaction: receipt.transaction_hash,
+            transaction: recording,
             wave,
         }),
-    })
+    }
+}
+
+/// The earliest signed time (Unix seconds) of any quote `plans` carry: a
+/// root wave can't be recorded before it, give or take clock skew.
+fn earliest_quote(plans: &[ChunkPaymentPlan]) -> u64 {
+    plans
+        .iter()
+        .flat_map(|plan| plan.peer_quotes.iter())
+        .filter_map(|(_, quote)| quote.timestamp.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|since| since.as_secs())
+        .min()
+        .unwrap_or(0)
 }
 
 /// Why a journaled transaction can't be read.
@@ -824,9 +883,8 @@ async fn execute_once<A: UploadAdapter, F: Fn(&UploadState) -> bool + Send + Syn
             tracing::warn!(
                 "the root wave's own transaction {transaction} didn't pay it, and the root vault \
                  records the wave under its key {} as paid, by another transaction: its records \
-                 are taken as paid, with proofs of the recorded wave. Storers check the vault's \
-                 record under the key, not the transaction the proofs name, which is this \
-                 payment's own; this payment moved no tokens",
+                 are taken as paid, with proofs naming the transaction that recorded it, found \
+                 by its RootPaid log; this payment moved no tokens",
                 hex::encode(key)
             );
             return finish(
@@ -844,7 +902,8 @@ async fn execute_once<A: UploadAdapter, F: Fn(&UploadState) -> bool + Send + Syn
 /// (`transaction`) reverted or was replaced and the root vault records the
 /// wave by another ([`root_wave_recorded_elsewhere`]): it moved no tokens
 /// and its gas isn't read, and the wave's records are paid. [`pay_root`]
-/// builds their proofs from the wave, naming `transaction`.
+/// builds their proofs from the wave, naming the transaction that recorded
+/// it, found by its `RootPaid` log ([`Client::root_wave_transaction`]).
 fn recorded_elsewhere(transaction: ant_protocol::evm::TxHash) -> PaymentReceipt {
     PaymentReceipt {
         transaction_hash: transaction,
@@ -868,8 +927,10 @@ fn journaled_hash(signed: &SignedPayment) -> Result<ant_protocol::evm::TxHash> {
 /// leaves, sent by any wallet in any block, are recorded under the same
 /// key, and a recorded key counts as paid. `false`: the vault records none,
 /// and the records can be paid again. `true`: the wave is paid, by another
-/// transaction, and its records' proofs are built from it, since storers
-/// check the vault's record under the key.
+/// transaction, and its records' proofs are built from it, naming that
+/// transaction ([`Client::root_wave_transaction`]): storers check a
+/// record's payment by the vault's record under the key, and an envelope's
+/// in the transaction its proof names.
 ///
 /// # Errors
 ///
@@ -1303,9 +1364,60 @@ mod tests {
         }
     }
 
+    /// A root wave recorded by another transaction than the payment's own
+    /// (the own one reverted, was replaced, or found the wave already
+    /// recorded) moved no tokens of the payment's, and every record's proof
+    /// names the recording transaction, which the envelope's payment record
+    /// and storers' listing checks read the envelope leaf's payment log in.
+    /// A wave the payment's own transaction recorded names that one, with
+    /// the payment's total.
+    #[test]
+    fn a_root_wave_recorded_by_another_names_the_recording_transaction() {
+        use crate::data::client::upload_state::test_state::plan_priced;
+        let quoted = std::time::UNIX_EPOCH + Duration::from_secs(1_800_000_000);
+        let plans: Vec<ChunkPaymentPlan> = (0u8..3)
+            .map(|n| {
+                let at = quoted + Duration::from_secs(u64::from(n) * 60);
+                let mut plan = plan_priced(&[n, 0x7e], at, &[10, 20, 30]);
+                plan.vault = PaymentVault::Root;
+                plan
+            })
+            .collect();
+        assert_eq!(earliest_quote(&plans), 1_800_000_000);
+        let wave = root_payment::wave_of(&plans).unwrap();
+        let quotes = root_payment::wave_quotes(&wave);
+        let total = quotes
+            .iter()
+            .fold(ant_protocol::evm::Amount::ZERO, |sum, q| sum + q.2);
+        let own = ant_protocol::evm::TxHash::from([0x0a; 32]);
+        let recording = ant_protocol::evm::TxHash::from([0x0b; 32]);
+
+        let elsewhere = root_wave_payment(&quotes, own, recording, wave.clone(), total, 7);
+        assert!(elsewhere.amount.is_zero(), "no tokens of this payment's");
+        assert_eq!(elsewhere.gas, 7, "its own transaction's gas was spent");
+        assert_eq!(elsewhere.transactions.len(), quotes.len());
+        assert!(elsewhere.transactions.values().all(|tx| *tx == recording));
+        let root = elsewhere.root.as_ref().unwrap();
+        assert_eq!(root.transaction, recording);
+        for plan in &plans {
+            let proof = ant_protocol::payment::deserialize_root_proof(
+                &root_payment::root_proof(plan, root).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(proof.payment.tx_hashes, vec![recording]);
+        }
+        super::super::upload::validate_payment_total(&plans, &elsewhere).unwrap();
+
+        let own_wave = root_wave_payment(&quotes, own, own, wave, total, 7);
+        assert_eq!(own_wave.amount, total);
+        assert!(own_wave.transactions.values().all(|tx| *tx == own));
+        assert_eq!(own_wave.root.unwrap().transaction, own);
+    }
+
     /// A root wave whose own transaction reverted or was replaced, and
     /// which the vault records by another, ends as paid: its receipt names
-    /// the payment's own transaction and moved no tokens.
+    /// the payment's own transaction and moved no tokens, and [`pay_root`]
+    /// then names the recording transaction found by its `RootPaid` log.
     #[test]
     fn a_root_wave_recorded_elsewhere_names_its_own_transaction() {
         use alloy::consensus::TxEnvelope;

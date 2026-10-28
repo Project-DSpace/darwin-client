@@ -499,6 +499,111 @@ impl Client {
             KeptPayment::Unreadable
         }
     }
+
+    /// The transaction that recorded the root vault `vault`'s wave under
+    /// `key`, which a root wave's proofs and its envelope's payment record
+    /// name: storers check an envelope's payment in the transactions its
+    /// proof names. That is `own`, the payment's own transaction, when it
+    /// was confirmed (`own_confirmed`) and its receipt holds the vault's
+    /// `RootPaid` log naming the key. Otherwise another transaction recorded
+    /// the same leaves first: `own` reverted or was replaced, or the vault
+    /// found the wave already recorded and recorded nothing. That one is
+    /// found by its `RootPaid` log, filtered by the key
+    /// ([`recording_transaction_via`]).
+    ///
+    /// # Errors
+    ///
+    /// If the recording transaction can't be found or read: the payment's
+    /// journal is kept, and a retry looks again, never paying again.
+    #[cfg(feature = "native")]
+    pub(crate) async fn root_wave_transaction(
+        &self,
+        vault: &[u8; 20],
+        key: &[u8; 32],
+        own: &[u8; 32],
+        own_confirmed: bool,
+        earliest_quote: u64,
+    ) -> crate::data::error::Result<[u8; 32]> {
+        let network = self.evm_network.as_ref().ok_or_else(|| {
+            Error::Payment("no EVM network to find the root wave's recording on".into())
+        })?;
+        let chain = read_back_chain(network)?;
+        recording_transaction_via(
+            &chain,
+            vault,
+            key,
+            own,
+            own_confirmed,
+            earliest_quote,
+            ROOT_RECORDING_READS,
+        )
+        .await
+    }
+}
+
+/// How many times the recording of a root wave is looked for, 2 seconds
+/// apart, while its transaction's receipt or `RootPaid` log isn't found:
+/// as many as the root vault's record is read after a payment, since an
+/// RPC can lag the one that confirmed it.
+#[cfg(feature = "native")]
+const ROOT_RECORDING_READS: usize = 5;
+
+/// [`Client::root_wave_transaction`], reading through `chain`, up to
+/// `reads` times 2 seconds apart. Another transaction's recording is
+/// searched for from the block at the wave's earliest quote time
+/// (`earliest_quote`, Unix seconds) less [`ant_listings::CLOCK_MARGIN`] (a
+/// quote hash covers its signed time, so the wave can't be recorded before
+/// its quotes, give or take a node's clock against the chain's) up to the
+/// block of `own`, where its receipt was read, else the latest.
+#[cfg(feature = "native")]
+pub(crate) async fn recording_transaction_via(
+    chain: &ListingChain,
+    vault: &[u8; 20],
+    key: &[u8; 32],
+    own: &[u8; 32],
+    own_confirmed: bool,
+    earliest_quote: u64,
+    reads: usize,
+) -> crate::data::error::Result<[u8; 32]> {
+    const PAUSE: std::time::Duration = std::time::Duration::from_secs(2);
+
+    let from_time = earliest_quote.saturating_sub(ant_listings::CLOCK_MARGIN);
+    let mut until = None;
+    let mut problem = String::from("no RootPaid log names its key");
+    for read in 0..reads {
+        if read > 0 {
+            crate::runtime::sleep(PAUSE).await;
+        }
+        if own_confirmed && until.is_none() {
+            match chain.root_paid_in(own, vault, key).await {
+                Ok(Some((true, _))) => return Ok(*own),
+                Ok(Some((false, block))) => until = Some(block),
+                Ok(None) => {
+                    problem = "its own confirmed transaction's receipt isn't found".into();
+                    continue;
+                }
+                Err(error) => {
+                    problem = format!("its own transaction's receipt couldn't be read: {error}");
+                    continue;
+                }
+            }
+        }
+        match chain
+            .root_paid_transaction(vault, key, from_time, until)
+            .await
+        {
+            Ok(Some(recording)) => return Ok(recording),
+            Ok(None) => problem = "no RootPaid log names its key".into(),
+            Err(error) => problem = format!("the search for its RootPaid log failed: {error}"),
+        }
+    }
+    Err(Error::Payment(format!(
+        "the transaction that recorded the root wave under its key {} wasn't found ({problem}); \
+         its proofs and its envelope's payment record must name it. The payment's journal is \
+         kept, and a retry looks for it again rather than pay twice. Don't delete the upload's \
+         checkpoint",
+        hex::encode(key)
+    )))
 }
 
 /// The vault's record of `hash`, read up to 3 times 2 seconds apart while
