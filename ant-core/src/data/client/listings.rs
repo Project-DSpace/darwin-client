@@ -3104,12 +3104,16 @@ impl ListingChain {
                                 (at_log_index(seen.clone(), shown.log_index), seen)
                             }
                             None => {
+                                // Only a root reader keys by the log index: a reader of
+                                // the per-quote vault alone keeps a search only when it
+                                // saw no payment at all, so its search holds for every
+                                // index and is shared as before.
                                 let key = (
                                     quote_hash,
                                     search_from,
                                     not_after,
                                     shown.block_timestamp,
-                                    shown.log_index,
+                                    self.vaults.root.and(shown.log_index),
                                 );
                                 let before = self.searched_before(&key);
                                 let (logs, seen, searched) = self
