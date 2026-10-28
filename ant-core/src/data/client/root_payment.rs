@@ -108,7 +108,9 @@ pub(crate) fn askable_settlement_version(version: u32) -> Result<u32> {
     );
     if version > current || version < min {
         return Err(Error::Config(format!(
-            "quotes at settlement version {version} can't be asked by this build, which              settles under versions {min} to {current}; root payments need a build whose              protocol settles under version {ROOT_SETTLEMENT_VERSION}"
+            "quotes at settlement version {version} can't be asked by this build, which \
+             settles under versions {min} to {current}; root payments need a build whose \
+             protocol settles under version {ROOT_SETTLEMENT_VERSION}"
         )));
     }
     Ok(version)
