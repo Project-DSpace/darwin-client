@@ -376,9 +376,9 @@ static SIGNING_LOCKS: Mutex<Option<HashMap<Address, Weak<tokio::sync::Mutex<()>>
 /// vault it pays. They hold it while they sign and send:
 ///
 /// - the upload engine's journaled payments (`native_payment`): a payment
-///   of its own, which also holds the paying wallet's own lock
-///   (`Wallet::lock`) inside it, the lead of a shared wave, and the
-///   reconciling of a shared wave;
+///   of its own, the lead of a shared wave, and the reconciling of a
+///   shared wave, each of which also holds the paying wallet's own lock
+///   (`Wallet::lock`) inside it, never the other way round;
 /// - `Client::batch_pay`, which pays prepared chunks in one transaction,
 ///   and the in-memory upload adapter's per-chunk payment
 ///   (`MemoryUploadAdapter::pay`);

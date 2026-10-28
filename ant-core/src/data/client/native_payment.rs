@@ -619,6 +619,9 @@ async fn lead(client: &Client, wallet: &Wallet, member: &Member) {
     let _signing = root_payment::signing_lock(wallet.address())
         .lock_owned()
         .await;
+    // And the wallet's own lock inside it, as in `execute_once`: the lead
+    // prepares and sends the wave's payment (`Wallet::prepare_payment`).
+    let _wallet_lock = wallet.lock().await;
     let quotes = member.close(client.shared_waves()).await;
     if quotes.is_empty() {
         member.end(WaveEnd::NotSent(Error::Payment(
@@ -717,6 +720,9 @@ async fn reconcile_wave<A: UploadAdapter, F: Fn(&UploadState) -> bool + Send + S
 ) -> Result<Option<(PaymentReceipt, usize)>> {
     let wallet = client.require_wallet()?;
     let _signing = client.lock_signing().await?;
+    // And the wallet's own lock inside it, as in `execute_once`: the wave's
+    // transaction may be sent again below.
+    let _wallet_lock = wallet.lock().await;
     let file = super::shared_wave::read_wave_file(wave)?;
     let file_gone = file.is_none();
     let Some(signed) = super::shared_wave::wave_payment(file, own, quotes)? else {

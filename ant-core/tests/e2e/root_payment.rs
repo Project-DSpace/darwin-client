@@ -11,9 +11,13 @@
 //! a record can pay is known before it is uploaded.
 //!
 //! Every payment, a wave's leaf or a quote paid through the per-quote vault,
-//! is its record's size-class amount priced on the curve of its quote's
-//! signing time (`quote_price_at`): the earlier x32 curve before ds.20's
-//! switch and the new one from it, as a version-2 record is priced.
+//! is checked to be its record's size-class amount on a curve nodes quote
+//! during the upload: `quote_price_at` when the upload starts or when it
+//! ends, the earlier x32 curve before ds.20's switch and the new one from
+//! it. Which quote paid which amount isn't read here. The signing-time rule
+//! itself, each leaf its own quote's price on whichever curve that quote was
+//! priced, is pinned without the clock by `root_payment`'s unit test
+//! `each_leaf_is_its_own_quotes_price_at_its_records_weight_on_either_curve`.
 
 use crate::support::runner::Case;
 use crate::support::{MiniTestnet, CLIENT_NODE, ROOT_UNAWARE_NODES};
