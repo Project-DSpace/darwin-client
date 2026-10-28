@@ -2769,7 +2769,7 @@ mod tests {
     /// switch price, passes the band check like one on the current curve.
     #[test]
     fn binding_accepts_a_legacy_curve_quote() {
-        use ant_protocol::payment::calculate_price_legacy;
+        use ant_protocol::payment::pricing::calculate_price_legacy;
         let q = quote_with_binding(0, None, calculate_price_legacy(0));
         assert!(quote_commitment_binding_is_valid(&any_peer(), &q, &None).is_ok());
 

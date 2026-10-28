@@ -174,7 +174,8 @@ pub enum Error {
     },
 
     /// ADR-0004: a quote's commitment binding does not hold — its price is
-    /// outside the band up to `calculate_price(committed_key_count)`, its `(count, pin)` shape is
+    /// outside the band up to `calculate_price(committed_key_count)` and outside the same band on
+    /// `calculate_price_legacy` (the legacy curve, still accepted), its `(count, pin)` shape is
     /// incoherent, or a shipped commitment does not match the pinned count/hash.
     /// The storer's arithmetic gate would reject such a quote, so the client
     /// drops it before paying ("the client pays nothing it cannot resolve").

@@ -64,7 +64,7 @@ impl QuotePrice for ant_protocol::evm::Amount {
     }
 
     fn legacy_for_key_count(count: u32) -> Self {
-        ant_protocol::payment::calculate_price_legacy(count as usize)
+        ant_protocol::payment::pricing::calculate_price_legacy(count as usize)
     }
 }
 

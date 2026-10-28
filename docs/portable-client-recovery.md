@@ -135,7 +135,7 @@ import the same definitions at their original application-protocol layer:
 | --- | --- |
 | Close-group size and majority | `ant_protocol::{CLOSE_GROUP_SIZE, CLOSE_GROUP_MAJORITY}` |
 | Lookup K, concurrency and iteration grace defaults | `saorsa_core::dht_lookup` (re-exported by `ant_protocol::transport`) |
-| Pricing curve | `ant_protocol::payment::calculate_price` (and `calculate_price_legacy`, still accepted) |
+| Pricing curve | `ant_protocol::payment::calculate_price` (and `ant_protocol::payment::pricing::calculate_price_legacy`, still accepted) |
 | Commitment type, limits, domains, signature bytes, verification and pin | `ant_protocol::payment::commitment` |
 | Quote signing bytes and hash | `ant_protocol::evm::PaymentQuote` (from evmlib) |
 | ML-DSA public-key size | `ant_protocol::pqc::api::MlDsaVariant::MlDsa65.public_key_size()` |

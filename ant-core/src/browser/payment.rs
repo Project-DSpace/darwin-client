@@ -452,7 +452,7 @@ mod tests {
     /// price, verifies in the browser too; one on neither curve doesn't.
     #[test]
     fn browser_verifies_a_legacy_curve_quote_and_refuses_one_on_neither() {
-        let legacy = ant_protocol::payment::calculate_price_legacy(0).to::<u128>();
+        let legacy = ant_protocol::payment::pricing::calculate_price_legacy(0).to::<u128>();
         let (quote, content, peer_id) = baseline_quote_at(legacy);
         let verified = verify_storage_quote(quote, &content, &peer_id, RecordWeight::FULL)
             .expect("a legacy-curve quote verifies");
