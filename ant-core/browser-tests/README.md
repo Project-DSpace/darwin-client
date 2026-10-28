@@ -56,8 +56,10 @@ pins the node: darwin-node's repository, then the revision. It is the revision
 native suites run the same nodes (the native suite's nodes dial in upstream's order;
 the workspace `Cargo.toml` says why, beside its `webrtc` patch);
 `scripts/darwin-node-pin.py`, which CI runs, checks that the pins agree. It is
-currently `81dbac7`: darwin-node's `main` released as `v0.23.0+ds.18`, node
-release 2, which prices records by size, quotes a client settling at version 2
+currently `5d97082`: darwin-node's `main` after `v0.23.0+ds.19`, adding only
+the price curve of 0.23.0+ds.20 (100 DARWIN per GB of full chunks on empty
+nodes, divisor 2,000, quoted from its switch time, both curves accepted). Like
+node release 2 it prices records by size, quotes a client settling at version 2
 at its weight total, and settles at version 2 itself (`CURRENT_SETTLEMENT_VERSION`
 in its vendored ant-protocol, which this repository's copy matches).
 

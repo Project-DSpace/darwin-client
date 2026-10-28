@@ -919,7 +919,7 @@ dependencies = [
 [[package]]
 name = "ant-listings"
 version = "0.3.1"
-source = "git+https://github.com/Project-DSpace/darwin-node.git?rev=81dbac76f1c6fccc6cbe0ab2ab725b6fda90ba90#81dbac76f1c6fccc6cbe0ab2ab725b6fda90ba90"
+source = "git+https://github.com/Project-DSpace/darwin-node.git?rev=5d9708269b61d2a3f720630e64a9ad4f0b2f4e78#5d9708269b61d2a3f720630e64a9ad4f0b2f4e78"
 dependencies = [
  "ant-protocol",
  "postcard",
@@ -956,8 +956,8 @@ dependencies = [
 
 [[package]]
 name = "ant-node"
-version = "0.23.0+ds.18"
-source = "git+https://github.com/Project-DSpace/darwin-node.git?rev=81dbac76f1c6fccc6cbe0ab2ab725b6fda90ba90#81dbac76f1c6fccc6cbe0ab2ab725b6fda90ba90"
+version = "0.23.0+ds.20"
+source = "git+https://github.com/Project-DSpace/darwin-node.git?rev=5d9708269b61d2a3f720630e64a9ad4f0b2f4e78#5d9708269b61d2a3f720630e64a9ad4f0b2f4e78"
 dependencies = [
  "ant-listings 0.3.1",
  "ant-protocol",
@@ -3531,7 +3531,7 @@ dependencies = [
  "js-sys",
  "log",
  "wasm-bindgen",
- "windows-core 0.62.2",
+ "windows-core 0.57.0",
 ]
 
 [[package]]
@@ -7347,7 +7347,7 @@ dependencies = [
 [[package]]
 name = "webrtc"
 version = "0.14.0"
-source = "git+https://github.com/Project-DSpace/darwin-node.git?rev=81dbac76f1c6fccc6cbe0ab2ab725b6fda90ba90#81dbac76f1c6fccc6cbe0ab2ab725b6fda90ba90"
+source = "git+https://github.com/Project-DSpace/darwin-node.git?rev=5d9708269b61d2a3f720630e64a9ad4f0b2f4e78#5d9708269b61d2a3f720630e64a9ad4f0b2f4e78"
 dependencies = [
  "arc-swap",
  "async-trait",
