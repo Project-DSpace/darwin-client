@@ -9,13 +9,21 @@
 //! quoted, paid and stored through the per-quote vault instead. Each case
 //! picks its records' content by where their addresses fall, so which vault
 //! a record can pay is known before it is uploaded.
+//!
+//! Every payment, a wave's leaf or a quote paid through the per-quote vault,
+//! is its record's size-class amount priced on the curve of its quote's
+//! signing time (`quote_price_at`): the earlier x32 curve before ds.20's
+//! switch and the new one from it, as a version-2 record is priced.
 
 use crate::support::runner::Case;
 use crate::support::{MiniTestnet, CLIENT_NODE, ROOT_UNAWARE_NODES};
 use ant_core::data::compute_address;
-use ant_protocol::evm::Address;
+use ant_node::payment::pricing::quote_price_at;
+use ant_protocol::evm::{Address, Amount};
+use ant_protocol::payment::pricing::{record_weight, weighted_amount};
 use bytes::Bytes;
 use std::sync::Arc;
+use std::time::SystemTime;
 
 pub fn cases() -> Vec<Case> {
     vec![
@@ -156,18 +164,53 @@ async fn root_waves(testnet: &MiniTestnet) -> Vec<u64> {
         .collect()
 }
 
+/// The amounts `vault` has recorded paid, in the chain's order: its
+/// `DataPaymentMade` logs of a nonzero amount, one for each paid quote (the
+/// root vault logs one for each leaf of a wave, before the wave's
+/// `RootPaid`).
+async fn paid_amounts(testnet: &MiniTestnet, vault: Address) -> Vec<Amount> {
+    logs(testnet, vault, DATA_PAYMENT_MADE)
+        .await
+        .iter()
+        .filter_map(|log| log.topics().get(2))
+        .map(|amount| Amount::from_be_bytes(amount.0))
+        .filter(|amount| !amount.is_zero())
+        .collect()
+}
+
+/// The per-quote vault's address.
+fn per_quote_vault(testnet: &MiniTestnet) -> Address {
+    *testnet.evm_network().payment_vault_address()
+}
+
 /// How many quotes the per-quote vault has recorded a payment of: its
 /// `DataPaymentMade` logs of a nonzero amount.
 async fn per_quote_payments(testnet: &MiniTestnet) -> usize {
-    logs(
-        testnet,
-        *testnet.evm_network().payment_vault_address(),
-        DATA_PAYMENT_MADE,
-    )
-    .await
-    .iter()
-    .filter(|log| log.topics().get(2).is_some_and(|amount| !amount.is_zero()))
-    .count()
+    paid_amounts(testnet, per_quote_vault(testnet)).await.len()
+}
+
+/// What a record of [`RECORD_LEN`] bytes pays when its quotes are signed at
+/// `at`: its size class's share of three times the price the shared
+/// network's nodes (no commitment, count 0) quote at `at`, on the earlier
+/// x32 curve before ds.20's switch and the new one from it.
+fn record_amount_at(at: SystemTime) -> Amount {
+    let weight = record_weight(ant_protocol::DATA_TYPE_CHUNK, RECORD_LEN);
+    weighted_amount(quote_price_at(0, at), weight).expect("a record's amount")
+}
+
+/// Each of `paid`, the amounts paid for records whose quotes were all
+/// signed between `before` and `after`, is a record's amount on the curve
+/// of its quote's signing time: `before`'s curve or `after`'s, the same
+/// curve unless the switch fell between them.
+fn assert_priced_at_signing(paid: &[Amount], before: SystemTime, after: SystemTime) {
+    let amounts = [record_amount_at(before), record_amount_at(after)];
+    for amount in paid {
+        assert!(
+            amounts.contains(amount),
+            "paid {amount}, not a record's amount on the curve of its quote's signing time \
+             ({amounts:?})"
+        );
+    }
 }
 
 /// Each of `stored` reads back as its content, from `client`.
@@ -192,10 +235,13 @@ async fn a_wave_of_records_pays_the_root_vault_once_and_reads_back(testnet: Arc<
     let chunks = records(&testnet, 0x31, 6, pays_root);
     let waves = root_waves(&testnet).await;
     let per_quote = per_quote_payments(&testnet).await;
+    let leaves = paid_amounts(&testnet, testnet.root_vault()).await.len();
+    let quoted_from = SystemTime::now();
     let (addresses, _, _) = client
         .batch_upload_chunks(chunks.clone())
         .await
         .expect("a root wave upload");
+    let paid_by = SystemTime::now();
     assert_eq!(addresses.len(), chunks.len());
     let after = root_waves(&testnet).await;
     assert_eq!(after.len(), waves.len() + 1, "one wave: {after:?}");
@@ -205,6 +251,11 @@ async fn a_wave_of_records_pays_the_root_vault_once_and_reads_back(testnet: Arc<
         per_quote,
         "nothing through the per-quote vault"
     );
+    let paid = paid_amounts(&testnet, testnet.root_vault())
+        .await
+        .split_off(leaves);
+    assert_eq!(paid.len(), 6, "a payment for each leaf: {paid:?}");
+    assert_priced_at_signing(&paid, quoted_from, paid_by);
     reads_back(&testnet.client(), &chunks).await;
 }
 
@@ -215,12 +266,20 @@ async fn a_single_record_pays_a_wave_of_one(testnet: Arc<MiniTestnet>) {
     let chunk = records(&testnet, 0x32, 1, pays_root).remove(0);
     let waves = root_waves(&testnet).await;
     let per_quote = per_quote_payments(&testnet).await;
+    let leaves = paid_amounts(&testnet, testnet.root_vault()).await.len();
+    let quoted_from = SystemTime::now();
     let address = client.chunk_put(chunk.clone()).await.expect("chunk_put");
+    let paid_by = SystemTime::now();
     assert_eq!(address, compute_address(&chunk));
     let after = root_waves(&testnet).await;
     assert_eq!(after.len(), waves.len() + 1, "one wave: {after:?}");
     assert_eq!(after.last(), Some(&1), "of one leaf");
     assert_eq!(per_quote_payments(&testnet).await, per_quote);
+    let paid = paid_amounts(&testnet, testnet.root_vault())
+        .await
+        .split_off(leaves);
+    assert_eq!(paid.len(), 1, "a payment for the leaf: {paid:?}");
+    assert_priced_at_signing(&paid, quoted_from, paid_by);
     reads_back(&testnet.client(), &[chunk]).await;
 }
 
@@ -234,13 +293,19 @@ async fn a_record_quoted_by_a_node_without_the_root_vault_pays_the_per_quote_vau
     let chunk = records(&testnet, 0x33, 1, pays_per_quote).remove(0);
     let waves = root_waves(&testnet).await;
     let per_quote = per_quote_payments(&testnet).await;
+    let quoted_from = SystemTime::now();
     client.chunk_put(chunk.clone()).await.expect("chunk_put");
+    let paid_by = SystemTime::now();
     assert_eq!(root_waves(&testnet).await, waves, "no wave");
     assert_eq!(
         per_quote_payments(&testnet).await,
         per_quote + 1,
         "one quote paid through the per-quote vault"
     );
+    let paid = paid_amounts(&testnet, per_quote_vault(&testnet))
+        .await
+        .split_off(per_quote);
+    assert_priced_at_signing(&paid, quoted_from, paid_by);
     reads_back(&testnet.client(), &[chunk]).await;
 }
 
@@ -253,10 +318,13 @@ async fn a_mixed_wave_pays_each_vault_once(testnet: Arc<MiniTestnet>) {
     chunks.extend(records(&testnet, 0x35, 1, pays_per_quote));
     let waves = root_waves(&testnet).await;
     let per_quote = per_quote_payments(&testnet).await;
+    let leaves = paid_amounts(&testnet, testnet.root_vault()).await.len();
+    let quoted_from = SystemTime::now();
     let (addresses, _, _) = client
         .batch_upload_chunks(chunks.clone())
         .await
         .expect("a mixed upload");
+    let paid_by = SystemTime::now();
     assert_eq!(addresses.len(), chunks.len());
     let after = root_waves(&testnet).await;
     assert_eq!(after.len(), waves.len() + 1, "one wave: {after:?}");
@@ -266,5 +334,15 @@ async fn a_mixed_wave_pays_each_vault_once(testnet: Arc<MiniTestnet>) {
         per_quote + 1,
         "one quote through the per-quote vault"
     );
+    let mut paid = paid_amounts(&testnet, testnet.root_vault())
+        .await
+        .split_off(leaves);
+    assert_eq!(paid.len(), 5, "a payment for each leaf: {paid:?}");
+    paid.extend(
+        paid_amounts(&testnet, per_quote_vault(&testnet))
+            .await
+            .split_off(per_quote),
+    );
+    assert_priced_at_signing(&paid, quoted_from, paid_by);
     reads_back(&testnet.client(), &chunks).await;
 }
