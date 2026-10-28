@@ -918,19 +918,6 @@ dependencies = [
 
 [[package]]
 name = "ant-listings"
-version = "0.3.1"
-source = "git+https://github.com/Project-DSpace/darwin-node.git?rev=81dbac76f1c6fccc6cbe0ab2ab725b6fda90ba90#81dbac76f1c6fccc6cbe0ab2ab725b6fda90ba90"
-dependencies = [
- "ant-protocol",
- "postcard",
- "rmp-serde",
- "self_encryption",
- "serde",
- "thiserror 2.0.18",
-]
-
-[[package]]
-name = "ant-listings"
 version = "0.4.0"
 dependencies = [
  "ant-protocol",
@@ -946,6 +933,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "ant-listings"
+version = "0.4.0"
+source = "git+https://github.com/Project-DSpace/darwin-node.git?rev=a80b4ff108c931ed6c0e5006dffd5f23e2943eb5#a80b4ff108c931ed6c0e5006dffd5f23e2943eb5"
+dependencies = [
+ "ant-protocol",
+ "postcard",
+ "rmp-serde",
+ "self_encryption",
+ "serde",
+ "sha3 0.10.9",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "ant-merkle"
 version = "1.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -956,10 +957,10 @@ dependencies = [
 
 [[package]]
 name = "ant-node"
-version = "0.23.0+ds.18"
-source = "git+https://github.com/Project-DSpace/darwin-node.git?rev=81dbac76f1c6fccc6cbe0ab2ab725b6fda90ba90#81dbac76f1c6fccc6cbe0ab2ab725b6fda90ba90"
+version = "0.23.0+ds.16"
+source = "git+https://github.com/Project-DSpace/darwin-node.git?rev=a80b4ff108c931ed6c0e5006dffd5f23e2943eb5#a80b4ff108c931ed6c0e5006dffd5f23e2943eb5"
 dependencies = [
- "ant-listings 0.3.1",
+ "ant-listings 0.4.0 (git+https://github.com/Project-DSpace/darwin-node.git?rev=a80b4ff108c931ed6c0e5006dffd5f23e2943eb5)",
  "ant-protocol",
  "bao",
  "blake3",
@@ -7347,7 +7348,7 @@ dependencies = [
 [[package]]
 name = "webrtc"
 version = "0.14.0"
-source = "git+https://github.com/Project-DSpace/darwin-node.git?rev=81dbac76f1c6fccc6cbe0ab2ab725b6fda90ba90#81dbac76f1c6fccc6cbe0ab2ab725b6fda90ba90"
+source = "git+https://github.com/Project-DSpace/darwin-node.git?rev=a80b4ff108c931ed6c0e5006dffd5f23e2943eb5#a80b4ff108c931ed6c0e5006dffd5f23e2943eb5"
 dependencies = [
  "arc-swap",
  "async-trait",

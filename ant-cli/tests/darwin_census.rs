@@ -66,6 +66,7 @@ const STORES: Counting = &[
     (None, "pay_for_record*"),
     (None, "batch_pay"),
     (None, "prepare_payment"),
+    (None, "pay_root"),
     (None, "batch_upload_chunks*"),
     (None, "upload_records"),
     (None, "upload_records_then"),
@@ -176,6 +177,7 @@ const JOURNALED: &str = "Per-chunk payment in the network's token through the cl
     chain-bound wallet, signed and journaled before it is sent: a payment of its own, or a \
     shared wave of one wallet's small payments, each member's journal and payment record \
     holding only its own quotes and its share.";
+const ROOT_JOURNALED: &str = "Per-chunk payment in the network's token to the root vault,     through the client's chain-bound wallet built for it: the payment's records as one wave, their     paid quotes as leaves in ascending quote-hash order, signed and journaled before it is sent,     never shared with another payment; each record's proof names its leaf, its place and its     path. Every transaction from the key is sent under the key's one lock.";
 const RAW_CHUNK_PUT: &str = "raw, by the caller's choice: no envelope. `darwin chunk put` \
     stores one raw chunk; its help names `darwin file upload` as the standard way. Paid per chunk \
     with the read-back.";
@@ -705,6 +707,13 @@ const STORE_SITES: &[Site] = &[
         JOURNALED,
     ),
     (
+        "ant-core/src/data/client/native_payment.rs",
+        "pay_with",
+        "pay_root",
+        1,
+        ROOT_JOURNALED,
+    ),
+    (
         "ant-core/src/data/client/payment.rs",
         "Client::pay_for_storage",
         "pay_for_storage_split",
@@ -1158,13 +1167,20 @@ const SET_KEPT: &str = "The listings producer's kept receipts and quotes' paymen
     vault set read and holding the logs of every vault in it and of the root vault's token; \
     those kept for the per-quote vault alone are dropped once a root vault is read.";
 const ROOT_CONFIG: &str = "The bundled network's root vault address \
-    (resources/payment_network.toml), read only by ListingChain::new; nothing pays it.";
+    (resources/payment_network.toml), read by ListingChain::new and by a payer through the root \
+    vault, as the one root vault it may pay.";
+const ROOT_PAYER: &str = "A payer through the root vault (Client::with_root_payments) takes the \
+    bundled network's root vault as the only one it pays, and reads its payments back there.";
+const ENVELOPE_ROOT: &str = "The envelope reader of a client paying the root vault adds the vault \
+    it pays to the reader of both vaults, so an envelope paid in a root wave is checked as one \
+    paid alone; on the bundled network it is the vault ListingChain::new already reads.";
 const ROOT_LOGS: &str = "One eth_getLogs for every vault in the set (both addresses where a \
     root vault is read).";
 const LOGS_KIND: &str = "Sorts RPC calls by method, to send log queries to the RPCs that \
     answer them; reads no vault.";
-const PAYER_READ_BACK: &str = "A payer's read-back: the per-quote vault's record of a quote this \
-    client paid there (completedPayments), the only vault this client pays.";
+const PAYER_READ_BACK: &str = "A payer's read-back, at the vault it paid: the per-quote vault's \
+    record of a quote this client paid there (completedPayments), or the root vault's record of a \
+    wave it paid there (records, by the wave's key).";
 const PAYER_CHAIN: &str = "The reader a payer reads its paid quotes back through; it reads them \
     at the per-quote vault only (completed_payment).";
 
@@ -1206,17 +1222,24 @@ const VAULT_READ_SITES: &[Site] = &[
     ),
     (
         "ant-core/src/data/client/envelope.rs",
-        "Client::complete_upload_envelope",
+        "Client::listing_chain",
         "ListingChain::new",
         1,
         ENVELOPE_READER,
     ),
     (
         "ant-core/src/data/client/envelope.rs",
-        "Client::reuse_upload_record",
-        "ListingChain::new",
+        "Client::listing_chain",
+        "RootVault",
         1,
-        ENVELOPE_READER,
+        ENVELOPE_ROOT,
+    ),
+    (
+        "ant-core/src/data/client/envelope.rs",
+        "Client::listing_chain",
+        "with_root_vault",
+        1,
+        ENVELOPE_ROOT,
     ),
     (
         "ant-core/src/data/client/envelope.rs",
@@ -1392,6 +1415,34 @@ const VAULT_READ_SITES: &[Site] = &[
         "ListingChain::new",
         1,
         PRODUCER_READER,
+    ),
+    (
+        "ant-core/src/data/client/mod.rs",
+        "root_wallet_mismatch",
+        "root_vault_address",
+        1,
+        ROOT_PAYER,
+    ),
+    (
+        "ant-core/src/data/client/native_payment.rs",
+        "vault_named",
+        "root_vault_address",
+        1,
+        ROOT_PAYER,
+    ),
+    (
+        "ant-core/src/data/client/occupied.rs",
+        "Client::root_vault",
+        "root_vault_address",
+        1,
+        ROOT_PAYER,
+    ),
+    (
+        "ant-core/src/data/client/occupied.rs",
+        "Client::root_wave_recorded",
+        "root_record",
+        1,
+        PAYER_READ_BACK,
     ),
     (
         "ant-core/src/data/client/occupied.rs",
@@ -3321,7 +3372,8 @@ fn every_payment_reader_reads_the_vault_set() {
          and, on the bundled network, the root vault (ListingChain::new), each payment checked \
          by the vault whose log it is. A reader of one vault alone is built only for another \
          network or in tests. A payer reads only the vault it paid (completed_payment reads the \
-         per-quote vault's record of a quote it paid).",
+         per-quote vault's record of a quote it paid, root_record the root vault's record of a \
+         wave it paid).",
     );
 }
 

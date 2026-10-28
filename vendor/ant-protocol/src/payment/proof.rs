@@ -3,8 +3,8 @@
 //! `PaymentProof` bundles a `ProofOfPayment` (quotes + peer IDs) with the
 //! on-chain transaction hashes returned by the wallet after payment.
 
-use crate::chunk::{PROOF_TAG_MERKLE, PROOF_TAG_SINGLE_NODE};
-use evmlib::common::TxHash;
+use crate::chunk::{PROOF_TAG_MERKLE, PROOF_TAG_ROOT, PROOF_TAG_SINGLE_NODE};
+use evmlib::common::{Amount, Hash, QuoteHash, TxHash};
 use evmlib::merkle_payments::MerklePaymentProof;
 use evmlib::ProofOfPayment;
 use serde::{Deserialize, Serialize};
@@ -33,14 +33,48 @@ pub struct PaymentProof {
     pub commitment_sidecars: Vec<Vec<u8>>,
 }
 
+/// A root payment's proof: the paid quote's payment recorded in a root
+/// vault's wave, one record for the whole wave.
+///
+/// It carries what a single-node proof carries, the quotes, the transaction
+/// hashes (the wave's recording transaction among them) and the commitment
+/// sidecars, and then the paid quote's leaf in the wave's tree: the quote's
+/// hash, the amount the wave pays it, the leaf's place in the wave, the
+/// wave's leaf count, and the path, the leaf's siblings from the leaf up, one
+/// for each level where it has one. The payee is the paid quote's rewards
+/// address and the vault is the storer's own setting, so the proof names
+/// neither.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RootPaymentProof {
+    /// The quotes, transaction hashes and commitment sidecars, as a
+    /// single-node proof holds them.
+    pub payment: PaymentProof,
+    /// The paid quote's hash.
+    pub quote_hash: QuoteHash,
+    /// The amount the wave pays the paid quote.
+    pub amount: Amount,
+    /// The leaf's place in its wave, from 0.
+    pub index: u64,
+    /// How many payments the wave holds.
+    pub leaf_count: u64,
+    /// The leaf's siblings from the leaf up.
+    pub path: Vec<Hash>,
+}
+
 /// The detected type of a payment proof.
+///
+/// Not `#[non_exhaustive]`: every `match` on it names each type, so a new
+/// tag doesn't build until every place that decides by proof type handles
+/// it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[non_exhaustive]
 pub enum ProofType {
     /// `SingleNode` payment (`CLOSE_GROUP_SIZE` quotes, median-paid).
     SingleNode,
     /// Merkle batch payment (one tx for many chunks).
     Merkle,
+    /// Root payment: the median quote paid in a root vault's wave
+    /// ([`RootPaymentProof`]).
+    Root,
 }
 
 /// Detect the proof type from the first byte (version tag).
@@ -51,6 +85,7 @@ pub fn detect_proof_type(bytes: &[u8]) -> Option<ProofType> {
     match bytes.first() {
         Some(&PROOF_TAG_SINGLE_NODE) => Some(ProofType::SingleNode),
         Some(&PROOF_TAG_MERKLE) => Some(ProofType::Merkle),
+        Some(&PROOF_TAG_ROOT) => Some(ProofType::Root),
         _ => None,
     }
 }
@@ -83,6 +118,39 @@ pub fn serialize_merkle_proof(
     tagged.push(PROOF_TAG_MERKLE);
     tagged.extend_from_slice(&body);
     Ok(tagged)
+}
+
+/// Serialize a [`RootPaymentProof`] with the version tag prefix.
+///
+/// # Errors
+///
+/// Returns an error if serialization fails.
+pub fn serialize_root_proof(
+    proof: &RootPaymentProof,
+) -> std::result::Result<Vec<u8>, rmp_serde::encode::Error> {
+    let body = rmp_serde::to_vec(proof)?;
+    let mut tagged = Vec::with_capacity(1 + body.len());
+    tagged.push(PROOF_TAG_ROOT);
+    tagged.extend_from_slice(&body);
+    Ok(tagged)
+}
+
+/// Deserialize proof bytes as a [`RootPaymentProof`].
+///
+/// Expects the first byte to be `PROOF_TAG_ROOT`.
+///
+/// # Errors
+///
+/// Returns an error if the tag is missing or the bytes cannot be deserialized.
+pub fn deserialize_root_proof(bytes: &[u8]) -> Result<RootPaymentProof, String> {
+    if bytes.first() != Some(&PROOF_TAG_ROOT) {
+        return Err("Missing root proof tag byte".to_string());
+    }
+    let payload = bytes
+        .get(1..)
+        .ok_or_else(|| "Root proof tag present but no payload".to_string())?;
+    rmp_serde::from_slice::<RootPaymentProof>(payload)
+        .map_err(|e| format!("Failed to deserialize root proof: {e}"))
 }
 
 /// Deserialize proof bytes from the `PaymentProof` format (single-node).
@@ -260,6 +328,49 @@ mod tests {
         let bytes = [PROOF_TAG_MERKLE, 0x00, 0x01];
         let result = detect_proof_type(&bytes);
         assert_eq!(result, Some(ProofType::Merkle));
+    }
+
+    #[test]
+    fn test_detect_proof_type_root() {
+        let bytes = [PROOF_TAG_ROOT, 0x00, 0x01];
+        assert_eq!(detect_proof_type(&bytes), Some(ProofType::Root));
+    }
+
+    #[test]
+    fn test_root_proof_roundtrip() {
+        let proof = RootPaymentProof {
+            payment: PaymentProof {
+                proof_of_payment: make_proof_of_payment(),
+                tx_hashes: vec![FixedBytes::from([0xABu8; 32])],
+                commitment_sidecars: vec![vec![7u8; 3]],
+            },
+            quote_hash: FixedBytes::from([0x11u8; 32]),
+            amount: Amount::from(12_345u64),
+            index: 5,
+            leaf_count: 64,
+            path: (0u8..6).map(|byte| FixedBytes::from([byte; 32])).collect(),
+        };
+        let bytes = serialize_root_proof(&proof).unwrap();
+        assert_eq!(bytes.first(), Some(&PROOF_TAG_ROOT));
+        assert_eq!(detect_proof_type(&bytes), Some(ProofType::Root));
+        let read = deserialize_root_proof(&bytes).unwrap();
+        assert_eq!(read.quote_hash, proof.quote_hash);
+        assert_eq!(read.amount, proof.amount);
+        assert_eq!(read.index, 5);
+        assert_eq!(read.leaf_count, 64);
+        assert_eq!(read.path, proof.path);
+        assert_eq!(read.payment.tx_hashes, proof.payment.tx_hashes);
+        assert_eq!(
+            read.payment.commitment_sidecars,
+            proof.payment.commitment_sidecars
+        );
+        // A root proof is no single-node or merkle proof, nor the reverse.
+        assert!(deserialize_single_node_proof(&bytes).is_err());
+        assert!(deserialize_merkle_proof(&bytes).is_err());
+        let single = serialize_single_node_proof(&proof.payment).unwrap();
+        assert!(deserialize_root_proof(&single).is_err());
+        assert!(deserialize_root_proof(&[]).is_err());
+        assert!(deserialize_root_proof(&[PROOF_TAG_ROOT]).is_err());
     }
 
     #[test]

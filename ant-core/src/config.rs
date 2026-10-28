@@ -247,9 +247,8 @@ pub fn vault_deployment_block(network: &EvmNetwork) -> Option<u64> {
 }
 
 /// The root vault of `network`: the bundled network's `root_vault_address`,
-/// and none for any other network. Readers of listings and payment records
-/// read its payments beside `network`'s payment vault's
-/// (`ListingChain::new`); nothing in this client pays it.
+/// and none for any other network unless its caller names one. Root
+/// payments go to it; `network`'s payment vault stays its identity.
 #[must_use]
 pub fn root_vault_address(network: &EvmNetwork) -> Option<EvmAddress> {
     match (
@@ -261,6 +260,29 @@ pub fn root_vault_address(network: &EvmNetwork) -> Option<EvmAddress> {
             .and_then(|address| address.parse().ok()),
         _ => None,
     }
+}
+
+/// `network` with `vault` as its payment vault: the same RPC and token. A
+/// wallet built on it pays `vault` ([`root_wallet`]).
+#[must_use]
+pub fn network_paying(network: &EvmNetwork, vault: EvmAddress) -> EvmNetwork {
+    EvmNetwork::Custom(CustomNetwork {
+        rpc_url_http: network.rpc_url().clone(),
+        payment_token_address: *network.payment_token_address(),
+        payment_vault_address: vault,
+    })
+}
+
+/// The wallet of `private_key` that pays the root vault `vault` on
+/// `network`, signing as [`wallet`] does: the wallet a client's root
+/// payments go through (`Client::with_root_payments`).
+pub fn root_wallet(
+    network: &EvmNetwork,
+    vault: EvmAddress,
+    private_key: &str,
+    chain_id: Option<u64>,
+) -> Result<Wallet> {
+    wallet(network_paying(network, vault), private_key, chain_id)
 }
 
 /// The timestamp, in Unix seconds, of the block `network`'s payment vault
@@ -449,12 +471,14 @@ mod tests {
                 word(vector["key"].as_str().unwrap())
             );
         }
-        let other = EvmNetwork::Custom(CustomNetwork {
-            rpc_url_http: bundled.rpc_url().clone(),
-            payment_token_address: *bundled.payment_token_address(),
-            payment_vault_address: root,
-        });
-        assert_eq!(root_vault_address(&other), None);
+        let paying = network_paying(&bundled, root);
+        assert_eq!(paying.payment_vault_address(), &root);
+        assert_eq!(
+            paying.payment_token_address(),
+            bundled.payment_token_address()
+        );
+        assert_eq!(paying.rpc_url(), bundled.rpc_url());
+        assert_eq!(root_vault_address(&paying), None);
     }
 
     #[test]

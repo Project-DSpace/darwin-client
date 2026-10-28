@@ -37,4 +37,4 @@ ant-protocol = { path = "vendor/ant-protocol" }
 # this client's own dial order too: the in-process nodes dial in upstream's
 # order, as the client does, while the browser tests' devnet, built in
 # darwin-node's own workspace, has it. The dial order changes no message.
-webrtc = { git = "https://github.com/Project-DSpace/darwin-node.git", rev = "81dbac76f1c6fccc6cbe0ab2ab725b6fda90ba90" }
+webrtc = { git = "https://github.com/Project-DSpace/darwin-node.git", rev = "a80b4ff108c931ed6c0e5006dffd5f23e2943eb5" }

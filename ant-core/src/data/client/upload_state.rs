@@ -32,20 +32,35 @@
 //!
 //! # Paid proofs
 //!
-//! A paid single-node proof has no age limit: it is kept until its record is
-//! stored. The upload decides whether to reuse it by where its paid node
+//! A paid single-node or root proof has no age limit: it is kept until its
+//! record is stored. The upload decides whether to reuse it by where its paid node
 //! stands in a fresh lookup, and by whether storers take it, never by its
 //! age. An unpaid plan keeps its age limit ([`UploadState::retained_plan`]),
 //! and a Merkle proof its one-week check.
+//!
+//! # Root payments
+//!
+//! A checkpoint that holds a root payment, a plan that pays the root vault
+//! or a root proof (tag 0x03), starts with [`CHECKPOINT_FORMAT_ROOT`]
+//! instead of [`CHECKPOINT_FORMAT`], so a client that reads only the first
+//! refuses it whole rather than take its plans for payments to the
+//! per-quote vault. Each plan records the vault it pays; a plan with none
+//! recorded, as every plan saved before, pays the per-quote vault. A root
+//! proof is checked on restore as it is built: its paid quote among its
+//! signed quotes, and its path leading from its leaf to a root.
 
 use super::batch::{
     build_plan_proof, proof_is_safely_fresh, ChunkPaymentPlan, PaidChunk, PreparedChunk,
     SingleNodeQuotePayment,
 };
+use super::root_payment::{self, PaymentVault, RootWavePayment};
 use crate::data::error::{Error, Result};
 use ant_protocol::{
     evm::{QuoteHash, TxHash},
-    payment::{deserialize_proof, pricing::RecordWeight},
+    payment::{
+        deserialize_proof, deserialize_root_proof, detect_proof_type, pricing::RecordWeight,
+        ProofType,
+    },
     XorName,
 };
 use serde::{Deserialize, Serialize};
@@ -88,6 +103,11 @@ pub(crate) const SNAPSHOT_TEXT_REFUSED: &str =
 
 /// The format version that follows [`CHECKPOINT_MAGIC`].
 pub const CHECKPOINT_FORMAT: u8 = 1;
+
+/// The format version that follows [`CHECKPOINT_MAGIC`] in a checkpoint
+/// that holds a root payment: a plan paying the root vault, or a root
+/// proof. A client that reads only [`CHECKPOINT_FORMAT`] refuses it whole.
+pub const CHECKPOINT_FORMAT_ROOT: u8 = 2;
 
 /// How long the proofs of an upload that is never resumed are kept: a
 /// checkpoint, or a cached receipt, untouched for this long, and holding no
@@ -247,23 +267,32 @@ fn decode_snapshot_text(text: &str) -> Option<Vec<u8>> {
 /// one for `address`: it is kept until its record is stored. A Merkle proof
 /// keeps its one-week check.
 pub fn reusable_proof(address: &XorName, bytes: &[u8], now: SystemTime) -> bool {
-    if let Ok(proof) = ant_protocol::payment::deserialize_merkle_proof(bytes) {
-        return proof.address.0 == *address
-            && proof.data_proof.verify()
-            && proof.data_proof.root() == proof.winner_pool.midpoint_proof.root()
-            && merkle_fresh(
-                proof.winner_pool.midpoint_proof.merkle_payment_timestamp,
-                now,
-            );
-    }
-    let Ok((proof, _)) = deserialize_proof(bytes) else {
-        return false;
+    let for_address = |quotes: &[(
+        ant_protocol::evm::EncodedPeerId,
+        ant_protocol::evm::PaymentQuote,
+    )]| {
+        !quotes.is_empty() && quotes.iter().all(|(_, quote)| quote.content.0 == *address)
     };
-    !proof.peer_quotes.is_empty()
-        && proof
-            .peer_quotes
-            .iter()
-            .all(|(_, quote)| quote.content.0 == *address)
+    match detect_proof_type(bytes) {
+        Some(ProofType::Merkle) => ant_protocol::payment::deserialize_merkle_proof(bytes)
+            .is_ok_and(|proof| {
+                proof.address.0 == *address
+                    && proof.data_proof.verify()
+                    && proof.data_proof.root() == proof.winner_pool.midpoint_proof.root()
+                    && merkle_fresh(
+                        proof.winner_pool.midpoint_proof.merkle_payment_timestamp,
+                        now,
+                    )
+            }),
+        Some(ProofType::SingleNode) => {
+            deserialize_proof(bytes).is_ok_and(|(proof, _)| for_address(&proof.peer_quotes))
+        }
+        Some(ProofType::Root) => deserialize_root_proof(bytes).is_ok_and(|proof| {
+            for_address(&proof.payment.proof_of_payment.peer_quotes)
+                && root_payment::root_proof_well_formed(&proof)
+        }),
+        None => false,
+    }
 }
 
 /// The node a single-node proof paid: the issuer of its one quote with a
@@ -273,14 +302,20 @@ pub(crate) fn paid_node(bytes: &[u8]) -> Option<[u8; 32]> {
     paid_quote(bytes).map(|(node, _, _)| node)
 }
 
-/// The quote a single-node proof paid ([`paid_node`]): its issuer, its hash
-/// and its rewards address. `None` for a Merkle proof or one that can't be
-/// read.
+/// The quote a single-node or root proof paid ([`paid_node`]): its issuer,
+/// its hash and its rewards address. `None` for a Merkle proof or one that
+/// can't be read.
 pub(crate) fn paid_quote(
     bytes: &[u8],
 ) -> Option<([u8; 32], QuoteHash, ant_protocol::evm::RewardsAddress)> {
-    if ant_protocol::payment::deserialize_merkle_proof(bytes).is_ok() {
-        return None;
+    match detect_proof_type(bytes)? {
+        ProofType::SingleNode => {}
+        ProofType::Merkle => return None,
+        ProofType::Root => {
+            let proof = deserialize_root_proof(bytes).ok()?;
+            let (peer, quote) = root_payment::proof_paid_quote(&proof)?;
+            return Some((*peer.as_bytes(), proof.quote_hash, quote.rewards_address));
+        }
     }
     let (proof, _) = deserialize_proof(bytes).ok()?;
     // Which quote is paid doesn't depend on the record's weight.
@@ -558,6 +593,7 @@ impl UploadState {
             payment: chunk.payment,
             peer_quotes: chunk.peer_quotes,
             commitment_sidecars: chunk.commitment_sidecars,
+            vault: crate::data::client::root_payment::PaymentVault::V2,
         });
         state.confirm(
             &[chunk.address],
@@ -643,6 +679,28 @@ impl UploadState {
         transactions: &HashMap<QuoteHash, TxHash>,
         now: SystemTime,
     ) -> Result<()> {
+        self.confirm_paid(addresses, transactions, None, now)
+    }
+
+    /// [`Self::confirm`] with a confirmed `payment` of either vault: a plan
+    /// that pays the root vault gets a root proof from the wave the payment
+    /// sent, and any other plan a single-node proof from its transactions.
+    pub fn confirm_payment(
+        &mut self,
+        addresses: &[XorName],
+        payment: &super::upload::UploadPayment,
+        now: SystemTime,
+    ) -> Result<()> {
+        self.confirm_paid(addresses, &payment.transactions, payment.root.as_ref(), now)
+    }
+
+    fn confirm_paid(
+        &mut self,
+        addresses: &[XorName],
+        transactions: &HashMap<QuoteHash, TxHash>,
+        root: Option<&RootWavePayment>,
+        now: SystemTime,
+    ) -> Result<()> {
         let proofs = addresses
             .iter()
             .filter(|address| !self.is_paid(address, now))
@@ -651,7 +709,15 @@ impl UploadState {
                     .plans
                     .get(address)
                     .ok_or_else(|| Error::Payment("missing prepared payment plan".into()))?;
-                build_plan_proof(plan, transactions).map(|proof| (*address, proof))
+                let proof = match (plan.vault, root) {
+                    (PaymentVault::V2, _) => build_plan_proof(plan, transactions),
+                    (PaymentVault::Root, Some(root)) => root_payment::root_proof(plan, root),
+                    (PaymentVault::Root, None) => Err(Error::Payment(format!(
+                        "the plan for {} pays the root vault, and its payment names no root wave",
+                        hex::encode(address)
+                    ))),
+                };
+                proof.map(|proof| (*address, proof))
             })
             .collect::<Result<Vec<_>>>()?;
         for (address, proof) in proofs {
@@ -829,10 +895,26 @@ impl UploadState {
         };
         let mut bytes = Vec::with_capacity(5);
         bytes.extend_from_slice(&CHECKPOINT_MAGIC);
-        bytes.push(CHECKPOINT_FORMAT);
+        bytes.push(if self.holds_root_payment() {
+            CHECKPOINT_FORMAT_ROOT
+        } else {
+            CHECKPOINT_FORMAT
+        });
         rmp_serde::encode::write_named(&mut bytes, &body)
             .map_err(|e| Error::Serialization(e.to_string()))?;
         Ok(bytes)
+    }
+
+    /// Whether this holds a root payment: a plan that pays the root vault,
+    /// or a root proof. Its checkpoint is then in [`CHECKPOINT_FORMAT_ROOT`].
+    pub(crate) fn holds_root_payment(&self) -> bool {
+        self.plans
+            .values()
+            .any(|plan| plan.vault == PaymentVault::Root)
+            || self
+                .proofs
+                .values()
+                .any(|bytes| detect_proof_type(bytes) == Some(ProofType::Root))
     }
 
     /// The checkpoint as the client before [`CHECKPOINT_MAGIC`] wrote it.
@@ -857,7 +939,7 @@ impl UploadState {
         let (&format, body) = rest
             .split_first()
             .ok_or_else(|| Error::InvalidData("checkpoint ends after its magic".into()))?;
-        if format != CHECKPOINT_FORMAT {
+        if format != CHECKPOINT_FORMAT && format != CHECKPOINT_FORMAT_ROOT {
             return Err(Error::InvalidData(format!(
                 "checkpoint format {format} is not one this client reads; \
                  finish the upload with the client that saved it"
@@ -955,27 +1037,51 @@ impl UploadState {
             }
         }
         for (address, bytes) in &self.proofs {
-            if let Ok(proof) = ant_protocol::payment::deserialize_merkle_proof(bytes) {
-                if proof.address.0 != *address
-                    || !proof.data_proof.verify()
-                    || proof.data_proof.root() != proof.winner_pool.midpoint_proof.root()
-                    || proof.winner_pool.candidate_nodes.iter().any(|candidate| {
-                        !ant_protocol::payment::verify_merkle_candidate_signature(candidate)
-                    })
-                {
-                    return Err(Error::InvalidData("invalid checkpoint Merkle proof".into()));
+            match detect_proof_type(bytes) {
+                Some(ProofType::Merkle) => {
+                    let proof = ant_protocol::payment::deserialize_merkle_proof(bytes)
+                        .map_err(Error::InvalidData)?;
+                    if proof.address.0 != *address
+                        || !proof.data_proof.verify()
+                        || proof.data_proof.root() != proof.winner_pool.midpoint_proof.root()
+                        || proof.winner_pool.candidate_nodes.iter().any(|candidate| {
+                            !ant_protocol::payment::verify_merkle_candidate_signature(candidate)
+                        })
+                    {
+                        return Err(Error::InvalidData("invalid checkpoint Merkle proof".into()));
+                    }
                 }
-                continue;
-            }
-            let proof = ant_protocol::payment::proof::deserialize_single_node_proof(bytes)
-                .map_err(Error::InvalidData)?;
-            if proof.tx_hashes.is_empty()
-                || proof.proof_of_payment.peer_quotes.is_empty()
-                || !quotes_signed_for(address, &proof.proof_of_payment.peer_quotes)
-            {
-                return Err(Error::InvalidData(
-                    "invalid checkpoint payment proof".into(),
-                ));
+                Some(ProofType::SingleNode) => {
+                    let proof = ant_protocol::payment::proof::deserialize_single_node_proof(bytes)
+                        .map_err(Error::InvalidData)?;
+                    if proof.tx_hashes.is_empty()
+                        || proof.proof_of_payment.peer_quotes.is_empty()
+                        || !quotes_signed_for(address, &proof.proof_of_payment.peer_quotes)
+                    {
+                        return Err(Error::InvalidData(
+                            "invalid checkpoint payment proof".into(),
+                        ));
+                    }
+                }
+                Some(ProofType::Root) => {
+                    let proof = deserialize_root_proof(bytes).map_err(Error::InvalidData)?;
+                    if !root_payment::root_proof_well_formed(&proof)
+                        || !quotes_signed_for(address, &proof.payment.proof_of_payment.peer_quotes)
+                    {
+                        return Err(Error::InvalidData(
+                            "invalid checkpoint root payment proof".into(),
+                        ));
+                    }
+                }
+                None => {
+                    return Err(Error::InvalidData(format!(
+                        "the checkpoint holds a payment proof for {} with tag {:?}, which this \
+                         client doesn't know: finish the upload with the client that saved it, \
+                         and don't delete the checkpoint, which holds a payment that was made",
+                        hex::encode(address),
+                        bytes.first()
+                    )));
+                }
             }
         }
         Ok(self)
@@ -1037,6 +1143,7 @@ pub(crate) mod test_state {
             .unwrap(),
             peer_quotes,
             commitment_sidecars: Vec::new(),
+            vault: crate::data::client::root_payment::PaymentVault::V2,
         }
     }
 
@@ -1230,8 +1337,184 @@ mod tests {
         assert!(rmp_serde::from_slice::<UploadState>(&bytes).is_err());
         // A later format is refused here, for the same reason.
         let mut later = bytes.clone();
-        later[4] = CHECKPOINT_FORMAT + 1;
+        later[4] = CHECKPOINT_FORMAT_ROOT + 1;
         assert!(UploadState::restore(&later).is_err());
+    }
+
+    /// `plans`, each paying the root vault, paid in one wave.
+    fn paid_root_wave(plans: &mut [ChunkPaymentPlan]) -> super::super::upload::UploadPayment {
+        for plan in plans.iter_mut() {
+            plan.vault = PaymentVault::Root;
+        }
+        let wave = root_payment::wave_of(plans).unwrap();
+        let transaction = TxHash::from([0x5c; 32]);
+        super::super::upload::UploadPayment {
+            transactions: root_payment::wave_quotes(&wave)
+                .into_iter()
+                .map(|(hash, _, _)| (hash, transaction))
+                .collect(),
+            amount: wave.total(),
+            gas: 0,
+            root: Some(RootWavePayment { transaction, wave }),
+        }
+    }
+
+    /// A checkpoint holding a root payment, a plan or a proof, starts with
+    /// the root format, which a client reading only the first format
+    /// refuses; one holding none starts with the first format, its plans
+    /// written as before plans recorded their vault.
+    #[test]
+    fn a_root_payment_raises_the_checkpoint_format() {
+        let now = SystemTime::now();
+        let v2 = plan(b"per-quote", now);
+        let mut state = UploadState::default();
+        state.prepare(v2.clone());
+        let bytes = state.checkpoint().unwrap();
+        assert_eq!(bytes[4], CHECKPOINT_FORMAT);
+        let encoded = rmp_serde::to_vec_named(&v2).unwrap();
+        assert!(!encoded.windows(5).any(|w| w == b"vault"));
+        let restored = UploadState::restore(&bytes).unwrap();
+        assert_eq!(
+            restored.plans.get(&v2.address).unwrap().vault,
+            PaymentVault::V2
+        );
+
+        let mut root = vec![plan(b"root", now)];
+        paid_root_wave(&mut root);
+        state.prepare(root[0].clone());
+        let bytes = state.checkpoint().unwrap();
+        // A client that reads only the first format refuses any other.
+        assert_eq!(bytes[4], CHECKPOINT_FORMAT_ROOT);
+        assert_ne!(CHECKPOINT_FORMAT_ROOT, CHECKPOINT_FORMAT);
+        let restored = UploadState::restore(&bytes).unwrap();
+        assert_eq!(
+            restored.plans.get(&root[0].address).unwrap().vault,
+            PaymentVault::Root
+        );
+    }
+
+    /// A root wave's records each get a root proof, kept, reused and
+    /// restored as a single-node proof is, its paid quote the one its leaf
+    /// pays; a checkpoint holding one is in the root format.
+    #[test]
+    fn root_proofs_are_kept_and_restored() {
+        let now = SystemTime::now();
+        let mut plans = (0u8..5)
+            .map(|n| plan_priced(&[n, 0x0d], now, &[10, 20, 30]))
+            .collect::<Vec<_>>();
+        let payment = paid_root_wave(&mut plans);
+        let mut state = UploadState::default();
+        for plan in &plans {
+            state.prepare(plan.clone());
+        }
+        let addresses = plans.iter().map(|p| p.address).collect::<Vec<_>>();
+        state.start_payment(false, addresses.clone()).unwrap();
+        state.confirm_payment(&addresses, &payment, now).unwrap();
+        assert!(state.pending_payment.is_none());
+        for plan in &plans {
+            let bytes = state.proof(&plan.address).unwrap();
+            assert_eq!(bytes[0], ant_protocol::PROOF_TAG_ROOT);
+            assert!(reusable_proof(&plan.address, bytes, now));
+            assert!(!reusable_proof(&[0xee; 32], bytes, now));
+            let paid = plan
+                .payment
+                .quotes
+                .iter()
+                .find(|q| !q.amount.is_zero())
+                .unwrap();
+            let (_, hash, rewards) = paid_quote(bytes).unwrap();
+            assert_eq!((hash, rewards), (paid.quote_hash, paid.rewards_address));
+        }
+        let bytes = state.checkpoint().unwrap();
+        assert_eq!(bytes[4], CHECKPOINT_FORMAT_ROOT);
+        let restored = UploadState::restore(&bytes).unwrap();
+        for plan in &plans {
+            assert_eq!(restored.proof(&plan.address), state.proof(&plan.address));
+        }
+    }
+
+    /// A kept root proof has no age test: the root vault's record of its
+    /// wave never expires, so the proof is reused, not paid for again,
+    /// however old its quotes are, as long as it is its record's.
+    #[test]
+    fn a_kept_root_proof_is_reused_whatever_its_age() {
+        let quoted = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+        let mut plans = (0u8..3)
+            .map(|n| plan_priced(&[n, 0x0e], quoted, &[10, 20, 30]))
+            .collect::<Vec<_>>();
+        let payment = paid_root_wave(&mut plans);
+        let mut state = UploadState::default();
+        for plan in &plans {
+            state.prepare(plan.clone());
+        }
+        let addresses = plans.iter().map(|p| p.address).collect::<Vec<_>>();
+        state.start_payment(false, addresses.clone()).unwrap();
+        state.confirm_payment(&addresses, &payment, quoted).unwrap();
+        let later = quoted + std::time::Duration::from_secs(10 * 365 * 86_400);
+        for plan in &plans {
+            let bytes = state.proof(&plan.address).unwrap();
+            assert!(reusable_proof(&plan.address, bytes, later));
+            assert!(state.is_paid(&plan.address, later));
+        }
+    }
+
+    /// A root plan confirmed by a payment that names no root wave gets no
+    /// proof, and its plan is kept.
+    #[test]
+    fn a_root_plan_needs_its_wave() {
+        let now = SystemTime::now();
+        let mut plans = vec![plan(b"root", now)];
+        let mut payment = paid_root_wave(&mut plans);
+        payment.root = None;
+        let mut state = UploadState::default();
+        state.prepare(plans[0].clone());
+        assert!(state
+            .confirm_payment(&[plans[0].address], &payment, now)
+            .is_err());
+        assert!(state.proof(&plans[0].address).is_none());
+        assert!(state.plans.contains_key(&plans[0].address));
+    }
+
+    /// A checkpoint holding a proof with a tag this client doesn't know is
+    /// refused whole, saying not to delete it; so is a root proof whose path
+    /// doesn't lead from its leaf.
+    #[test]
+    fn an_unknown_or_broken_proof_refuses_the_checkpoint() {
+        let now = SystemTime::now();
+        let mut plans = vec![plan(b"a", now), plan(b"b", now)];
+        let payment = paid_root_wave(&mut plans);
+        let mut state = UploadState::default();
+        for plan in &plans {
+            state.prepare(plan.clone());
+        }
+        let addresses = plans.iter().map(|p| p.address).collect::<Vec<_>>();
+        state.confirm_payment(&addresses, &payment, now).unwrap();
+
+        let mut unknown = state.clone();
+        let mut bytes = unknown.proof(&addresses[0]).unwrap().clone();
+        bytes[0] = 0x04;
+        unknown.insert_proof(addresses[0], bytes);
+        let error = UploadState::restore(&unknown.checkpoint().unwrap())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("don't delete the checkpoint"), "{error}");
+
+        let mut broken = state.clone();
+        let mut proof = deserialize_root_proof(broken.proof(&addresses[0]).unwrap()).unwrap();
+        proof.index = 1 - proof.index;
+        broken.insert_proof(
+            addresses[0],
+            ant_protocol::payment::serialize_root_proof(&proof).unwrap(),
+        );
+        // The other leaf's place: its path leads from another leaf, to
+        // another root, which only the chain can tell; a place outside the
+        // wave is refused here.
+        proof.index = 2;
+        broken.insert_proof(
+            addresses[0],
+            ant_protocol::payment::serialize_root_proof(&proof).unwrap(),
+        );
+        assert!(UploadState::restore(&broken.checkpoint().unwrap()).is_err());
     }
 
     /// A checkpoint in the format before the magic restores, plans, proofs

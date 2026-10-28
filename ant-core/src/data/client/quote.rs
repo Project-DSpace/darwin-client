@@ -4,6 +4,7 @@
 //! managing payment for data storage.
 
 use crate::data::client::peer_xor_distance;
+use crate::data::client::root_payment::{PaymentVault, V2_SETTLEMENT_VERSION};
 use crate::data::client::Client;
 use crate::data::client::SettlementRefusals;
 use crate::data::client::PUT_TARGET_WIDTH;
@@ -231,15 +232,18 @@ fn drop_quotes_with_bad_bindings(quotes: &mut Vec<QuotedPeer>) -> usize {
 }
 
 /// The quote request for a record: always the versioned shape, declaring
-/// [`CURRENT_SETTLEMENT_VERSION`].
+/// `settlement_version`, the version of the vault the record pays
+/// ([`PaymentVault::settlement_version`]).
 fn store_quote_message(
     request_id: u64,
     address: [u8; 32],
     data_size: u64,
     data_type: u32,
+    settlement_version: u32,
 ) -> ChunkMessage {
     let mut request = ChunkQuoteRequestV2::new(address, data_size);
     request.data_type = data_type;
+    request.settlement_version = settlement_version;
     ChunkMessage {
         request_id,
         body: ChunkMessageBody::QuoteRequestV2(request),
@@ -255,6 +259,7 @@ async fn request_store_quote_from_peer(
     address: [u8; 32],
     data_size: u64,
     data_type: u32,
+    settlement_version: u32,
     per_peer_timeout: Duration,
 ) -> StoreQuoteRequestResult {
     // Declare the settlement version so a storer can turn us away before we
@@ -264,7 +269,13 @@ async fn request_store_quote_from_peer(
     // the payment made on that quote and then refuse the record. A storer
     // that can't decode this request stays silent, and is one more peer that
     // didn't quote.
-    let message = store_quote_message(request_id, address, data_size, data_type);
+    let message = store_quote_message(
+        request_id,
+        address,
+        data_size,
+        data_type,
+        settlement_version,
+    );
 
     let message_bytes = match message.encode() {
         Ok(bytes) => bytes,
@@ -286,7 +297,7 @@ async fn request_store_quote_from_peer(
         request_id,
         per_peer_timeout,
         &peer_addrs,
-        |body| map_quote_response(&peer_id, &address, body),
+        |body| map_quote_response(&peer_id, &address, settlement_version, body),
         |e| Error::Network(format!("Failed to send quote request to {peer_id}: {e}")),
         || Error::Timeout(format!("Timeout waiting for quote from {peer_id}")),
     )
@@ -304,6 +315,7 @@ async fn request_store_quote_from_peer(
 fn map_quote_response(
     peer_id: &PeerId,
     address: &[u8; 32],
+    sent_version: u32,
     body: ChunkMessageBody,
 ) -> Option<ClassifiedQuote> {
     match body {
@@ -323,8 +335,9 @@ fn map_quote_response(
                 client_settlement_version,
                 min_settlement_version,
             },
-        )) => Some(Err(settlement_refusal_error(
+        )) => Some(Err(settlement_refusal_error_for(
             peer_id,
+            sent_version,
             client_settlement_version,
             min_settlement_version,
         ))),
@@ -346,18 +359,40 @@ fn map_quote_response(
 /// must be ours, and the stated minimum must genuinely exceed it. A peer that
 /// fails either is confused or lying, and is treated as an ordinary bad peer
 /// rather than as evidence about this build.
+///
+/// For a request asked at the per-quote vault's version
+/// ([`V2_SETTLEMENT_VERSION`], or this build's own if older), as every
+/// merkle candidate request is.
 pub(super) fn settlement_refusal_error(
     peer_id: &PeerId,
     client_settlement_version: u32,
     min_settlement_version: u32,
 ) -> Error {
-    if client_settlement_version != CURRENT_SETTLEMENT_VERSION
+    settlement_refusal_error_for(
+        peer_id,
+        CURRENT_SETTLEMENT_VERSION.min(V2_SETTLEMENT_VERSION),
+        client_settlement_version,
+        min_settlement_version,
+    )
+}
+
+/// [`settlement_refusal_error`] for a request sent at `sent_version`: the
+/// echoed version is compared with the version the request asked, not with
+/// this build's own, so a refusal of a per-quote vault's request, asked at
+/// an older version than the build's, isn't dropped as incoherent.
+pub(super) fn settlement_refusal_error_for(
+    peer_id: &PeerId,
+    sent_version: u32,
+    client_settlement_version: u32,
+    min_settlement_version: u32,
+) -> Error {
+    if client_settlement_version != sent_version
         || min_settlement_version <= client_settlement_version
     {
         return Error::Protocol(format!(
             "Peer {peer_id} sent an incoherent settlement refusal (claimed this client is at \
-             version {client_settlement_version} needing {min_settlement_version}, but this \
-             client is at {CURRENT_SETTLEMENT_VERSION}); ignoring it"
+             version {client_settlement_version} needing {min_settlement_version}, but the \
+             request asked version {sent_version}); ignoring it"
         ));
     }
     Error::ClientUpdateRequired(update_required_message(
@@ -496,6 +531,8 @@ fn record_store_quote_result(
     bad_quote_count: &mut usize,
     settlement_refusal: &mut Option<Error>,
     refusals: &SettlementRefusals,
+    root_close_group: Option<&HashSet<PeerId>>,
+    root_refused: &mut Option<PeerId>,
 ) -> Result<()> {
     match quote_result {
         Ok((quote, price, commitment)) => {
@@ -543,6 +580,23 @@ fn record_store_quote_result(
                 *settlement_refusal = Some(Error::ClientUpdateRequired(verdict.to_string()));
             }
             return Err(verdict);
+        }
+        // A record quoted for the root vault leaves root collection at once
+        // when one of its close group can't check a root proof: it is quoted
+        // again for the per-quote vault, which every storer checks. Never one
+        // more failed peer, or collection would go on and pay root with the
+        // quotes of the others, and that storer would refuse the proof. A
+        // refusal from a peer outside the close group, asked only for fault
+        // tolerance, is an ordinary failed peer.
+        Err(e @ Error::StorerUpdateRequired(_))
+            if root_close_group.is_some_and(|group| group.contains(&peer_id)) =>
+        {
+            info!(
+                "Peer {peer_id} can't check a root payment ({e}); quoting the record for the \
+                 per-quote vault"
+            );
+            *root_refused = Some(peer_id);
+            return Err(e);
         }
         Err(e) => {
             if matches!(&e, Error::BadQuoteBinding { .. }) {
@@ -660,6 +714,24 @@ type WitnessedVoteData = (HashMap<PeerId, DHTNode>, VotersByPeer, Vec<(PeerId, u
 pub(crate) struct StoreQuotePlan {
     pub(crate) quotes: Vec<StoreQuote>,
     pub(crate) put_peers: Vec<(PeerId, Vec<MultiAddr>)>,
+    /// The vault the quotes were asked for: the one asked, or the per-quote
+    /// vault when a root request's close group holds a storer that can't
+    /// check a root proof.
+    pub(crate) vault: PaymentVault,
+}
+
+/// The `CLOSE_GROUP_SIZE` peers of `peers` closest to `routing`: a record's
+/// close group, whose refusal of a root request moves the record to the
+/// per-quote vault.
+fn close_group_of(peers: &[(PeerId, Vec<MultiAddr>)], routing: &[u8; 32]) -> HashSet<PeerId> {
+    let mut ids = peers.iter().map(|(peer, _)| *peer).collect::<Vec<_>>();
+    ids.sort_by(|left, right| {
+        peer_xor_distance(left, routing)
+            .cmp(&peer_xor_distance(right, routing))
+            .then_with(|| left.as_bytes().cmp(right.as_bytes()))
+    });
+    ids.truncate(CLOSE_GROUP_SIZE);
+    ids.into_iter().collect()
 }
 
 #[derive(Debug, Clone)]
@@ -961,7 +1033,7 @@ impl Client {
         data_type: u32,
     ) -> Result<Vec<StoreQuote>> {
         Ok(self
-            .get_store_quote_plan(address, data_size, data_type)
+            .get_store_quote_plan(address, data_size, data_type, PaymentVault::V2)
             .await?
             .quotes)
     }
@@ -977,8 +1049,9 @@ impl Client {
         address: &[u8; 32],
         data_size: u64,
         data_type: u32,
+        vault: PaymentVault,
     ) -> Result<StoreQuotePlan> {
-        self.get_store_quote_plan_split(address, address, data_size, data_type)
+        self.get_store_quote_plan_split(address, address, data_size, data_type, vault)
             .await
     }
 
@@ -994,15 +1067,22 @@ impl Client {
     /// Quoted again, after a wait, while every quote is refused because this
     /// client or its address is over the storers' quote rate (see
     /// [`retry_while_rate_limited`]).
+    ///
+    /// The quotes are asked for `vault`, at its settlement version
+    /// ([`PaymentVault::settlement_version`]). For the root vault, a record
+    /// whose close group holds a storer that can't check a root proof, one
+    /// that answers `StorerUpdateRequired` now or did before on this client,
+    /// is quoted for the per-quote vault instead, and the plan says so.
     pub(crate) async fn get_store_quote_plan_split(
         &self,
         routing: &[u8; 32],
         content: &[u8; 32],
         data_size: u64,
         data_type: u32,
+        vault: PaymentVault,
     ) -> Result<StoreQuotePlan> {
         retry_while_rate_limited(content, || {
-            self.get_store_quote_plan_split_once(routing, content, data_size, data_type)
+            self.get_store_quote_plan_split_once(routing, content, data_size, data_type, vault)
         })
         .await
     }
@@ -1014,6 +1094,7 @@ impl Client {
         content: &[u8; 32],
         data_size: u64,
         data_type: u32,
+        vault: PaymentVault,
     ) -> Result<StoreQuotePlan> {
         let address = content;
         let witnessed_selection = self.select_witnessed_quote_selection(routing).await?;
@@ -1022,25 +1103,99 @@ impl Client {
             .iter()
             .map(|peer| (peer.peer_id, peer.voters.clone()))
             .collect();
-        let remote_peers = witnessed_selection
+        let remote_peers: Vec<(PeerId, Vec<MultiAddr>)> = witnessed_selection
             .quote_peers
             .into_iter()
             .map(|peer| (peer.peer_id, peer.addrs))
             .collect();
         let initial_put_peers = witnessed_selection.initial_put_peers;
         let quorum = witnessed_selection.quorum;
+        let policy = || QuoteSelectionPolicy::WitnessedMedianVoters {
+            voters_by_peer: voters_by_peer.clone(),
+            quorum,
+        };
+        let mut paying = vault;
+        if paying == PaymentVault::Root {
+            let close_group = close_group_of(&remote_peers, routing);
+            let refused_before = self
+                .root_refusing_peers()
+                .lock()
+                .is_ok_and(|peers| close_group.iter().any(|peer| peers.contains(peer)));
+            if refused_before {
+                debug!(
+                    "a storer near {} refused a root request before; quoting it for the \
+                     per-quote vault",
+                    hex::encode(address)
+                );
+                paying = PaymentVault::V2;
+            } else {
+                match self
+                    .collect_store_quotes_from_remote_peers(
+                        address,
+                        data_size,
+                        data_type,
+                        PaymentVault::Root.settlement_version()?,
+                        Some(close_group),
+                        remote_peers.clone(),
+                        policy(),
+                    )
+                    .await
+                {
+                    Ok(quotes) => {
+                        return self.store_quote_plan(
+                            address,
+                            data_type,
+                            quotes,
+                            &initial_put_peers,
+                            &voters_by_peer,
+                            quorum,
+                            PaymentVault::Root,
+                        );
+                    }
+                    // The one deliberate step down: the record is quoted
+                    // again, still versioned, at the per-quote vault's
+                    // version, and paid and proved there.
+                    Err(Error::StorerUpdateRequired(_)) => paying = PaymentVault::V2,
+                    Err(e) => return Err(e),
+                }
+            }
+        }
         let quotes = self
             .collect_store_quotes_from_remote_peers(
                 address,
                 data_size,
                 data_type,
+                paying.settlement_version()?,
+                None,
                 remote_peers,
-                QuoteSelectionPolicy::WitnessedMedianVoters {
-                    voters_by_peer: voters_by_peer.clone(),
-                    quorum,
-                },
+                policy(),
             )
             .await?;
+        self.store_quote_plan(
+            address,
+            data_type,
+            quotes,
+            &initial_put_peers,
+            &voters_by_peer,
+            quorum,
+            paying,
+        )
+    }
+
+    /// The plan of `quotes`, collected for `vault`: refused when too few
+    /// quoted a pointer's state, with its PUT targets ordered for the paid
+    /// median.
+    #[allow(clippy::too_many_arguments)]
+    fn store_quote_plan(
+        &self,
+        address: &[u8; 32],
+        data_type: u32,
+        quotes: Vec<StoreQuote>,
+        initial_put_peers: &[(PeerId, Vec<MultiAddr>)],
+        voters_by_peer: &VotersByPeer,
+        quorum: usize,
+        vault: PaymentVault,
+    ) -> Result<StoreQuotePlan> {
         // A full node quotes no pointer it doesn't hold, so the nodes that
         // quoted a pointer's state are those that can take its write. Fewer
         // than its write quorum can't, and nothing is paid then.
@@ -1055,23 +1210,23 @@ impl Client {
                 )));
             }
         }
-        let put_peers = put_peers_with_median_voters_first(
-            &quotes,
-            &initial_put_peers,
-            &voters_by_peer,
-            quorum,
-        )
-        .ok_or_else(|| {
-            Error::InsufficientPeers(format!(
+        let put_peers =
+            put_peers_with_median_voters_first(&quotes, initial_put_peers, voters_by_peer, quorum)
+                .ok_or_else(|| {
+                    Error::InsufficientPeers(format!(
                 "Collected {} witnessed quotes, but fewer than {} initial witness PUT peers \
                  voted for the paid median issuer for {}",
                 quotes.len(),
                 quorum,
                 hex::encode(address)
             ))
-        })?;
+                })?;
 
-        Ok(StoreQuotePlan { quotes, put_peers })
+        Ok(StoreQuotePlan {
+            quotes,
+            put_peers,
+            vault,
+        })
     }
 
     /// Get storage quotes with the previous over-query behaviour.
@@ -1096,6 +1251,8 @@ impl Client {
             address,
             data_size,
             data_type,
+            PaymentVault::V2.settlement_version()?,
+            None,
             remote_peers,
             QuoteSelectionPolicy::ClosestByDistance,
         )
@@ -1173,11 +1330,14 @@ impl Client {
     }
 
     #[allow(clippy::too_many_lines)]
+    #[allow(clippy::too_many_arguments)]
     async fn collect_store_quotes_from_remote_peers(
         &self,
         address: &[u8; 32],
         data_size: u64,
         data_type: u32,
+        settlement_version: u32,
+        root_close_group: Option<HashSet<PeerId>>,
         remote_peers: Vec<(PeerId, Vec<MultiAddr>)>,
         quote_selection_policy: QuoteSelectionPolicy,
     ) -> Result<Vec<StoreQuote>> {
@@ -1233,6 +1393,10 @@ impl Client {
         let mut settlement_refusal: Option<Error> = None;
         let refusals = self.settlement_refusals();
         let ceiling = self.config().max_chunk_price;
+        // A storer of the record's close group that can't check a root
+        // proof, when the quotes are asked for the root vault: collection
+        // stops, and the peer is remembered for this client.
+        let mut root_refused: Option<PeerId> = None;
 
         if staged_witnessed_collection {
             let mut quote_futures = FuturesUnordered::new();
@@ -1266,6 +1430,7 @@ impl Client {
                                 *address,
                                 data_size,
                                 data_type,
+                                settlement_version,
                                 per_peer_timeout,
                             ));
                         }
@@ -1288,6 +1453,8 @@ impl Client {
                             &mut bad_quote_count,
                             &mut settlement_refusal,
                             &refusals,
+                            root_close_group.as_ref(),
+                            &mut root_refused,
                         )?;
                     }
                     Ok(())
@@ -1301,7 +1468,10 @@ impl Client {
                         hex::encode(address)
                     );
                 }
-                Ok(Err(e)) => return Err(e),
+                Ok(Err(e)) => {
+                    self.remember_root_refusal(root_refused);
+                    return Err(e);
+                }
                 Ok(Ok(())) => {}
             }
             // Outranks the timeout: a refusal says paying is unsafe no matter
@@ -1324,6 +1494,7 @@ impl Client {
                     *address,
                     data_size,
                     data_type,
+                    settlement_version,
                     per_peer_timeout,
                 ));
             }
@@ -1341,6 +1512,8 @@ impl Client {
                             &mut bad_quote_count,
                             &mut settlement_refusal,
                             &refusals,
+                            root_close_group.as_ref(),
+                            &mut root_refused,
                         )?;
                     }
                     Ok(())
@@ -1357,7 +1530,10 @@ impl Client {
                     // The timeout fires when slow peers haven't responded yet, but we
                     // may already have enough successful quotes from fast peers.
                 }
-                Ok(Err(e)) => return Err(e),
+                Ok(Err(e)) => {
+                    self.remember_root_refusal(root_refused);
+                    return Err(e);
+                }
                 Ok(Ok(())) => {}
             }
             // Outranks the timeout: a refusal says paying is unsafe no matter
@@ -1453,6 +1629,17 @@ impl Client {
              {bad_quote_count} with mismatched peer bindings). Failures: [{}]",
             failures.join("; ")
         )))
+    }
+
+    /// Remember `peer`, a storer that refused a root request, for this
+    /// client: records whose close group holds it are quoted for the
+    /// per-quote vault straight away.
+    fn remember_root_refusal(&self, peer: Option<PeerId>) {
+        if let Some(peer) = peer {
+            if let Ok(mut peers) = self.root_refusing_peers().lock() {
+                peers.insert(peer);
+            }
+        }
     }
 
     /// Whether the peers claiming to hold the chunk at `address` prove it, by
@@ -1697,24 +1884,34 @@ mod tests {
         compute_address(&quote.pub_key) == *peer_id.as_bytes()
     }
 
-    /// Settlement version 2 pays a record by its size class, and every quote
-    /// request declares it: no unversioned request is ever sent, since a
-    /// storer asked without a version quotes as for version 1 and would
-    /// refuse the weighted payment made on it.
+    /// Every quote request declares the settlement version of the vault its
+    /// record pays: 2 for the per-quote vault, which pays a record by its
+    /// size class, and 3 for the root vault, "root proofs accepted", at the
+    /// same price. No unversioned request is ever sent, since a storer asked
+    /// without a version quotes as for version 1 and would refuse the
+    /// weighted payment made on it.
     #[test]
-    fn every_quote_request_declares_settlement_version_2() {
-        assert_eq!(CURRENT_SETTLEMENT_VERSION, 2);
+    fn every_quote_request_declares_its_vaults_settlement_version() {
+        assert_eq!(CURRENT_SETTLEMENT_VERSION, 3);
         assert_eq!(ant_protocol::MIN_SUPPORTED_SETTLEMENT_VERSION, 1);
-        let message = store_quote_message(7, [3; 32], 16 * 1024, DATA_TYPE_CHUNK);
-        assert_eq!(message.request_id, 7);
-        match message.body {
-            ChunkMessageBody::QuoteRequestV2(request) => {
-                assert_eq!(request.settlement_version, CURRENT_SETTLEMENT_VERSION);
-                assert_eq!(request.address, [3; 32]);
-                assert_eq!(request.data_size, 16 * 1024);
-                assert_eq!(request.data_type, DATA_TYPE_CHUNK);
+        for (vault, version) in [(PaymentVault::V2, 2), (PaymentVault::Root, 3)] {
+            let message = store_quote_message(
+                7,
+                [3; 32],
+                16 * 1024,
+                DATA_TYPE_CHUNK,
+                vault.settlement_version().unwrap(),
+            );
+            assert_eq!(message.request_id, 7);
+            match message.body {
+                ChunkMessageBody::QuoteRequestV2(request) => {
+                    assert_eq!(request.settlement_version, version, "{vault:?}");
+                    assert_eq!(request.address, [3; 32]);
+                    assert_eq!(request.data_size, 16 * 1024);
+                    assert_eq!(request.data_type, DATA_TYPE_CHUNK);
+                }
+                other => panic!("expected a versioned quote request, got {other:?}"),
             }
-            other => panic!("expected a versioned quote request, got {other:?}"),
         }
     }
 
@@ -2925,6 +3122,7 @@ mod tests {
         let mapped = map_quote_response(
             &peer_id,
             &[0x11; 32],
+            CURRENT_SETTLEMENT_VERSION,
             ChunkMessageBody::QuoteResponse(ChunkQuoteResponse::Error(refusal)),
         );
 
@@ -3084,6 +3282,7 @@ mod tests {
         let mapped = map_quote_response(
             &peer_id,
             &[0x11; 32],
+            CURRENT_SETTLEMENT_VERSION,
             ChunkMessageBody::QuoteResponse(ChunkQuoteResponse::Error(
                 ProtocolError::StorerUpdateRequired {
                     client_settlement_version: 2,
@@ -3127,6 +3326,8 @@ mod tests {
                     &mut bad_quotes,
                     slot,
                     &refusals,
+                    None,
+                    &mut None,
                 )
             };
 
@@ -3168,6 +3369,8 @@ mod tests {
             &mut bad_quotes,
             &mut refusal_slot,
             &SettlementRefusals::default(),
+            None,
+            &mut None,
         );
 
         assert!(outcome.is_ok());
@@ -3203,6 +3406,8 @@ mod tests {
                 &mut bad_quotes,
                 &mut refusal_slot,
                 &refusals,
+                None,
+                &mut None,
             )
             .unwrap();
         }
@@ -3240,6 +3445,8 @@ mod tests {
             &mut bad_quotes,
             &mut refusal_slot,
             &SettlementRefusals::default(),
+            None,
+            &mut None,
         );
 
         assert!(
@@ -3281,6 +3488,8 @@ mod tests {
                 &mut bad_quotes,
                 &mut refusal_slot,
                 &refusals,
+                None,
+                &mut None,
             );
         }
 
@@ -3361,32 +3570,176 @@ mod tests {
     #[test]
     fn an_incoherent_refusal_is_treated_as_a_bad_peer() {
         let peer_id = PeerId::from_bytes([0x64; 32]);
+        // The version a merkle candidate request asks: the per-quote vault's.
+        let sent = CURRENT_SETTLEMENT_VERSION.min(V2_SETTLEMENT_VERSION);
 
         // Claims to be about some other client version.
-        let wrong_echo = settlement_refusal_error(
-            &peer_id,
-            CURRENT_SETTLEMENT_VERSION.saturating_add(7),
-            CURRENT_SETTLEMENT_VERSION.saturating_add(8),
-        );
+        let wrong_echo =
+            settlement_refusal_error(&peer_id, sent.saturating_add(7), sent.saturating_add(8));
         assert!(matches!(wrong_echo, Error::Protocol(_)), "{wrong_echo:?}");
 
         // Claims a minimum that our version already satisfies.
-        let no_gap = settlement_refusal_error(
-            &peer_id,
-            CURRENT_SETTLEMENT_VERSION,
-            CURRENT_SETTLEMENT_VERSION,
-        );
+        let no_gap = settlement_refusal_error(&peer_id, sent, sent);
         assert!(matches!(no_gap, Error::Protocol(_)), "{no_gap:?}");
 
         // A coherent one is believed, and carries the upgrade instruction.
-        let real = settlement_refusal_error(
-            &peer_id,
-            CURRENT_SETTLEMENT_VERSION,
-            CURRENT_SETTLEMENT_VERSION.saturating_add(1),
-        );
+        let real = settlement_refusal_error(&peer_id, sent, sent.saturating_add(1));
         match real {
             Error::ClientUpdateRequired(msg) => assert_names_darwins_update(&msg),
             other => panic!("expected ClientUpdateRequired, got {other:?}"),
+        }
+    }
+
+    /// A record quoted for the root vault leaves root collection the moment
+    /// one of its close group answers `StorerUpdateRequired`: collection
+    /// stops, the peer is named, and the answer is never one more failed
+    /// peer. The same answer from a peer outside the close group, asked
+    /// only for fault tolerance, is an ordinary failure, and so is any
+    /// `StorerUpdateRequired` to a request for the per-quote vault.
+    #[test]
+    fn a_root_refusal_from_the_close_group_moves_the_record_and_is_never_a_failed_peer() {
+        let member = PeerId::from_bytes([0x51; 32]);
+        let extra = PeerId::from_bytes([0x52; 32]);
+        let group: HashSet<PeerId> = [member].into_iter().collect();
+        let behind = || Err(Error::StorerUpdateRequired("node behind".into()));
+        let mut quotes = Vec::new();
+        let mut already_stored = Vec::new();
+        let mut failures = Vec::new();
+        let mut bad_quotes = 0usize;
+        let mut refusal_slot: Option<Error> = None;
+        let refusals = SettlementRefusals::default();
+
+        let mut refused = None;
+        let outcome = record_store_quote_result(
+            extra,
+            Vec::new(),
+            behind(),
+            &mut quotes,
+            &mut already_stored,
+            &mut failures,
+            &mut bad_quotes,
+            &mut refusal_slot,
+            &refusals,
+            Some(&group),
+            &mut refused,
+        );
+        assert!(
+            outcome.is_ok(),
+            "an extra peer's refusal doesn't move the record"
+        );
+        assert_eq!(failures.len(), 1);
+        assert!(refused.is_none());
+
+        let outcome = record_store_quote_result(
+            member,
+            Vec::new(),
+            behind(),
+            &mut quotes,
+            &mut already_stored,
+            &mut failures,
+            &mut bad_quotes,
+            &mut refusal_slot,
+            &refusals,
+            Some(&group),
+            &mut refused,
+        );
+        assert!(matches!(outcome, Err(Error::StorerUpdateRequired(_))));
+        assert_eq!(refused, Some(member));
+        assert_eq!(failures.len(), 1, "never counted as one more failed peer");
+        assert!(refusal_slot.is_none(), "not a verdict about this client");
+
+        let mut refused = None;
+        let outcome = record_store_quote_result(
+            member,
+            Vec::new(),
+            behind(),
+            &mut quotes,
+            &mut already_stored,
+            &mut failures,
+            &mut bad_quotes,
+            &mut refusal_slot,
+            &refusals,
+            None,
+            &mut refused,
+        );
+        assert!(
+            outcome.is_ok(),
+            "a per-quote request skips a lagging storer"
+        );
+        assert!(refused.is_none());
+    }
+
+    /// A record's close group is its `CLOSE_GROUP_SIZE` peers nearest the
+    /// routing address, whatever order the peers were listed in.
+    #[test]
+    fn a_records_close_group_is_its_nearest_peers() {
+        let routing = [0u8; 32];
+        let peers = (1..=10u8)
+            .rev()
+            .map(|seed| (PeerId::from_bytes([seed; 32]), Vec::new()))
+            .collect::<Vec<_>>();
+        let group = close_group_of(&peers, &routing);
+        assert_eq!(group.len(), CLOSE_GROUP_SIZE);
+        for seed in 1..=10u8 {
+            let peer = PeerId::from_bytes([seed; 32]);
+            assert_eq!(
+                group.contains(&peer),
+                usize::from(seed) <= CLOSE_GROUP_SIZE,
+                "{seed}"
+            );
+        }
+    }
+
+    /// A refusal is compared with the version its request asked, not with
+    /// the build's: a request for the per-quote vault may ask an older
+    /// version than the build's own, and its refusal still describes it.
+    #[test]
+    fn a_refusal_is_compared_with_the_version_sent() {
+        let peer_id = PeerId::from_bytes([0x65; 32]);
+        let sent = 2;
+        let real = settlement_refusal_error_for(&peer_id, sent, sent, sent + 1);
+        assert!(matches!(real, Error::ClientUpdateRequired(_)), "{real:?}");
+        let other = settlement_refusal_error_for(&peer_id, sent, sent + 1, sent + 2);
+        assert!(matches!(other, Error::Protocol(_)), "{other:?}");
+        let mapped = map_quote_response(
+            &peer_id,
+            &[0x11; 32],
+            sent,
+            ChunkMessageBody::QuoteResponse(ChunkQuoteResponse::Error(
+                ProtocolError::ClientUpdateRequired {
+                    client_settlement_version: sent,
+                    min_settlement_version: sent + 1,
+                },
+            )),
+        );
+        assert!(matches!(mapped, Some(Err(Error::ClientUpdateRequired(_)))));
+    }
+
+    /// Each vault's quotes ask its own settlement version: the per-quote
+    /// vault's at most version 2, and the root vault's version 3, which a
+    /// build settling under an older protocol refuses to ask rather than
+    /// quote a root payment its storers might not check.
+    #[test]
+    fn each_vault_asks_its_own_settlement_version() {
+        use crate::data::client::root_payment::{
+            askable_settlement_version, ROOT_SETTLEMENT_VERSION,
+        };
+        assert_eq!(
+            PaymentVault::V2.settlement_version().unwrap(),
+            CURRENT_SETTLEMENT_VERSION.min(V2_SETTLEMENT_VERSION)
+        );
+        assert_eq!(ROOT_SETTLEMENT_VERSION, 3);
+        assert_eq!(
+            PaymentVault::Root.settlement_version().is_ok(),
+            CURRENT_SETTLEMENT_VERSION >= ROOT_SETTLEMENT_VERSION
+        );
+        assert!(askable_settlement_version(CURRENT_SETTLEMENT_VERSION + 1).is_err());
+        assert!(askable_settlement_version(CURRENT_SETTLEMENT_VERSION).is_ok());
+        if ant_protocol::MIN_SUPPORTED_SETTLEMENT_VERSION > 0 {
+            assert!(
+                askable_settlement_version(ant_protocol::MIN_SUPPORTED_SETTLEMENT_VERSION - 1)
+                    .is_err()
+            );
         }
     }
 }
