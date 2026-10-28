@@ -214,14 +214,16 @@ fn record_amount_at(at: SystemTime) -> Amount {
 
 /// Each of `paid`, the amounts paid for records whose quotes were all
 /// signed between `before` and `after`, is a record's amount on the curve
-/// of its quote's signing time: `before`'s curve or `after`'s, the same
-/// curve unless the switch fell between them.
+/// nodes quote during the upload: `before`'s curve or `after`'s, the same
+/// curve unless the switch fell between them. Which quote paid which amount
+/// isn't read here; the unit tests of `root_payment` pin that each leaf is
+/// its own quote's price.
 fn assert_priced_at_signing(paid: &[Amount], before: SystemTime, after: SystemTime) {
     let amounts = [record_amount_at(before), record_amount_at(after)];
     for amount in paid {
         assert!(
             amounts.contains(amount),
-            "paid {amount}, not a record's amount on the curve of its quote's signing time \
+            "paid {amount}, not a record's amount on the curve nodes quote during the upload \
              ({amounts:?})"
         );
     }

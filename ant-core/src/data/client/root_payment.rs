@@ -513,6 +513,101 @@ mod tests {
         assert!(second.try_lock().is_ok());
     }
 
+    /// Each leaf of a wave is its own quote's price on that quote's own
+    /// curve, at its record's weight, whatever the clock says: plans from
+    /// quotes priced on the earlier x32 curve (`calculate_price_legacy(0)`),
+    /// on the current one (`calculate_price(0)`), and from close groups
+    /// quoting both, for records of four size classes, built by
+    /// `from_quotes_within` at each record's weight, settled by
+    /// `split_vaults` and made a wave by `wave_of`: each leaf is
+    /// `weighted_amount` of the price of the quote it pays.
+    #[test]
+    fn each_leaf_is_its_own_quotes_price_at_its_records_weight_on_either_curve() {
+        use crate::data::client::batch::SingleNodeQuotePayment;
+        use ant_protocol::payment::pricing::{
+            calculate_price, calculate_price_legacy, record_weight, weighted_amount,
+        };
+        use ant_protocol::DATA_TYPE_CHUNK;
+        use std::time::Duration;
+
+        let legacy = calculate_price_legacy(0).to::<u64>();
+        let current = calculate_price(0).to::<u64>();
+        assert_ne!(legacy, current);
+        // One fixed signing time for every quote: nothing here reads the
+        // clock, and the curve a quote is on is its price alone.
+        let signed = SystemTime::UNIX_EPOCH + Duration::from_secs(1_793_000_000);
+        let groups: [&[u64]; 4] = [
+            &[legacy, legacy, legacy],
+            &[current, current, current],
+            &[legacy, current, legacy],
+            &[current, legacy, current],
+        ];
+        let sizes = [4_096, 100_000, 1_000_000, 4 * 1024 * 1024];
+        let weight = |size: usize| record_weight(DATA_TYPE_CHUNK, size);
+        let mut plans = Vec::new();
+        for (group, prices) in groups.iter().enumerate() {
+            for (class, &size) in sizes.iter().enumerate() {
+                let fill = u8::try_from(group * sizes.len() + class).unwrap();
+                let mut plan = plan_priced(&vec![fill; size], signed, prices);
+                plan.payment = SingleNodeQuotePayment::from_quotes_within(
+                    plan.peer_quotes
+                        .iter()
+                        .map(|(_, quote)| quote.clone())
+                        .collect(),
+                    weight(size),
+                    None,
+                )
+                .unwrap();
+                plan.vault = PaymentVault::Root;
+                plans.push(plan);
+            }
+        }
+        // A record paying the per-quote vault beside them: 16 root records
+        // outweigh a second transaction, so none moves.
+        plans.push(plan_priced(&[0xee; 4_096], signed, &[current]));
+        assert_eq!(split_vaults(plans.iter_mut(), |_| false, None, false), 0);
+        let roots = plans
+            .iter()
+            .filter(|plan| plan.vault == PaymentVault::Root)
+            .cloned()
+            .collect::<Vec<_>>();
+        assert_eq!(roots.len(), 16);
+
+        let wave = wave_of(&roots).unwrap();
+        assert_eq!(wave.payments().len(), roots.len());
+        for leaf in wave.payments() {
+            let (plan, quote) = roots
+                .iter()
+                .find_map(|plan| {
+                    plan.peer_quotes
+                        .iter()
+                        .find(|(_, quote)| quote.hash().0 == leaf.quote_hash)
+                        .map(|(_, quote)| (plan, quote))
+                })
+                .expect("each leaf pays a quote of one of the plans");
+            let size = usize::try_from(plan.data_size).unwrap();
+            assert_eq!(
+                leaf.amount,
+                weighted_amount(quote.price, weight(size)).unwrap(),
+                "a leaf of a {size}-byte record quoted at {}",
+                quote.price
+            );
+            assert_eq!(leaf.payee, quote.rewards_address.0 .0);
+        }
+        // Both curves are in the wave at every size, and give different
+        // amounts there, so a leaf on the wrong curve couldn't pass.
+        for size in sizes {
+            for price in [legacy, current] {
+                let amount = weighted_amount(Amount::from(price), weight(size)).unwrap();
+                assert!(wave.payments().iter().any(|leaf| leaf.amount == amount));
+            }
+            assert_ne!(
+                weighted_amount(Amount::from(legacy), weight(size)),
+                weighted_amount(Amount::from(current), weight(size))
+            );
+        }
+    }
+
     /// A plan saved before plans recorded their vault paid the per-quote
     /// vault, and one payment never pays both.
     #[test]
