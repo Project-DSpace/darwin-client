@@ -22,7 +22,8 @@
 use crate::support::runner::Case;
 use crate::support::{MiniTestnet, CLIENT_NODE, ROOT_UNAWARE_NODES};
 use ant_core::ant_listings::{
-    Envelope, Metadata, RootVault, Salt, ShownFields, DATA_PAYMENT_MADE_TOPIC,
+    Envelope, Metadata, PaymentError, ProofError, RootVault, Salt, ShownFields,
+    DATA_PAYMENT_MADE_TOPIC,
 };
 use ant_core::data::{
     compute_address, file_data_map, forget_upload_record, paid_quote_hash, proof_data_map, DataMap,
@@ -597,8 +598,13 @@ async fn a_file_with_the_default_envelope_pays_one_root_wave_and_its_record_name
         })
         .expect("the envelope's paid quote is a leaf of the wave");
     assert_eq!(proven.payment.log_index, leaf_log.log_index);
-    assert!(
-        per_quote_reader.check_proof(&record).await.is_err(),
+    // Refused for the reason a reader of the per-quote vault alone has, not
+    // an RPC failure or a transaction it can't find: it keeps only its own
+    // vault's logs of a receipt, and the per-quote vault has none paying the
+    // quote in this transaction.
+    assert_eq!(
+        per_quote_reader.check_proof(&record).await.err(),
+        Some(ProofError::Payment(PaymentError::NotPaid).to_string()),
         "a reader of the per-quote vault alone can't check a root payment"
     );
 

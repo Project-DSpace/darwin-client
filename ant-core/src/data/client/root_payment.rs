@@ -520,10 +520,13 @@ mod tests {
     /// quoting both, for records of four size classes, built by
     /// `from_quotes_within` at each record's weight, settled by
     /// `split_vaults` and made a wave by `wave_of`: each leaf is
-    /// `weighted_amount` of the price of the quote it pays.
+    /// `weighted_amount` of the price of the quote it pays, paid to that
+    /// quote's rewards address, which no other quote shares.
     #[test]
     fn each_leaf_is_its_own_quotes_price_at_its_records_weight_on_either_curve() {
         use crate::data::client::batch::SingleNodeQuotePayment;
+        use crate::data::client::upload_state::test_state::plan_paying;
+        use ant_protocol::evm::RewardsAddress;
         use ant_protocol::payment::pricing::{
             calculate_price, calculate_price_legacy, record_weight, weighted_amount,
         };
@@ -544,11 +547,21 @@ mod tests {
         ];
         let sizes = [4_096, 100_000, 1_000_000, 4 * 1024 * 1024];
         let weight = |size: usize| record_weight(DATA_TYPE_CHUNK, size);
+        // Every quote is paid to a rewards address of its own, so a leaf
+        // paying another quote's node couldn't pass.
+        let mut payees = 0x10..;
         let mut plans = Vec::new();
         for (group, prices) in groups.iter().enumerate() {
             for (class, &size) in sizes.iter().enumerate() {
                 let fill = u8::try_from(group * sizes.len() + class).unwrap();
-                let mut plan = plan_priced(&vec![fill; size], signed, prices);
+                let quotes = prices
+                    .iter()
+                    .map(|&price| {
+                        let payee = payees.next().unwrap();
+                        (price, RewardsAddress::new([payee; 20]))
+                    })
+                    .collect::<Vec<_>>();
+                let mut plan = plan_paying(&vec![fill; size], signed, &quotes);
                 plan.payment = SingleNodeQuotePayment::from_quotes_within(
                     plan.peer_quotes
                         .iter()
@@ -575,6 +588,12 @@ mod tests {
 
         let wave = wave_of(&roots).unwrap();
         assert_eq!(wave.payments().len(), roots.len());
+        let paid = wave
+            .payments()
+            .iter()
+            .map(|leaf| leaf.payee)
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(paid.len(), roots.len(), "each leaf pays a node of its own");
         for leaf in wave.payments() {
             let (plan, quote) = roots
                 .iter()

@@ -1106,16 +1106,30 @@ pub(crate) mod test_state {
         timestamp: SystemTime,
         prices: &[u64],
     ) -> ChunkPaymentPlan {
-        let address = ant_protocol::compute_address(content);
-        let peer_quotes = prices
+        let quotes = prices
             .iter()
-            .map(|price| {
+            .map(|&price| (price, RewardsAddress::new([1; 20])))
+            .collect::<Vec<_>>();
+        plan_paying(content, timestamp, &quotes)
+    }
+
+    /// A plan for `content`, with one quote at each price of `quotes`, paid
+    /// to its rewards address, each from a new node, signed at `timestamp`.
+    pub(crate) fn plan_paying(
+        content: &[u8],
+        timestamp: SystemTime,
+        quotes: &[(u64, RewardsAddress)],
+    ) -> ChunkPaymentPlan {
+        let address = ant_protocol::compute_address(content);
+        let peer_quotes = quotes
+            .iter()
+            .map(|&(price, rewards_address)| {
                 let identity = NodeIdentity::generate().unwrap();
                 let mut quote = PaymentQuote {
                     content: xor_name::XorName(address),
                     timestamp,
-                    price: Amount::from(*price),
-                    rewards_address: RewardsAddress::new([1; 20]),
+                    price: Amount::from(price),
+                    rewards_address,
                     pub_key: identity.public_key().as_bytes().to_vec(),
                     signature: Vec::new(),
                     committed_key_count: 0,

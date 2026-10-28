@@ -20,10 +20,11 @@ chain_id = 4663
 # records) go to PublicNode (`rpc_url`), then Robinhood's own RPC, then
 # ordofi; log queries go to Robinhood's RPC first, since PublicNode refuses
 # the ranged `eth_getLogs` that finding a payment whose transaction hash is
-# hidden needs, then PublicNode, then ordofi. ordofi is the last fallback for
-# every read (Dan, 2026-10-28: "just keep it as last fallback"): it answered
-# payment reads "busy" or too late in October 2026, and still answered
-# -32005 "busy" on 28 October.
+# hidden needs, then PublicNode, then ordofi. ordofi stays, as the last
+# fallback, rather than being dropped (Dan, 2026-10-28: "just keep it as last
+# fallback"), and goes last for ordinary reads too (Dan, 2026-10-28: "Make it
+# last"): it answered payment reads "busy" or too late in October 2026, and
+# still answered -32005 "busy" on 28 October.
 fallback_rpc_urls = ["https://rpc.mainnet.chain.robinhood.com", "https://rpc.ordofi.network"]
 payment_token_address = "0x511f76a3de41f000ec11ea4fd212fb3587c6cef3"
 payment_vault_address = "0xE0f627986c0438De0E314B644f3C8aA21D3f4f6B"

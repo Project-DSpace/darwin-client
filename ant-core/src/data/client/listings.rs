@@ -2633,10 +2633,12 @@ impl ListingChain {
     /// remaining fallbacks in their listed order: on the bundled network,
     /// receipts and blocks go to PublicNode first, then Robinhood's RPC,
     /// then ordofi, and log queries to Robinhood's RPC first, then
-    /// PublicNode (which refuses ranged ones), then ordofi. ordofi is last
-    /// for both (Dan, 2026-10-28: "just keep it as last fallback"), since it
-    /// answered payment reads "busy" or too late in October 2026. On the
-    /// bundled network, [`RPC_URLS_ENV`] replaces them when set.
+    /// PublicNode (which refuses ranged ones), then ordofi. ordofi stays, as
+    /// the last fallback, rather than being dropped (Dan, 2026-10-28: "just
+    /// keep it as last fallback"), and is last for ordinary reads too (Dan,
+    /// 2026-10-28: "Make it last"), since it answered payment reads "busy"
+    /// or too late in October 2026. On the bundled network, [`RPC_URLS_ENV`]
+    /// replaces them when set.
     ///
     /// # Errors
     ///
