@@ -6,7 +6,7 @@
 //! network, runs every case on it one after another, and tears it down once;
 //! the ADR-0004 cases get a committed network of their own after it. Select
 //! cases as with libtest, by name: `storage`, `envelopes`, `refusals`,
-//! `pointers` and `committed` are the groups, so
+//! `pointers`, `root_payments` and `committed` are the groups, so
 //!
 //! ```text
 //! cargo test -p ant-core --features test-utils --test e2e -- refusals
@@ -30,6 +30,9 @@
 //! - `pointers`: pointer rules as the client sees them against real nodes.
 //! - `committed`: ADR-0004 commitment-bound quotes, and the refusal of a
 //!   batch on a commitment-bound network.
+//! - `root_payments`: records paid in waves through the root vault, and
+//!   records whose close group holds a node without it paid through the
+//!   per-quote vault instead.
 
 #![allow(
     clippy::unwrap_used,
@@ -65,6 +68,8 @@ mod payment;
 mod payment_recovery;
 #[path = "e2e/pointer.rs"]
 mod pointer;
+#[path = "e2e/root_payment.rs"]
+mod root_payment;
 #[path = "e2e/security.rs"]
 mod security;
 #[path = "e2e/size_pricing.rs"]
@@ -99,6 +104,7 @@ fn main() -> std::process::ExitCode {
         ],
     ));
     cases.extend(group("pointers", [pointer::cases()]));
+    cases.extend(group("root_payments", [root_payment::cases()]));
     cases.extend(group("committed", [adr0004::cases()]));
     run(cases)
 }
