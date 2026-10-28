@@ -3051,9 +3051,11 @@ impl ListingChain {
     /// since, and doesn't look back from the quote's time again. So a
     /// payment that lands later is found as soon as it does, and a quote
     /// paid nowhere costs a round or two of log queries a time (one or two
-    /// queries, or two to four with a root vault), not a search. The kept
-    /// search is keyed by the listing's log index too, so it only ever
-    /// skips blocks holding no payment at that index.
+    /// queries, or two to four with a root vault), not a search. A reader
+    /// that also reads the root vault keys the kept search by the listing's
+    /// log index too, so it only ever skips blocks holding no payment at that
+    /// index; a reader of the per-quote vault alone keeps a search only when
+    /// it saw no payment at all, so one kept search holds for every index.
     ///
     /// # Errors
     ///
