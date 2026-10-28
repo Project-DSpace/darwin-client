@@ -36,7 +36,13 @@ Uploads from the browser core (`uploadPublicFile`, `uploadStagedPublicFile`,
 envelope: no payment record, listing or `.record`, which `darwin file upload`
 stores by default. The browser core doesn't yet read paid quotes back, as the
 native client does, and has no price ceiling option like `--max-chunk-price`.
-A page that names no payment mode pays per chunk (`single`).
+A page that names no payment mode pays per chunk (`single`). The core's uploads
+pay each record by its size class, as the native client does. A page that
+quotes with `quote_chunk` itself passes the chunk's length to
+`verifyStorageQuote` only for a quote from a node that advertises
+`size_priced_quote`, which the core then asks at the next browser protocol
+version; on any other quote it passes none and pays a full chunk's amount,
+which every node accepts.
 
 Native and WASM reads share `ant-core/src/client_engine/read.rs` and
 `client_engine/files.rs`. The engine owns XOR-ordered peer selection, bounded
@@ -204,7 +210,7 @@ needs DARWIN for storage and a little ETH on Robinhood Chain for gas.
 darwin file cost notes.txt
 # Output (an 8 KB file):
 #   Chunks: 4 (3 + 1 envelope)
-#   Cost:   1.50 DARWIN (gas: 0.000150 ETH)
+#   Cost:   0.3794 DARWIN (gas: 0.000150 ETH)
 
 # Upload (private: the data map is saved locally)
 SECRET_KEY=0x... darwin file upload notes.txt
@@ -213,14 +219,19 @@ SECRET_KEY=0x... darwin file upload notes.txt
 #     Datamap:  notes.txt.datamap
 #     Record:   notes.txt.record
 #     Chunks:   4 (3 + 1 envelope)
-#     Cost:     1.50 DARWIN (gas: 0.000005 ETH)
+#     Cost:     0.3794 DARWIN (gas: 0.000005 ETH)
 
 # Download using the local data map
 darwin file download --datamap notes.txt.datamap -o notes_copy.txt
 ```
 
-Each chunk costs three times the median quote of the nodes that store it: about 0.375 DARWIN
-on today's network, rising as nodes fill. The gas in `darwin file cost` is upstream's fixed
+Each chunk costs three times the median quote of the nodes that store it, times the weight of
+its size class. A full 4 MiB chunk weighs 1 and costs about 0.375 DARWIN on today's network; a
+chunk of 16 KiB or less, like each of the four above, weighs 259/1,024, about 0.095 DARWIN. The
+classes' tops are the powers of two from 16 KiB to 4 MiB, and a chunk pays for the top of its
+class: weight = 1/4 + 3/4 × (class top ÷ 4 MiB), so 259, 262, 268, 280, 304, 352, 448, 640 and
+1,024 in 1/1,024 of a full chunk. A pointer write pays as a 16 KiB-class record. Quotes rise as
+nodes fill, measured by the weight of what they store. The gas in `darwin file cost` is upstream's fixed
 estimate; an upload's actual gas on Robinhood Chain is far lower.
 
 ### Store and retrieve a file (local devnet)
@@ -289,7 +300,7 @@ Upload complete!
   Record:   my_data.bin.record
   Chunks:   4 (3 + 1 envelope)
   Size:     8.0 KB
-  Cost:     1.50 DARWIN (gas: 0.000005 ETH)
+  Cost:     0.3794 DARWIN (gas: 0.000005 ETH)
   Time:     6.3s
 
 Anyone can download this file with:
@@ -313,7 +324,7 @@ Upload complete!
   Record:   my_data.bin.record
   Chunks:   4 (3 + 1 envelope)
   Size:     8.0 KB
-  Cost:     1.50 DARWIN (gas: 0.000005 ETH)
+  Cost:     0.3794 DARWIN (gas: 0.000005 ETH)
   Time:     6.1s
 
 Download this file with:
@@ -342,7 +353,7 @@ Mistakes in `--hide`, `--name` or `--content-type` are reported before `SECRET_K
 **How it works:**
 1. The file is streamed through self-encryption in 8KB reads (never fully loaded into memory).
 2. Each encrypted chunk is stored on the network at its XOR content address. A chunk the nearest nodes say they already hold is skipped, unpaid, only once 4 of its 7 nearest nodes prove it by serving it: the client reads it from them one at a time and checks the bytes against the address. Claims that aren't proven are set aside and the chunk is paid for and stored as usual. So a re-run of an interrupted upload pays nothing for the chunks it already stored, and reads each of them back from 4 nodes. A new chunk is sent to its 7 nearest nodes at once, each that fails or is full replaced by the next nearest, and counts as stored once 4 of them accept it.
-3. Payment is made per chunk, in transactions of up to 64 chunks each. Batch (merkle) payments are off on the Darwin network since 2026-10-09: the DARWIN vault picks a batch's paid pool from inputs the payer chooses, so a payer can steer the payout, and a re-sent batch can be charged twice. Upstream pays uploads of 64 chunks or more in batches. After each payment the client reads every paid quote's record back from the vault. The vault keeps a quote hash's first payment and skips later ones without reverting, so someone who knew a quote hash first (such as the node that issued it) can record it with a dust payment of their own; the client's payment for it then moves no tokens. A chunk whose record isn't the client's payment (another rewards address, or less than the quote) is quoted again, which gives a new quote hash, and paid again, up to 3 times. If its quotes are occupied every time, that chunk fails, with an error starting `quotes occupied` that names the node that issued them; the rest of the upload is stored. A chunk is paid 3 times the median of its quotes. With `--max-chunk-price`, a quote asking more than the ceiling is ignored, as if its node hadn't answered, and no payment is planned on one, so a chunk costs at most 3 times the ceiling; a chunk left without a quote under it fails before anything is paid.
+3. Payment is made per chunk, in transactions of up to 64 chunks each. Batch (merkle) payments are off on the Darwin network since 2026-10-09: the DARWIN vault picks a batch's paid pool from inputs the payer chooses, so a payer can steer the payout, and a re-sent batch can be charged twice. Upstream pays uploads of 64 chunks or more in batches. After each payment the client reads every paid quote's record back from the vault. The vault keeps a quote hash's first payment and skips later ones without reverting, so someone who knew a quote hash first (such as the node that issued it) can record it with a dust payment of their own; the client's payment for it then moves no tokens. A chunk whose record isn't the client's payment (another rewards address, or less than the quote) is quoted again, which gives a new quote hash, and paid again, up to 3 times. If its quotes are occupied every time, that chunk fails, with an error starting `quotes occupied` that names the node that issued them; the rest of the upload is stored. A chunk is paid 3 times the median of its quotes, times the weight of its size class (see [Quick Start](#store-and-retrieve-a-file)): a full chunk weighs 1. Quotes are asked at settlement version 2; a node too old to price by size answers `StorerUpdateRequired` and is skipped before anything is paid. With `--max-chunk-price`, a quote asking more than the ceiling is ignored, as if its node hadn't answered, and no payment is planned on one, so a chunk costs at most 3 times the ceiling times its weight; a chunk left without a quote under it fails before anything is paid.
 4. A `DataMap` is produced that records which chunks compose the file.
 5. Unless the upload hides every payment field, is not in the index and has no name or content type, the client stores an **envelope**: a small chunk holding the data map (readable uploads) or a salted hash of it (private uploads), the name and content type, and flags saying which payment fields its listing shows and whether it is in the index. Its address is the file's address. Nodes that keep listings record the envelope's payment, so anyone with the address can check it against the chain. The envelope is paid in the same payment as the content (one payment for any upload under 64 chunks; from 64, with the chunks left after the merkle batches, or alone) and stored after every content chunk, so it never points at missing content.
 6. Without an envelope, a readable upload stores the DataMap itself as a chunk and returns its address; a private one stores nothing extra.
@@ -767,7 +778,8 @@ ant-protocol = { git = "https://github.com/Project-DSpace/darwin-client", tag = 
 ```
 
 `<tag>` is a release's tag, such as `v0.3.11+ds.1`, the same in both lines. The patch puts
-`vendor/ant-protocol`, upstream's protocol crate with this network's price multiplier, in place
+`vendor/ant-protocol`, upstream's protocol crate with this network's pricing (its price
+multiplier, and payment by record size), in place
 of the crates.io release. Cargo applies a `[patch]` only in the top-level workspace, so taking
 `ant-core` alone isn't enough, and `ant-core` doesn't compile without it. `ant-core` requires
 exactly `ant-protocol` 5.0.0, the vendored copy's version, so a later crates.io release can't

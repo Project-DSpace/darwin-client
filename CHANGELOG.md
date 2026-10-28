@@ -11,6 +11,18 @@ Our changes on top of upstream 0.3.11 (ant-core 0.13.0). Releases are tagged `vX
 ant-cli's version set to match; other builds are told apart by the commit `darwin --version`
 prints. Upstream's entries follow.
 
+- `v0.3.11+ds.4`, the pricing switch: ant-cli's version is 0.3.11+ds.4 (ant-core stays 0.13.0).
+  The client settles at version 2 and pays each record by its size class (below): a record's paid
+  quote receives 3 × the median quote × the record's weight, from 259/1,024 for a record of 16 KiB
+  or less to exactly 1 for a full 4 MiB chunk, which pays as before. A quote's price is checked
+  against a band in place of the exact price; nodes older than node release 2 answer
+  `StorerUpdateRequired` and are skipped before anything is paid. The browser core's own uploads
+  pay by class; a JavaScript caller pays the weighted amount only on a quote from a size-priced
+  `quote_chunk`, at the next browser protocol version, and a full chunk's amount otherwise. How
+  payments are made, read back and recovered is unchanged, and old clients keep working at a full
+  chunk's price. It is tested against darwin-node 0.23.0+ds.18 (`81dbac7`, node release 2, the
+  revision its tests pin). Its notes are `release-notes/v0.3.11+ds.4.md`, which say how to go back
+  to v0.3.11+ds.3.
 - `v0.3.11+ds.3`, the readers release: ant-cli's version is 0.3.11+ds.3 (ant-core stays 0.13.0).
   Every reader of payments reads two vaults, the per-quote payment vault and the root vault
   (DarwinRootVault, `0xf6675722f443132b045857546E57e35360Bb03b9` on the bundled network), which
@@ -52,7 +64,7 @@ prints. Upstream's entries follow.
   0.13.0; library users take it by the tag, README "Rust Library API"). It is tested against
   darwin-node 0.23.0+ds.16 (node release 1a, `1315dcc` on darwin-node's main), the first node
   release that declines a busy browser session quickly. Everything below is in it, apart from what
-  v0.3.11+ds.2 brings; its notes are `release-notes/v0.3.11+ds.1.md`.
+  v0.3.11+ds.2 and v0.3.11+ds.4 bring; its notes are `release-notes/v0.3.11+ds.1.md`.
 - Releases: `.github/workflows/release.yml` publishes `darwin-linux-x64.tar.gz` and its
   `SHA256SUMS.txt` for a `vX.Y.Z+ds.N` tag a person pushes, only after the tagged commit's Test run
   (the end-to-end and browser tests) and its Build run from the push to main both succeeded, and

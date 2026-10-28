@@ -1,6 +1,6 @@
 [package]
 name = "ant-cli"
-version = "0.3.11+ds.3"
+version = "0.3.11+ds.4"
 edition = "2021"
 description = "CLI (`darwin`) for the Darwin storage network: store and retrieve data."
 license = "MIT OR Apache-2.0"
