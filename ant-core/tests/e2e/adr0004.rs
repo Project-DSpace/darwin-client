@@ -29,7 +29,7 @@ use crate::support::runner::{Case, COMMITTED_KEYS};
 use crate::support::{assert_batch_refused, wallet_spend, MiniTestnet};
 use ant_core::data::client::merkle::PaymentMode;
 use ant_core::data::compute_address;
-use ant_protocol::payment::calculate_price;
+use ant_node::payment::pricing::quote_price_at;
 use ant_protocol::payment::commitment::{
     commitment_hash, verify_commitment_signature, StorageCommitment,
 };
@@ -69,8 +69,10 @@ async fn adr0004_bound_quotes_are_shipped_priced_and_resolve(testnet: Arc<MiniTe
         quotes.len()
     );
 
-    let expected_price = calculate_price(COMMITTED_KEYS as usize);
     for (peer_id, _addrs, quote, price, commitment) in &quotes {
+        // The node prices on the curve of the quote's own signing time: the
+        // earlier x32 curve before its PRICE_SWITCH_AT, the new one from it.
+        let expected_price = quote_price_at(COMMITTED_KEYS as usize, quote.timestamp);
         // Bound shape: the count is what the node committed, with a pin.
         assert_eq!(
             quote.committed_key_count, COMMITTED_KEYS,
@@ -84,7 +86,7 @@ async fn adr0004_bound_quotes_are_shipped_priced_and_resolve(testnet: Arc<MiniTe
         // the ceiling — a node cannot charge above what it can prove it stores.
         assert_eq!(
             quote.price, expected_price,
-            "quote from {peer_id} must be priced at calculate_price(committed_key_count)"
+            "quote from {peer_id} must be priced on its curve at the committed key count"
         );
         assert_eq!(*price, expected_price);
 

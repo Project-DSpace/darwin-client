@@ -5,7 +5,7 @@
 use crate::support::runner::Case;
 use crate::support::{test_client_config, MiniTestnet, CLIENT_NODE, DEFAULT_NODE_COUNT};
 use ant_core::data::{compute_address, Client};
-use ant_protocol::payment::calculate_price;
+use ant_node::payment::pricing::quote_price_at;
 use bytes::Bytes;
 use std::sync::Arc;
 use std::time::Duration;
@@ -106,8 +106,10 @@ async fn quote_collection(testnet: Arc<MiniTestnet>) {
         quotes.len()
     );
 
-    let baseline = calculate_price(0);
     for (peer_id, _addrs, quote, price, commitment) in &quotes {
+        // The node prices on the curve of the quote's own signing time: the
+        // earlier x32 curve before its PRICE_SWITCH_AT, the new one from it.
+        let baseline = quote_price_at(0, quote.timestamp);
         assert!(
             !price.is_zero(),
             "Quote price from peer {peer_id} should be > 0"
@@ -122,7 +124,7 @@ async fn quote_collection(testnet: Arc<MiniTestnet>) {
         );
         assert_eq!(
             quote.price, baseline,
-            "baseline quote must price at calculate_price(0) ({peer_id})"
+            "baseline quote must price at the node's curve at count 0 ({peer_id})"
         );
         assert!(
             commitment.is_none(),
