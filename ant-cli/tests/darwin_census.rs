@@ -1183,6 +1183,10 @@ const PAYER_READ_BACK: &str = "A payer's read-back, at the vault it paid: the pe
     wave it paid there (records, by the wave's key).";
 const PAYER_CHAIN: &str = "The reader a payer reads its paid quotes back through; it reads them \
     at the per-quote vault only (completed_payment).";
+const PAYER_ROOT_RECORDING: &str = "A payer through the root vault looks for the transaction that \
+    recorded a wave it paid (Client::root_wave_transaction): eth_getLogs at the root vault it \
+    paid alone, filtered by RootPaid and the wave's key, each log taken only once its receipt \
+    shows that vault's RootPaid naming the key.";
 
 const VAULT_READ_SITES: &[Site] = &[
     (
@@ -1331,6 +1335,13 @@ const VAULT_READ_SITES: &[Site] = &[
         "with_rpc_setup",
         1,
         BOTH_VAULTS,
+    ),
+    (
+        "ant-core/src/data/client/listings.rs",
+        "ListingChain::root_paid_transaction",
+        "\"eth_getLogs\"",
+        1,
+        PAYER_ROOT_RECORDING,
     ),
     (
         "ant-core/src/data/client/listings.rs",
