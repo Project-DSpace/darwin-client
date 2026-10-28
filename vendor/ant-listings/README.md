@@ -258,8 +258,13 @@ records each wave of payments under one key. Both log each paid quote as the
 same `DataPaymentMade` event, so neither the listing nor the proof names the
 vault: the log's emitter does, and both formats are unchanged. To find a
 payment by its quote's hash, or by its block and log index, search the logs of
-every vault in the set in one `eth_getLogs`. Of the logs in a receipt that
-would be the payment, the earliest that counts is the payment.
+every vault in the set: one `eth_getLogs` per vault, each naming that vault's
+address alone, sent together in one JSON-RPC batch, with the logs merged in
+chain order (block number, then log index). Some providers allow a far shorter
+block range when a filter names several addresses than when it names one, so a
+single query with every address can fail over a range that single-address
+queries cover. Of the logs in a receipt that would be the payment, the earliest
+that counts is the payment.
 
 A log of that shape from a contract outside the set is never a payment, since
 any contract can emit one. It is refused with an error of its own, "a payment

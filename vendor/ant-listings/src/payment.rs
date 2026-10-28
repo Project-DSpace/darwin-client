@@ -109,8 +109,13 @@ impl VaultSet {
         }
     }
 
-    /// The vaults' addresses, the per-quote vault's first: search the logs of
-    /// all of them at once, as one `eth_getLogs` with every address.
+    /// The vaults' addresses, the per-quote vault's first. To search their
+    /// logs, send one `eth_getLogs` per vault, each naming that vault's
+    /// address alone, together in one JSON-RPC batch, and merge the logs in
+    /// chain order (block number, then log index). Some providers allow a far
+    /// shorter block range when a filter names several addresses than when
+    /// it names one, so a single query with every address can fail over a
+    /// range that single-address queries cover.
     #[must_use]
     pub fn addresses(&self) -> Vec<[u8; 20]> {
         std::iter::once(self.v2)
@@ -302,9 +307,10 @@ pub enum Lookup {
     },
     /// The quote is shown but the tx hash is hidden: find the vaults'
     /// `DataPaymentMade` logs whose topic 3 is `quote_hash` (one `eth_getLogs`
-    /// on every address in the [`VaultSet`], topics
-    /// `[DATA_PAYMENT_MADE_TOPIC, *, *, quote_hash]`), then fetch the receipt
-    /// of the transaction that emitted each.
+    /// per address in the [`VaultSet`], each with topics
+    /// `[DATA_PAYMENT_MADE_TOPIC, *, *, quote_hash]`, sent in one batch and
+    /// merged in chain order, as [`VaultSet::addresses`] says), then fetch the
+    /// receipt of the transaction that emitted each.
     ///
     /// Search `block_number` alone if given. Otherwise search backwards from
     /// the block at `not_after` (or the latest block) to the block at
@@ -337,8 +343,9 @@ pub enum Lookup {
     },
     /// The block number and log index are shown, but neither the tx hash nor
     /// the quote: find the vaults' `DataPaymentMade` log at `log_index` in
-    /// block `block_number` (one `eth_getLogs` on every address in the
-    /// [`VaultSet`] for that block), then fetch the receipt of the
+    /// block `block_number` (one `eth_getLogs` per address in the
+    /// [`VaultSet`] for that block, sent in one batch and merged in chain
+    /// order, as [`VaultSet::addresses`] says), then fetch the receipt of the
     /// transaction that emitted it.
     BlockLog {
         /// The listing's block number.

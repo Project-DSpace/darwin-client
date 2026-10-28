@@ -7993,6 +7993,80 @@ mod tests {
         }
     }
 
+    /// Fault injection: a reader with a root vault searches for a quote
+    /// whose only payment on the chain is one the listing doesn't show (at
+    /// another log index). The search found none the listing shows, so it
+    /// keeps how far it went through final blocks, as a search that found
+    /// nothing does. Decided again, with the same key, the search goes on
+    /// from the block after the last final one it went through, not from the
+    /// quote's time, and finds the payment the listing shows, which landed
+    /// since.
+    #[tokio::test]
+    async fn a_root_readers_search_that_finds_only_another_payment_goes_on_where_it_stopped() {
+        let quote = signed_quote([0x36; 32], 30);
+        let quote_hash = quote.hash().0;
+        let mut chain = MockChain::with_blocks(1_000, PAST);
+        chain.finalized = Some(900);
+        chain.add_receipt(payment_in(&quote, ROOT_VAULT.address, 0xb1, 300, 7));
+        let mock = Arc::new(Mutex::new(chain));
+        let dir = tempfile::tempdir().unwrap();
+        let store = test_store(dir.path());
+        let chain = reader(serve(Arc::clone(&mock)).await)
+            .unpaced()
+            .with_store(&store)
+            .unwrap()
+            .with_root_vault(ROOT_VAULT);
+        let lookup = Lookup::Quote {
+            quote_hash,
+            block_number: None,
+            search_from: PAST + 400,
+            not_after: None,
+        };
+        let shown = ListingPayment {
+            log_index: Some(4),
+            ..ListingPayment::default()
+        };
+        let key: SearchKey = (quote_hash, PAST + 400, None, None);
+        let log_queries = || mock.lock().unwrap().calls_to("eth_getLogs");
+
+        assert_eq!(chain.fetch(&lookup, &shown).await.unwrap(), Vec::new());
+        // Forwards from the quote's time, then back from it: a query per
+        // vault each time.
+        assert_eq!(log_queries(), 4);
+        // Kept as far as the finalized block, with the search back made.
+        assert_eq!(
+            chain.searched_before(&key),
+            Some(Searched {
+                through: Some(900),
+                back: true,
+            })
+        );
+
+        // The payment the listing shows lands after the blocks searched.
+        let paid = payment_in(&quote, ROOT_VAULT.address, 0xb2, 950, 4);
+        mock.lock().unwrap().add_receipt(paid.clone());
+        let filters_before = mock.lock().unwrap().log_filters.len();
+        assert_eq!(
+            chain.fetch(&lookup, &shown).await.unwrap(),
+            vec![(Some(paid), Some(PAST + 1_900))]
+        );
+        let filters = mock.lock().unwrap().log_filters[filters_before..].to_vec();
+        assert_eq!(filters.len(), 2, "one round: a query per vault");
+        for filter in &filters {
+            assert_eq!(filter["fromBlock"], json!(quantity(901)));
+            assert_eq!(filter["toBlock"], json!(quantity(999)));
+        }
+        // Found: the search is forgotten, and the payment is held with the
+        // quote's facts.
+        assert_eq!(chain.searched_before(&key), None);
+        let facts = chain.facts.as_ref().unwrap();
+        assert!(facts.quote(&quote_hash).unwrap().value.contains(&VaultLog {
+            tx_hash: [0xb2; 32],
+            block_number: 950,
+            log_index: 4,
+        }));
+    }
+
     #[tokio::test]
     async fn every_call_has_its_own_id_and_calls_known_together_go_in_batches_of_100() {
         let mut mock = MockChain::with_blocks(200, PAST);

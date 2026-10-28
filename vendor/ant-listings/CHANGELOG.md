@@ -31,7 +31,10 @@ every reader of payments to this version, indexers included, before then.
   total, then one transfer of the vault's token from the payer to each of the
   wave's payees, of the sum of its payments.
 - Searches by quote hash, and by block and log index, cover every vault in the
-  set in one `eth_getLogs` (`VaultSet::addresses`).
+  set (`VaultSet::addresses`): one single-address `eth_getLogs` per vault, sent
+  in one batch and merged in chain order (block number, then log index), since
+  some providers allow a far shorter block range for a filter naming several
+  addresses.
 
 ### Added
 
