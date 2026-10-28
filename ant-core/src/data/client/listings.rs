@@ -2629,14 +2629,14 @@ impl ListingChain {
     ///
     /// It reads through `network`'s RPC and then the RPCs it falls back to
     /// ([`crate::config::fallback_rpc_urls`]), except that log queries go to
-    /// the last fallback first, then to the network's own RPC and the
-    /// remaining fallbacks in their listed order (with two fallbacks, as on
-    /// the bundled network, this puts the first fallback last): on the bundled
-    /// network, receipts and blocks go to PublicNode first, then ordofi, then
-    /// Robinhood's RPC, and log queries to Robinhood's RPC first, then
-    /// PublicNode (which refuses ranged ones), then ordofi, which answered
-    /// payment reads "busy" or too late in October 2026. On the bundled
-    /// network, [`RPC_URLS_ENV`] replaces them when set.
+    /// the first fallback first, then to the network's own RPC, then the
+    /// remaining fallbacks in their listed order: on the bundled network,
+    /// receipts and blocks go to PublicNode first, then Robinhood's RPC,
+    /// then ordofi, and log queries to Robinhood's RPC first, then
+    /// PublicNode (which refuses ranged ones), then ordofi. ordofi is last
+    /// for both (Dan, 2026-10-28: "just keep it as last fallback"), since it
+    /// answered payment reads "busy" or too late in October 2026. On the
+    /// bundled network, [`RPC_URLS_ENV`] replaces them when set.
     ///
     /// # Errors
     ///
@@ -4148,10 +4148,10 @@ impl ListingChain {
 /// `listed` (the value of [`RPC_URLS_ENV`]), those listed, in that order for
 /// everything, each checked to be on the network's chain; otherwise the
 /// network's own RPC and then the RPCs it falls back to
-/// ([`crate::config::fallback_rpc_urls`]), log queries going to the last
-/// fallback first, then to the network's own RPC and the remaining
+/// ([`crate::config::fallback_rpc_urls`]), log queries going to the first
+/// fallback first, then to the network's own RPC, then the remaining
 /// fallbacks in their listed order ([`fallback_logs_order`]; on the bundled
-/// network, with two fallbacks, this puts the first fallback last).
+/// network, with two fallbacks, the last one, ordofi's, stays last).
 fn rpc_setup(network: &EvmNetwork, listed: Option<&str>) -> std::result::Result<RpcSetup, String> {
     if let (Some(chain_id), Some(listed)) = (crate::config::chain_id(network), listed) {
         let urls: Vec<String> = listed.split_whitespace().map(str::to_string).collect();
@@ -4219,14 +4219,13 @@ fn span_answers(urls: &[String]) -> Vec<usize> {
 }
 
 /// The order of log queries over `len` RPCs (a network's own RPC and then
-/// its fallbacks), as indexes: the last fallback first, then the network's
-/// own RPC and the remaining fallbacks in their listed order; `None` when
+/// its fallbacks), as indexes: the first fallback first, then the network's
+/// own RPC, then the remaining fallbacks in their listed order; `None` when
 /// there is no fallback.
 fn fallback_logs_order(len: usize) -> Option<Vec<usize>> {
     (len > 1).then(|| {
-        let last = len - 1;
-        let mut order = vec![last];
-        order.extend(0..last);
+        let mut order = vec![1, 0];
+        order.extend(2..len);
         order
     })
 }
@@ -8893,17 +8892,17 @@ mod tests {
         let host = |index: usize| crate::data::client::listings_rpc::rpc_host(&setup.urls[index]);
         assert_eq!(setup.urls.len(), 3);
         assert_eq!(host(0), "robinhood-rpc.publicnode.com");
-        assert_eq!(host(1), "rpc.ordofi.network");
-        assert_eq!(host(2), "rpc.mainnet.chain.robinhood.com");
-        assert_eq!(setup.logs_order, Some(vec![2, 0, 1]));
+        assert_eq!(host(1), "rpc.mainnet.chain.robinhood.com");
+        assert_eq!(host(2), "rpc.ordofi.network");
+        assert_eq!(setup.logs_order, Some(vec![1, 0, 2]));
         // ordofi's busy answers to log queries are span answers.
-        assert_eq!(setup.span_answers, vec![1]);
+        assert_eq!(setup.span_answers, vec![2]);
         assert_eq!(setup.chain_id, None);
         let rpc = Rpc::new(setup.urls, setup.logs_order, &setup.span_answers, None).unwrap();
-        // Calls: PublicNode, ordofi, Robinhood's RPC.
+        // Calls: PublicNode, Robinhood's RPC, ordofi last.
         assert_eq!(rpc.order(Kind::Chain), vec![0, 1, 2]);
         // Log queries: Robinhood's RPC, PublicNode, ordofi last.
-        assert_eq!(rpc.order(Kind::Logs), vec![2, 0, 1]);
+        assert_eq!(rpc.order(Kind::Logs), vec![1, 0, 2]);
     }
 
     #[test]
@@ -8932,17 +8931,18 @@ mod tests {
     }
 
     #[test]
-    fn log_queries_go_to_the_last_fallback_first_then_the_rest_in_listed_order() {
+    fn log_queries_go_to_the_first_fallback_first_then_the_rest_in_listed_order() {
         // No fallback: the same order as everything else.
         assert_eq!(fallback_logs_order(0), None);
         assert_eq!(fallback_logs_order(1), None);
         // One fallback: it comes first.
         assert_eq!(fallback_logs_order(2), Some(vec![1, 0]));
-        // Two (the bundled network): the first fallback comes last.
-        assert_eq!(fallback_logs_order(3), Some(vec![2, 0, 1]));
-        // Three: the last fallback first, then the network's own RPC and
-        // the first two fallbacks in their listed order.
-        assert_eq!(fallback_logs_order(4), Some(vec![3, 0, 1, 2]));
+        // Two (the bundled network): the first fallback first, then the
+        // network's own RPC, and the last fallback stays last.
+        assert_eq!(fallback_logs_order(3), Some(vec![1, 0, 2]));
+        // Three: the first fallback first, then the network's own RPC, then
+        // the other two fallbacks in their listed order.
+        assert_eq!(fallback_logs_order(4), Some(vec![1, 0, 2, 3]));
     }
 
     #[test]

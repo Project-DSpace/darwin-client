@@ -6,12 +6,12 @@
 //!   ([`Kind`]), on to the next whenever one fails it, and the next call
 //!   starts at the first again. Log queries have an order of their own. On
 //!   the bundled network, receipts and blocks go to the network's own RPC
-//!   (PublicNode's) first, then ordofi's, then Robinhood's RPC; log queries
-//!   go to Robinhood's RPC first, then PublicNode's, then ordofi's last,
-//!   since ordofi answered payment reads "busy" or too late in October
-//!   2026. A provider that refuses a kind of call outright (HTTP 403, as
-//!   PublicNode refuses ranged `eth_getLogs`) is asked last for that kind
-//!   for the next [`BUSY_MAX`], then in its place again.
+//!   (PublicNode's) first, then Robinhood's RPC, then ordofi's; log queries
+//!   go to Robinhood's RPC first, then PublicNode's, then ordofi's. ordofi's
+//!   is last for both, since it answered payment reads "busy" or too late in
+//!   October 2026. A provider that refuses a kind of call outright (HTTP
+//!   403, as PublicNode refuses ranged `eth_getLogs`) is asked last for that
+//!   kind for the next [`BUSY_MAX`], then in its place again.
 //! - **Batches.** Calls known together go to a provider in one request, a
 //!   JSON-RPC batch of up to [`RPC_BATCH`], and every call carries an id of
 //!   its own, unique for the reader's life.
@@ -938,12 +938,12 @@ mod tests {
     async fn a_busy_answer_to_a_log_query_holds_off_every_provider_but_ordofi() {
         let filter = json!({ "fromBlock": "0x0", "toBlock": "0x9" });
         let logs_call = || Call::new("eth_getLogs", json!([filter]));
-        // The bundled network: log queries to Robinhood's RPC (2), then
-        // PublicNode's (0), then ordofi's (1) last. Listed in RPC_URLS as
+        // The bundled network: log queries to Robinhood's RPC (1), then
+        // PublicNode's (0), then ordofi's (2) last. Listed in RPC_URLS as
         // the gateway's README gives them: ordofi's (0), Robinhood's (1),
         // PublicNode's (2), in that order for everything, so PublicNode's,
         // not ordofi's, is asked last for log queries.
-        for (logs_order, ordofi, others) in [(Some(vec![2, 0, 1]), 1, [2, 0]), (None, 0, [1, 2])] {
+        for (logs_order, ordofi, others) in [(Some(vec![1, 0, 2]), 2, [1, 0]), (None, 0, [1, 2])] {
             // Any other provider, over its limit, is held off, wherever it is
             // in the order...
             for other in others {
