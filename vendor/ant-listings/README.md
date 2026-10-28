@@ -1,7 +1,7 @@
-# ant-listings
+# darwin-listings
 
-Envelopes and listings for storage networks built on Autonomi's protocol
-(`ant-protocol`).
+The `ant-listings` crate: envelopes and listings for storage networks built on
+`ant-protocol`.
 
 An upload makes three independent choices:
 

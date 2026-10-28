@@ -16,7 +16,12 @@ prints. Upstream's entries follow.
   on the bundled network), which records each wave of payments under one key. `ListingChain::new`
   reads both on the bundled network, so the listings producer, `darwin file verify`, listing
   lookups and envelope records accept a payment from either vault, each checked by the vault whose
-  log it is; one `eth_getLogs` asks both addresses. Kept receipts are keyed by the vaults read.
+  log it is. Each vault is asked in its own `eth_getLogs` naming one address, both sent in one
+  batch: Robinhood's RPC allows 10,000,000 blocks per log query with one value in each filter
+  position but only 100,000 when any position is a list, so a list of both addresses would fail a
+  quote's search on its first query. Kept receipts are keyed by the vaults read. A root vault can
+  record a quote again in a later wave, so a reader with one searches again when none of a
+  quote's kept payments is the one a listing shows, and keeps what it finds beside them.
   Nothing in this client pays the root vault, and no price, quote or payment changes.
   `vendor/ant-listings` is darwin-listings 0.4.0. Readers that aren't updated (older darwin-listings,
   older CLIs, other indexers) will report root-paid listings and upload proofs as unpaid until they

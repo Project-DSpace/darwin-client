@@ -12,9 +12,12 @@
 //!     a root vault keeps its receipts and quotes' payments apart from a
 //!     reader of the per-quote vault alone, whose receipts hold fewer logs;
 //!   - a block's timestamp;
-//!   - a quote's payments, as log queries found them: the vault records a
-//!     quote's payment once and skips any repeat, so once found they are all
-//!     it will have;
+//!   - a quote's payments, as log queries found them. The per-quote vault
+//!     records a quote's payment once and skips any repeat, but a root vault
+//!     can record a quote again in a later wave, so a reader with a root
+//!     vault takes the kept payments as what was found so far, not as all a
+//!     quote will have: where none of them is the payment a listing shows,
+//!     it searches again and keeps what it finds beside them;
 //!   - the transaction of the vault's log at a block and log index.
 //!
 //! A fact is used as soon as it is read. It is kept for good only once its
@@ -375,18 +378,20 @@ impl Facts {
         })
     }
 
-    /// The payments of `quote_hash`, kept or held.
+    /// The payments of `quote_hash`, held or kept. Held ones come first: a
+    /// quote is held again only after a search found payments the kept ones
+    /// lack, and is held with the kept ones too, so it holds the most found.
     pub(crate) fn quote(&self, quote_hash: &[u8; 32]) -> Option<Known<Vec<VaultLog>>> {
-        if let Some(payments) = self.kept_quote(quote_hash) {
+        if let Some(payments) = self.held().quotes.get(quote_hash) {
             return Some(Known {
-                value: payments,
-                kept: true,
+                value: payments.clone(),
+                kept: false,
                 source: None,
             });
         }
-        self.held().quotes.get(quote_hash).map(|payments| Known {
-            value: payments.clone(),
-            kept: false,
+        self.kept_quote(quote_hash).map(|payments| Known {
+            value: payments,
+            kept: true,
             source: None,
         })
     }
