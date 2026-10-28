@@ -101,7 +101,9 @@ async fn put_and_check(client: &Client, testnet: &MiniTestnet, len: usize, seed:
 
 async fn each_chunk_pays_its_class_and_is_stored(testnet: Arc<MiniTestnet>) {
     let client = testnet.client();
-    assert_eq!(ant_protocol::CURRENT_SETTLEMENT_VERSION, 2);
+    // Version 2 pays by size class, and version 3 (root proofs accepted)
+    // keeps its price rule.
+    assert_eq!(ant_protocol::CURRENT_SETTLEMENT_VERSION, 3);
     let class_top = 256 * 1024;
     for (len, seed) in [
         // The smallest class.

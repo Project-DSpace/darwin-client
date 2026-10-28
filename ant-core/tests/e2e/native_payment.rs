@@ -341,7 +341,9 @@ async fn a_journaled_payment_saved_before_the_switch_reconciles_with_no_new_tran
     use ant_core::data::client::batch::SingleNodeQuotePayment;
     use ant_protocol::payment::pricing::record_weight;
 
-    assert_eq!(ant_protocol::CURRENT_SETTLEMENT_VERSION, 2);
+    // Version 2 pays by size class, and version 3 (root proofs accepted)
+    // keeps its price rule.
+    assert_eq!(ant_protocol::CURRENT_SETTLEMENT_VERSION, 3);
     let chain = Testnet::new().await.unwrap();
     let wallet = Wallet::new_from_private_key(
         chain.to_network(),
