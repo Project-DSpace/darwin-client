@@ -130,7 +130,10 @@ pub const NEAREST_NODES: usize = CLOSE_GROUP_SIZE;
 /// refuses a wider range.
 const MIN_LOG_RANGE: u64 = 64;
 
-/// The most `eth_getLogs` calls one search for a quote's payment makes.
+/// The most rounds of log queries one search for a quote's payment makes.
+/// A round is one `eth_getLogs` call for a reader of the per-quote vault
+/// alone, and a batch of two, one per vault, for a reader with a root vault
+/// ([`ListingChain::vault_logs`]): at most 64 or 128 calls.
 const MAX_LOG_CALLS: usize = 64;
 
 /// The fewest blocks each `eth_getLogs` call covers when a search for a
@@ -2515,10 +2518,14 @@ pub struct ListingChain {
     searched: Mutex<HashMap<SearchKey, Searched>>,
 }
 
-/// What a search for a quote's payments looks through: the quote's hash,
-/// and the search's `search_from`, `not_after` and shown block timestamp
-/// ([`ListingChain::fetch`]).
-type SearchKey = ([u8; 32], u64, Option<u64>, Option<u64>);
+/// What a search for a quote's payments looks for and through: the
+/// quote's hash, the search's `search_from` and `not_after`, and the shown
+/// block timestamp and log index ([`ListingChain::fetch`]). With the log
+/// index in it, how far a search went says only that no payment at that
+/// index is in the blocks searched, whatever happened since to the other
+/// payments it came across: a listing showing another index searches on
+/// its own.
+type SearchKey = ([u8; 32], u64, Option<u64>, Option<u64>, Option<u64>);
 
 /// How far a search for a quote's payments that found none went
 /// ([`ListingChain::search_quote_logs`]).
@@ -2526,7 +2533,8 @@ type SearchKey = ([u8; 32], u64, Option<u64>, Option<u64>);
 struct Searched {
     /// The last block searched forwards from the quote's time, with every
     /// block before it from there: none of them holds a payment of the
-    /// quote. Final blocks only, once kept: a final block can't gain one.
+    /// quote at the key's log index (any, where it has none). Final blocks
+    /// only, once kept: a final block can't gain one.
     through: Option<u64>,
     /// Whether the search back from the quote's time was made.
     back: bool,
@@ -2796,8 +2804,9 @@ impl ListingChain {
     }
 
     /// This reader, reading the payments of the root vault `root` beside
-    /// the per-quote vault's: each log query asks both addresses in one
-    /// `eth_getLogs`, and a payment is checked by the vault whose log it is
+    /// the per-quote vault's: each vault is asked in its own `eth_getLogs`,
+    /// both in one batch ([`Self::vault_logs`]), and a payment is checked by
+    /// the vault whose log it is
     /// (`ant_listings::VaultSet`). Payments to the root vault are recorded
     /// a wave at a time; its token's transfers show what each payee got.
     #[must_use]
@@ -3023,7 +3032,10 @@ impl ListingChain {
     /// range with such a payment, since the earliest payment is the one that
     /// counts; if that finds nothing, it runs backwards from `search_from`.
     /// A shown timestamp narrows the search to the blocks of that second
-    /// instead. Either way it makes at most 64 log queries. The blocks at a
+    /// instead. Either way it makes at most 64 rounds of log queries
+    /// ([`MAX_LOG_CALLS`]): 64 queries for a reader of the per-quote vault
+    /// alone, 128 for one with a root vault, which asks each vault in its
+    /// own query of a round. The blocks at a
     /// time are found as darwin-node finds them: between the nearest blocks
     /// already read, guessed from their timestamps. A quote's payments, once
     /// found and final, are kept with a store. A reader of the per-quote
@@ -3038,7 +3050,10 @@ impl ListingChain {
     /// decided again, it goes on forwards from there through the blocks
     /// since, and doesn't look back from the quote's time again. So a
     /// payment that lands later is found as soon as it does, and a quote
-    /// paid nowhere costs a log query or two a time, not a search.
+    /// paid nowhere costs a round or two of log queries a time (one or two
+    /// queries, or two to four with a root vault), not a search. The kept
+    /// search is keyed by the listing's log index too, so it only ever
+    /// skips blocks holding no payment at that index.
     ///
     /// # Errors
     ///
@@ -3089,8 +3104,13 @@ impl ListingChain {
                                 (at_log_index(seen.clone(), shown.log_index), seen)
                             }
                             None => {
-                                let key =
-                                    (quote_hash, search_from, not_after, shown.block_timestamp);
+                                let key = (
+                                    quote_hash,
+                                    search_from,
+                                    not_after,
+                                    shown.block_timestamp,
+                                    shown.log_index,
+                                );
                                 let before = self.searched_before(&key);
                                 let (logs, seen, searched) = self
                                     .search_quote_logs(
@@ -3108,8 +3128,15 @@ impl ListingChain {
                                 // reader with a root vault searches again
                                 // while none found is the one the listing
                                 // shows, so it keeps how far it went until
-                                // then: payments it came across are held
-                                // below, and their blocks hold nothing new.
+                                // then. That is all it says: the blocks it
+                                // went through hold no payment at the
+                                // listing's log index, which is in the key.
+                                // The payments it came across at others are
+                                // held below, but may be dropped before they
+                                // are kept (a receipt no second provider
+                                // confirms, a failed write); a listing
+                                // showing one of them has its own key, and
+                                // searches from the quote's time.
                                 let found_none = match self.vaults.root {
                                     Some(_) => logs.is_empty(),
                                     None => seen.is_empty(),
@@ -8026,7 +8053,7 @@ mod tests {
             log_index: Some(4),
             ..ListingPayment::default()
         };
-        let key: SearchKey = (quote_hash, PAST + 400, None, None);
+        let key: SearchKey = (quote_hash, PAST + 400, None, None, Some(4));
         let log_queries = || mock.lock().unwrap().calls_to("eth_getLogs");
 
         assert_eq!(chain.fetch(&lookup, &shown).await.unwrap(), Vec::new());
@@ -8065,6 +8092,87 @@ mod tests {
             block_number: 950,
             log_index: 4,
         }));
+    }
+
+    /// Fault injection: a reader with a root vault and one RPC searches for
+    /// a quote for a listing showing log index 4, and comes across only the
+    /// quote's payment at log index 7, which it holds. The search found none
+    /// the listing shows, so how far it went is kept. No second provider
+    /// confirms that payment's receipt, so the held payment is dropped once
+    /// final, not kept. A listing copy with the same quote, `search_from`
+    /// and timestamp showing log index 7 then searches from the quote's
+    /// time, not from where the first search stopped, and finds the payment
+    /// at block 300: the kept search said only that no payment at index 4
+    /// is in the blocks it went through.
+    #[tokio::test]
+    async fn a_root_readers_kept_search_never_skips_a_payment_it_passed_that_was_dropped() {
+        let quote = signed_quote([0x37; 32], 30);
+        let quote_hash = quote.hash().0;
+        let mut chain = MockChain::with_blocks(1_000, PAST);
+        chain.finalized = Some(900);
+        let passed = payment_in(&quote, ROOT_VAULT.address, 0xb3, 300, 7);
+        chain.add_receipt(passed.clone());
+        let mock = Arc::new(Mutex::new(chain));
+        let dir = tempfile::tempdir().unwrap();
+        let store = test_store(dir.path());
+        let chain = reader(serve(Arc::clone(&mock)).await)
+            .unpaced()
+            .with_store(&store)
+            .unwrap()
+            .with_root_vault(ROOT_VAULT);
+        let lookup = Lookup::Quote {
+            quote_hash,
+            block_number: None,
+            search_from: PAST + 400,
+            not_after: None,
+        };
+        let shown_other = ListingPayment {
+            log_index: Some(4),
+            ..ListingPayment::default()
+        };
+        assert_eq!(
+            chain.fetch(&lookup, &shown_other).await.unwrap(),
+            Vec::new()
+        );
+        assert_eq!(
+            chain.searched_before(&(quote_hash, PAST + 400, None, None, Some(4))),
+            Some(Searched {
+                through: Some(900),
+                back: true,
+            })
+        );
+        // One RPC: no second provider confirms the passed payment's receipt,
+        // so the quote's held payments were dropped once final, not kept.
+        let facts = chain.facts.as_ref().unwrap();
+        assert!(facts.quote(&quote_hash).is_none());
+
+        let shown_passed = ListingPayment {
+            log_index: Some(7),
+            ..ListingPayment::default()
+        };
+        assert_eq!(
+            chain.searched_before(&(quote_hash, PAST + 400, None, None, Some(7))),
+            None
+        );
+        let filters_before = mock.lock().unwrap().log_filters.len();
+        assert_eq!(
+            chain.fetch(&lookup, &shown_passed).await.unwrap(),
+            vec![(Some(passed), Some(PAST + 600))]
+        );
+        // Searched from the quote's time (block 200), through block 300.
+        let filters = mock.lock().unwrap().log_filters[filters_before..].to_vec();
+        assert!(!filters.is_empty());
+        for filter in &filters {
+            assert_eq!(filter["fromBlock"], json!(quantity(200)));
+        }
+        // The kept search for log index 4 is untouched: it still holds.
+        assert_eq!(
+            chain.searched_before(&(quote_hash, PAST + 400, None, None, Some(4))),
+            Some(Searched {
+                through: Some(900),
+                back: true,
+            })
+        );
     }
 
     #[tokio::test]
