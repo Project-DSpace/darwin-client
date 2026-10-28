@@ -11,6 +11,23 @@ Our changes on top of upstream 0.3.11 (ant-core 0.13.0). Releases are tagged `vX
 ant-cli's version set to match; other builds are told apart by the commit `darwin --version`
 prints. Upstream's entries follow.
 
+- `v0.3.11+ds.6`, root payments: ant-cli's version is 0.3.11+ds.6 (ant-core stays 0.13.0). A
+  client can pay through the root vault (DarwinRootVault, `0xf6675722f443132b045857546E57e35360Bb03b9`
+  on the bundled network), opting in with `darwin --root-payments` or the library's
+  `Client::with_root_payments`: a payment's records are paid as one wave in one transaction, the
+  vault keeps one record for the wave under its key, and each record's proof (tag 0x03) carries its
+  leaf, its place and its path. Root-paid records are quoted at settlement version 3, others at
+  version 2. Each record falls back on its own to today's payment vault when its close group holds
+  a node that can't check a root proof; a payment pays both vaults only when at least 3 of its
+  records pay root, and the envelope never pays alone in either. An envelope paid in a root wave
+  gets a payment record checked against the root vault, naming the transaction that recorded the
+  wave. Without the flag, every payment goes through today's payment vault, which stays the
+  default. Quotes on either price curve of v0.3.11+ds.5 are accepted. A checkpoint holding a root
+  plan or proof is written in a second format, which older clients refuse. Payment reads on the
+  bundled network go to PublicNode, then Robinhood's RPC, then ordofi last (Dan, 2026-10-28); log
+  queries keep Robinhood's RPC, PublicNode, then ordofi. It is tested against darwin-node
+  0.23.0+ds.20 (`363640e`), the revision its tests pin. Its notes are
+  `release-notes/v0.3.11+ds.6.md`.
 - `v0.3.11+ds.5`, the price curve: ant-cli's version is 0.3.11+ds.5 (ant-core stays 0.13.0). The
   vendored `calculate_price` is 100 DARWIN per GB of full chunks on empty nodes (0.1396736 DARWIN a
   quote) with divisor 2,000 (Dan, 2026-10-28); every quote check (native, merkle and browser)
