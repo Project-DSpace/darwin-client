@@ -1181,8 +1181,10 @@ const LOGS_KIND: &str = "Sorts RPC calls by method, to send log queries to the R
 const PAYER_READ_BACK: &str = "A payer's read-back, at the vault it paid: the per-quote vault's \
     record of a quote this client paid there (completedPayments), or the root vault's record of a \
     wave it paid there (records, by the wave's key).";
-const PAYER_CHAIN: &str = "The reader a payer reads its paid quotes back through; it reads them \
-    at the per-quote vault only (completed_payment).";
+const PAYER_CHAIN: &str = "The reader a payer reads its own payments back through: at the \
+    per-quote vault, its record of each quote paid there (completed_payment); at the root vault \
+    the payer paid, its record of a wave paid there (root_record) and the transaction that \
+    recorded the wave (root_paid_in, root_paid_transaction).";
 const PAYER_ROOT_RECORDING: &str = "A payer through the root vault looks for the transaction that \
     recorded a wave it paid (Client::root_wave_transaction): eth_getLogs at the root vault it \
     paid alone, filtered by RootPaid and the wave's key, each log taken only once its receipt \
