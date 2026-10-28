@@ -133,6 +133,7 @@ const VAULT_READS: Counting = &[
     (None, "check_proof"),
     (None, "completed_payment"),
     (None, "root_record"),
+    (None, "root_paid_in"),
     (None, "\"eth_getLogs\""),
 ];
 
@@ -1189,6 +1190,10 @@ const PAYER_ROOT_RECORDING: &str = "A payer through the root vault looks for the
     recorded a wave it paid (Client::root_wave_transaction): eth_getLogs at the root vault it \
     paid alone, filtered by RootPaid and the wave's key, each log taken only once its receipt \
     shows that vault's RootPaid naming the key.";
+const PAYER_ROOT_RECEIPT: &str = "A payer through the root vault reads a transaction's receipt \
+    for that vault's RootPaid log naming the key of a wave it paid (ListingChain::root_paid_in): \
+    its own payment's transaction, the one that replaced it, or one a RootPaid log search found, \
+    at the root vault it paid alone.";
 
 const VAULT_READ_SITES: &[Site] = &[
     (
@@ -1340,6 +1345,13 @@ const VAULT_READ_SITES: &[Site] = &[
     ),
     (
         "ant-core/src/data/client/listings.rs",
+        "ListingChain::root_paid_among",
+        "root_paid_in",
+        1,
+        PAYER_ROOT_RECEIPT,
+    ),
+    (
+        "ant-core/src/data/client/listings.rs",
         "ListingChain::root_paid_transaction",
         "\"eth_getLogs\"",
         1,
@@ -1484,6 +1496,13 @@ const VAULT_READ_SITES: &[Site] = &[
         "completed_payment",
         1,
         PAYER_READ_BACK,
+    ),
+    (
+        "ant-core/src/data/client/occupied.rs",
+        "recording_transaction_via",
+        "root_paid_in",
+        2,
+        PAYER_ROOT_RECEIPT,
     ),
 ];
 
@@ -3393,7 +3412,8 @@ fn every_payment_reader_reads_the_vault_set() {
          by the vault whose log it is. A reader of one vault alone is built only for another \
          network or in tests. A payer reads only the vault it paid (completed_payment reads the \
          per-quote vault's record of a quote it paid, root_record the root vault's record of a \
-         wave it paid).",
+         wave it paid, root_paid_in a transaction's receipt for the root vault's RootPaid log of \
+         a wave it paid).",
     );
 }
 
