@@ -506,10 +506,10 @@ impl Client {
     /// proof names. That is `own`, the payment's own transaction, when it
     /// was confirmed (`own_confirmed`) and its receipt holds the vault's
     /// `RootPaid` log naming the key. Otherwise another transaction recorded
-    /// the same leaves first: `own` reverted or was replaced, or the vault
-    /// found the wave already recorded and recorded nothing. That one is
-    /// found by its `RootPaid` log, filtered by the key
-    /// ([`recording_transaction_via`]).
+    /// the same leaves first: `own` reverted or was replaced (by
+    /// `replaced_by`, if that is known), or the vault found the wave already
+    /// recorded and recorded nothing. That one is found by its `RootPaid`
+    /// log, filtered by the key ([`recording_transaction_via`]).
     ///
     /// # Errors
     ///
@@ -522,6 +522,7 @@ impl Client {
         key: &[u8; 32],
         own: &[u8; 32],
         own_confirmed: bool,
+        replaced_by: Option<&[u8; 32]>,
         earliest_quote: u64,
     ) -> crate::data::error::Result<[u8; 32]> {
         let network = self.evm_network.as_ref().ok_or_else(|| {
@@ -530,11 +531,14 @@ impl Client {
         let chain = read_back_chain(network)?;
         recording_transaction_via(
             &chain,
-            vault,
-            key,
-            own,
-            own_confirmed,
-            earliest_quote,
+            &RootWave {
+                vault,
+                key,
+                own,
+                own_confirmed,
+                replaced_by,
+                earliest_quote,
+            },
             ROOT_RECORDING_READS,
         )
         .await
@@ -548,27 +552,55 @@ impl Client {
 #[cfg(feature = "native")]
 const ROOT_RECORDING_READS: usize = 5;
 
+/// A root wave whose recording transaction is looked for
+/// ([`Client::root_wave_transaction`]).
+#[cfg(feature = "native")]
+pub(crate) struct RootWave<'a> {
+    /// The root vault.
+    pub(crate) vault: &'a [u8; 20],
+    /// The wave's key.
+    pub(crate) key: &'a [u8; 32],
+    /// The payment's own transaction.
+    pub(crate) own: &'a [u8; 32],
+    /// Whether `own` was confirmed, rather than reverted or replaced.
+    pub(crate) own_confirmed: bool,
+    /// The transaction that took `own`'s nonce, if `own` was replaced.
+    pub(crate) replaced_by: Option<&'a [u8; 32]>,
+    /// The wave's earliest quote time, in Unix seconds.
+    pub(crate) earliest_quote: u64,
+}
+
 /// [`Client::root_wave_transaction`], reading through `chain`, up to
-/// `reads` times 2 seconds apart. Another transaction's recording is
-/// searched for from the block at the wave's earliest quote time
-/// (`earliest_quote`, Unix seconds) less [`ant_listings::CLOCK_MARGIN`] (a
-/// quote hash covers its signed time, so the wave can't be recorded before
-/// its quotes, give or take a node's clock against the chain's) up to the
-/// block of `own`, where its receipt was read, else the latest.
+/// `reads` times 2 seconds apart. The transaction that took the own one's
+/// nonce, if it was replaced, is read first. Another transaction's
+/// recording is searched for forwards from the block at the wave's earliest
+/// quote time less [`ant_listings::CLOCK_MARGIN`] (a quote hash covers its
+/// signed time, so the wave can't be recorded before its quotes, give or
+/// take a node's clock against the chain's, and is recorded soon after
+/// them) up to the block of `own`, where its receipt was read, else the
+/// latest ([`ListingChain::root_paid_transaction`]). A search that used all
+/// its calls before reaching its last block isn't made again: the error
+/// says so, apart from finding nothing.
 #[cfg(feature = "native")]
 pub(crate) async fn recording_transaction_via(
     chain: &ListingChain,
-    vault: &[u8; 20],
-    key: &[u8; 32],
-    own: &[u8; 32],
-    own_confirmed: bool,
-    earliest_quote: u64,
+    wave: &RootWave<'_>,
     reads: usize,
 ) -> crate::data::error::Result<[u8; 32]> {
+    use super::listings::RootPaidSearch;
     const PAUSE: std::time::Duration = std::time::Duration::from_secs(2);
 
+    let RootWave {
+        vault,
+        key,
+        own,
+        own_confirmed,
+        replaced_by,
+        earliest_quote,
+    } = *wave;
     let from_time = earliest_quote.saturating_sub(ant_listings::CLOCK_MARGIN);
     let mut until = None;
+    let mut replacement_read = replaced_by.is_none();
     let mut problem = String::from("no RootPaid log names its key");
     for read in 0..reads {
         if read > 0 {
@@ -588,12 +620,32 @@ pub(crate) async fn recording_transaction_via(
                 }
             }
         }
+        if let (Some(replacement), false) = (replaced_by, replacement_read) {
+            match chain.root_paid_in(replacement, vault, key).await {
+                Ok(Some((true, _))) => return Ok(*replacement),
+                Ok(_) => replacement_read = true,
+                Err(error) => {
+                    problem = format!(
+                        "the receipt of the transaction that replaced its own couldn't be read: \
+                         {error}"
+                    );
+                    continue;
+                }
+            }
+        }
         match chain
             .root_paid_transaction(vault, key, from_time, until)
             .await
         {
-            Ok(Some(recording)) => return Ok(recording),
-            Ok(None) => problem = "no RootPaid log names its key".into(),
+            Ok(RootPaidSearch::Found(recording)) => return Ok(recording),
+            Ok(RootPaidSearch::NotFound) => problem = "no RootPaid log names its key".into(),
+            Ok(RootPaidSearch::Incomplete { next, last }) => {
+                problem = format!(
+                    "the search for its RootPaid log stopped at its limit of eth_getLogs calls \
+                     with blocks {next} to {last} unsearched, so it is incomplete, not empty"
+                );
+                break;
+            }
             Err(error) => problem = format!("the search for its RootPaid log failed: {error}"),
         }
     }
