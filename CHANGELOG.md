@@ -11,28 +11,33 @@ Our changes on top of upstream 0.3.11 (ant-core 0.13.0). Releases are tagged `vX
 ant-cli's version set to match; other builds are told apart by the commit `darwin --version`
 prints. Upstream's entries follow.
 
-- Not yet released, the readers release: every reader of payments reads two vaults, the per-quote
-  payment vault and the root vault (DarwinRootVault, `0xf6675722f443132b045857546E57e35360Bb03b9`
-  on the bundled network), which records each wave of payments under one key. `ListingChain::new`
-  reads both on the bundled network, so the listings producer, `darwin file verify`, listing
-  lookups and envelope records accept a payment from either vault, each checked by the vault whose
-  log it is. Each vault is asked in its own `eth_getLogs` naming one address, both sent in one
-  batch: Robinhood's RPC allows 10,000,000 blocks per log query with one value in each filter
-  position but only 100,000 when any position is a list, so a list of both addresses would fail a
-  quote's search on its first query. Kept receipts are keyed by the vaults read. A root vault can
-  record a quote again in a later wave, so a reader with one searches again when none of a
-  quote's kept payments is the one a listing shows, and keeps what it finds beside them. How far
-  a search that found none went is kept per listing log index, so it never skips a payment at
-  another index that was dropped before it was kept. With a root vault, a quote's search is up to
-  64 rounds of two log queries (128 queries), and a quote paid nowhere costs two to four a time.
-  The first start after upgrading drops the receipts and quote payments kept for the per-quote
-  vault alone (they lack the root vault's logs), so that start re-reads every kept receipt and
-  quote payment once, with both vaults' logs: a one-time burst of chain reads, paced like any
-  other, after which they are kept again.
-  Nothing in this client pays the root vault, and no price, quote or payment changes.
-  `vendor/ant-listings` is darwin-listings 0.4.0. Readers that aren't updated (older darwin-listings,
-  older CLIs, other indexers) will report root-paid listings and upload proofs as unpaid until they
-  update. A census test (`every_payment_reader_reads_the_vault_set`) lists every reader of payments.
+- `v0.3.11+ds.3`, the readers release: ant-cli's version is 0.3.11+ds.3 (ant-core stays 0.13.0).
+  Every reader of payments reads two vaults, the per-quote payment vault and the root vault
+  (DarwinRootVault, `0xf6675722f443132b045857546E57e35360Bb03b9` on the bundled network), which
+  records each wave of payments under one key. `ListingChain::new` reads both on the bundled
+  network, so the listings producer, `darwin file verify`, listing lookups and envelope records
+  accept a payment from either vault, each checked by the vault whose log it is; a root vault's
+  payment counts only where its receipt shows the whole wave, the key its tree gives, its total and
+  its token transfers. A reader on any other network reads the per-quote vault alone, as before.
+  Each vault is asked in its own `eth_getLogs` naming one address, both sent in one batch:
+  Robinhood's RPC allows 10,000,000 blocks per log query with one value in each filter position but
+  only 100,000 when any position is a list, so a list of both addresses would fail a quote's search
+  on its first query. Kept receipts are keyed by the vaults read. A root vault can record a quote
+  again in a later wave, so a reader with one searches again when none of a quote's kept payments
+  is the one a listing shows, and keeps what it finds beside them. How far a search that found none
+  went is kept per listing log index, so it never skips a payment at another index that was dropped
+  before it was kept. With a root vault, a quote's search is up to 64 rounds of two log queries
+  (128 queries), and a quote paid nowhere costs two to four a time. The first start after upgrading
+  drops the receipts and quote payments kept for the per-quote vault alone (they lack the root
+  vault's logs), so each is read again once, with both vaults' logs, as listings need it: a
+  one-time burst of chain reads, paced like any other, after which they are kept again. Nothing in
+  this client pays the root vault, and no price, quote, payment or checkpoint changes.
+  `vendor/ant-listings` is darwin-listings 0.4.0. Readers that aren't updated (older
+  darwin-listings, older CLIs, other indexers) will report root-paid listings and upload proofs as
+  unpaid until they update. A census test (`every_payment_reader_reads_the_vault_set`) lists every
+  reader of payments. It is tested against darwin-node 0.23.0+ds.17 (`0deb787`, the revision its
+  tests pin). Its notes are `release-notes/v0.3.11+ds.3.md`, which say how to go back to
+  v0.3.11+ds.2.
 - `v0.3.11+ds.2`: ant-cli's version is 0.3.11+ds.2 (ant-core stays 0.13.0). It changes how
   uploads pay and resume, with prices and quotes unchanged: upload checkpoints in a format of their
   own (below), one wallet's small payments shared in waves of up to 64 records, paid proofs kept
