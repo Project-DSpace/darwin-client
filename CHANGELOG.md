@@ -25,13 +25,15 @@ prints. Upstream's entries follow.
   on its first query. Kept receipts are keyed by the vaults read. A root vault can record a quote
   again in a later wave, so a reader with one searches again when none of a quote's kept payments
   is the one a listing shows, and keeps what it finds beside them. How far a search that found none
-  went is kept per listing log index, so it never skips a payment at another index that was dropped
-  before it was kept. With a root vault, a quote's search is up to 64 rounds of two log queries
-  (128 queries), and a quote paid nowhere costs two to four a time. The first start after upgrading
-  drops the receipts and quote payments kept for the per-quote vault alone (they lack the root
-  vault's logs), so each is read again once, with both vaults' logs, as listings need it: a
-  one-time burst of chain reads, paced like any other, after which they are kept again. Nothing in
-  this client pays the root vault, and no price, quote, payment or checkpoint changes.
+  went is kept per listing log index for a reader with a root vault, so it never skips a payment at
+  another index that was dropped before it was kept; a reader of the per-quote vault alone keeps one
+  search for every index, as before. With a root vault, a quote's search is up to 64 rounds of two
+  log queries (128 queries), and a quote paid nowhere costs two to four a time. The first start
+  after upgrading with a root vault drops the receipts and quote payments kept for the per-quote
+  vault alone (they lack the root vault's logs), so each is read again once, with both vaults'
+  logs, as listings need it: a one-time burst of chain reads, paced like any other, after which
+  they are kept again. Nothing in this client pays the root vault, and no price, quote, payment or
+  checkpoint changes.
   `vendor/ant-listings` is darwin-listings 0.4.0. Readers that aren't updated (older
   darwin-listings, older CLIs, other indexers) will report root-paid listings and upload proofs as
   unpaid until they update. A census test (`every_payment_reader_reads_the_vault_set`) lists every
