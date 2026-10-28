@@ -540,7 +540,14 @@ impl Client {
         // established a settlement refusal; quotes over the price ceiling
         // are left out.
         let plan = self
-            .prepare_payment_plan_split(routing, content, data_size, data_type, weight)
+            .prepare_payment_plan_split(
+                routing,
+                content,
+                data_size,
+                data_type,
+                weight,
+                self.payment_vault(),
+            )
             .await?;
         info!(
             "Paying {} atto for address {}",

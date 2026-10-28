@@ -2431,6 +2431,10 @@ impl Client {
     /// Pay the plan's median quote, build the proof with
     /// [`ChunkPaymentPlan::proof`], then store with [`Self::pointer_put_paid`].
     ///
+    /// The state is quoted for the per-quote vault, even on a client paying
+    /// the root vault ([`Self::with_root_payments`]): the plan is paid one
+    /// quote at a time, never in a root wave.
+    ///
     /// # Errors
     ///
     /// Returns an error if no peer is responsible for the address, or if too
@@ -2439,12 +2443,18 @@ impl Client {
         let address = record.address();
         // As for a wallet payment: nothing is quoted with nowhere to store it.
         self.pointer_write_group(&address).await?;
+        // The per-quote vault, whatever vault this client pays: the payer
+        // outside the client pays the median quote and `ChunkPaymentPlan::proof`
+        // builds a per-quote proof. Quoted for the root vault, the state would
+        // ask settlement version 3 for nothing, and a close group holding a
+        // storer that can't check a root proof would cost a second round.
         self.prepare_payment_plan_split(
             &address,
             &record.state_id(),
             POINTER_WIRE_LEN as u64,
             DATA_TYPE_POINTER,
             crate::data::client::payment::declared_size_weight(DATA_TYPE_POINTER),
+            crate::data::client::root_payment::PaymentVault::V2,
         )
         .await
     }

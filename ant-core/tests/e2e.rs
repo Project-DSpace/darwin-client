@@ -30,9 +30,10 @@
 //! - `pointers`: pointer rules as the client sees them against real nodes.
 //! - `committed`: ADR-0004 commitment-bound quotes, and the refusal of a
 //!   batch on a commitment-bound network.
-//! - `root_payments`: records paid in waves through the root vault, and
-//!   records whose close group holds a node without it paid through the
-//!   per-quote vault instead.
+//! - `root_payments`: records paid in waves through the root vault, records
+//!   whose close group holds a node without it paid through the per-quote
+//!   vault instead, and what a client paying the root vault hands a payer
+//!   outside it quoted for the per-quote vault.
 
 #![allow(
     clippy::unwrap_used,

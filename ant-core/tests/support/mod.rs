@@ -158,6 +158,9 @@ pub struct TestNode {
     pub pointer_silence: Arc<PointerSilence>,
     /// Chunk GET requests the node has received.
     pub chunk_gets: Arc<ChunkGetCounts>,
+    /// The settlement versions the quote requests the node has received
+    /// declared.
+    pub quote_versions: Arc<QuoteVersions>,
     /// Cleared once the node is shut down.
     up: AtomicBool,
     handler: Mutex<Option<tokio::task::JoinHandle<()>>>,
@@ -250,6 +253,47 @@ impl ChunkGetCounts {
     }
 }
 
+/// The settlement version each quote request a node has received declared,
+/// by the address it quotes, noted as each message arrives and before the
+/// node handles it.
+#[derive(Default)]
+pub struct QuoteVersions(Mutex<HashMap<[u8; 32], Vec<u32>>>);
+
+impl QuoteVersions {
+    /// A quote request is a few dozen bytes, so anything larger, such as a
+    /// PUT carrying a chunk, is not decoded.
+    const MAX_QUOTE_REQUEST_BYTES: usize = 1024;
+
+    fn note(&self, data: &[u8]) {
+        if data.len() > Self::MAX_QUOTE_REQUEST_BYTES {
+            return;
+        }
+        if let Ok(ChunkMessage {
+            body: ChunkMessageBody::QuoteRequestV2(request),
+            ..
+        }) = ChunkMessage::decode(data)
+        {
+            self.0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .entry(request.address)
+                .or_default()
+                .push(request.settlement_version);
+        }
+    }
+
+    /// The settlement versions the quote requests received for `address`
+    /// declared, in the order they arrived.
+    pub fn get(&self, address: &[u8; 32]) -> Vec<u32> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(address)
+            .cloned()
+            .unwrap_or_default()
+    }
+}
+
 pub struct MiniTestnet {
     pub nodes: Vec<TestNode>,
     _temp_dirs: Vec<tempfile::TempDir>,
@@ -269,6 +313,7 @@ struct Spawned {
     protocol: Arc<AntProtocol>,
     pointer_silence: Arc<PointerSilence>,
     chunk_gets: Arc<ChunkGetCounts>,
+    quote_versions: Arc<QuoteVersions>,
     handler: tokio::task::JoinHandle<()>,
 }
 
@@ -374,6 +419,7 @@ impl MiniTestnet {
                 protocol: node.protocol,
                 pointer_silence: node.pointer_silence,
                 chunk_gets: node.chunk_gets,
+                quote_versions: node.quote_versions,
                 up: AtomicBool::new(true),
                 handler: Mutex::new(Some(node.handler)),
             })
@@ -644,6 +690,8 @@ impl MiniTestnet {
         let handler_silence = Arc::clone(&pointer_silence);
         let chunk_gets = Arc::new(ChunkGetCounts::default());
         let handler_gets = Arc::clone(&chunk_gets);
+        let quote_versions = Arc::new(QuoteVersions::default());
+        let handler_quotes = Arc::clone(&quote_versions);
         let handler_node = Arc::clone(&node);
         let handler_protocol = Arc::clone(&protocol);
         let handler = tokio::spawn(async move {
@@ -658,6 +706,7 @@ impl MiniTestnet {
                     }) => {
                         if topic == ant_protocol::CHUNK_PROTOCOL_ID {
                             handler_gets.note(&data);
+                            handler_quotes.note(&data);
                             if handler_silence.drops(&data) {
                                 continue;
                             }
@@ -711,6 +760,7 @@ impl MiniTestnet {
             protocol,
             pointer_silence,
             chunk_gets,
+            quote_versions,
             handler,
         }
     }
@@ -732,6 +782,18 @@ impl MiniTestnet {
         self.nodes
             .iter()
             .map(|node| node.chunk_gets.get(address))
+            .collect()
+    }
+
+    /// The settlement versions declared by the quote requests every node has
+    /// received for `address`, node by node in node order. Call
+    /// [`Self::flush_chunk_gets`] first so a request still in transit, such
+    /// as an unanswered hedge, is noted too: each node notes every message
+    /// before the sentinel that follows it.
+    pub fn quote_versions_received(&self, address: &[u8; 32]) -> Vec<u32> {
+        self.nodes
+            .iter()
+            .flat_map(|node| node.quote_versions.get(address))
             .collect()
     }
 

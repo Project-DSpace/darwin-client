@@ -10,13 +10,21 @@
 //! picks its records' content by where their addresses fall, so which vault
 //! a record can pay is known before it is uploaded.
 //!
-//! Every payment, a wave's leaf or a quote paid through the per-quote vault,
-//! is checked to be its record's size-class amount on a curve nodes quote
+//! What such a client hands a payer outside it, a prepared upload or a
+//! pointer's quote, is quoted for the per-quote vault: every quote request
+//! the nodes received for it declared settlement version 2, never the root
+//! vault's 3.
+//!
+//! The amount checks are in the four cases of single records (a wave, a wave
+//! of one, a record paying the per-quote vault, a mixed wave): every payment
+//! there, a wave's leaf or a quote paid through the per-quote vault, is
+//! checked to be its record's size-class amount on a curve nodes quote
 //! during the upload: `quote_price_at` when the upload starts or when it
 //! ends, the earlier x32 curve before ds.20's switch and the new one from
-//! it. Which quote paid which amount isn't read here. The signing-time rule
-//! itself, each leaf its own quote's price on whichever curve that quote was
-//! priced, is pinned without the clock by `root_payment`'s unit test
+//! it. Which quote paid which amount isn't read here. The file case and the
+//! outside payer's case check no amounts. The signing-time rule itself, each
+//! leaf its own quote's price on whichever curve that quote was priced, is
+//! pinned without the clock by `root_payment`'s unit test
 //! `each_leaf_is_its_own_quotes_price_at_its_records_weight_on_either_curve`.
 
 use crate::support::runner::Case;
@@ -26,14 +34,15 @@ use ant_core::ant_listings::{
     DATA_PAYMENT_MADE_TOPIC,
 };
 use ant_core::data::{
-    compute_address, file_data_map, forget_upload_record, paid_quote_hash, proof_data_map, DataMap,
-    ListingChain, PaymentMode, UploadEvent, Visibility,
+    compute_address, file_data_map, forget_upload_record, ml_dsa_65, paid_quote_hash,
+    proof_data_map, DataMap, ExternalPaymentInfo, ListingChain, PaymentMode, Pointer,
+    PointerTarget, PointerTargetKind, UploadEvent, Visibility,
 };
 use ant_node::payment::pricing::quote_price_at;
-use ant_protocol::evm::{Address, Amount};
+use ant_protocol::evm::{Address, Amount, QuoteHash, RewardsAddress, TxHash};
 use ant_protocol::payment::pricing::{record_weight, weighted_amount};
 use bytes::Bytes;
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -61,6 +70,10 @@ pub fn cases() -> Vec<Case> {
         Case::on_network(
             "root_payment::a_file_with_the_default_envelope_pays_one_root_wave_and_its_record_names_it",
             a_file_with_the_default_envelope_pays_one_root_wave_and_its_record_names_it,
+        ),
+        Case::on_network(
+            "root_payment::what_a_root_client_hands_an_outside_payer_is_quoted_for_the_per_quote_vault",
+            what_a_root_client_hands_an_outside_payer_is_quoted_for_the_per_quote_vault,
         ),
     ]
 }
@@ -292,6 +305,14 @@ async fn a_single_record_pays_a_wave_of_one(testnet: Arc<MiniTestnet>) {
     let address = client.chunk_put(chunk.clone()).await.expect("chunk_put");
     let paid_by = SystemTime::now();
     assert_eq!(address, compute_address(&chunk));
+    // Quoted at the root vault's settlement version, 3, where the outside
+    // payer's case sees version 2 alone.
+    testnet.flush_chunk_gets(client.network().node()).await;
+    let versions = testnet.quote_versions_received(&address);
+    assert!(
+        !versions.is_empty() && versions.iter().all(|version| *version == 3),
+        "quoted at settlement versions {versions:?}, not 3 alone"
+    );
     let after = root_waves(&testnet).await;
     assert_eq!(after.len(), waves.len() + 1, "one wave: {after:?}");
     assert_eq!(after.last(), Some(&1), "of one leaf");
@@ -621,5 +642,115 @@ async fn a_file_with_the_default_envelope_pays_one_root_wave_and_its_record_name
     assert_eq!(
         std::fs::read(&path).expect("read the download"),
         std::fs::read(file.path()).expect("read the file")
+    );
+}
+
+/// Pay `payments` as a payer outside the client does, through the per-quote
+/// vault with the funded wallet, returning the transaction of each quote.
+async fn pay_outside(
+    testnet: &MiniTestnet,
+    payments: Vec<(QuoteHash, RewardsAddress, Amount)>,
+) -> HashMap<QuoteHash, TxHash> {
+    let (transactions, _) = testnet
+        .wallet()
+        .pay_for_quotes(payments)
+        .await
+        .expect("pay outside the client");
+    transactions.into_iter().collect()
+}
+
+/// What a client paying the root vault hands a payer outside it is quoted
+/// for the per-quote vault, at settlement version 2: a prepared upload's
+/// records, its envelope among them (`data_prepare_upload`), and a pointer's
+/// state (`prepare_pointer_payment`). Every quote request the nodes received
+/// for them declared version 2, none the root vault's 3, so none was asked
+/// for a root payment the payer can't make, and a close group holding a node
+/// without the root vault is quoted once. Paid per quote outside the client,
+/// the upload is finished with `finalize_upload` and the pointer stored with
+/// `pointer_put_paid`: no wave is paid, and each record and the pointer pay
+/// one quote through the per-quote vault.
+async fn what_a_root_client_hands_an_outside_payer_is_quoted_for_the_per_quote_vault(
+    testnet: Arc<MiniTestnet>,
+) {
+    let client = testnet.root_client();
+    let waves = root_waves(&testnet).await;
+    let per_quote = per_quote_payments(&testnet).await;
+
+    let content: Vec<u8> = (0..20_000).map(|_| rand::random::<u8>()).collect();
+    let prepared = client
+        .data_prepare_upload(Bytes::from(content))
+        .await
+        .expect("prepare the upload");
+    let envelope = prepared.envelope.as_ref().expect("an envelope").address();
+    let ExternalPaymentInfo::WaveBatch {
+        prepared_chunks,
+        payment_intent,
+    } = &prepared.payment_info
+    else {
+        panic!("expected a wave batch");
+    };
+    let records = prepared_chunks
+        .iter()
+        .map(|chunk| chunk.address)
+        .collect::<Vec<_>>();
+    assert!(records.contains(&envelope), "the envelope is prepared too");
+    let upload_payments = payment_intent.payments.clone();
+
+    let (public_key, secret_key) = ml_dsa_65().generate_keypair().expect("an owner key");
+    let pointer = Pointer::create(
+        &secret_key,
+        &public_key,
+        PointerTarget::new(PointerTargetKind::Chunk, [0x36; 32]),
+    )
+    .expect("sign the pointer");
+    let plan = client
+        .prepare_pointer_payment(&pointer)
+        .await
+        .expect("quote the pointer's state");
+    assert!(
+        plan.vault.is_v2(),
+        "the pointer's plan pays the per-quote vault"
+    );
+
+    testnet.flush_chunk_gets(client.network().node()).await;
+    for address in records.iter().chain([&pointer.state_id()]) {
+        let versions = testnet.quote_versions_received(address);
+        assert!(!versions.is_empty(), "{} was quoted", hex::encode(address));
+        assert!(
+            versions.iter().all(|version| *version == 2),
+            "{} quoted at settlement versions {versions:?}, not 2 alone",
+            hex::encode(address)
+        );
+    }
+
+    let transactions = pay_outside(&testnet, upload_payments).await;
+    let result = client
+        .finalize_upload(prepared, &transactions)
+        .await
+        .expect("finalize the upload");
+    assert_eq!(result.total_chunks, records.len());
+    assert_eq!(result.chunks_stored, records.len());
+
+    let pointer_payments = plan
+        .payment
+        .quotes
+        .iter()
+        .filter(|quote| !quote.amount.is_zero())
+        .map(|quote| (quote.quote_hash, quote.rewards_address, quote.amount))
+        .collect();
+    let pointer_transactions = pay_outside(&testnet, pointer_payments).await;
+    let proof = plan
+        .proof(&pointer_transactions)
+        .expect("the pointer's proof");
+    client
+        .pointer_put_paid(&pointer, proof)
+        .await
+        .expect("store the pointer");
+
+    assert_eq!(root_waves(&testnet).await, waves, "no wave");
+    assert_eq!(
+        per_quote_payments(&testnet).await,
+        per_quote + records.len() + 1,
+        "one quote for each record and the pointer through the per-quote vault"
     );
 }

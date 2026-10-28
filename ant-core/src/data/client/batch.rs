@@ -489,6 +489,11 @@ impl Client {
     /// on-chain transaction. Returns `Ok(None)` if the chunk is already
     /// stored on the network.
     ///
+    /// The chunk is quoted for the per-quote vault, at its settlement
+    /// version, even on a client paying the root vault
+    /// ([`Self::with_root_payments`]): a prepared chunk is paid one quote at
+    /// a time, never in a root wave.
+    ///
     /// # Errors
     ///
     /// Returns an error if quote collection or payment construction fails.
@@ -506,7 +511,13 @@ impl Client {
         let address = compute_address(&content);
         let data_size = u64::try_from(content.len())
             .map_err(|e| Error::InvalidData(format!("content size too large: {e}")))?;
-        self.prepare_chunk_payment_plan(address, data_size)
+        // The per-quote vault, whatever vault this client pays: a prepared
+        // chunk is finished by `finalize_upload`, `finalize_chunk` or an
+        // external signer, which pay per quote through the per-quote vault
+        // (`with_content` keeps no vault). Quoted for the root vault, it would
+        // ask settlement version 3 for nothing, and a close group holding a
+        // storer that can't check a root proof would cost a second round.
+        self.prepare_chunk_payment_plan_in(address, data_size, PaymentVault::V2)
             .await?
             .map(|plan| plan.with_content(content))
             .transpose()
@@ -516,12 +527,15 @@ impl Client {
     /// returned plan must be bound to verified content before proof
     /// construction ([`ChunkPaymentPlan::with_content`], which checks the
     /// length): it pays for a chunk of `data_size` bytes, by its size class.
+    ///
+    /// Quoted for the per-quote vault, as [`Self::prepare_chunk_payment`]
+    /// quotes: the plan is paid one quote at a time, never in a root wave.
     pub async fn prepare_chunk_payment_plan(
         &self,
         address: XorName,
         data_size: u64,
     ) -> Result<Option<ChunkPaymentPlan>> {
-        self.prepare_chunk_payment_plan_in(address, data_size, self.payment_vault())
+        self.prepare_chunk_payment_plan_in(address, data_size, PaymentVault::V2)
             .await
     }
 
@@ -569,7 +583,9 @@ impl Client {
     ///
     /// The two are one address for a chunk and two for a pointer, which is
     /// quoted at its state and collected from the group around its address.
-    /// The plan pays for a record of `weight`.
+    /// The plan pays for a record of `weight`, through `vault`, or the
+    /// per-quote vault where the record's close group can't check a root
+    /// payment.
     pub(crate) async fn prepare_payment_plan_split(
         &self,
         routing: &XorName,
@@ -577,18 +593,13 @@ impl Client {
         data_size: u64,
         data_type: u32,
         weight: RecordWeight,
+        vault: PaymentVault,
     ) -> Result<ChunkPaymentPlan> {
         if let Some(refusal) = self.corroborated_settlement_refusal() {
             return Err(Error::ClientUpdateRequired(refusal));
         }
         let quote_plan = self
-            .get_store_quote_plan_split(
-                routing,
-                content,
-                data_size,
-                data_type,
-                self.payment_vault(),
-            )
+            .get_store_quote_plan_split(routing, content, data_size, data_type, vault)
             .await?;
         payment_plan_from_quotes(
             *content,
