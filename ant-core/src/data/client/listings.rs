@@ -79,7 +79,7 @@ use std::time::Duration;
 use tokio::sync::broadcast::error::RecvError;
 use tokio::sync::oneshot;
 use tokio::time::Instant;
-use tracing::debug;
+use tracing::{debug, warn};
 
 /// How long to wait for a node to answer a listings request.
 pub(crate) const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
@@ -2449,6 +2449,24 @@ pub struct RootRecord {
     pub payer: [u8; 20],
 }
 
+/// What a search for the transaction that recorded a root wave found
+/// ([`ListingChain::root_paid_transaction`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RootPaidSearch {
+    /// The transaction, its receipt read to show the recording.
+    Found([u8; 32]),
+    /// Every block searched was, and none holds the recording.
+    NotFound,
+    /// The search used all its calls before its last block: blocks `next`
+    /// to `last` weren't searched, and may hold the recording.
+    Incomplete {
+        /// The first block not searched.
+        next: u64,
+        /// The last block the search was to reach.
+        last: u64,
+    },
+}
+
 impl RootRecord {
     /// The record `records(bytes32)` answers with: three words, the time,
     /// the leaf count and the payer; `None` if all are zero.
@@ -3052,11 +3070,15 @@ impl ListingChain {
     /// The transaction that recorded the root vault `vault`'s wave under
     /// `key`: the one whose `RootPaid` log from the vault names the key, its
     /// one indexed topic. The vault records a key once, so there is at most
-    /// one. Searched for in one `eth_getLogs` filtered by the vault, the
-    /// event and the key, back from block `until` (the latest if `None`) to
-    /// the block at `from_time` (Unix seconds), as wide as the chain allows,
-    /// narrowed where it refuses a range, in at most [`MAX_LOG_CALLS`]
-    /// calls. `None` if none was found.
+    /// one. Searched for with `eth_getLogs` filtered by the vault, the event
+    /// and the key, forwards from the block at `from_time` (Unix seconds),
+    /// near which the wave is recorded, to block `until` (the latest if
+    /// `None`), as wide as the chain allows, narrowed where it refuses a
+    /// range, in at most [`MAX_LOG_CALLS`] calls. A log is taken only once
+    /// its transaction's receipt shows the vault's `RootPaid` naming the key
+    /// ([`Self::root_paid_in`]): a log the RPC answers that its receipt
+    /// doesn't bear out (an RPC that doesn't filter, or a block reorganized
+    /// away) is passed over.
     ///
     /// # Errors
     ///
@@ -3067,7 +3089,7 @@ impl ListingChain {
         key: &[u8; 32],
         from_time: u64,
         until: Option<u64>,
-    ) -> std::result::Result<Option<[u8; 32]>, String> {
+    ) -> std::result::Result<RootPaidSearch, String> {
         let latest = self.latest_block().await?;
         let last = until.map_or(latest, |until| until.min(latest));
         let first = self.block_at(from_time, last).await?;
@@ -3075,12 +3097,10 @@ impl ListingChain {
             format!("0x{}", hex::encode(ROOT_PAID_TOPIC)),
             format!("0x{}", hex::encode(key)),
         ]);
-        let mut range = last - first + 1;
-        let mut to = last;
-        let mut budget = MAX_LOG_CALLS;
-        while budget > 0 {
-            budget -= 1;
-            let from = to.saturating_sub(range - 1).max(first);
+        let mut from = first;
+        let mut range = last.saturating_sub(first).saturating_add(1);
+        for _ in 0..MAX_LOG_CALLS {
+            let to = from.saturating_add(range - 1).min(last);
             let filter = json!({
                 "address": format!("0x{}", hex::encode(vault)),
                 "fromBlock": quantity(from),
@@ -3091,19 +3111,66 @@ impl ListingChain {
                 Ok(answer) => {
                     let logs = answer.value;
                     let logs = logs.as_array().ok_or("logs are not a list")?;
-                    if let Some(log) = logs.iter().find_map(parse_vault_log) {
-                        return Ok(Some(log.tx_hash));
+                    if let Some(recording) = self.root_paid_among(logs, vault, key).await? {
+                        return Ok(RootPaidSearch::Found(recording));
                     }
-                    if from == first {
-                        return Ok(None);
+                    if to >= last {
+                        return Ok(RootPaidSearch::NotFound);
                     }
-                    to = from - 1;
+                    from = to + 1;
                 }
                 Err(e) if range > MIN_LOG_RANGE => {
                     debug!("Narrowing a search for a root wave's recording after: {e}");
                     range = (range / 2).max(MIN_LOG_RANGE);
                 }
                 Err(e) => return Err(e),
+            }
+        }
+        Ok(RootPaidSearch::Incomplete { next: from, last })
+    }
+
+    /// The transaction of the first of `logs` (an `eth_getLogs` answer for
+    /// the root vault `vault`'s `RootPaid` naming `key`) whose receipt shows
+    /// it recorded the wave ([`Self::root_paid_in`]), if any does. A log
+    /// that names another contract or event, or was removed, isn't read
+    /// further; one whose receipt doesn't show the recording is passed over.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a receipt can't be read.
+    async fn root_paid_among(
+        &self,
+        logs: &[Value],
+        vault: &[u8; 20],
+        key: &[u8; 32],
+    ) -> std::result::Result<Option<[u8; 32]>, String> {
+        let mut read = Vec::new();
+        for log in logs {
+            let other_address = log["address"]
+                .as_str()
+                .is_some_and(|address| parse_bytes::<20>(address) != Some(*vault));
+            let other_topics = log["topics"].as_array().is_some_and(|topics| {
+                let topic = |i: usize| topics.get(i).and_then(Value::as_str).and_then(parse_bytes);
+                topic(0) != Some(ROOT_PAID_TOPIC) || topic(1) != Some(*key)
+            });
+            if other_address || other_topics || log["removed"].as_bool() == Some(true) {
+                continue;
+            }
+            let Some(found) = parse_vault_log(log) else {
+                continue;
+            };
+            if read.contains(&found.tx_hash) {
+                continue;
+            }
+            read.push(found.tx_hash);
+            match self.root_paid_in(&found.tx_hash, vault, key).await? {
+                Some((true, _)) => return Ok(Some(found.tx_hash)),
+                shown => warn!(
+                    "a RootPaid log of the root vault naming the key {} is in transaction {}, \
+                     whose receipt reads {shown:?} rather than its recording; it is passed over",
+                    hex::encode(key),
+                    hex::encode(found.tx_hash)
+                ),
             }
         }
         Ok(None)
@@ -4325,6 +4392,9 @@ pub(crate) mod test_chain {
         pub(crate) max_list_log_range: Option<u64>,
         /// The filter of each `eth_getLogs` call, in order.
         pub(crate) log_filters: Vec<Value>,
+        /// Whether `eth_getLogs` answers every log in its blocks, whatever
+        /// its filter's address and topics, as an RPC that doesn't filter.
+        pub(crate) unfiltered_logs: bool,
         /// Methods answered with HTTP 403, as PublicNode answers
         /// `eth_getLogs`.
         pub(crate) refused: Vec<&'static str>,
@@ -4334,6 +4404,9 @@ pub(crate) mod test_chain {
         /// The vault's `completedPayments` records by quote hash: the first
         /// 16 bytes of the rewards address paid, and the amount.
         pub(crate) vault_records: HashMap<[u8; 32], ([u8; 16], u128)>,
+        /// The keys any root vault records a wave under, read through
+        /// `records(bytes32)`.
+        pub(crate) root_records: std::collections::HashSet<[u8; 32]>,
         /// The block the chain reports as finalized; the latest when
         /// `None`.
         pub(crate) finalized: Option<u64>,
@@ -4412,10 +4485,7 @@ pub(crate) mod test_chain {
                         None => None,
                     };
                     match number.and_then(|number| Some((number, self.blocks.get(&number)?))) {
-                        Some((number, timestamp)) => json!({
-                            "number": quantity(number),
-                            "timestamp": quantity(*timestamp),
-                        }),
+                        Some((number, timestamp)) => block_json(number, *timestamp),
                         None => Value::Null,
                     }
                 }
@@ -4456,14 +4526,17 @@ pub(crate) mod test_chain {
                             continue;
                         }
                         for log in &receipt.logs {
-                            let matches = address
-                                .as_ref()
-                                .is_none_or(|addresses| addresses.contains(&log.address))
-                                && topics.iter().enumerate().all(|(i, topic)| {
-                                    topic.is_none_or(|topic| log.topics.get(i) == Some(&topic))
-                                });
+                            let matches = self.unfiltered_logs
+                                || (address
+                                    .as_ref()
+                                    .is_none_or(|addresses| addresses.contains(&log.address))
+                                    && topics.iter().enumerate().all(|(i, topic)| {
+                                        topic.is_none_or(|topic| log.topics.get(i) == Some(&topic))
+                                    }));
                             if matches {
                                 logs.push(json!({
+                                    "address": format!("0x{}", hex::encode(log.address)),
+                                    "topics": log.topics.iter().map(|t| format!("0x{}", hex::encode(t))).collect::<Vec<_>>(),
                                     "transactionHash": format!("0x{}", hex::encode(receipt.tx_hash)),
                                     "blockNumber": quantity(receipt.block_number),
                                     "logIndex": quantity(log.log_index),
@@ -4487,6 +4560,15 @@ pub(crate) mod test_chain {
                 .as_str()
                 .and_then(|data| hex::decode(data.trim_start_matches("0x")).ok())
                 .unwrap_or_default();
+            if data.len() == 36 && data[..4] == ROOT_RECORDS_SELECTOR {
+                let mut words = [0u8; 96];
+                if self.root_records.contains(&data[4..]) {
+                    words[24..32].copy_from_slice(&1_800_000_000u64.to_be_bytes());
+                    words[60..64].copy_from_slice(&1u32.to_be_bytes());
+                    words[76..96].copy_from_slice(&[0x9a; 20]);
+                }
+                return json!(format!("0x{}", hex::encode(words)));
+            }
             let selector = alloy::primitives::keccak256(b"completedPayments(bytes32)");
             if to != Some(VAULT) || data.len() != 36 || data[..4] != selector[..4] {
                 return json!("0x");
@@ -4501,15 +4583,70 @@ pub(crate) mod test_chain {
         }
     }
 
-    fn receipt_json(receipt: &PaymentReceipt) -> Value {
+    /// The hash the mock gives block `number`.
+    fn block_hash(number: u64) -> String {
+        format!("0x{}{:016x}", "bb".repeat(24), number)
+    }
+
+    /// A zero value of `bytes` bytes, in hex.
+    fn zeros(bytes: usize) -> String {
+        format!("0x{}", "00".repeat(bytes))
+    }
+
+    /// A block with no transactions, whole as an Ethereum client answers
+    /// one (as alloy reads it).
+    fn block_json(number: u64, timestamp: u64) -> Value {
         json!({
+            "hash": block_hash(number),
+            "parentHash": block_hash(number.saturating_sub(1)),
+            "sha3Uncles": zeros(32),
+            "miner": zeros(20),
+            "stateRoot": zeros(32),
+            "transactionsRoot": zeros(32),
+            "receiptsRoot": zeros(32),
+            "logsBloom": zeros(256),
+            "difficulty": "0x0",
+            "number": quantity(number),
+            "gasLimit": "0x1c9c380",
+            "gasUsed": "0x0",
+            "timestamp": quantity(timestamp),
+            "extraData": "0x",
+            "mixHash": zeros(32),
+            "nonce": zeros(8),
+            "baseFeePerGas": "0x1",
+            "uncles": [],
+            "transactions": [],
+        })
+    }
+
+    /// A receipt, whole as an Ethereum client answers one (as alloy reads
+    /// it), in the block the mock hashes for its number.
+    fn receipt_json(receipt: &PaymentReceipt) -> Value {
+        let tx_hash = format!("0x{}", hex::encode(receipt.tx_hash));
+        json!({
+            "type": "0x2",
             "status": if receipt.success { "0x1" } else { "0x0" },
+            "cumulativeGasUsed": "0x5208",
+            "logsBloom": zeros(256),
+            "transactionHash": tx_hash,
+            "transactionIndex": "0x0",
+            "blockHash": block_hash(receipt.block_number),
             "blockNumber": quantity(receipt.block_number),
+            "gasUsed": "0x5208",
+            "effectiveGasPrice": "0x1",
+            "from": zeros(20),
+            "to": zeros(20),
+            "contractAddress": null,
             "logs": receipt.logs.iter().map(|log| json!({
                 "address": format!("0x{}", hex::encode(log.address)),
                 "topics": log.topics.iter().map(|t| format!("0x{}", hex::encode(t))).collect::<Vec<_>>(),
                 "data": format!("0x{}", hex::encode(&log.data)),
+                "blockHash": block_hash(receipt.block_number),
+                "blockNumber": quantity(receipt.block_number),
+                "transactionHash": tx_hash,
+                "transactionIndex": "0x0",
                 "logIndex": quantity(log.log_index),
+                "removed": false,
             })).collect::<Vec<_>>(),
         })
     }
@@ -4838,8 +4975,9 @@ mod tests {
     /// The transaction that recorded a wave is found by the root vault's
     /// `RootPaid` log naming its key, in one `eth_getLogs` filtered by the
     /// vault, the event and the key, from the block at the time given up to
-    /// the block given; narrowed where the chain refuses a range. Outside
-    /// the blocks searched, or for a key no log names, there is none.
+    /// the block given, and its receipt read to show it; searched forwards
+    /// in steps where the chain refuses a range. Outside the blocks
+    /// searched, or for a key no log names, there is none.
     #[tokio::test]
     async fn a_root_waves_recording_is_found_by_its_root_paid_log() {
         let mock = Arc::new(Mutex::new(recorded_by_another()));
@@ -4848,10 +4986,11 @@ mod tests {
             .root_paid_transaction(&RV_VAULT, &RV_KEY, RV_PAST + 20, Some(90))
             .await
             .unwrap();
-        assert_eq!(found, Some(RV_RECORDING));
+        assert_eq!(found, RootPaidSearch::Found(RV_RECORDING));
         {
             let mock = mock.lock().unwrap();
             assert_eq!(mock.calls_to("eth_getLogs"), 1);
+            assert_eq!(mock.calls_to("eth_getTransactionReceipt"), 1);
             let filter = mock.log_filters.last().unwrap();
             assert_eq!(
                 filter["address"],
@@ -4864,6 +5003,7 @@ mod tests {
                     format!("0x{}", hex::encode(RV_KEY)),
                 ])
             );
+            assert_eq!(filter["fromBlock"], json!(quantity(10)));
             assert_eq!(filter["toBlock"], json!(quantity(90)));
         }
         // Blocks 61 to 90 hold none, nor does a key no log names.
@@ -4872,23 +5012,173 @@ mod tests {
                 .root_paid_transaction(&RV_VAULT, &RV_KEY, RV_PAST + 122, Some(90))
                 .await
                 .unwrap(),
-            None
+            RootPaidSearch::NotFound
         );
         assert_eq!(
             reader
                 .root_paid_transaction(&RV_VAULT, &[0x60; 32], RV_PAST, None)
                 .await
                 .unwrap(),
-            None
+            RootPaidSearch::NotFound
         );
-        // A chain answering 64 blocks at a time is searched back in steps.
+        // A chain answering 64 blocks at a time is searched forwards in
+        // steps, from the block at the time given.
         mock.lock().unwrap().max_log_range = Some(64);
+        let before = mock.lock().unwrap().log_filters.len();
         assert_eq!(
             reader
                 .root_paid_transaction(&RV_VAULT, &RV_KEY, RV_PAST, None)
                 .await
                 .unwrap(),
-            Some(RV_RECORDING)
+            RootPaidSearch::Found(RV_RECORDING)
+        );
+        let mock = mock.lock().unwrap();
+        let filters = &mock.log_filters[before..];
+        assert_eq!(filters.len(), 2, "100 blocks refused, then 0 to 63");
+        assert_eq!(filters[1]["fromBlock"], json!(quantity(0)));
+        assert_eq!(filters[1]["toBlock"], json!(quantity(63)));
+    }
+
+    /// A chain of `blocks` blocks two seconds apart from `RV_PAST`, whose
+    /// RPC answers [`MIN_LOG_RANGE`] blocks of logs at a time, with the
+    /// wave recorded by `RV_RECORDING` in block `recorded_in`.
+    fn long_chain(blocks: u64, recorded_in: u64) -> MockChain {
+        let mut chain = MockChain::with_blocks(blocks, RV_PAST);
+        chain.max_log_range = Some(MIN_LOG_RANGE);
+        chain.add_receipt(PaymentReceipt {
+            tx_hash: RV_RECORDING,
+            success: true,
+            block_number: recorded_in,
+            logs: vec![root_paid_log(RV_VAULT, RV_KEY, 0)],
+        });
+        chain
+    }
+
+    /// The search runs forwards from the wave's quote time, near which it
+    /// is recorded: on a chain answering few blocks per call, a recording
+    /// soon after the quotes is found however far the latest block is. A
+    /// search that uses its [`MAX_LOG_CALLS`] calls before its last block
+    /// says so, apart from finding nothing.
+    #[tokio::test]
+    async fn a_root_waves_recording_is_searched_forwards_and_an_unfinished_search_says_so() {
+        let mock = Arc::new(Mutex::new(long_chain(5000, 100)));
+        let reader = reader(serve(Arc::clone(&mock)).await);
+        assert_eq!(
+            reader
+                .root_paid_transaction(&RV_VAULT, &RV_KEY, RV_PAST, None)
+                .await
+                .unwrap(),
+            RootPaidSearch::Found(RV_RECORDING)
+        );
+        // Recorded past what 64 calls reach: 7 refused (5000 blocks halved
+        // to 78), then 57 of 64 blocks, through block 3647.
+        let mock = Arc::new(Mutex::new(long_chain(5000, 4900)));
+        let reader = super::test_chain::reader(serve(Arc::clone(&mock)).await);
+        assert_eq!(
+            reader
+                .root_paid_transaction(&RV_VAULT, &RV_KEY, RV_PAST, None)
+                .await
+                .unwrap(),
+            RootPaidSearch::Incomplete {
+                next: 3648,
+                last: 4999
+            }
+        );
+        assert_eq!(mock.lock().unwrap().calls_to("eth_getLogs"), MAX_LOG_CALLS);
+    }
+
+    /// A log the RPC answers is taken only once its transaction's receipt
+    /// shows the vault's `RootPaid` naming the key: one whose receipt
+    /// doesn't (a block reorganized away) is passed over, and the search
+    /// goes on; from an RPC that doesn't filter, logs of another contract
+    /// or key aren't read further.
+    #[tokio::test]
+    async fn a_root_paid_log_its_receipt_doesnt_show_is_passed_over() {
+        let unshown = PaymentReceipt {
+            tx_hash: [0x0d; 32],
+            success: false,
+            block_number: 50,
+            logs: vec![root_paid_log(RV_VAULT, RV_KEY, 0)],
+        };
+        let mut chain = recorded_by_another();
+        chain.add_receipt(unshown.clone());
+        let reader = reader(serve(Arc::new(Mutex::new(chain))).await);
+        assert_eq!(
+            reader
+                .root_paid_transaction(&RV_VAULT, &RV_KEY, RV_PAST, Some(90))
+                .await
+                .unwrap(),
+            RootPaidSearch::Found(RV_RECORDING)
+        );
+
+        let mut chain = MockChain::with_blocks(100, RV_PAST);
+        chain.add_receipt(unshown);
+        let reader = super::test_chain::reader(serve(Arc::new(Mutex::new(chain))).await);
+        assert_eq!(
+            reader
+                .root_paid_transaction(&RV_VAULT, &RV_KEY, RV_PAST, None)
+                .await
+                .unwrap(),
+            RootPaidSearch::NotFound
+        );
+
+        let mut chain = recorded_by_another();
+        chain.unfiltered_logs = true;
+        let mock = Arc::new(Mutex::new(chain));
+        let reader = super::test_chain::reader(serve(Arc::clone(&mock)).await);
+        assert_eq!(
+            reader
+                .root_paid_transaction(&RV_VAULT, &RV_KEY, RV_PAST + 122, None)
+                .await
+                .unwrap(),
+            RootPaidSearch::NotFound
+        );
+        assert_eq!(
+            mock.lock().unwrap().calls_to("eth_getTransactionReceipt"),
+            0
+        );
+    }
+
+    /// A search whose `eth_getLogs` fails other than for a range too wide
+    /// fails, once narrowed to [`MIN_LOG_RANGE`] blocks, or at once over no
+    /// more; so does one whose found log's receipt can't be read.
+    #[tokio::test]
+    async fn a_failed_search_for_a_root_waves_recording_is_an_error() {
+        let mut chain = recorded_by_another();
+        chain.failing = vec![("eth_getLogs", -32_603)];
+        let mock = Arc::new(Mutex::new(chain));
+        let reader = reader(serve(Arc::clone(&mock)).await);
+        let error = reader
+            .root_paid_transaction(&RV_VAULT, &RV_KEY, RV_PAST, None)
+            .await
+            .unwrap_err();
+        assert!(error.contains("eth_getLogs refused"), "{error}");
+        assert_eq!(
+            mock.lock().unwrap().calls_to("eth_getLogs"),
+            2,
+            "100 blocks, then 64"
+        );
+        let error = reader
+            .root_paid_transaction(&RV_VAULT, &RV_KEY, RV_PAST + 122, Some(90))
+            .await
+            .unwrap_err();
+        assert!(error.contains("eth_getLogs refused"), "{error}");
+        assert_eq!(
+            mock.lock().unwrap().calls_to("eth_getLogs"),
+            3,
+            "30 blocks, once"
+        );
+
+        let mut chain = recorded_by_another();
+        chain.failing = vec![("eth_getTransactionReceipt", -32_603)];
+        let reader = super::test_chain::reader(serve(Arc::new(Mutex::new(chain))).await);
+        let error = reader
+            .root_paid_transaction(&RV_VAULT, &RV_KEY, RV_PAST, None)
+            .await
+            .unwrap_err();
+        assert!(
+            error.contains("eth_getTransactionReceipt refused"),
+            "{error}"
         );
     }
 
@@ -4896,12 +5186,15 @@ mod tests {
     /// own when its receipt holds the vault's `RootPaid` naming the key;
     /// else, when its own transaction recorded nothing (the vault found the
     /// wave already recorded) or didn't pay (it reverted or was replaced),
-    /// the one whose `RootPaid` names the key, searched for from the
-    /// wave's earliest quote time less the clock margin. None found is an
-    /// error, which keeps the payment's journal, never a payment again.
+    /// the one that replaced it if that recorded the wave, else the one
+    /// whose `RootPaid` names the key, searched for from the wave's
+    /// earliest quote time less the clock margin. None found, a failed
+    /// search, or one that used all its calls, is an error, which keeps
+    /// the payment's journal, never a payment again; an unfinished search
+    /// isn't made again.
     #[tokio::test]
     async fn a_root_waves_proofs_name_the_transaction_that_recorded_it() {
-        use crate::data::client::occupied::recording_transaction_via;
+        use crate::data::client::occupied::{recording_transaction_via, RootWave};
         let mut chain = recorded_by_another();
         chain.add_receipt(PaymentReceipt {
             tx_hash: [0x0f; 32],
@@ -4909,29 +5202,101 @@ mod tests {
             block_number: 95,
             logs: vec![root_paid_log(RV_VAULT, [0x61; 32], 0)],
         });
-        let reader = reader(serve(Arc::new(Mutex::new(chain))).await);
+        let mock = Arc::new(Mutex::new(chain));
+        let reader = reader(serve(Arc::clone(&mock)).await);
         // The recording's block is at RV_PAST + 120; its quotes signed up to
         // the clock margin later still find it.
         let quoted = RV_PAST + 120 + CLOCK_MARGIN;
-        let via = |own: [u8; 32], confirmed: bool, key: [u8; 32]| {
+        let via = |own: [u8; 32], confirmed: bool, replaced_by: Option<[u8; 32]>, key: [u8; 32]| {
             let reader = &reader;
             async move {
-                recording_transaction_via(reader, &RV_VAULT, &key, &own, confirmed, quoted, 1).await
+                let wave = RootWave {
+                    vault: &RV_VAULT,
+                    key: &key,
+                    own: &own,
+                    own_confirmed: confirmed,
+                    replaced_by: replaced_by.as_ref(),
+                    earliest_quote: quoted,
+                };
+                recording_transaction_via(reader, &wave, 1).await
             }
         };
+        let searches = || mock.lock().unwrap().calls_to("eth_getLogs");
         // Its own transaction recorded its own wave.
-        assert_eq!(via([0x0f; 32], true, [0x61; 32]).await.unwrap(), [0x0f; 32]);
+        assert_eq!(
+            via([0x0f; 32], true, None, [0x61; 32]).await.unwrap(),
+            [0x0f; 32]
+        );
         // Its own confirmed transaction found the wave already recorded.
-        assert_eq!(via(RV_OWN, true, RV_KEY).await.unwrap(), RV_RECORDING);
-        // Its own transaction reverted or was replaced.
-        assert_eq!(via([0x0e; 32], false, RV_KEY).await.unwrap(), RV_RECORDING);
+        assert_eq!(via(RV_OWN, true, None, RV_KEY).await.unwrap(), RV_RECORDING);
+        // Its own transaction reverted.
+        assert_eq!(
+            via([0x0e; 32], false, None, RV_KEY).await.unwrap(),
+            RV_RECORDING
+        );
+        // It was replaced by the recording: read first, with no search.
+        let before = searches();
+        assert_eq!(
+            via([0x0e; 32], false, Some(RV_RECORDING), RV_KEY)
+                .await
+                .unwrap(),
+            RV_RECORDING
+        );
+        assert_eq!(searches(), before);
+        // It was replaced by another transaction: the search finds the
+        // recording.
+        assert_eq!(
+            via([0x0e; 32], false, Some([0x0c; 32]), RV_KEY)
+                .await
+                .unwrap(),
+            RV_RECORDING
+        );
+        assert_eq!(searches(), before + 1);
         // No transaction recorded the key.
-        let error = via(RV_OWN, true, [0x62; 32]).await.unwrap_err().to_string();
+        let error = via(RV_OWN, true, None, [0x62; 32])
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("no RootPaid log names its key"), "{error}");
         assert!(error.contains("journal is"), "{error}");
         assert!(error.contains("rather than pay twice"), "{error}");
         // Its own confirmed transaction's receipt isn't found.
-        let error = via([0x0e; 32], true, RV_KEY).await.unwrap_err().to_string();
+        let error = via([0x0e; 32], true, None, RV_KEY)
+            .await
+            .unwrap_err()
+            .to_string();
         assert!(error.contains("receipt isn't found"), "{error}");
+        // The search fails.
+        mock.lock().unwrap().failing = vec![("eth_getLogs", -32_603)];
+        let error = via(RV_OWN, true, None, RV_KEY)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("search for its RootPaid log failed"),
+            "{error}"
+        );
+        assert!(error.contains("rather than pay twice"), "{error}");
+
+        // A search that used all its calls says so, and isn't made again.
+        let mock = Arc::new(Mutex::new(long_chain(5000, 4900)));
+        let reader = super::test_chain::reader(serve(Arc::clone(&mock)).await);
+        let wave = RootWave {
+            vault: &RV_VAULT,
+            key: &RV_KEY,
+            own: &[0x0e; 32],
+            own_confirmed: false,
+            replaced_by: None,
+            earliest_quote: RV_PAST,
+        };
+        let error = recording_transaction_via(&reader, &wave, 3)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("incomplete, not empty"), "{error}");
+        assert!(error.contains("blocks 3648 to 4999 unsearched"), "{error}");
+        assert!(error.contains("rather than pay twice"), "{error}");
+        assert_eq!(mock.lock().unwrap().calls_to("eth_getLogs"), MAX_LOG_CALLS);
     }
 
     /// The bundled network's reader reads the root vault the network

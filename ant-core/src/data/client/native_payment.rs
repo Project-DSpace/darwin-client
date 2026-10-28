@@ -269,9 +269,9 @@ async fn pay_with<A: UploadAdapter>(
             _ => {
                 let request = PaymentRequest::Quotes(quotes.clone());
                 let wallet = client.require_wallet()?;
-                let receipt =
+                let executed =
                     execute(client, wallet, adapter, &request, state, fresh, None).await?;
-                (receipt, quotes.len())
+                (executed.receipt, quotes.len())
             }
         },
     };
@@ -348,7 +348,10 @@ async fn pay_root<A: UploadAdapter>(
         })
     };
     let request = PaymentRequest::Quotes(quotes.clone());
-    let receipt = execute(
+    let Executed {
+        receipt,
+        replaced_by,
+    } = execute(
         client,
         wallet,
         adapter,
@@ -375,7 +378,14 @@ async fn pay_root<A: UploadAdapter>(
     let own = receipt.transaction_hash;
     let recording = ant_protocol::evm::TxHash::from(
         client
-            .root_wave_transaction(&vault, &key, &own.0, own_confirmed, earliest_quote(plans))
+            .root_wave_transaction(
+                &vault,
+                &key,
+                &own.0,
+                own_confirmed,
+                replaced_by.as_ref().map(|replacement| &replacement.0),
+                earliest_quote(plans),
+            )
             .await?,
     );
     let share = super::shared_wave::share_of(&receipt, &quotes, quotes.len())?;
@@ -777,7 +787,9 @@ pub(super) async fn pay_merkle<A: UploadAdapter>(
         )
     };
     let wallet = client.require_wallet()?;
-    let receipt = execute(client, wallet, adapter, &request, state, fresh, None).await?;
+    let receipt = execute(client, wallet, adapter, &request, state, fresh, None)
+        .await?
+        .receipt;
     Ok(MerkleUploadPayment {
         winner_pool: receipt
             .winner_pool
@@ -800,6 +812,25 @@ fn is_stale_nonce(message: &str) -> bool {
 /// A root wave's vault and key, for a payment through the root vault.
 type RootKey = ([u8; 20], [u8; 32]);
 
+/// How [`execute`] ended with a payment made.
+struct Executed {
+    /// The payment's receipt.
+    receipt: PaymentReceipt,
+    /// For a root wave whose own transaction was replaced, and which the
+    /// vault records by another ([`recorded_elsewhere`]): the transaction
+    /// that took its nonce, the first [`pay_root`] reads for the recording.
+    replaced_by: Option<ant_protocol::evm::TxHash>,
+}
+
+impl From<PaymentReceipt> for Executed {
+    fn from(receipt: PaymentReceipt) -> Self {
+        Self {
+            receipt,
+            replaced_by: None,
+        }
+    }
+}
+
 /// Pay `request` through `wallet`, journaled in `state`. For a root wave
 /// (`root`: its vault and key), a transaction that reverted or was replaced
 /// ends the attempt only once the vault shows no record under the wave's
@@ -813,7 +844,7 @@ async fn execute<A: UploadAdapter, F: Fn(&UploadState) -> bool + Send + Sync>(
     state: &mut UploadState,
     fresh: F,
     root: Option<RootKey>,
-) -> Result<PaymentReceipt> {
+) -> Result<Executed> {
     // A nonce is read from a public endpoint whose replicas lag each other, so
     // a freshly signed payment can carry a nonce the chain already consumed
     // (measured 1 in 150 reads on Arbitrum Sepolia, DEV-03 run 589). Such bytes
@@ -834,7 +865,7 @@ async fn execute_once<A: UploadAdapter, F: Fn(&UploadState) -> bool + Send + Syn
     state: &mut UploadState,
     fresh: &F,
     root: Option<RootKey>,
-) -> Result<PaymentReceipt> {
+) -> Result<Executed> {
     let journal = journal_of(state)?;
     // One transaction in flight per signing key, whichever vault it pays.
     let _signing = root_payment::signing_lock(wallet.address())
@@ -887,15 +918,23 @@ async fn execute_once<A: UploadAdapter, F: Fn(&UploadState) -> bool + Send + Syn
                  by its RootPaid log; this payment moved no tokens",
                 hex::encode(key)
             );
-            return finish(
+            let replaced_by = match &settled {
+                Settled::Replaced(replacement) => Some(*replacement),
+                _ => None,
+            };
+            let receipt = finish(
                 adapter,
                 state,
                 Settled::Confirmed(recorded_elsewhere(transaction)),
             )
-            .await;
+            .await?;
+            return Ok(Executed {
+                receipt,
+                replaced_by,
+            });
         }
     }
-    finish(adapter, state, settled).await
+    finish(adapter, state, settled).await.map(Executed::from)
 }
 
 /// The receipt a root wave's payment ends with when its own transaction
@@ -1123,6 +1162,7 @@ impl Client {
             None,
         )
         .await
+        .map(|executed| executed.receipt)
     }
 }
 
@@ -1412,6 +1452,153 @@ mod tests {
         assert_eq!(own_wave.amount, total);
         assert!(own_wave.transactions.values().all(|tx| *tx == own));
         assert_eq!(own_wave.root.unwrap().transaction, own);
+    }
+
+    /// A root wave whose own confirmed transaction found the wave already
+    /// recorded, and whose recording transaction can't be looked up, fails
+    /// with its journal kept, nothing prepared or sent; the retry settles
+    /// the same journaled transaction again, sending and preparing nothing,
+    /// and once the lookup answers, its proofs name the recording
+    /// transaction and it moved no tokens.
+    #[tokio::test]
+    async fn a_root_waves_failed_recording_lookup_keeps_its_journal_and_pays_nothing_again() {
+        use crate::data::client::listings::test_chain::{serve, MockChain};
+        use alloy::consensus::{SignableTransaction as _, TxEip1559, TxEnvelope};
+        use alloy::eips::eip2718::Encodable2718 as _;
+        use alloy::network::TxSignerSync as _;
+        use alloy::sol_types::SolCall as _;
+        use ant_listings::{root::ROOT_PAID_TOPIC, PaymentLog};
+        use ant_protocol::evm::contract::payment_vault::interface::IPaymentVault;
+        use std::sync::{Arc, Mutex};
+
+        const KEY: &str = "0x4c0883a69102937d6231471b5dbb6204fe5129617082792ae468d01a3f362318";
+        const CHAIN: u64 = 31_337;
+        let root = ant_protocol::evm::Address::from([0x33; 20]);
+        let vault: [u8; 20] = root.0 .0;
+        // 100 blocks two seconds apart, up to now; quoted at block 50's time.
+        let now = crate::runtime::system_time()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let start = now - 200;
+        let mut plan = signed_plan(
+            [9; 32],
+            1024,
+            std::time::UNIX_EPOCH + Duration::from_secs(start + 100),
+        );
+        plan.vault = PaymentVault::Root;
+        let plans = vec![plan];
+        let wave = root_payment::wave_of(&plans).unwrap();
+        let key = wave.key(&vault);
+        let quotes = root_payment::wave_quotes(&wave);
+
+        // The journaled transaction: the wave's payment, signed by the
+        // client's key for the root vault.
+        let payments: Vec<IPaymentVault::DataPayment> =
+            quotes.iter().map(|quote| (*quote).into()).collect();
+        let mut tx = TxEip1559 {
+            chain_id: CHAIN,
+            gas_limit: 100_000,
+            max_fee_per_gas: 1,
+            to: alloy::primitives::TxKind::Call(root),
+            input: IPaymentVault::payForQuotesCall::new((payments,))
+                .abi_encode()
+                .into(),
+            ..TxEip1559::default()
+        };
+        let signer: alloy::signers::local::PrivateKeySigner = KEY.parse().unwrap();
+        let signature = signer.sign_transaction_sync(&mut tx).unwrap();
+        let envelope = TxEnvelope::from(tx.into_signed(signature));
+        let own = *envelope.tx_hash();
+        let signed: SignedPayment =
+            serde_json::from_value(serde_json::json!({ "raw": envelope.encoded_2718() })).unwrap();
+
+        // Its own transaction succeeded in block 90 and recorded nothing;
+        // another recorded the wave in block 60.
+        let recording = ant_protocol::evm::TxHash::from([0x0b; 32]);
+        let mut chain = MockChain::with_blocks(100, start);
+        chain.chain_id = CHAIN;
+        chain.root_records.insert(key);
+        chain.add_receipt(ant_listings::PaymentReceipt {
+            tx_hash: own.0,
+            success: true,
+            block_number: 90,
+            logs: Vec::new(),
+        });
+        chain.add_receipt(ant_listings::PaymentReceipt {
+            tx_hash: recording.0,
+            success: true,
+            block_number: 60,
+            logs: vec![PaymentLog {
+                address: vault,
+                topics: vec![ROOT_PAID_TOPIC, key],
+                data: vec![0; 96],
+                log_index: 0,
+            }],
+        });
+        chain.failing = vec![("eth_getLogs", -32_603)];
+        let chain = Arc::new(Mutex::new(chain));
+        let url = serve(Arc::clone(&chain)).await;
+        let net = Network::Custom(ant_protocol::evm::CustomNetwork {
+            rpc_url_http: url.parse().unwrap(),
+            payment_token_address: [0x11; 20].into(),
+            payment_vault_address: [0x22; 20].into(),
+        });
+        let node = crate::data::Network::unstarted(&[], true, false)
+            .await
+            .unwrap();
+        let client = Client::from_node(Arc::clone(node.node()), Default::default())
+            .with_wallet(Wallet::new_from_private_key(net.clone(), KEY).unwrap())
+            .with_root_payments(
+                Wallet::new_from_private_key(crate::config::network_paying(&net, root), KEY)
+                    .unwrap(),
+            )
+            .unwrap();
+        let mut state = UploadState::default();
+        state.prepare(plans[0].clone());
+        state.start_payment(false, vec![plans[0].address]).unwrap();
+        set_journal(&mut state, &Journal::Signed(signed)).unwrap();
+        let adapter = Counting::default();
+        let nothing_prepared_or_sent = |from: usize| {
+            let calls = chain.lock().unwrap().calls[from..].to_vec();
+            assert!(
+                !calls.iter().any(|method| method.starts_with("eth_send")
+                    || method == "eth_getTransactionCount"
+                    || method == "eth_estimateGas"),
+                "{calls:?}"
+            );
+            assert!(
+                calls
+                    .iter()
+                    .any(|method| method == "eth_getTransactionReceipt"),
+                "{calls:?}"
+            );
+        };
+
+        let error = pay_root(&client, &adapter, &plans, &mut state)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("search for its RootPaid log failed"),
+            "{error}"
+        );
+        assert!(error.contains("Don't delete"), "{error}");
+        let Journal::Signed(kept) = journal_of(&state).unwrap() else {
+            panic!("the journal is kept")
+        };
+        assert_eq!(journaled_hash(&kept).unwrap(), own);
+        nothing_prepared_or_sent(0);
+
+        let retried = chain.lock().unwrap().calls.len();
+        chain.lock().unwrap().failing.clear();
+        let payment = pay_root(&client, &adapter, &plans, &mut state)
+            .await
+            .unwrap();
+        nothing_prepared_or_sent(retried);
+        assert!(payment.amount.is_zero(), "no tokens of this payment's");
+        assert!(payment.transactions.values().all(|tx| *tx == recording));
+        assert_eq!(payment.root.unwrap().transaction, recording);
     }
 
     /// A root wave whose own transaction reverted or was replaced, and
