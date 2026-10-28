@@ -871,6 +871,10 @@ async fn execute_once<A: UploadAdapter, F: Fn(&UploadState) -> bool + Send + Syn
     let _signing = root_payment::signing_lock(wallet.address())
         .lock_owned()
         .await;
+    // And the wallet's own lock inside it, as evmlib asks of a caller that
+    // prepares and sends a payment through a wallet it may share
+    // (`Wallet::prepare_payment`). Always taken after the signing lock.
+    let _wallet_lock = wallet.lock().await;
     // True only for bytes signed below, in this call: they have never been
     // broadcast, so there is nothing on chain to observe before sending them.
     let (signed, unsent) = match journal {

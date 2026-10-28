@@ -28,9 +28,10 @@
 //!   so a plan kept in a checkpoint is always paid, and reconciled, through
 //!   the vault it recorded.
 //! - **One signer at a time.** A root payment and a per-quote payment from
-//!   one key go through two wallets, so the client serialises every
-//!   transaction a key sends through one lock per signing key
-//!   ([`signing_lock`]), not through either wallet's own lock.
+//!   one key go through two wallets, and either wallet's own lock covers
+//!   that wallet alone, so the client serialises the transactions its
+//!   payment paths send from a key through one lock per signing key
+//!   ([`signing_lock`], which names the paths that hold it).
 
 // Browser builds pay through the page's wallet, which neither builds a wave
 // nor sends from a key of its own.
@@ -368,10 +369,24 @@ static SIGNING_LOCKS: Mutex<Option<HashMap<Address, Weak<tokio::sync::Mutex<()>>
     Mutex::new(None);
 
 /// The lock of the signing key `address`: one per key in this process,
-/// shared by every client and every wallet built with that key. Every path
-/// that sends a transaction from the key holds it, so one transaction is in
-/// flight per key whichever vault it pays. Separate processes with one key
-/// are not serialised: one key per process.
+/// shared by every client and every wallet built with that key, so one
+/// transaction of the paths that hold it is in flight per key whichever
+/// vault it pays. They hold it while they sign and send:
+///
+/// - the upload engine's journaled payments (`native_payment`): a payment
+///   of its own, which also holds the paying wallet's own lock
+///   (`Wallet::lock`) inside it, the lead of a shared wave, and the
+///   reconciling of a shared wave;
+/// - `Client::batch_pay`, which pays prepared chunks in one transaction,
+///   and the in-memory upload adapter's per-chunk payment
+///   (`MemoryUploadAdapter::pay`);
+/// - `Client::approve_token_spend`, for each vault it approves.
+///
+/// Three paths send without it, as they did before root payments: merkle
+/// batch payments (`Client::pay_for_merkle_batch`'s single batches, and
+/// `MemoryUploadAdapter::pay_merkle`), which the network's nodes refuse,
+/// and `SingleNodeQuotePayment::pay`, a raw building block. Separate
+/// processes with one key are not serialised: one key per process.
 #[must_use]
 pub(crate) fn signing_lock(address: Address) -> Arc<tokio::sync::Mutex<()>> {
     let mut locks = SIGNING_LOCKS

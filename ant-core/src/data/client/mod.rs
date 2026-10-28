@@ -898,8 +898,8 @@ impl Client {
     }
 
     /// Hold the lock of the client's signing key
-    /// ([`root_payment::signing_lock`]): every transaction the key sends,
-    /// through either vault's wallet, is signed and sent under it.
+    /// ([`root_payment::signing_lock`], which names the paths that sign and
+    /// send under it, through either vault's wallet).
     ///
     /// # Errors
     ///
