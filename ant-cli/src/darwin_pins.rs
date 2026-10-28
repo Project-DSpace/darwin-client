@@ -57,6 +57,7 @@ const COMMANDS: &[Reviewed] = &[
             "verbose",
             "evm_network",
             "max_chunk_price",
+            "root_payments",
         ],
     ),
     ("node", HeldBack, &[]),

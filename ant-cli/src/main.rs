@@ -87,6 +87,7 @@ async fn run() -> anyhow::Result<()> {
         verbose: _,
         evm_network,
         max_chunk_price,
+        root_payments,
         quote_concurrency,
         store_concurrency,
     } = cli;
@@ -102,6 +103,7 @@ async fn run() -> anyhow::Result<()> {
         chunk_get_timeout_secs,
         evm_network,
         max_chunk_price,
+        root_payments,
         quote_concurrency,
         store_concurrency,
     };
@@ -263,6 +265,8 @@ struct DataCliContext {
     chunk_get_timeout_secs: Option<u64>,
     evm_network: Option<String>,
     max_chunk_price: Option<ant_core::data::U256>,
+    /// Pay through the root vault (`--root-payments`).
+    root_payments: bool,
     quote_concurrency: Option<usize>,
     store_concurrency: Option<usize>,
 }
@@ -442,9 +446,17 @@ async fn build_data_client(
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("SECRET_KEY environment variable required"))?;
         let network = resolve_evm_network(ctx.evm_network.as_deref(), manifest.as_ref())?;
-        let wallet = create_wallet(key, network, ctx)?;
+        let wallet = create_wallet(key, network.clone(), ctx)?;
         info!("Wallet configured for EVM payments");
         client = client.with_wallet(wallet);
+        if ctx.root_payments {
+            client = client
+                .with_root_payments(create_root_wallet(key, &network, ctx)?)
+                .map_err(|e| anyhow::anyhow!("Failed to pay through the root vault: {e}"))?;
+            info!("Payments go through the root vault");
+        }
+    } else if ctx.root_payments {
+        anyhow::bail!("--root-payments is for commands that pay");
     }
 
     Ok(client)
@@ -498,14 +510,35 @@ fn create_wallet(
     network: EvmNetwork,
     ctx: &DataCliContext,
 ) -> anyhow::Result<Wallet> {
-    let chain_id = match (ctx.evm_network.as_deref(), &ctx.devnet_manifest) {
+    let chain_id = wallet_chain_id(&network, ctx)?;
+    ant_core::config::wallet(network, private_key, chain_id)
+        .map_err(|e| anyhow::anyhow!("Failed to create wallet: {e}"))
+}
+
+/// The chain a wallet on `network` signs for ([`create_wallet`]).
+fn wallet_chain_id(network: &EvmNetwork, ctx: &DataCliContext) -> anyhow::Result<Option<u64>> {
+    Ok(match (ctx.evm_network.as_deref(), &ctx.devnet_manifest) {
         (Some("local"), Some(path)) => {
             ant_core::config::manifest_chain_id(&std::fs::read_to_string(path)?)?
         }
-        _ => ant_core::config::chain_id(&network),
-    };
-    ant_core::config::wallet(network, private_key, chain_id)
-        .map_err(|e| anyhow::anyhow!("Failed to create wallet: {e}"))
+        _ => ant_core::config::chain_id(network),
+    })
+}
+
+/// The wallet of `private_key` that pays `network`'s root vault, signing
+/// for the chain [`create_wallet`]'s does. Only the bundled network names
+/// a root vault (`ant_core::config::root_vault_address`).
+fn create_root_wallet(
+    private_key: &str,
+    network: &EvmNetwork,
+    ctx: &DataCliContext,
+) -> anyhow::Result<Wallet> {
+    let root = ant_core::config::root_vault_address(network).ok_or_else(|| {
+        anyhow::anyhow!("--root-payments needs the bundled network: no other names a root vault")
+    })?;
+    let chain_id = wallet_chain_id(network, ctx)?;
+    ant_core::config::root_wallet(network, root, private_key, chain_id)
+        .map_err(|e| anyhow::anyhow!("Failed to create the root vault's wallet: {e}"))
 }
 
 /// Load and parse the devnet manifest once (if configured).
