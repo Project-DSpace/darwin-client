@@ -104,13 +104,22 @@ pub struct Cli {
     #[arg(long, value_name = "BASE_UNITS", value_parser = parse_base_units)]
     pub max_chunk_price: Option<U256>,
 
-    /// Pay through the root vault: each payment's records as one wave, with
-    /// one record kept by the vault for the whole wave, and each record's
-    /// proof showing its place in the wave (proof tag 0x03). A record whose
-    /// close group holds a node that can't check a root proof is paid
-    /// through the payment vault instead. Needs the bundled network, whose
-    /// root vault this build names.
+    /// Pay through the payment vault only, one record kept by the vault for
+    /// each quote paid. By default payments go through the root vault: each
+    /// payment's records as one wave, with one record kept by the vault for
+    /// the whole wave, and each record's proof showing its place in the wave
+    /// (proof tag 0x03). A record whose close group holds a node that can't
+    /// check a root proof is paid through the payment vault even then, and
+    /// so is every payment on a network whose root vault isn't known: the
+    /// bundled network's is built in, and a devnet's is the one its manifest
+    /// names (`evm.root_vault_address`).
     #[arg(long)]
+    pub no_root_payments: bool,
+
+    /// Pay through the root vault: the default since root payments became
+    /// the CLI's own, kept so that commands written for earlier builds still
+    /// run.
+    #[arg(long, hide = true, conflicts_with = "no_root_payments")]
     pub root_payments: bool,
 
     #[command(subcommand)]
@@ -426,12 +435,25 @@ mod bootstrap_tests {
     }
 
     #[test]
-    fn root_payments_are_asked_for() {
+    fn root_payments_are_the_default_and_opted_out_of() {
         let cli = Cli::try_parse_from(["darwin", "wallet", "address"]).unwrap();
-        assert!(!cli.root_payments, "the payment vault unless asked");
+        assert!(!cli.no_root_payments, "the root vault unless opted out");
+        let cli =
+            Cli::try_parse_from(["darwin", "--no-root-payments", "file", "upload", "a"]).unwrap();
+        assert!(cli.no_root_payments);
+        // The earlier opt-in still parses, and asks for the default.
         let cli =
             Cli::try_parse_from(["darwin", "--root-payments", "file", "upload", "a"]).unwrap();
-        assert!(cli.root_payments);
+        assert!(cli.root_payments && !cli.no_root_payments);
+        assert!(Cli::try_parse_from([
+            "darwin",
+            "--root-payments",
+            "--no-root-payments",
+            "file",
+            "upload",
+            "a"
+        ])
+        .is_err());
     }
 
     #[test]
