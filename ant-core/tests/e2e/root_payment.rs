@@ -703,10 +703,11 @@ async fn pay_outside(
 /// state (`prepare_pointer_payment`). Every quote request the nodes received
 /// for them declared version 2, none the root vault's 3, so none was asked
 /// for a root payment the payer can't make, and a close group holding a node
-/// without the root vault is quoted once. Paid per quote outside the client,
-/// the upload is finished with `finalize_upload` and the pointer stored with
-/// `pointer_put_paid`: no wave is paid, and each record and the pointer pay
-/// one quote through the per-quote vault.
+/// without the root vault is quoted once. So is a record quoted without its
+/// bytes (`prepare_chunk_payment_plan`), which is not paid here. Paid per
+/// quote outside the client, the upload is finished with `finalize_upload`
+/// and the pointer stored with `pointer_put_paid`: no wave is paid, and each
+/// record and the pointer pay one quote through the per-quote vault.
 async fn what_a_root_client_hands_an_outside_payer_is_quoted_for_the_per_quote_vault(
     testnet: Arc<MiniTestnet>,
 ) {
@@ -749,9 +750,21 @@ async fn what_a_root_client_hands_an_outside_payer_is_quoted_for_the_per_quote_v
         plan.vault.is_v2(),
         "the pointer's plan pays the per-quote vault"
     );
+    // A record quoted without its bytes, for a payer to pay
+    // (`prepare_chunk_payment_plan`): only quoted here, never paid.
+    let unpaid: [u8; 32] = rand::random();
+    let chunk_plan = client
+        .prepare_chunk_payment_plan(unpaid, 4_096)
+        .await
+        .expect("quote the record")
+        .expect("a record not stored");
+    assert!(
+        chunk_plan.vault.is_v2(),
+        "a chunk's plan pays the per-quote vault"
+    );
 
     testnet.flush_chunk_gets(client.network().node()).await;
-    for address in records.iter().chain([&pointer.state_id()]) {
+    for address in records.iter().chain([&pointer.state_id(), &unpaid]) {
         let versions = testnet.quote_versions_received(address);
         assert!(!versions.is_empty(), "{} was quoted", hex::encode(address));
         assert!(

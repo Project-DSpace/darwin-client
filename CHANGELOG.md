@@ -11,6 +11,29 @@ Our changes on top of upstream 0.3.11 (ant-core 0.13.0). Releases are tagged `vX
 ant-cli's version set to match; other builds are told apart by the commit `darwin --version`
 prints. Upstream's entries follow.
 
+- `v0.3.11+ds.7`, the root switch: ant-cli's version is 0.3.11+ds.7 (ant-core stays 0.13.0). The
+  darwin CLI pays through the root vault by default; `--no-root-payments` pays today's payment
+  vault only, and `--root-payments`, the opt-in of v0.3.11+ds.6, still parses, hidden. Each record
+  still falls back on its own to the payment vault when its close group holds a node that can't
+  check a root proof, and the split and envelope rules of v0.3.11+ds.6 are unchanged. On a devnet
+  (`--evm-network local`) the CLI reads and pays the root vault its manifest names
+  (`evm.root_vault_address`, read by `ant_core::config::manifest_root_vault`); where none is
+  known, it pays the payment vault and logs a warning instead of stopping. The library's default
+  stays the payment vault: `Client::with_root_payments` opts in as before, and the new
+  `Client::with_root_payments_from_key` builds both wallets from one key. A client can name a root
+  vault without a wallet to pay it (`Client::with_root_vault`, read by `Client::root_vault`;
+  `ListingChain::new_with_root_vault` for a reader), and its envelope records and payment
+  read-backs read that vault. An outside payer (`UploadPayer`) is quoted for the root vault only
+  when it asks (`pays_root_waves`, false by default) and the client knows the root vault; it pays
+  each root wave in one `payForQuotes` call to the root vault, and the client reads the vault's
+  record of the wave back and builds each record's proof naming the transaction that recorded it,
+  paying nothing again when another transaction recorded it first. `exact_approvals` (true by
+  default) says the payer approves each vault for exactly what it pays: its payments use both
+  vaults only from 5 records that can pay the root vault (3 for the client's own wallets).
+  Prepared uploads and chunks finished with `finalize_upload*` or `finalize_chunk`, other external
+  signers, and a pointer's state quoted with `prepare_pointer_payment` stay on the payment vault.
+  It is tested against darwin-node 0.23.0+ds.20 (`363640e`), the revision its tests pin. Its notes
+  are `release-notes/v0.3.11+ds.7.md`.
 - `v0.3.11+ds.6`, root payments: ant-cli's version is 0.3.11+ds.6 (ant-core stays 0.13.0). A
   client can pay through the root vault (DarwinRootVault, `0xf6675722f443132b045857546E57e35360Bb03b9`
   on the bundled network), opting in with `darwin --root-payments` or the library's
@@ -19,7 +42,11 @@ prints. Upstream's entries follow.
   leaf, its place and its path. Root-paid records are quoted at settlement version 3, others at
   version 2. Each record falls back on its own to today's payment vault when its close group holds
   a node that can't check a root proof; a payment pays both vaults only when at least 3 of its
-  records pay root, and the envelope never pays alone in either. An envelope paid in a root wave
+  records pay root, and the envelope never pays alone in either. Records kept from an
+  interrupted attempt never move: they pay the vault that attempt chose. What an `UploadPayer` or
+  an external signer pays (`file_upload_with_payer`, prepared uploads finished with
+  `finalize_upload*`, prepared chunks finished with `finalize_chunk`, a pointer's state quoted with
+  `prepare_pointer_payment`) is quoted for today's payment vault. An envelope paid in a root wave
   gets a payment record checked against the root vault, naming the transaction that recorded the
   wave. Without the flag, every payment goes through today's payment vault, which stays the
   default. Quotes on either price curve of v0.3.11+ds.5 are accepted. A checkpoint holding a root

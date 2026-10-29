@@ -8,7 +8,7 @@ use crate::commands::data::{
 use crate::commands::node::NodeCommand;
 use crate::commands::update::UpdateArgs;
 
-/// `darwin 0.3.11+ds.6` on line 1, the git commit on line 2 (see build.rs).
+/// `darwin 0.3.11+ds.7` on line 1, the git commit on line 2 (see build.rs).
 const VERSION: &str = concat!(
     env!("CARGO_PKG_VERSION"),
     "\ncommit ",

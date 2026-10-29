@@ -67,6 +67,7 @@ const STORES: Counting = &[
     (None, "batch_pay"),
     (None, "prepare_payment"),
     (None, "pay_root"),
+    (None, "outside_root_payment"),
     (None, "batch_upload_chunks*"),
     (None, "upload_records"),
     (None, "upload_records_then"),
@@ -95,6 +96,7 @@ const CHOICES: Counting = &[
     (None, "hiding"),
     (Some("ShownFields"), "NONE"),
     (None, "into_visibility"),
+    (None, "pays_root_waves"),
     (Some("PaymentMode"), "Auto"),
     (Some("PaymentMode"), "Merkle"),
     (None, "\"auto\""),
@@ -185,6 +187,12 @@ const ROOT_JOURNALED: &str = "Per-chunk payment in the network's token to the ro
     never shared with another payment; each record's proof names its leaf, its place and its \
     path. Signed and sent under the key's one lock, with the root vault's wallet's own lock \
     inside it.";
+const OUTSIDE_ROOT: &str = "Per-chunk payment in the network's token by an outside payer that \
+    asked for root waves (UploadPayer::pays_root_waves), one payForQuotes call to the root vault a \
+    wave: the root vault's record of the wave is read back and each record's proof names the \
+    transaction that recorded it, paid nothing again where another transaction recorded it first; \
+    quotes the per-quote vault records instead are proved there; neither keeps the payment \
+    pending and pays nothing.";
 const RAW_CHUNK_PUT: &str = "raw, by the caller's choice: no envelope. `darwin chunk put` \
     stores one raw chunk; its help names `darwin file upload` as the standard way. Paid per chunk \
     with the read-back.";
@@ -223,6 +231,10 @@ const MERKLE_MODE: &str = "Upstream's merkle mode in the library and cost estima
     command chooses it, and PaymentMode::default() is Single.";
 const BROWSER_MODE: &str = "The browser's payment mode names, mapped in one tested native \
     function; the browser's default is Single.";
+const PAYER_ROOT_ASKED: &str = "An outside payer (UploadPayer) is quoted for the root vault only \
+    when it asks (pays_root_waves, false by default) and the client knows the root vault, and is \
+    handed root plans only then; any other payer pays quote by quote at the per-quote vault, as \
+    the client's own wallets pay the vault the client pays. Per chunk, in the network's token.";
 
 const CHAIN_WALLET: &str = "The one wallet: built from the configured key and bound to the \
     configured chain's id.";
@@ -848,6 +860,20 @@ const STORE_SITES: &[Site] = &[
     ),
     (
         "ant-core/src/data/client/upload.rs",
+        "Client::pay_wave_to_one_vault",
+        "outside_root_payment",
+        1,
+        OUTSIDE_ROOT,
+    ),
+    (
+        "ant-core/src/data/client/upload.rs",
+        "Client::reconcile_upload_payment",
+        "outside_root_payment",
+        1,
+        OUTSIDE_ROOT,
+    ),
+    (
+        "ant-core/src/data/client/upload.rs",
         "MemoryUploadAdapter::pay",
         "pay_for_quotes",
         1,
@@ -1095,11 +1121,32 @@ const CHOICE_SITES: &[Site] = &[
         MERKLE_MODE,
     ),
     (
+        "ant-core/src/data/client/file/native.rs",
+        "SpillUploadAdapter::pays_root_waves",
+        "pays_root_waves",
+        1,
+        PAYER_ROOT_ASKED,
+    ),
+    (
+        "ant-core/src/data/client/file/native.rs",
+        "payer_pays_per_quote",
+        "pays_root_waves",
+        1,
+        PAYER_ROOT_ASKED,
+    ),
+    (
         "ant-core/src/data/client/upload.rs",
         "Client::store_upload_merkle",
         "PaymentMode::Merkle",
         1,
         MERKLE_MODE,
+    ),
+    (
+        "ant-core/src/data/client/upload.rs",
+        "Client::upload_vault",
+        "pays_root_waves",
+        1,
+        PAYER_ROOT_ASKED,
     ),
 ];
 
@@ -1181,7 +1228,14 @@ const ROOT_CONFIG: &str = "The bundled network's root vault address \
     (resources/payment_network.toml), read by ListingChain::new and by a payer through the root \
     vault, as the one root vault it may pay.";
 const ROOT_PAYER: &str = "A payer through the root vault (Client::with_root_payments) takes the \
-    bundled network's root vault as the only one it pays, and reads its payments back there.";
+    bundled network's root vault as the only one it pays there, and reads its payments back at \
+    the vault it pays.";
+const CLI_ROOT_PAYER: &str = "darwin pays through the root vault by default (--no-root-payments \
+    opts out): the bundled network's root vault, else the one a devnet's manifest names \
+    (DEVNET_ROOT); where none is known it pays the per-quote vault, and says so.";
+const CLI_DEVNET_ROOT: &str = "On a devnet (--evm-network local) darwin names the root vault its \
+    manifest names (Client::with_root_vault), with a wallet or without: where its readers of the \
+    client read root-paid records, and the one its root payments go to.";
 const ENVELOPE_ROOT: &str = "The envelope reader of a client reads the client's root vault \
     (Client::root_vault: the one it pays, else its network's, else the one it names) beside the \
     per-quote vault, so an envelope paid in a root wave is checked as one paid alone, whoever \
@@ -1223,10 +1277,17 @@ const VAULT_READ_SITES: &[Site] = &[
     ),
     (
         "ant-cli/src/main.rs",
+        "build_data_client",
+        "with_root_vault",
+        1,
+        CLI_DEVNET_ROOT,
+    ),
+    (
+        "ant-cli/src/main.rs",
         "create_root_wallet",
         "root_vault_address",
         1,
-        ROOT_PAYER,
+        CLI_ROOT_PAYER,
     ),
     (
         "ant-cli/src/main.rs",
@@ -3347,14 +3408,12 @@ fn check_found(
     let report = differences(found, reviewed);
     assert!(
         report.is_empty(),
-        "
-The sites in ant-core/src and ant-cli/src no longer match the reviewed list.
-
-         {report}
-{rule}
-
-         To review a site: check it against that rule. Then add or change its entry in          ant-cli/tests/darwin_census.rs with the file, site and name exactly as shown, the          count, and a one-line reason naming how it goes through the rule, and have it          reviewed. For a listed site that has gone, remove or lower its entry.
-"
+        "\nThe sites in ant-core/src and ant-cli/src no longer match the reviewed list.\n\n\
+         {report}\n{rule}\n\n\
+         To review a site: check it against that rule. Then add or change its entry in \
+         ant-cli/tests/darwin_census.rs with the file, site and name exactly as shown, the \
+         count, and a one-line reason naming how it goes through the rule, and have it \
+         reviewed. For a listed site that has gone, remove or lower its entry.\n"
     );
 }
 
@@ -3380,7 +3439,8 @@ fn every_visibility_and_payment_mode_choice_is_reviewed() {
         CHOICES,
         CHOICE_SITES,
         "Uploads are private by default with every payment field shown, and paid per chunk: \
-         merkle (batch) payments are refused by the nodes, so no path may choose them.",
+         merkle (batch) payments are refused by the nodes, so no path may choose them. An \
+         outside payer is quoted for the root vault only when it asks (pays_root_waves).",
     );
 }
 

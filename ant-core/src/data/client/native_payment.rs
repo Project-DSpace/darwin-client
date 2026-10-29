@@ -2158,6 +2158,107 @@ mod tests {
         }
     }
 
+    /// While a caller sharing the client's wallet holds its own lock
+    /// (`Wallet::lock`), a shared wave's lead waits for it, holding the
+    /// key's lock as it waits: the wallet's lock is taken inside the key's,
+    /// as in `execute_once`. Once the wallet's lock is free, the lead goes
+    /// on (here to end a wave every payment left).
+    #[tokio::test]
+    async fn a_waves_lead_takes_the_wallets_lock_inside_the_keys() {
+        let node = crate::data::Network::unstarted(&[], true, false)
+            .await
+            .unwrap();
+        // A key of its own, so no other test holds its locks.
+        let client = Client::from_node(std::sync::Arc::clone(node.node()), Default::default())
+            .with_wallet(Wallet::new_with_random_wallet(network(1)));
+        let wallet = client.require_wallet().unwrap();
+        let member = client.shared_waves().join(1);
+        member.ready(Vec::new());
+
+        let held = wallet.lock().await;
+        let signing = root_payment::signing_lock(wallet.address());
+        let (waited, ()) = futures::join!(
+            tokio::time::timeout(Duration::from_millis(300), lead(&client, wallet, &member)),
+            async {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                assert!(
+                    signing.try_lock().is_err(),
+                    "the lead holds the key's lock while it waits for the wallet's"
+                );
+            }
+        );
+        assert!(waited.is_err(), "the lead waits for the wallet's lock");
+        assert!(
+            signing.try_lock().is_ok(),
+            "and lets the key's go when stopped"
+        );
+
+        drop(held);
+        tokio::time::timeout(Duration::from_secs(5), lead(&client, wallet, &member))
+            .await
+            .expect("the lead goes on once the wallet's lock is free");
+        match tokio::time::timeout(Duration::from_secs(5), member.next())
+            .await
+            .expect("the wave ended")
+        {
+            Step::Ended(ended) => assert!(matches!(ended.ended, WaveEnd::NotSent(_))),
+            Step::Save(..) => panic!("nothing was signed"),
+        }
+    }
+
+    /// While a caller sharing the client's wallet holds its own lock
+    /// (`Wallet::lock`), reconciling a shared wave waits for it, holding the
+    /// key's lock as it waits, before it reads the wave or checkpoints: the
+    /// wave's transaction may be sent again. Once the wallet's lock is free,
+    /// it goes on (here a wave whose file is gone and whose quotes the vault
+    /// doesn't record starts afresh).
+    #[tokio::test]
+    async fn reconciling_a_wave_takes_the_wallets_lock_inside_the_keys() {
+        let node = crate::data::Network::unstarted(&[], true, false)
+            .await
+            .unwrap();
+        let client = Client::from_node(std::sync::Arc::clone(node.node()), Default::default())
+            .with_wallet(Wallet::new_with_random_wallet(network(1)));
+        let wallet = client.require_wallet().unwrap();
+        let wave = hex::encode(rand::random::<[u8; 32]>());
+        let adapter = Counting::default();
+        let mut state = UploadState::default();
+        let fresh = |_: &UploadState| true;
+
+        let held = wallet.lock().await;
+        let signing = root_payment::signing_lock(wallet.address());
+        let (waited, ()) = futures::join!(
+            tokio::time::timeout(
+                Duration::from_millis(300),
+                reconcile_wave(&client, &adapter, &wave, None, &[], &mut state, &fresh),
+            ),
+            async {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                assert!(
+                    signing.try_lock().is_err(),
+                    "reconciling holds the key's lock while it waits for the wallet's"
+                );
+            }
+        );
+        assert!(waited.is_err(), "reconciling waits for the wallet's lock");
+        assert_eq!(adapter.0.load(std::sync::atomic::Ordering::Relaxed), 0);
+        assert!(
+            signing.try_lock().is_ok(),
+            "and lets the key's go when stopped"
+        );
+
+        drop(held);
+        let reconciled = tokio::time::timeout(
+            Duration::from_secs(5),
+            reconcile_wave(&client, &adapter, &wave, None, &[], &mut state, &fresh),
+        )
+        .await
+        .expect("reconciling goes on once the wallet's lock is free")
+        .unwrap();
+        assert!(reconciled.is_none(), "nothing was signed: it starts afresh");
+        assert_eq!(adapter.0.load(std::sync::atomic::Ordering::Relaxed), 1);
+    }
+
     /// An external payer's payment of root plans, which names no wave, is
     /// settled from the chain ([`outside_root_payment`]):
     ///
