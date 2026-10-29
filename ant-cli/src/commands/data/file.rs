@@ -13,7 +13,7 @@ use ant_core::data::manifest::path::portable_component;
 use ant_core::data::{
     file_data_map, forget_upload_record, parse_link, proof_data_map, shown_after_hiding,
     spawn_download_diagnostics_writer, Client, CollisionPolicy, ContentRef, CostEstimateConfidence,
-    DownloadEvent, EnvelopeOptions, Error as DataError, EvmNetwork, FileChunkPeerReport,
+    DownloadEvent, EnvelopeOptions, Error as DataError, EvmAddress, FileChunkPeerReport,
     FileChunkPeerReportPeer, FileChunkPeerStatus, FileChunkPeerSweepReport, Link, ListingChain,
     Manifest, ManifestEntry, PaymentMode, UploadEvent,
 };
@@ -276,12 +276,12 @@ impl FileAction {
         !matches!(self, FileAction::Prove { .. } | FileAction::Verify { .. })
     }
 
-    /// Run an action that needs no storage network. `evm_network` resolves
-    /// the payment chain, for `verify` only.
+    /// Run an action that needs no storage network. `chain` builds the
+    /// payment chain's reader, for `verify` only.
     pub async fn execute_offline(
         self,
         json: bool,
-        evm_network: impl FnOnce() -> anyhow::Result<EvmNetwork>,
+        chain: impl FnOnce() -> anyhow::Result<ListingChain>,
     ) -> anyhow::Result<()> {
         match self {
             FileAction::Prove {
@@ -291,8 +291,7 @@ impl FileAction {
                 force,
             } => handle_file_prove(&record, output, no_reveal, force, json),
             FileAction::Verify { proof, file } => {
-                let chain = ListingChain::new(&evm_network()?)?;
-                handle_file_verify(&chain, &proof, file.as_deref(), json).await
+                handle_file_verify(&chain()?, &proof, file.as_deref(), json).await
             }
             _ => anyhow::bail!("this command needs the network"),
         }
@@ -418,9 +417,12 @@ impl FileAction {
             }
             action @ (FileAction::Prove { .. } | FileAction::Verify { .. }) => {
                 let network = client.wallet().map(|wallet| wallet.network().clone());
+                let root_vault = client.root_vault().map(EvmAddress::from);
                 action
                     .execute_offline(json, || {
-                        network.ok_or_else(|| anyhow::anyhow!("no payment chain configured"))
+                        let network = network
+                            .ok_or_else(|| anyhow::anyhow!("no payment chain configured"))?;
+                        Ok(ListingChain::new_with_root_vault(&network, root_vault)?)
                     })
                     .await
             }
