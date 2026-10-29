@@ -123,11 +123,27 @@ pub trait UploadAdapter: AdapterBounds {
     /// Initialize adapter-owned recovery evidence before persisting an attempt.
     fn initialize_payment_attempt(&self, _attempt: &mut super::upload_state::PaymentAttempt) {}
     /// Whether this adapter pays root waves: whether its payments go through
-    /// the client's own wallets ([`Client::with_root_payments`]). One that
-    /// pays elsewhere, through an external payer or signer, pays quotes one
-    /// by one and so the per-quote vault alone, and the records it uploads
-    /// are quoted for that vault ([`Client::upload_vault`]).
+    /// the client's own wallets ([`Client::with_root_payments`]), or through
+    /// an external payer that asked for root waves
+    /// (`UploadPayer::pays_root_waves`). One that pays elsewhere, through
+    /// any other payer or signer, pays quotes one by one and so the
+    /// per-quote vault alone, and the records it uploads are quoted for that
+    /// vault ([`Client::upload_vault`]).
     fn pays_root_waves(&self) -> bool {
+        false
+    }
+    /// Whether this adapter's payments go to an external payer
+    /// (`UploadPayer`) rather than the client's own wallets. Such a payer,
+    /// when it pays root waves, needs no root vault's wallet in the client:
+    /// only the root vault's address ([`Client::upload_vault`]).
+    fn outside_payer(&self) -> bool {
+        false
+    }
+    /// Whether whoever pays approves each vault for exactly what it pays,
+    /// so a payment split between both vaults costs a second approval
+    /// ([`split_upload_vaults`]). The client's own wallets approve each
+    /// vault without limit.
+    fn exact_approvals(&self) -> bool {
         false
     }
     /// Submit while updating the shared journal. Existing adapters may keep their callback journal.
@@ -232,19 +248,29 @@ pub struct UploadOutcome {
 }
 
 impl Client {
-    /// The vault the records `adapter` uploads are quoted for: the client's
-    /// ([`Client::payment_vault`]) when the adapter pays root waves, else
-    /// the per-quote vault, which an external payer's quote-by-quote
-    /// payment pays ([`UploadAdapter::pays_root_waves`]).
+    /// The vault the records `adapter` uploads are quoted for, when the
+    /// adapter pays root waves ([`UploadAdapter::pays_root_waves`]): through
+    /// the client's own wallets, the client's ([`Client::payment_vault`]);
+    /// through an external payer that asked for root waves, the root vault
+    /// whenever the client knows its network's root vault
+    /// (`Client::root_vault`), with no root vault's wallet needed. Else, and
+    /// for a payer or signer that pays quote by quote, the per-quote vault.
     pub(crate) fn upload_vault<A: UploadAdapter>(
         &self,
         adapter: &A,
     ) -> crate::data::client::root_payment::PaymentVault {
-        if adapter.pays_root_waves() {
-            self.payment_vault()
-        } else {
-            crate::data::client::root_payment::PaymentVault::V2
+        use crate::data::client::root_payment::PaymentVault;
+        if !adapter.pays_root_waves() {
+            return PaymentVault::V2;
         }
+        if !adapter.outside_payer() {
+            return self.payment_vault();
+        }
+        #[cfg(feature = "native")]
+        if self.root_vault().is_some() {
+            return PaymentVault::Root;
+        }
+        PaymentVault::V2
     }
 
     fn ensure_upload_payment_allowed(&self) -> Result<()> {
@@ -557,6 +583,7 @@ impl Client {
                 &unpaid,
                 state,
                 last.as_ref().map(|record| &record.address),
+                adapter.exact_approvals(),
             );
             let mut payable = Vec::new();
             for plan in plans
@@ -795,7 +822,13 @@ impl Client {
             .iter()
             .filter_map(|(_, plan)| plan.as_ref().map(|plan| plan.address))
             .collect::<HashSet<_>>();
-        split_upload_vaults(&mut plans, &unpaid, state, envelope_address.as_ref());
+        split_upload_vaults(
+            &mut plans,
+            &unpaid,
+            state,
+            envelope_address.as_ref(),
+            adapter.exact_approvals(),
+        );
         let mut payable = Vec::new();
         for (record, plan) in &plans {
             match plan {
@@ -848,8 +881,13 @@ impl Client {
                 let paid = super::merkle::finalize_merkle_batch(batch, payment.winner_pool)?;
                 state.insert_merkle(paid);
             } else {
-                let plans = state.pending_plans()?;
+                #[cfg_attr(not(feature = "native"), allow(unused_mut))]
+                let mut plans = state.pending_plans()?;
                 let payment = adapter.reconcile_payment(&plans, state).await?;
+                #[cfg(feature = "native")]
+                let payment =
+                    super::native_payment::outside_root_payment(self, &mut plans, state, payment)
+                        .await?;
                 validate_payment_total(&plans, &payment)?;
                 // Records whose quote was occupied stay unpaid: the waves
                 // below quote them again.
@@ -1006,6 +1044,10 @@ impl Client {
                 return Err(error);
             }
             let payment = adapter.submit_payment(&payable, state).await?;
+            #[cfg(feature = "native")]
+            let payment =
+                super::native_payment::outside_root_payment(self, &mut payable, state, payment)
+                    .await?;
             validate_payment_total(&payable, &payment)?;
             let occupied = self.occupied_quotes(&payable).await;
             let released = state.release_occupied(&occupied);
@@ -1737,9 +1779,9 @@ pub(crate) fn release_last<T>(
 /// `state` holds its record: that payment may already have sent its
 /// transaction, and is reconciled through the root vault's wallet. With
 /// none, nothing was sent for it, so an upload quoting for the per-quote
-/// vault (a client without a root vault's wallet, or an external payer)
-/// quotes the record again for that vault rather than stop on a root
-/// payment it can't make.
+/// vault (a client without a root vault's wallet, or an external payer
+/// that doesn't ask for root waves) quotes the record again for that vault
+/// rather than stop on a root payment it can't make.
 pub(crate) fn keeps_retained_plan(
     state: &UploadState,
     plan: &ChunkPaymentPlan,
@@ -1760,12 +1802,15 @@ pub(crate) fn keeps_retained_plan(
 /// attempt pays the vault it recorded, since an interrupted payment may
 /// already have sent its transaction. This client approves each vault
 /// without limit (`Client::approve_token_spend`), so a split costs no
-/// second approval.
+/// second approval; an external payer says whether its approvals are exact
+/// (`exact_approvals`, [`UploadAdapter::exact_approvals`]), when a split
+/// costs one.
 pub(crate) fn split_upload_vaults(
     plans: &mut [(UploadRecord, Option<ChunkPaymentPlan>)],
     unpaid: &HashSet<[u8; 32]>,
     state: &UploadState,
     envelope: Option<&[u8; 32]>,
+    exact_approvals: bool,
 ) {
     let now = crate::runtime::system_time();
     let moved = super::root_payment::split_vaults(
@@ -1779,7 +1824,7 @@ pub(crate) fn split_upload_vaults(
                 .is_some()
         },
         envelope,
-        false,
+        exact_approvals,
     );
     if moved > 0 {
         tracing::info!(
@@ -3021,7 +3066,7 @@ mod tests {
             .iter()
             .filter_map(|(_, plan)| plan.as_ref().map(|plan| plan.address))
             .collect::<HashSet<_>>();
-        split_upload_vaults(&mut wave, &unpaid, &state, None);
+        split_upload_vaults(&mut wave, &unpaid, &state, None, false);
         let vaults = wave
             .iter()
             .map(|(_, plan)| plan.as_ref().unwrap().vault)
@@ -3030,6 +3075,49 @@ mod tests {
             vaults,
             vec![PaymentVault::V2, PaymentVault::Root, PaymentVault::V2]
         );
+    }
+
+    /// A payer whose approvals are exact splits a payment between the
+    /// vaults only from 5 records that can pay the root vault, against 3
+    /// for one approving without limit: below it, every root plan pays the
+    /// per-quote vault with the rest.
+    #[test]
+    fn exact_approvals_split_a_payment_from_five_root_records() {
+        use crate::data::client::root_payment::PaymentVault;
+        use crate::data::client::upload_state::test_state::plan_priced;
+        let now = std::time::SystemTime::now();
+        let wave = |roots: u8| {
+            (0..=roots)
+                .map(|n| {
+                    let mut plan = plan_priced(&[n, 0x5e], now, &[10, 20, 30]);
+                    if n > 0 {
+                        plan.vault = PaymentVault::Root;
+                    }
+                    let record = UploadRecord {
+                        address: plan.address,
+                        size: plan.data_size,
+                        index: usize::from(n),
+                    };
+                    (record, Some(plan))
+                })
+                .collect::<Vec<_>>()
+        };
+        let state = UploadState::default();
+        let split = |roots: u8, exact: bool| {
+            let mut wave = wave(roots);
+            let unpaid = wave
+                .iter()
+                .filter_map(|(_, plan)| plan.as_ref().map(|plan| plan.address))
+                .collect::<HashSet<_>>();
+            split_upload_vaults(&mut wave, &unpaid, &state, None, exact);
+            wave.iter()
+                .filter(|(_, plan)| plan.as_ref().unwrap().vault == PaymentVault::Root)
+                .count()
+        };
+        assert_eq!(split(3, false), 3, "3 root records split without limit");
+        assert_eq!(split(3, true), 0, "but not with exact approvals");
+        assert_eq!(split(4, true), 0);
+        assert_eq!(split(5, true), 5, "5 do");
     }
 
     /// The mark that a record was paid again is saved with the checkpoint

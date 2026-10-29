@@ -2016,9 +2016,24 @@ impl Drop for TempDownload {
 #[allow(clippy::double_must_use)]
 #[async_trait::async_trait]
 pub trait UploadPayer: Send + Sync {
-    /// Pay every non-zero quote in `plans` with `payForQuotes`. Returns the
-    /// transaction that paid each quote hash and the total paid, which must
-    /// equal the plans' total.
+    /// Pay every non-zero quote in `plans` with `payForQuotes`, at the vault
+    /// the plans name (`ChunkPaymentPlan::vault`): one payment holds plans
+    /// for one vault. Returns the transaction that paid each quote hash and
+    /// the total paid, which must equal the plans' total.
+    ///
+    /// Plans for the root vault come only to a payer that asked for them
+    /// ([`Self::pays_root_waves`]). Their paid quotes are one wave: one
+    /// `payForQuotes` call to the root vault, with the leaves in ascending
+    /// quote-hash order. The payer returns the transaction it sent (or
+    /// found) for each quote and the plans' total, and leaves `root` as
+    /// `None`: the engine finds the wave itself. It reads the root vault's
+    /// record under the wave's key and builds each record's root proof from
+    /// the transaction that recorded the wave, whichever that was. If the
+    /// wave was paid at the per-quote vault instead, it reads each quote's
+    /// record there and stores the records with single-node proofs from the
+    /// returned transactions. If neither vault shows the payment, the upload
+    /// stops with its payment kept pending, and the next attempt asks the
+    /// payer again for the payment it made.
     async fn pay_quotes(
         &self,
         plans: &[crate::data::client::batch::ChunkPaymentPlan],
@@ -2042,6 +2057,28 @@ pub trait UploadPayer: Send + Sync {
     fn checkpoint_scope(&self) -> Vec<u8> {
         Vec::new()
     }
+
+    /// Whether this payer pays root waves: plans for the root vault, as
+    /// [`Self::pay_quotes`] describes. `false` by default, so a payer that
+    /// doesn't ask is quoted for the per-quote vault alone, as before. A
+    /// payer that asks is quoted for the root vault wherever every quoter of
+    /// a record accepts root proofs and the client knows its network's root
+    /// vault (built in, or named with `Client::with_root_vault`); the other
+    /// records of the same upload come in plans for the per-quote vault, in
+    /// a payment of their own.
+    fn pays_root_waves(&self) -> bool {
+        false
+    }
+
+    /// Whether this payer approves each vault for exactly what it pays, so
+    /// that paying both vaults in one upload costs a second approval. `true`
+    /// by default; a payer that approves without limit returns `false`. A
+    /// payment then pays both vaults only when at least 5 of its records can
+    /// pay the root vault (3 when `false`); with fewer, they all pay the
+    /// per-quote vault.
+    fn exact_approvals(&self) -> bool {
+        true
+    }
 }
 
 /// Where an upload's record bytes come from.
@@ -2064,21 +2101,24 @@ impl ChunkSource<'_> {
     }
 }
 
-/// Refuse, before an external payer is asked to pay anything, plans that
-/// don't all pay the per-quote vault: a payer pays quotes one by one, never
-/// a root wave, so a payment of root plans could never be confirmed, and
-/// each retry would pay again. Uploads through a payer are quoted for the
-/// per-quote vault ([`super::super::upload::UploadAdapter::pays_root_waves`]).
+/// Refuse, before an external payer that didn't ask for root waves
+/// ([`UploadPayer::pays_root_waves`]) is asked to pay anything, plans that
+/// don't all pay the per-quote vault: such a payer pays quotes one by one,
+/// never a root wave, so a payment of root plans could never be confirmed,
+/// and each retry would pay again. Its uploads are quoted for the per-quote
+/// vault ([`super::super::upload::UploadAdapter::pays_root_waves`]). A payer
+/// that asked is refused nothing here.
 ///
 /// When `reconciling`, the plans are an earlier run's journaled payment,
 /// which may have signed and sent its root transaction with the client's
 /// own wallet: the refusal says so, and that the checkpoint holding its
 /// journal must be kept, never that nothing was paid.
 fn payer_pays_per_quote(
+    payer: &dyn UploadPayer,
     plans: &[crate::data::client::batch::ChunkPaymentPlan],
     reconciling: bool,
 ) -> Result<()> {
-    if plans.iter().all(|plan| plan.vault.is_v2()) {
+    if payer.pays_root_waves() || plans.iter().all(|plan| plan.vault.is_v2()) {
         Ok(())
     } else if reconciling {
         Err(Error::Payment(
@@ -2095,6 +2135,21 @@ fn payer_pays_per_quote(
                 .into(),
         ))
     }
+}
+
+/// An external payer's `payment` of `plans`, without any root wave it named:
+/// the upload engine finds a root wave's payment on the chain itself
+/// (`native_payment::outside_root_payment`), so a payer never builds root
+/// proofs, and never names a wave the vault didn't record.
+fn outside_payment(
+    plans: &[crate::data::client::batch::ChunkPaymentPlan],
+    payment: Result<super::super::upload::UploadPayment>,
+) -> Result<super::super::upload::UploadPayment> {
+    let mut payment = payment?;
+    if plans.iter().any(|plan| !plan.vault.is_v2()) {
+        payment.root = None;
+    }
+    Ok(payment)
 }
 
 /// Uploads records from a [`ChunkSource`], paying through `payer` when there
@@ -2115,9 +2170,18 @@ impl super::super::upload::UploadAdapter for SpillUploadAdapter<'_> {
             super::super::native_payment::initialize(attempt);
         }
     }
-    /// An external payer pays quotes one by one: the per-quote vault.
+    /// The client's own wallets pay root waves, and so does an external
+    /// payer that asks ([`UploadPayer::pays_root_waves`]); any other pays
+    /// quotes one by one, at the per-quote vault.
     fn pays_root_waves(&self) -> bool {
-        self.payer.is_none()
+        self.payer.is_none_or(|payer| payer.pays_root_waves())
+    }
+    fn outside_payer(&self) -> bool {
+        self.payer.is_some()
+    }
+    /// The client approves each vault without limit; a payer says.
+    fn exact_approvals(&self) -> bool {
+        self.payer.is_some_and(|payer| payer.exact_approvals())
     }
     #[cfg(feature = "native")]
     async fn submit_payment(
@@ -2127,8 +2191,8 @@ impl super::super::upload::UploadAdapter for SpillUploadAdapter<'_> {
     ) -> Result<super::super::upload::UploadPayment> {
         match self.payer {
             Some(payer) => {
-                payer_pays_per_quote(plans, false)?;
-                payer.pay_quotes(plans).await
+                payer_pays_per_quote(payer, plans, false)?;
+                outside_payment(plans, payer.pay_quotes(plans).await)
             }
             None => super::super::native_payment::pay_shared(self.client, self, plans, state).await,
         }
@@ -2141,8 +2205,8 @@ impl super::super::upload::UploadAdapter for SpillUploadAdapter<'_> {
     ) -> Result<super::super::upload::UploadPayment> {
         match self.payer {
             Some(payer) => {
-                payer_pays_per_quote(plans, true)?;
-                payer.pay_quotes(plans).await
+                payer_pays_per_quote(payer, plans, true)?;
+                outside_payment(plans, payer.pay_quotes(plans).await)
             }
             None => super::super::native_payment::pay_shared(self.client, self, plans, state).await,
         }
@@ -6589,5 +6653,108 @@ mod payer_tests {
         let refused = through_payer.submit_payment(&plans[..1], &mut state).await;
         assert!(matches!(refused, Err(Error::Payment(reason)) if reason == "refused"));
         assert_eq!(payer.0.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    /// A payer that counts the payments it is asked for, and asks for root
+    /// waves.
+    struct AskingPayer(std::sync::atomic::AtomicUsize);
+
+    #[async_trait::async_trait]
+    impl UploadPayer for AskingPayer {
+        async fn pay_quotes(&self, _plans: &[ChunkPaymentPlan]) -> Result<UploadPayment> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err(Error::Payment("refused".into()))
+        }
+
+        async fn pay_merkle(&self, _batch: &PreparedMerkleBatch) -> Result<MerkleUploadPayment> {
+            Err(Error::Payment("refused".into()))
+        }
+
+        fn pays_root_waves(&self) -> bool {
+            true
+        }
+    }
+
+    /// An upload through an external payer that asks for root waves is
+    /// quoted for the root vault, on a client that knows its network's root
+    /// vault, with no root vault's wallet: the assertions of
+    /// `a_payer_upload_on_a_root_client_pays_the_per_quote_vault_alone`
+    /// flipped for such a payer. Plans that pay the root vault go to the
+    /// payer, paying or reconciling; a payer that doesn't ask keeps the
+    /// per-quote vault. A client that knows no root vault quotes even an
+    /// asking payer's uploads for the per-quote vault. A payer's approvals
+    /// count as exact unless it says otherwise; the client's own wallets'
+    /// never do.
+    #[tokio::test]
+    async fn a_payer_that_asks_for_root_waves_is_quoted_for_the_root_vault() {
+        use crate::data::client::native_payment::test_plans::{network, signed_plan};
+        use crate::data::client::root_payment::PaymentVault;
+        use crate::data::client::upload::UploadAdapter as _;
+        const KEY: &str = "0x4c0883a69102937d6231471b5dbb6204fe5129617082792ae468d01a3f362318";
+        let net = network(1);
+        let node = crate::data::Network::unstarted(&[], true, false)
+            .await
+            .unwrap();
+        let wallet = || ant_protocol::evm::Wallet::new_from_private_key(net.clone(), KEY).unwrap();
+        let named = Client::from_node(std::sync::Arc::clone(node.node()), Default::default())
+            .with_wallet(wallet())
+            .with_root_vault(ant_protocol::evm::Address::from([0x33; 20]));
+        assert!(named.root_wallet().is_none());
+        assert_eq!(named.payment_vault(), PaymentVault::V2);
+        let unnamed = Client::from_node(std::sync::Arc::clone(node.node()), Default::default())
+            .with_wallet(wallet());
+        let dir = tempfile::tempdir().unwrap();
+        let (checkpoint, _) = crate::data::client::upload_checkpoint::UploadCheckpointFiles::open(
+            dir.path().join(format!("{}.msgpack", "cd".repeat(32))),
+        )
+        .unwrap();
+        let spill = ChunkSpill::new().unwrap();
+        let asking = AskingPayer(std::sync::atomic::AtomicUsize::new(0));
+        let not_asking = CountingPayer(std::sync::atomic::AtomicUsize::new(0));
+        let adapter = |client, payer| SpillUploadAdapter {
+            client,
+            source: ChunkSource::Spill(&spill),
+            progress: None,
+            checkpoint: &checkpoint,
+            payer,
+        };
+        let through_asking = adapter(&named, Some(&asking as &dyn UploadPayer));
+        let through_not_asking = adapter(&named, Some(&not_asking as &dyn UploadPayer));
+        let through_wallet = adapter(&named, None);
+        assert!(through_asking.pays_root_waves());
+        assert!(through_asking.outside_payer());
+        assert_eq!(named.upload_vault(&through_asking), PaymentVault::Root);
+        assert_eq!(named.upload_vault(&through_not_asking), PaymentVault::V2);
+        // The client's own wallet holds no root vault's wallet: per-quote.
+        assert_eq!(named.upload_vault(&through_wallet), PaymentVault::V2);
+        assert_eq!(
+            unnamed.upload_vault(&adapter(&unnamed, Some(&asking as &dyn UploadPayer))),
+            PaymentVault::V2
+        );
+        assert!(through_asking.exact_approvals());
+        assert!(through_not_asking.exact_approvals());
+        assert!(!through_wallet.exact_approvals());
+
+        let now = std::time::SystemTime::now();
+        let mut plans = [
+            signed_plan([1; 32], 1024, now),
+            signed_plan([2; 32], 1024, now),
+        ];
+        for plan in &mut plans {
+            plan.vault = PaymentVault::Root;
+        }
+        let mut state = crate::data::client::upload_state::UploadState::default();
+        let refused = through_asking.submit_payment(&plans, &mut state).await;
+        assert!(matches!(refused, Err(Error::Payment(reason)) if reason == "refused"));
+        let refused = through_asking.reconcile_payment(&plans, &mut state).await;
+        assert!(matches!(refused, Err(Error::Payment(reason)) if reason == "refused"));
+        assert_eq!(asking.0.load(std::sync::atomic::Ordering::SeqCst), 2);
+        let message = through_not_asking
+            .submit_payment(&plans, &mut state)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(message.contains("nothing was paid"), "{message}");
+        assert_eq!(not_asking.0.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
 }

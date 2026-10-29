@@ -445,6 +445,136 @@ fn earliest_quote(plans: &[ChunkPaymentPlan]) -> u64 {
         .unwrap_or(0)
 }
 
+/// Settle an external payer's `payment` of `plans` from the chain, when the
+/// plans pay the root vault and the payment names no root wave: a payer
+/// that asked for root waves (`UploadPayer::pays_root_waves`) returns only
+/// its transactions and total, and the engine finds the wave itself. Any
+/// other payment is returned as it is: one of the per-quote vault, or the
+/// client's own root payment ([`pay_root`]), which names its wave.
+///
+/// - **The root vault records the wave** (its record under the wave's key,
+///   read again while empty, as after the client's own root payment): the
+///   proofs, and so the envelope's payment record, name the transaction
+///   that recorded it ([`Client::root_wave_transaction`]), the payer's own
+///   when its receipt holds the vault's `RootPaid` log naming the key. When
+///   another transaction recorded the same leaves first, the payer's moved
+///   no tokens (the vault records a key once and skips a wave it holds):
+///   the payment's amount is none, nothing is paid again, and the records
+///   are stored with proofs naming the recording transaction.
+/// - **The per-quote vault records every quote instead:** the wave's
+///   calldata was sent there, which pays each quote as a quotes payment
+///   does. Nodes accept a single-node proof for these quotes: a quote
+///   carries no settlement version, and one asked at the root vault's
+///   version is priced as one asked at the per-quote vault's. So `plans`
+///   (and their kept copies in `state`) pay the per-quote vault from here
+///   on, and the records are stored with single-node proofs from the
+///   payer's transactions, after the occupied-quote read-back as any
+///   per-quote payment.
+/// - **Neither:** the upload stops with the payment kept pending, and
+///   nothing is paid again: the next attempt reconciles it, asking the
+///   payer again for the payment it made.
+///
+/// # Errors
+///
+/// If no root vault or EVM network is known, the wave can't be built, the
+/// recording transaction isn't found, or neither vault shows the payment.
+pub(crate) async fn outside_root_payment(
+    client: &Client,
+    plans: &mut [ChunkPaymentPlan],
+    state: &mut UploadState,
+    payment: UploadPayment,
+) -> Result<UploadPayment> {
+    if payment.root.is_some()
+        || plans.is_empty()
+        || root_payment::vault_of(plans)? != PaymentVault::Root
+    {
+        return Ok(payment);
+    }
+    let vault = client.root_vault().ok_or_else(|| {
+        Error::Payment(
+            "these plans pay the root vault, and the client knows no root vault to find their \
+             payment at; the payment stays pending, and nothing is paid again. Don't delete the \
+             upload's checkpoint"
+                .into(),
+        )
+    })?;
+    let wave = root_payment::wave_of(plans)?;
+    let key = wave.key(&vault);
+    let read = client
+        .root_wave_recorded(&vault, &key, ROOT_READS_AFTER_PAYMENT)
+        .await;
+    if read == KeptPayment::Recorded {
+        // A payer names one transaction for a wave; any other answer leaves
+        // the recording transaction to its RootPaid log.
+        let mut sent = payment.transactions.values().copied();
+        let first = sent.next();
+        let own = first.filter(|first| sent.all(|tx| tx == *first));
+        let recording = ant_protocol::evm::TxHash::from(
+            client
+                .root_wave_transaction(
+                    &vault,
+                    &key,
+                    &own.map_or([0; 32], |own| own.0),
+                    own.is_some(),
+                    None,
+                    earliest_quote(plans),
+                )
+                .await?,
+        );
+        let quotes = root_payment::wave_quotes(&wave);
+        let total = quotes
+            .iter()
+            .try_fold(ant_protocol::evm::Amount::ZERO, |sum, quote| {
+                sum.checked_add(quote.2)
+            })
+            .ok_or_else(|| Error::Payment("payment total overflow".into()))?;
+        // The key binds every leaf's payee and amount, so a wave its own
+        // transaction recorded paid exactly the wave's total.
+        return Ok(root_wave_payment(
+            &quotes,
+            own.unwrap_or_default(),
+            recording,
+            wave,
+            total,
+            payment.gas,
+        ));
+    }
+    if read == KeptPayment::NotChecked {
+        return Err(Error::Payment(
+            "these plans pay the root vault, and the client has no EVM network to find their \
+             payment on (with_evm_network); the payment stays pending, and nothing is paid \
+             again. Don't delete the upload's checkpoint"
+                .into(),
+        ));
+    }
+    match client
+        .per_quote_vault_records(plans, ROOT_READS_AFTER_PAYMENT)
+        .await
+    {
+        KeptPayment::Recorded => {
+            tracing::warn!(
+                "the root wave under key {} isn't recorded at the root vault ({read:?}), and the \
+                 per-quote vault records each of its quotes: the payer sent it there, and its {} \
+                 record(s) are stored with single-node proofs",
+                hex::encode(key),
+                plans.len()
+            );
+            for plan in plans.iter_mut() {
+                plan.vault = PaymentVault::V2;
+                state.prepare(plan.clone());
+            }
+            Ok(payment)
+        }
+        per_quote => Err(Error::Payment(format!(
+            "the payment of the root wave under key {} wasn't found: the root vault's record \
+             read {read:?}, and the per-quote vault's records of its quotes {per_quote:?}. The \
+             payment stays pending, and nothing is paid again: the next attempt asks the payer \
+             for the payment it made. Don't delete the upload's checkpoint",
+            hex::encode(key)
+        ))),
+    }
+}
+
 /// Why a journaled transaction can't be read.
 fn journal_unreadable() -> Error {
     Error::Payment(
@@ -1966,6 +2096,239 @@ mod tests {
                 assert!(state.pending_payment.is_none());
             }
         }
+    }
+
+    /// An external payer's payment of root plans, which names no wave, is
+    /// settled from the chain ([`outside_root_payment`]):
+    ///
+    /// - the wave recorded by the payer's own transaction: every record's
+    ///   root proof names it, with the wave's total;
+    /// - the wave recorded first by another transaction, the payer's own
+    ///   recording nothing: the proofs name the recording transaction, and
+    ///   the payment moved no tokens, so nothing is paid twice;
+    /// - no wave, and the per-quote vault records every quote (the request
+    ///   paid there): the plans pay the per-quote vault from then on, in the
+    ///   upload's state too, and get single-node proofs from the payer's
+    ///   transactions;
+    /// - neither: an error that pays nothing again and keeps the payment
+    ///   pending.
+    ///
+    /// A payment of the per-quote vault's plans, or one naming its wave, is
+    /// left as it is, without a read.
+    #[tokio::test]
+    async fn an_outside_payers_root_wave_is_settled_from_the_chain() {
+        use crate::data::client::listings::test_chain::{serve, MockChain, VAULT};
+        use ant_listings::{root::ROOT_PAID_TOPIC, PaymentLog};
+        use ant_protocol::payment::{detect_proof_type, ProofType};
+        use std::sync::{Arc, Mutex};
+
+        /// A client reading `chain` through the per-quote vault [`VAULT`],
+        /// naming `root` as its root vault and holding no root vault's
+        /// wallet, and an upload's state with `plans` pending in a payment.
+        async fn settle(
+            node: &crate::data::Network,
+            chain: MockChain,
+            plans: &[ChunkPaymentPlan],
+            root: ant_protocol::evm::Address,
+        ) -> (
+            Client,
+            Vec<ChunkPaymentPlan>,
+            UploadState,
+            Arc<Mutex<MockChain>>,
+        ) {
+            let mut chain = chain;
+            chain.chain_id = 31_337;
+            let chain = Arc::new(Mutex::new(chain));
+            let url = serve(Arc::clone(&chain)).await;
+            let net = Network::Custom(ant_protocol::evm::CustomNetwork {
+                rpc_url_http: url.parse().unwrap(),
+                payment_token_address: [0x11; 20].into(),
+                payment_vault_address: VAULT.into(),
+            });
+            let client = Client::from_node(Arc::clone(node.node()), Default::default())
+                .with_evm_network(net)
+                .with_root_vault(root);
+            assert!(client.root_wallet().is_none(), "no root vault's wallet");
+            let mut state = UploadState::default();
+            for plan in plans {
+                state.prepare(plan.clone());
+            }
+            state
+                .start_payment(false, plans.iter().map(|plan| plan.address).collect())
+                .unwrap();
+            (client, plans.to_vec(), state, chain)
+        }
+
+        let root = ant_protocol::evm::Address::from([0x33; 20]);
+        let vault: [u8; 20] = root.0 .0;
+        let now = crate::runtime::system_time()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let start = now - 200;
+        let quoted = std::time::UNIX_EPOCH + Duration::from_secs(start + 100);
+        let plans = (1u8..=3)
+            .map(|n| {
+                let mut plan = signed_plan([n; 32], 1024, quoted);
+                plan.vault = PaymentVault::Root;
+                plan
+            })
+            .collect::<Vec<_>>();
+        let wave = root_payment::wave_of(&plans).unwrap();
+        let key = wave.key(&vault);
+        let total = plans
+            .iter()
+            .fold(ant_protocol::evm::Amount::ZERO, |sum, plan| {
+                sum + plan.payment.total_amount()
+            });
+        let own = ant_protocol::evm::TxHash::from([0x0a; 32]);
+        let recording = ant_protocol::evm::TxHash::from([0x0b; 32]);
+        let root_paid = |tx: ant_protocol::evm::TxHash, block| ant_listings::PaymentReceipt {
+            tx_hash: tx.0,
+            success: true,
+            block_number: block,
+            logs: vec![PaymentLog {
+                address: vault,
+                topics: vec![ROOT_PAID_TOPIC, key],
+                data: vec![0; 96],
+                log_index: 0,
+            }],
+        };
+        let paid_by = |tx| UploadPayment {
+            transactions: plans
+                .iter()
+                .flat_map(|plan| plan.payment.quotes.iter())
+                .map(|quote| (quote.quote_hash, tx))
+                .collect(),
+            amount: total,
+            gas: 3,
+            root: None,
+        };
+        let node = crate::data::Network::unstarted(&[], true, false)
+            .await
+            .unwrap();
+        let addresses = plans.iter().map(|plan| plan.address).collect::<Vec<_>>();
+
+        // Recorded by the payer's own transaction.
+        let mut chain = MockChain::with_blocks(100, start);
+        chain.root_records.insert(key);
+        chain.add_receipt(root_paid(own, 80));
+        let (client, mut paying, mut state, _) = settle(&node, chain, &plans, root).await;
+        let payment = outside_root_payment(&client, &mut paying, &mut state, paid_by(own))
+            .await
+            .unwrap();
+        assert_eq!(payment.amount, total);
+        assert_eq!(payment.gas, 3);
+        assert_eq!(payment.root.as_ref().unwrap().transaction, own);
+        super::super::upload::validate_payment_total(&paying, &payment).unwrap();
+        state
+            .confirm_payment(&addresses, &payment, crate::runtime::system_time())
+            .unwrap();
+        for address in &addresses {
+            let proof = state.proof(address).unwrap();
+            assert_eq!(detect_proof_type(proof), Some(ProofType::Root));
+            let proof = ant_protocol::payment::deserialize_root_proof(proof).unwrap();
+            assert_eq!(proof.payment.tx_hashes, vec![own]);
+        }
+        assert!(state.pending_payment.is_none());
+
+        // Recorded first by another: the payer's own transaction recorded
+        // nothing, and moved nothing.
+        let mut chain = MockChain::with_blocks(100, start);
+        chain.root_records.insert(key);
+        chain.add_receipt(ant_listings::PaymentReceipt {
+            tx_hash: own.0,
+            success: true,
+            block_number: 90,
+            logs: Vec::new(),
+        });
+        chain.add_receipt(root_paid(recording, 60));
+        let (client, mut paying, mut state, chain) = settle(&node, chain, &plans, root).await;
+        let payment = outside_root_payment(&client, &mut paying, &mut state, paid_by(own))
+            .await
+            .unwrap();
+        assert!(payment.amount.is_zero(), "nothing of this payment's moved");
+        assert_eq!(payment.root.as_ref().unwrap().transaction, recording);
+        assert!(payment.transactions.values().all(|tx| *tx == recording));
+        super::super::upload::validate_payment_total(&paying, &payment).unwrap();
+        state
+            .confirm_payment(&addresses, &payment, crate::runtime::system_time())
+            .unwrap();
+        for address in &addresses {
+            let proof = state.proof(address).unwrap();
+            let proof = ant_protocol::payment::deserialize_root_proof(proof).unwrap();
+            assert_eq!(proof.payment.tx_hashes, vec![recording]);
+        }
+        let calls = chain.lock().unwrap().calls.clone();
+        assert!(
+            !calls.iter().any(|method| method.starts_with("eth_send")),
+            "{calls:?}"
+        );
+
+        // Paid at the per-quote vault: single-node proofs.
+        let mut chain = MockChain::with_blocks(100, start);
+        for plan in &plans {
+            for quote in &plan.payment.quotes {
+                let mut prefix = [0u8; 16];
+                prefix.copy_from_slice(&quote.rewards_address.as_slice()[..16]);
+                let amount = quote.amount.to::<u128>();
+                chain
+                    .vault_records
+                    .insert(quote.quote_hash.0, (prefix, amount));
+            }
+        }
+        let (client, mut paying, mut state, _) = settle(&node, chain, &plans, root).await;
+        let payment = outside_root_payment(&client, &mut paying, &mut state, paid_by(own))
+            .await
+            .unwrap();
+        assert!(payment.root.is_none());
+        assert_eq!(payment.amount, total);
+        assert!(paying.iter().all(|plan| plan.vault.is_v2()));
+        super::super::upload::validate_payment_total(&paying, &payment).unwrap();
+        state
+            .confirm_payment(&addresses, &payment, crate::runtime::system_time())
+            .unwrap();
+        for address in &addresses {
+            let proof = state.proof(address).unwrap();
+            assert_eq!(detect_proof_type(proof), Some(ProofType::SingleNode));
+        }
+
+        // Neither: nothing is paid again, and the payment stays pending.
+        let (client, mut paying, mut state, chain) =
+            settle(&node, MockChain::with_blocks(100, start), &plans, root).await;
+        let error = outside_root_payment(&client, &mut paying, &mut state, paid_by(own))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("nothing is paid again"), "{error}");
+        assert!(error.contains("Don't delete"), "{error}");
+        assert!(state.pending_payment.is_some());
+        assert!(paying.iter().all(|plan| plan.vault == PaymentVault::Root));
+        let calls = chain.lock().unwrap().calls.clone();
+        assert!(
+            !calls.iter().any(|method| method.starts_with("eth_send")),
+            "{calls:?}"
+        );
+
+        // A payment of the per-quote vault, or naming its wave, is left
+        // alone, read nowhere.
+        let (client, mut paying, mut state, chain) =
+            settle(&node, MockChain::with_blocks(100, start), &plans, root).await;
+        let mut v2 = vec![signed_plan([7; 32], 1024, quoted)];
+        let kept = outside_root_payment(&client, &mut v2, &mut state, paid_by(own))
+            .await
+            .unwrap();
+        assert!(kept.root.is_none());
+        let mut named = paid_by(own);
+        named.root = Some(RootWavePayment {
+            transaction: own,
+            wave: wave.clone(),
+        });
+        let kept = outside_root_payment(&client, &mut paying, &mut state, named)
+            .await
+            .unwrap();
+        assert_eq!(kept.root.unwrap().transaction, own);
+        assert!(chain.lock().unwrap().calls.is_empty());
     }
 
     /// A second attempt at the same record waits for the first to let go of

@@ -32,8 +32,11 @@
 //!   batch on a commitment-bound network.
 //! - `root_payments`: records paid in waves through the root vault, records
 //!   whose close group holds a node without it paid through the per-quote
-//!   vault instead, and what a client paying the root vault hands a payer
-//!   outside it quoted for the per-quote vault.
+//!   vault instead, what a client paying the root vault hands a payer
+//!   outside it quoted for the per-quote vault, and a payer outside the
+//!   client that asks for root waves: a mixed wave paid through both vaults,
+//!   an interrupted payment reconciled without paying again, and a root
+//!   request paid at the per-quote vault stored with single-node proofs.
 
 #![allow(
     clippy::unwrap_used,

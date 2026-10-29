@@ -15,6 +15,15 @@
 //! the nodes received for it declared settlement version 2, never the root
 //! vault's 3.
 //!
+//! A payer outside the client that asks for root waves
+//! (`UploadPayer::pays_root_waves`), uploading through a client that names
+//! the root vault and holds no wallet for it, as a gateway does, is asked to
+//! pay a mixed file's root wave and its per-quote payment, each through its
+//! vault; the envelope's record names the transaction that recorded the
+//! wave. Interrupted after paying the wave, the upload reconciles it on the
+//! next attempt without paying it again. A root request paid at the
+//! per-quote vault is stored with single-node proofs.
+//!
 //! The amount checks are in the four cases of single records (a wave, a wave
 //! of one, a record paying the per-quote vault, a mixed wave): every payment
 //! there, a wave's leaf or a quote paid through the per-quote vault, is
@@ -33,10 +42,12 @@ use ant_core::ant_listings::{
     Envelope, Metadata, PaymentError, ProofError, RootVault, Salt, ShownFields,
     DATA_PAYMENT_MADE_TOPIC,
 };
+use ant_core::data::client::upload::{MerkleUploadPayment, UploadPayment};
 use ant_core::data::{
     compute_address, file_data_map, forget_upload_record, ml_dsa_65, paid_quote_hash,
-    proof_data_map, DataMap, ExternalPaymentInfo, ListingChain, PaymentMode, Pointer,
-    PointerTarget, PointerTargetKind, UploadEvent, Visibility,
+    proof_data_map, ChunkPaymentPlan, DataMap, Error, ExternalPaymentInfo, ListingChain,
+    PaymentMode, Pointer, PointerTarget, PointerTargetKind, PreparedMerkleBatch, UploadEvent,
+    UploadPayer, Visibility,
 };
 use ant_node::payment::pricing::quote_price_at;
 use ant_protocol::evm::{Address, Amount, QuoteHash, RewardsAddress, TxHash};
@@ -45,7 +56,8 @@ use bytes::Bytes;
 use std::collections::{BTreeSet, HashMap};
 use std::io::Write;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 use tempfile::{NamedTempFile, TempDir};
 
@@ -74,6 +86,18 @@ pub fn cases() -> Vec<Case> {
         Case::on_network(
             "root_payment::what_a_root_client_hands_an_outside_payer_is_quoted_for_the_per_quote_vault",
             what_a_root_client_hands_an_outside_payer_is_quoted_for_the_per_quote_vault,
+        ),
+        Case::on_network(
+            "root_payment::a_payer_that_asks_pays_a_mixed_wave_and_the_envelopes_record_names_the_recording_transaction",
+            a_payer_that_asks_pays_a_mixed_wave_and_the_envelopes_record_names_the_recording_transaction,
+        ),
+        Case::on_network(
+            "root_payment::a_payers_upload_stopped_after_its_root_wave_reconciles_without_paying_again",
+            a_payers_upload_stopped_after_its_root_wave_reconciles_without_paying_again,
+        ),
+        Case::on_network(
+            "root_payment::a_root_request_paid_at_the_per_quote_vault_stores_with_single_node_proofs",
+            a_root_request_paid_at_the_per_quote_vault_stores_with_single_node_proofs,
         ),
     ]
 }
@@ -413,7 +437,17 @@ fn file_content(n: u32) -> Vec<u8> {
 /// ids fall, and in some networks three records all doing so took thousands
 /// of files.
 async fn root_file(testnet: &MiniTestnet) -> (NamedTempFile, DataMap, usize) {
-    for n in 0..100_000 {
+    root_file_with(testnet, 0, 0).await
+}
+
+/// [`root_file`], with at least `per_quote_records` content records paying
+/// the per-quote vault, its content from `n` on.
+async fn root_file_with(
+    testnet: &MiniTestnet,
+    per_quote_records: usize,
+    from: u32,
+) -> (NamedTempFile, DataMap, usize) {
+    for n in from..from + 100_000 {
         let mut file = NamedTempFile::new().expect("a temp file");
         file.write_all(&file_content(n)).expect("write the file");
         file.flush().expect("flush the file");
@@ -431,7 +465,7 @@ async fn root_file(testnet: &MiniTestnet) -> (NamedTempFile, DataMap, usize) {
             .iter()
             .filter(|address| pays_per_quote(testnet, address))
             .count();
-        if roots >= 2 && roots + per_quote == addresses.len() {
+        if roots >= 2 && per_quote >= per_quote_records && roots + per_quote == addresses.len() {
             return (file, map, roots);
         }
     }
@@ -757,4 +791,382 @@ async fn what_a_root_client_hands_an_outside_payer_is_quoted_for_the_per_quote_v
         per_quote + records.len() + 1,
         "one quote for each record and the pointer through the per-quote vault"
     );
+}
+
+/// A payer outside the client that asks for root waves, as a gateway does:
+/// it pays each payment at the vault its plans name, from the funded
+/// wallet, a root wave's leaves in ascending quote-hash order, and leaves
+/// the wave to the engine to find. Asked again for a payment it made, it
+/// returns that payment and sends nothing, as a payer must after a restart.
+struct RootPayer<'a> {
+    testnet: &'a MiniTestnet,
+    /// Who the payer pays for ([`UploadPayer::checkpoint_scope`]).
+    account: &'static str,
+    /// Send every payment, a root wave's too, to the per-quote vault.
+    to_per_quote: bool,
+    /// Fail once after paying a root wave, as a payer stopped then.
+    stop_after_root: AtomicBool,
+    /// Payments asked for, of the root vault's plans and of the other's.
+    asked_root: AtomicUsize,
+    asked_per_quote: AtomicUsize,
+    /// Transactions sent for root plans.
+    sent_root: AtomicUsize,
+    /// Each payment made, by its quote hashes in order: its transactions
+    /// and total.
+    made: Mutex<HashMap<Vec<QuoteHash>, MadePayment>>,
+}
+
+/// A payment [`RootPayer`] made: its transaction for each quote hash, and
+/// its total.
+type MadePayment = (HashMap<QuoteHash, TxHash>, Amount);
+
+impl<'a> RootPayer<'a> {
+    fn new(testnet: &'a MiniTestnet, account: &'static str) -> Self {
+        Self {
+            testnet,
+            account,
+            to_per_quote: false,
+            stop_after_root: AtomicBool::new(false),
+            asked_root: AtomicUsize::new(0),
+            asked_per_quote: AtomicUsize::new(0),
+            sent_root: AtomicUsize::new(0),
+            made: Mutex::new(HashMap::new()),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl UploadPayer for RootPayer<'_> {
+    async fn pay_quotes(
+        &self,
+        plans: &[ChunkPaymentPlan],
+    ) -> ant_core::data::Result<UploadPayment> {
+        let root = plans.iter().any(|plan| !plan.vault.is_v2());
+        assert!(
+            plans.iter().all(|plan| plan.vault.is_v2() != root),
+            "one payment pays one vault"
+        );
+        if root {
+            self.asked_root.fetch_add(1, Ordering::SeqCst);
+        } else {
+            self.asked_per_quote.fetch_add(1, Ordering::SeqCst);
+        }
+        let mut payments = plans
+            .iter()
+            .flat_map(|plan| plan.payment.quotes.iter())
+            .filter(|quote| !quote.amount.is_zero())
+            .map(|quote| (quote.quote_hash, quote.rewards_address, quote.amount))
+            .collect::<Vec<_>>();
+        payments.sort_by_key(|payment| payment.0);
+        let hashes = payments.iter().map(|payment| payment.0).collect::<Vec<_>>();
+        let amount = plans
+            .iter()
+            .fold(Amount::ZERO, |sum, plan| sum + plan.payment.total_amount());
+        let made = self.made.lock().unwrap().get(&hashes).cloned();
+        if let Some((transactions, amount)) = made {
+            return Ok(UploadPayment {
+                transactions,
+                amount,
+                gas: 0,
+                root: None,
+            });
+        }
+        let wallet = if root && !self.to_per_quote {
+            self.testnet.root_wallet()
+        } else {
+            self.testnet.wallet().clone()
+        };
+        let (transactions, gas) = wallet
+            .pay_for_quotes(payments)
+            .await
+            .map_err(|e| Error::Payment(e.0.to_string()))?;
+        let transactions = transactions.into_iter().collect::<HashMap<_, _>>();
+        if root {
+            self.sent_root.fetch_add(1, Ordering::SeqCst);
+        }
+        self.made
+            .lock()
+            .unwrap()
+            .insert(hashes, (transactions.clone(), amount));
+        if root && self.stop_after_root.swap(false, Ordering::SeqCst) {
+            return Err(Error::Payment("stopped after paying the root wave".into()));
+        }
+        Ok(UploadPayment {
+            transactions,
+            amount,
+            gas: gas.gas_cost_wei,
+            root: None,
+        })
+    }
+
+    async fn pay_merkle(
+        &self,
+        _batch: &PreparedMerkleBatch,
+    ) -> ant_core::data::Result<MerkleUploadPayment> {
+        Err(Error::Payment("not used here".into()))
+    }
+
+    fn checkpoint_scope(&self) -> Vec<u8> {
+        self.account.as_bytes().to_vec()
+    }
+
+    fn pays_root_waves(&self) -> bool {
+        true
+    }
+
+    /// The funded wallet approves each vault without limit.
+    fn exact_approvals(&self) -> bool {
+        false
+    }
+}
+
+/// A client as a gateway runs one: it names the devnet's root vault
+/// ([`ant_core::data::Client::with_root_vault`]) and holds no wallet for
+/// it, so it pays the root vault only through a payer outside it.
+fn gateway_client(testnet: &MiniTestnet) -> ant_core::data::Client {
+    let client = testnet.client().with_root_vault(testnet.root_vault());
+    assert!(client.root_wallet().is_none());
+    client
+}
+
+/// Upload `file` through `payer`, stopping once its envelope's salt is
+/// saved (the upload says so with `UploadEvent::Encrypted`, before any
+/// quote is asked), and replace the salt with one whose envelope for `map`
+/// pays the root vault ([`root_salt`]), so the next upload of the file
+/// through the same payer resumes with it. Returns the envelope's address.
+async fn stop_with_root_salt(
+    testnet: &MiniTestnet,
+    client: &ant_core::data::Client,
+    payer: &RootPayer<'_>,
+    file: &NamedTempFile,
+    map: &DataMap,
+) -> [u8; 32] {
+    let salts = upload_salts();
+    {
+        let (events, mut received) = tokio::sync::mpsc::channel(64);
+        let stopped = client.file_upload_with_payer(
+            file.path(),
+            Visibility::default(),
+            PaymentMode::Single,
+            payer,
+            Some(events),
+        );
+        tokio::pin!(stopped);
+        loop {
+            tokio::select! {
+                biased;
+                event = received.recv() => match event {
+                    Some(UploadEvent::Encrypted { .. }) => break,
+                    Some(_) => {}
+                    None => panic!("the upload sent no Encrypted event"),
+                },
+                outcome = &mut stopped => {
+                    panic!("the upload ended before it could be stopped: {:?}", outcome.err())
+                }
+            }
+        }
+    }
+    let saved = upload_salts()
+        .difference(&salts)
+        .cloned()
+        .collect::<Vec<_>>();
+    assert_eq!(
+        saved.len(),
+        1,
+        "the stopped upload saved its salt: {saved:?}"
+    );
+    let (salt, address) = root_salt(testnet, map);
+    std::fs::write(&saved[0], salt).expect("replace the salt");
+    address
+}
+
+/// The file's upload through `payer`, with the default envelope.
+async fn upload_through(
+    client: &ant_core::data::Client,
+    payer: &RootPayer<'_>,
+    file: &NamedTempFile,
+) -> ant_core::data::Result<ant_core::data::FileUploadResult> {
+    client
+        .file_upload_with_payer(
+            file.path(),
+            Visibility::default(),
+            PaymentMode::Single,
+            payer,
+            None,
+        )
+        .await
+}
+
+/// That `result`, the upload of `file` (`map`, its envelope at `address`),
+/// stored every record, and its envelope's record checks out through
+/// `reader` with no problem at transaction `tx`; the file reads back from
+/// the record. Returns the record's transaction.
+async fn check_upload(
+    testnet: &MiniTestnet,
+    reader: &ListingChain,
+    file: &NamedTempFile,
+    map: &DataMap,
+    address: [u8; 32],
+    result: &ant_core::data::FileUploadResult,
+) -> [u8; 32] {
+    assert!(result.data_map == *map);
+    assert_eq!(
+        result.total_chunks,
+        map.infos().len() + 1,
+        "and its envelope"
+    );
+    assert_eq!(result.chunks_stored, result.total_chunks);
+    let envelope = result.envelope.clone().expect("an envelope");
+    forget_upload_record(&envelope.address()).expect("forget the kept record");
+    assert_eq!(envelope.address(), address, "the envelope of the root salt");
+    assert_eq!(envelope.proof_problem, None, "the record has no problem");
+    assert!(envelope.proof_checked);
+    let record = envelope.proof.clone().expect("a record");
+    let proven = reader
+        .check_proof(&record)
+        .await
+        .expect("the record checks out");
+    assert_eq!(proven.payment.tx_hash, record.tx_hash);
+    let revealed = proof_data_map(&record).expect("the revealed data map");
+    assert!(revealed == result.data_map);
+    let output = TempDir::new().expect("a temp folder");
+    let path = output.path().join("paid.bin");
+    testnet
+        .client()
+        .file_download(&revealed, &path)
+        .await
+        .expect("download");
+    assert_eq!(
+        std::fs::read(&path).expect("read the download"),
+        std::fs::read(file.path()).expect("read the file")
+    );
+    record.tx_hash
+}
+
+/// A payer outside the client that asks for root waves, through a client
+/// naming the root vault and holding no wallet for it, uploads a file whose
+/// envelope and two or more content records can pay the root vault and at
+/// least one content record can't (a node without the root vault is among
+/// its closest, [`ROOT_UNAWARE_NODES`]): it is asked for two payments, the
+/// root wave first, and the vaults record one wave of the envelope and the
+/// content records that can pay it, and a per-quote payment of each other
+/// record. The envelope's record names the transaction that recorded the
+/// wave and checks out at the root vault.
+async fn a_payer_that_asks_pays_a_mixed_wave_and_the_envelopes_record_names_the_recording_transaction(
+    testnet: Arc<MiniTestnet>,
+) {
+    let client = gateway_client(&testnet);
+    let vault = testnet.root_vault();
+    let reader =
+        ListingChain::new_with_root_vault(testnet.evm_network(), Some(vault)).expect("a reader");
+    let payer = RootPayer::new(&testnet, "root payer: mixed wave");
+    let (file, map, roots) = root_file_with(&testnet, 1, 200_000).await;
+    let content_records = map.infos().len();
+    assert!(roots < content_records, "a mixed file");
+    let address = stop_with_root_salt(&testnet, &client, &payer, &file, &map).await;
+
+    let waves = logs(&testnet, vault, ROOT_PAID).await.len();
+    let per_quote = per_quote_payments(&testnet).await;
+    let result = upload_through(&client, &payer, &file)
+        .await
+        .expect("an upload through the payer");
+    assert_eq!(payer.asked_root.load(Ordering::SeqCst), 1);
+    assert_eq!(payer.asked_per_quote.load(Ordering::SeqCst), 1);
+    assert_eq!(payer.sent_root.load(Ordering::SeqCst), 1);
+
+    let after = logs(&testnet, vault, ROOT_PAID).await;
+    assert_eq!(after.len(), waves + 1, "one wave: {}", after.len() - waves);
+    let wave = after.last().expect("the wave's log");
+    let leaves = alloy::primitives::U256::from_be_slice(&wave.data().data[32..64]);
+    assert_eq!(
+        leaves,
+        alloy::primitives::U256::from(roots + 1),
+        "the envelope and the content records paying the root vault are its leaves"
+    );
+    assert_eq!(
+        per_quote_payments(&testnet).await,
+        per_quote + content_records - roots,
+        "a per-quote payment of each content record that can't pay the root vault"
+    );
+    let recording = wave.transaction_hash.expect("the wave's transaction").0;
+    let named = check_upload(&testnet, &reader, &file, &map, address, &result).await;
+    assert_eq!(
+        named, recording,
+        "the record names the transaction that recorded the wave"
+    );
+}
+
+/// A payer's upload stopped once its root wave is paid (the payer fails
+/// after paying, as one interrupted then) keeps the payment pending; the
+/// next upload of the file through the same payer reconciles it, asking the
+/// payer for that payment again, which the payer returns without sending
+/// anything. One wave is recorded, and the records stored from it.
+async fn a_payers_upload_stopped_after_its_root_wave_reconciles_without_paying_again(
+    testnet: Arc<MiniTestnet>,
+) {
+    let client = gateway_client(&testnet);
+    let vault = testnet.root_vault();
+    let reader =
+        ListingChain::new_with_root_vault(testnet.evm_network(), Some(vault)).expect("a reader");
+    let payer = RootPayer::new(&testnet, "root payer: stopped");
+    payer.stop_after_root.store(true, Ordering::SeqCst);
+    let (file, map, _) = root_file_with(&testnet, 0, 400_000).await;
+    let address = stop_with_root_salt(&testnet, &client, &payer, &file, &map).await;
+
+    let waves = logs(&testnet, vault, ROOT_PAID).await.len();
+    let stopped = upload_through(&client, &payer, &file).await;
+    assert!(stopped.is_err(), "the payer stopped after paying the wave");
+    assert_eq!(payer.sent_root.load(Ordering::SeqCst), 1);
+    assert_eq!(logs(&testnet, vault, ROOT_PAID).await.len(), waves + 1);
+
+    let result = upload_through(&client, &payer, &file)
+        .await
+        .expect("the upload, reconciled");
+    assert_eq!(
+        payer.asked_root.load(Ordering::SeqCst),
+        2,
+        "asked again for the root wave it paid"
+    );
+    assert_eq!(payer.sent_root.load(Ordering::SeqCst), 1, "sent once");
+    let after = logs(&testnet, vault, ROOT_PAID).await;
+    assert_eq!(after.len(), waves + 1, "one wave, never paid again");
+    let recording = after
+        .last()
+        .and_then(|wave| wave.transaction_hash)
+        .expect("the wave's transaction")
+        .0;
+    let named = check_upload(&testnet, &reader, &file, &map, address, &result).await;
+    assert_eq!(named, recording);
+}
+
+/// A root wave's payment sent to the per-quote vault (the same calldata
+/// pays either), as a payer sending a root request to its own pinned vault
+/// does: the root vault records no wave, the per-quote vault records each
+/// quote, and every record, the envelope's among them, is stored with a
+/// single-node proof, which the nodes accept for quotes asked at the root
+/// vault's settlement version. The envelope's record names the payment's
+/// transaction and checks out with a reader of the per-quote vault alone.
+async fn a_root_request_paid_at_the_per_quote_vault_stores_with_single_node_proofs(
+    testnet: Arc<MiniTestnet>,
+) {
+    let client = gateway_client(&testnet);
+    let per_quote_reader = ListingChain::new(testnet.evm_network()).expect("a reader");
+    let mut payer = RootPayer::new(&testnet, "root payer: per-quote vault");
+    payer.to_per_quote = true;
+    let (file, map, _) = root_file_with(&testnet, 0, 600_000).await;
+    let address = stop_with_root_salt(&testnet, &client, &payer, &file, &map).await;
+
+    let waves = root_waves(&testnet).await;
+    let per_quote = per_quote_payments(&testnet).await;
+    let result = upload_through(&client, &payer, &file)
+        .await
+        .expect("an upload through the payer");
+    assert_eq!(payer.asked_root.load(Ordering::SeqCst), 1, "a root request");
+    assert_eq!(root_waves(&testnet).await, waves, "no wave");
+    assert_eq!(
+        per_quote_payments(&testnet).await,
+        per_quote + map.infos().len() + 1,
+        "each record and the envelope paid through the per-quote vault"
+    );
+    check_upload(&testnet, &per_quote_reader, &file, &map, address, &result).await;
 }

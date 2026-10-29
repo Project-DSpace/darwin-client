@@ -506,6 +506,78 @@ impl Client {
         }
     }
 
+    /// Whether the per-quote vault holds a record of every paid quote of
+    /// `plans`, plans for the root vault whose wave the root vault doesn't
+    /// record: the same calldata pays either vault, so a payer outside the
+    /// client may have sent a root wave to the per-quote vault. Read through
+    /// the payment network's RPC and those it falls back to, as
+    /// [`Self::occupied_quotes`] reads, up to `reads` rounds 2 seconds
+    /// apart while some record reads empty: `Recorded` once every paid
+    /// quote's record holds a payment (whose payee the occupied-quote
+    /// read-back then checks), `NotRecorded` if every read answered and some
+    /// record stayed empty, else `Unreadable` (`NotChecked` with no EVM
+    /// network).
+    #[cfg(feature = "native")]
+    pub(crate) async fn per_quote_vault_records(
+        &self,
+        plans: &[ChunkPaymentPlan],
+        reads: usize,
+    ) -> KeptPayment {
+        use futures::StreamExt;
+        const PAUSE: std::time::Duration = std::time::Duration::from_secs(2);
+
+        let Some(network) = self.evm_network.as_ref() else {
+            return KeptPayment::NotChecked;
+        };
+        let chain = match read_back_chain(network, self.root_vault()) {
+            Ok(chain) => chain,
+            Err(error) => {
+                tracing::warn!("cannot read the per-quote vault's records ({error})");
+                return KeptPayment::Unreadable;
+            }
+        };
+        let mut pending = plans
+            .iter()
+            .flat_map(|plan| plan.payment.quotes.iter())
+            .filter(|quote| !quote.amount.is_zero())
+            .map(|quote| quote.quote_hash)
+            .collect::<Vec<_>>();
+        let mut answered = true;
+        for read in 0..reads {
+            if pending.is_empty() {
+                break;
+            }
+            if read > 0 {
+                crate::runtime::sleep(PAUSE).await;
+            }
+            let chain = &chain;
+            let records = futures::stream::iter(pending.iter().copied())
+                .map(|hash| async move { (hash, read_record(chain, &hash).await) })
+                .buffer_unordered(16)
+                .collect::<Vec<_>>()
+                .await;
+            pending.clear();
+            answered = true;
+            for (hash, record) in records {
+                match record {
+                    Some(record) if !record.amount.is_zero() => {}
+                    Some(_) => pending.push(hash),
+                    None => {
+                        answered = false;
+                        pending.push(hash);
+                    }
+                }
+            }
+        }
+        if pending.is_empty() {
+            KeptPayment::Recorded
+        } else if answered {
+            KeptPayment::NotRecorded
+        } else {
+            KeptPayment::Unreadable
+        }
+    }
+
     /// The transaction that recorded the root vault `vault`'s wave under
     /// `key`, which a root wave's proofs and its envelope's payment record
     /// name: storers check an envelope's payment in the transactions its
