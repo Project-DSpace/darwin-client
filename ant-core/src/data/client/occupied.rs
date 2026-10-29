@@ -616,24 +616,26 @@ impl Client {
     /// mined, which the chain may no longer know.
     #[cfg(feature = "native")]
     pub(crate) async fn same_sender(&self, a: &[u8; 32], b: &[u8; 32]) -> Option<bool> {
+        Some(self.transaction_sender(a).await? == self.transaction_sender(b).await?)
+    }
+
+    /// The address transaction `tx` was sent from, read through the payment
+    /// network's RPCs: `None` if it can't be read, as for a transaction the
+    /// chain doesn't know.
+    #[cfg(feature = "native")]
+    pub(crate) async fn transaction_sender(&self, tx: &[u8; 32]) -> Option<[u8; 20]> {
         let network = self.evm_network.as_ref()?;
         let chain = read_back_chain(network, self.root_vault()).ok()?;
-        let sender = |tx: [u8; 32]| {
-            let chain = &chain;
-            async move {
-                match chain.transaction_sender(&tx).await {
-                    Ok(sender) => sender,
-                    Err(error) => {
-                        tracing::debug!(
-                            "the sender of transaction {} couldn't be read: {error}",
-                            hex::encode(tx)
-                        );
-                        None
-                    }
-                }
+        match chain.transaction_sender(tx).await {
+            Ok(sender) => sender,
+            Err(error) => {
+                tracing::debug!(
+                    "the sender of transaction {} couldn't be read: {error}",
+                    hex::encode(tx)
+                );
+                None
             }
-        };
-        Some(sender(*a).await? == sender(*b).await?)
+        }
     }
 }
 
