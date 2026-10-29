@@ -11,6 +11,30 @@ Our changes on top of upstream 0.3.11 (ant-core 0.13.0). Releases are tagged `vX
 ant-cli's version set to match; other builds are told apart by the commit `darwin --version`
 prints. Upstream's entries follow.
 
+- `v0.3.11+ds.8`, root by default in the library: ant-cli's version is 0.3.11+ds.8 (ant-core
+  stays 0.13.0). After upgrading, a library client given a wallet (`Client::with_wallet`) pays
+  through the root vault wherever its network's root vault is known (the bundled network's, or
+  the one the client names with `Client::with_root_vault`, before or after the wallet), as the
+  darwin CLI has since v0.3.11+ds.7 (Dan, 2026-10-29: "do what you recommend"). Its first root
+  payment is preceded by a one-time approval of the root vault to spend the wallet's DARWIN. The
+  root vault's wallet is made from the client's wallet's own signer
+  (`ant_core::config::root_wallet_of`), the wallet `with_root_payments_from_key` makes from the
+  key. `Client::without_root_payments` opts out and keeps the payment vault;
+  `with_root_payments` and `with_root_payments_from_key` opt back in, and a root vault's wallet the
+  caller gives is kept. A wallet whose transaction settings were changed
+  (`Wallet::set_transaction_config`) gets no root vault's wallet by default and pays the payment
+  vault, unless given one with `with_root_payments`. Outside payers stay opt-in
+  (`UploadPayer::pays_root_waves`, false by default), and prepared uploads and chunks, external
+  signers and a pointer's quoted state stay on the payment vault. `UploadPayer::payer_address`
+  (none by default) names the address a payer's transactions are sent from: when another
+  transaction recorded a root wave it paid, a recording from that address counts the wave's total
+  in the upload's cost, whether or not the returned transaction can be read; without an address
+  the senders of both transactions are compared, as before. On a devnet, `darwin listings`,
+  `darwin listing` and `darwin file verify` read the root vault the manifest names
+  (`ListingChain::new_with_root_vault`) beside the payment vault. The CLI builds its client on the
+  library's default; `--no-root-payments` calls `without_root_payments`. It is tested against
+  darwin-node 0.23.0+ds.20 (`363640e`), the revision its tests pin. Its notes are
+  `release-notes/v0.3.11+ds.8.md`.
 - `v0.3.11+ds.7`, the root switch: ant-cli's version is 0.3.11+ds.7 (ant-core stays 0.13.0). The
   darwin CLI pays through the root vault by default; `--no-root-payments` pays today's payment
   vault only, and `--root-payments`, the opt-in of v0.3.11+ds.6, still parses, hidden. Each record

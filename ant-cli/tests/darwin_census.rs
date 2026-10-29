@@ -192,7 +192,8 @@ const OUTSIDE_ROOT: &str = "Per-chunk payment in the network's token by an outsi
     wave: the root vault's record of the wave is read back and each record's proof names the \
     transaction that recorded it, paid nothing again where another transaction recorded it first; \
     quotes the per-quote vault records instead are proved there; neither keeps the payment \
-    pending and pays nothing.";
+    pending and pays nothing. A recording sent from the payer's own address \
+    (UploadPayer::payer_address) counts the wave's total in the upload's cost.";
 const RAW_CHUNK_PUT: &str = "raw, by the caller's choice: no envelope. `darwin chunk put` \
     stores one raw chunk; its help names `darwin file upload` as the standard way. Paid per chunk \
     with the read-back.";
@@ -238,6 +239,10 @@ const PAYER_ROOT_ASKED: &str = "An outside payer (UploadPayer) is quoted for the
 
 const CHAIN_WALLET: &str = "The one wallet: built from the configured key and bound to the \
     configured chain's id.";
+const ROOT_WALLET_OF: &str = "The root vault's wallet a client given a wallet pays through by \
+    default: the client's own wallet's signer, carrying the chain binding config::wallet gave it, \
+    on its RPC and token, paying the root vault; none for a wallet whose transaction settings \
+    aren't evmlib's defaults, which then pays the per-quote vault.";
 const DEVNET_WALLET: &str = "A funded wallet on a local devnet's Anvil chain (the devnet \
     feature), for tests.";
 
@@ -1167,6 +1172,13 @@ const WALLET_SITES: &[Site] = &[
     ),
     (
         "ant-core/src/config.rs",
+        "root_wallet_of",
+        "Wallet::new",
+        1,
+        ROOT_WALLET_OF,
+    ),
+    (
+        "ant-core/src/config.rs",
         "wallet",
         "EthereumWallet",
         1,
@@ -1208,10 +1220,13 @@ const BOTH_VAULTS: &str = "Builds the reader of the network's payments that read
     vault named (a devnet's manifest names it), never the per-quote vault.";
 const DEVNET_ROOT: &str = "A devnet manifest's evm.root_vault_address, read beside its chain ID: \
     the root vault a client on the devnet names (Client::with_root_vault).";
-const VERIFY_READER: &str = "`darwin file verify`: the reader of both vaults (ListingChain::new) \
-    checks the upload proof, by the vault whose log it is.";
-const LISTINGS_READER: &str = "darwin's listings and listing commands read listings through the \
-    reader of both vaults (ListingChain::new).";
+const VERIFY_READER: &str = "`darwin file verify`: the reader of both vaults \
+    (ListingChain::new_with_root_vault naming the client's root vault, or offline the reader of \
+    LISTINGS_READER) checks the upload proof, by the vault whose log it is.";
+const LISTINGS_READER: &str = "darwin's listings and listing commands, and `darwin file verify` \
+    offline, read through the reader of both vaults (listing_chain: \
+    ListingChain::new_with_root_vault naming the root vault a devnet's manifest names, DEVNET_ROOT; \
+    on the bundled network its built-in one), the vaults uploads pay.";
 const ENVELOPE_READER: &str = "An upload's envelope record is found and checked through the \
     reader of both vaults (ListingChain::new) and its vault set (ListingChain::vaults).";
 const PRODUCER_READER: &str = "The listings producer reads payments through the reader of both \
@@ -1227,12 +1242,16 @@ const SET_KEPT: &str = "The listings producer's kept receipts and quotes' paymen
 const ROOT_CONFIG: &str = "The bundled network's root vault address \
     (resources/payment_network.toml), read by ListingChain::new and by a payer through the root \
     vault, as the one root vault it may pay.";
-const ROOT_PAYER: &str = "A payer through the root vault (Client::with_root_payments) takes the \
-    bundled network's root vault as the only one it pays there, and reads its payments back at \
-    the vault it pays.";
-const CLI_ROOT_PAYER: &str = "darwin pays through the root vault by default (--no-root-payments \
-    opts out): the bundled network's root vault, else the one a devnet's manifest names \
-    (DEVNET_ROOT); where none is known it pays the per-quote vault, and says so.";
+const ROOT_PAYER: &str = "A payer through the root vault (by default a client given a wallet, \
+    ROOT_DEFAULT; Client::with_root_payments for a root vault's wallet of the caller's own) takes \
+    the bundled network's root vault as the only one it pays there, and reads its payments back \
+    at the vault it pays.";
+const ROOT_DEFAULT: &str = "A client given a wallet (Client::with_wallet) pays through the root \
+    vault by default: the bundled network's root vault, else the one the client names \
+    (Client::with_root_vault; DEVNET_ROOT on a devnet), through a wallet of the wallet's own \
+    signer (ROOT_WALLET_OF); where none is known it pays the per-quote vault, as it does after \
+    Client::without_root_payments. darwin builds its client on this default (paying_with, which \
+    warns where no root vault is known; --no-root-payments calls without_root_payments).";
 const CLI_DEVNET_ROOT: &str = "On a devnet (--evm-network local) darwin names the root vault its \
     manifest names (Client::with_root_vault), with a wallet or without: where its readers of the \
     client read root-paid records, and the one its root payments go to.";
@@ -1263,8 +1282,8 @@ const PAYER_ROOT_RECEIPT: &str = "A payer through the root vault reads a transac
 const VAULT_READ_SITES: &[Site] = &[
     (
         "ant-cli/src/commands/data/file.rs",
-        "FileAction::execute_offline",
-        "ListingChain::new",
+        "FileAction::execute",
+        "ListingChain::new_with_root_vault",
         1,
         VERIFY_READER,
     ),
@@ -1284,16 +1303,9 @@ const VAULT_READ_SITES: &[Site] = &[
     ),
     (
         "ant-cli/src/main.rs",
-        "create_root_wallet",
-        "root_vault_address",
+        "listing_chain",
+        "ListingChain::new_with_root_vault",
         1,
-        CLI_ROOT_PAYER,
-    ),
-    (
-        "ant-cli/src/main.rs",
-        "run",
-        "ListingChain::new",
-        2,
         LISTINGS_READER,
     ),
     (
@@ -1512,6 +1524,13 @@ const VAULT_READ_SITES: &[Site] = &[
         "ListingChain::new",
         1,
         PRODUCER_READER,
+    ),
+    (
+        "ant-core/src/data/client/mod.rs",
+        "Client::pay_root_by_default",
+        "root_vault_address",
+        1,
+        ROOT_DEFAULT,
     ),
     (
         "ant-core/src/data/client/mod.rs",
@@ -3450,7 +3469,8 @@ fn every_wallet_is_built_where_it_is_reviewed() {
         WALLETS,
         WALLET_SITES,
         "A wallet is built from the configured key and bound to the configured chain \
-         (config::wallet), or funded on a local devnet; nowhere else.",
+         (config::wallet), from such a wallet's own signer to pay its root vault \
+         (config::root_wallet_of), or funded on a local devnet; nowhere else.",
     );
 }
 
