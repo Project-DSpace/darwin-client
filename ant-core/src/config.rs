@@ -352,7 +352,9 @@ pub fn manifest_chain_id(manifest: &str) -> Result<Option<u64>> {
 /// (`Client::with_root_vault`) and pays through its root wallet
 /// ([`root_wallet`]). Upstream's [`DevnetManifest`] has no such field, so it
 /// is read from the manifest's JSON, as [`manifest_chain_id`] is. A
-/// manifest naming none gives none: the devnet has no root vault.
+/// manifest naming none gives none: the devnet has no root vault. One
+/// naming its own per-quote payment vault (`payment_vault_address`) as its
+/// root vault is refused, as `Client::with_root_vault` refuses it.
 pub fn manifest_root_vault(manifest: &str) -> Result<Option<EvmAddress>> {
     #[derive(serde::Deserialize)]
     struct Manifest {
@@ -361,18 +363,27 @@ pub fn manifest_root_vault(manifest: &str) -> Result<Option<EvmAddress>> {
     #[derive(serde::Deserialize)]
     struct Evm {
         root_vault_address: Option<String>,
+        payment_vault_address: Option<String>,
     }
     let manifest: Manifest = serde_json::from_str(manifest)
         .map_err(|e| Error::InvalidEvmManifest(format!("invalid root vault address: {e}")))?;
-    manifest
-        .evm
-        .and_then(|evm| evm.root_vault_address)
-        .map(|address| {
-            address
-                .parse()
-                .map_err(|e| Error::InvalidEvmManifest(format!("invalid root vault address: {e}")))
-        })
-        .transpose()
+    let Some(Evm {
+        root_vault_address: Some(root),
+        payment_vault_address: per_quote,
+    }) = manifest.evm
+    else {
+        return Ok(None);
+    };
+    let root: EvmAddress = root
+        .parse()
+        .map_err(|e| Error::InvalidEvmManifest(format!("invalid root vault address: {e}")))?;
+    if per_quote.and_then(|vault| vault.parse::<EvmAddress>().ok()) == Some(root) {
+        return Err(Error::InvalidEvmManifest(format!(
+            "the root vault address {root:#x} is the manifest's per-quote payment vault; a \
+             root vault is another contract"
+        )));
+    }
+    Ok(Some(root))
 }
 
 /// A wallet paying on `network` with `private_key` (hex, `0x` optional).
@@ -765,6 +776,20 @@ mod tests {
                 .payment_vault_address
                 .parse::<EvmAddress>()
                 .unwrap()
+        );
+        // The manifest's own per-quote payment vault is never its root
+        // vault, whatever the letter case it is written in.
+        let mut same = named.clone();
+        same["evm"]["root_vault_address"] = manifest_with_evm()
+            .evm
+            .unwrap()
+            .payment_vault_address
+            .to_lowercase()
+            .into();
+        let error = manifest_root_vault(&same.to_string()).unwrap_err();
+        assert!(
+            matches!(error, Error::InvalidEvmManifest(ref text) if text.contains("per-quote")),
+            "{error}"
         );
         for bad in [json_str("0x1234"), json_str("not an address"), 7.into()] {
             named["evm"]["root_vault_address"] = bad;

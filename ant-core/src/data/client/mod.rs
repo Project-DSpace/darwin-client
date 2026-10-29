@@ -820,8 +820,12 @@ impl Client {
     /// `wallet`; one of another key, token, RPC or vault is dropped, and the
     /// client pays the per-quote vault until `with_root_payments` is called
     /// again. Root waves are never signed by another key than the wallet's.
+    /// A root vault named earlier ([`Self::with_root_vault`]) that is
+    /// `wallet`'s per-quote payment vault is dropped, as that function
+    /// refuses it.
     #[must_use]
     pub fn with_wallet(mut self, wallet: Wallet) -> Self {
+        self.drop_root_vault_paid_per_quote(wallet.network());
         if self
             .root_wallet
             .as_ref()
@@ -880,8 +884,24 @@ impl Client {
     /// another vault than `vault` is dropped, as [`Self::with_wallet`] drops
     /// one that no longer matches, and the client pays the per-quote vault
     /// until `with_root_payments` is called again.
+    ///
+    /// The network's per-quote payment vault is never its root vault: once
+    /// the client's payment network is known (from [`Self::with_wallet`] or
+    /// [`Self::with_evm_network`]), naming it is refused with a warning and
+    /// the client is left as it was, and one named before the network is
+    /// known is dropped when the network turns out to pay it per quote.
     #[must_use]
     pub fn with_root_vault(mut self, vault: ant_protocol::evm::Address) -> Self {
+        let network = self
+            .evm_network
+            .as_ref()
+            .or_else(|| self.wallet.as_deref().map(Wallet::network));
+        if network.is_some_and(|network| network.payment_vault_address() == &vault) {
+            tracing::warn!(
+                "{vault:#x} is the payment network's per-quote payment vault, not its root                  vault; it isn't taken as the root vault"
+            );
+            return self;
+        }
         self.root_vault = Some(vault);
         let mismatched = match (self.wallet.as_deref(), self.root_wallet.as_deref()) {
             (Some(wallet), Some(root)) => {
@@ -1001,8 +1021,24 @@ impl Client {
     /// for external-signer flows where the private key lives outside Rust.
     #[must_use]
     pub fn with_evm_network(mut self, network: ant_protocol::evm::Network) -> Self {
+        self.drop_root_vault_paid_per_quote(&network);
         self.evm_network = Some(network);
         self
+    }
+
+    /// Drop the root vault named ([`Self::with_root_vault`]) if it is
+    /// `network`'s per-quote payment vault, which is never a root vault: the
+    /// client reads and pays the per-quote vault alone from then on, with a
+    /// warning.
+    fn drop_root_vault_paid_per_quote(&mut self, network: &ant_protocol::evm::Network) {
+        if let Some(vault) = self
+            .root_vault
+            .take_if(|vault| vault == network.payment_vault_address())
+        {
+            tracing::warn!(
+                "the root vault named, {vault:#x}, is the payment network's per-quote payment                  vault, not its root vault; it is dropped"
+            );
+        }
     }
 
     /// Get the EVM network, falling back to the wallet's network if available.
