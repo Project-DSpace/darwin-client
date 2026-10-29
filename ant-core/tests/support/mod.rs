@@ -524,14 +524,18 @@ impl MiniTestnet {
 
     /// A client on [`CLIENT_NODE`] with [`test_client_config`], naming the
     /// devnet's root vault ([`ant_core::data::Client::with_root_vault`], as
-    /// a devnet's manifest gives it) and paying through it
-    /// ([`ant_core::data::Client::with_root_payments`]) from the funded
-    /// wallet.
+    /// a devnet's manifest gives it) and so paying through it by default
+    /// ([`ant_core::data::Client::with_wallet`]) from the funded wallet's
+    /// own signer: the wallet [`Self::root_wallet`] makes from its key.
     pub fn root_client(&self) -> ant_core::data::Client {
-        self.client()
-            .with_root_vault(self.root_vault)
-            .with_root_payments(self.root_wallet())
-            .expect("a root client")
+        let client = self.client().with_root_vault(self.root_vault);
+        let root = client
+            .root_wallet()
+            .expect("the root vault is paid by default");
+        let keyed = self.root_wallet();
+        assert_eq!(root.address(), keyed.address());
+        assert_eq!(root.network(), keyed.network());
+        client
     }
 
     /// The funded wallet's key, paying the root vault.

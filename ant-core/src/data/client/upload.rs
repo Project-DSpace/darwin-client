@@ -2972,6 +2972,13 @@ mod tests {
         assert_eq!(rooted.upload_vault(&Outside), PaymentVault::V2);
         let unrooted = Client::from_node(std::sync::Arc::clone(node.node()), Default::default());
         assert_eq!(unrooted.upload_vault(&own), PaymentVault::V2);
+        // A client paying the root vault by default (`with_wallet`, on the
+        // bundled network) quotes an outside signer's upload as before.
+        let bundled = crate::config::bundled_payment_network().unwrap();
+        let by_default = Client::from_node(std::sync::Arc::clone(node.node()), Default::default())
+            .with_wallet(ant_protocol::evm::Wallet::new_from_private_key(bundled, KEY).unwrap());
+        assert_eq!(by_default.payment_vault(), PaymentVault::Root);
+        assert_eq!(by_default.upload_vault(&Outside), PaymentVault::V2);
     }
 
     /// A root plan kept from an earlier attempt is paid as it is while a

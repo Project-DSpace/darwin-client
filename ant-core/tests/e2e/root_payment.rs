@@ -935,9 +935,14 @@ impl UploadPayer for RootPayer<'_> {
 
 /// A client as a gateway runs one: it names the devnet's root vault
 /// ([`ant_core::data::Client::with_root_vault`]) and holds no wallet for
-/// it, so it pays the root vault only through a payer outside it.
+/// it, having opted out of paying it with its own
+/// ([`ant_core::data::Client::without_root_payments`]), so it pays the root
+/// vault only through a payer outside it.
 fn gateway_client(testnet: &MiniTestnet) -> ant_core::data::Client {
-    let client = testnet.client().with_root_vault(testnet.root_vault());
+    let client = testnet
+        .client()
+        .without_root_payments()
+        .with_root_vault(testnet.root_vault());
     assert!(client.root_wallet().is_none());
     client
 }

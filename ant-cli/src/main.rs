@@ -447,8 +447,7 @@ async fn build_data_client(
 
     // On a devnet, the root vault its manifest names: where the client reads
     // root-paid records, and the one its root payments go to.
-    let devnet_root = devnet_root_vault(ctx)?;
-    if let Some(vault) = devnet_root {
+    if let Some(vault) = devnet_root_vault(ctx)? {
         client = client.with_root_vault(vault);
     }
 
@@ -457,26 +456,9 @@ async fn build_data_client(
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("SECRET_KEY environment variable required"))?;
         let network = resolve_evm_network(ctx.evm_network.as_deref(), manifest.as_ref())?;
-        let wallet = create_wallet(key, network.clone(), ctx)?;
+        let wallet = create_wallet(key, network, ctx)?;
         info!("Wallet configured for EVM payments");
-        client = client.with_wallet(wallet);
-        if ctx.root_payments {
-            match create_root_wallet(key, &network, devnet_root, ctx)? {
-                Some(root_wallet) => {
-                    client = client.with_root_payments(root_wallet).map_err(|e| {
-                        anyhow::anyhow!("Failed to pay through the root vault: {e}")
-                    })?;
-                    info!("Payments go through the root vault");
-                }
-                None => eprintln!(
-                    "warning: no root vault is known for this payment network (a devnet \
-                     manifest names one as evm.root_vault_address): payments go through \
-                     the payment vault"
-                ),
-            }
-        } else {
-            info!("Payments go through the payment vault (--no-root-payments)");
-        }
+        client = paying_with(client, wallet, ctx.root_payments);
     }
 
     Ok(client)
@@ -557,24 +539,29 @@ fn devnet_root_vault(ctx: &DataCliContext) -> anyhow::Result<Option<EvmAddress>>
     })
 }
 
-/// The wallet of `private_key` that pays `network`'s root vault, signing
-/// for the chain [`create_wallet`]'s does: the bundled network's built-in
-/// root vault (`ant_core::config::root_vault_address`), else `devnet_root`,
-/// the one a devnet's manifest names ([`devnet_root_vault`]). None where
-/// no root vault is known: the client then pays the payment vault.
-fn create_root_wallet(
-    private_key: &str,
-    network: &EvmNetwork,
-    devnet_root: Option<EvmAddress>,
-    ctx: &DataCliContext,
-) -> anyhow::Result<Option<Wallet>> {
-    let Some(root) = ant_core::config::root_vault_address(network).or(devnet_root) else {
-        return Ok(None);
-    };
-    let chain_id = wallet_chain_id(network, ctx)?;
-    ant_core::config::root_wallet(network, root, private_key, chain_id)
-        .map(Some)
-        .map_err(|e| anyhow::anyhow!("Failed to create the root vault's wallet: {e}"))
+/// `client` paying with `wallet`. By default through the root vault, as a
+/// client given a wallet pays (`Client::with_wallet`): the bundled network's
+/// built-in root vault (`ant_core::config::root_vault_address`), else the
+/// one a devnet's manifest names, which `client` already names
+/// ([`devnet_root_vault`]), through a wallet of `wallet`'s own signer,
+/// signing for the chain [`create_wallet`]'s does. Where no root vault is
+/// known it pays the payment vault, and says so. Without `root_payments`
+/// (`--no-root-payments`) it pays the payment vault alone.
+fn paying_with(client: Client, wallet: Wallet, root_payments: bool) -> Client {
+    if !root_payments {
+        info!("Payments go through the payment vault (--no-root-payments)");
+        return client.without_root_payments().with_wallet(wallet);
+    }
+    let client = client.with_wallet(wallet);
+    if client.root_wallet().is_some() {
+        info!("Payments go through the root vault");
+    } else {
+        eprintln!(
+            "warning: no root vault is known for this payment network (a devnet manifest \
+             names one as evm.root_vault_address): payments go through the payment vault"
+        );
+    }
+    client
 }
 
 /// Load and parse the devnet manifest once (if configured).
@@ -740,9 +727,9 @@ mod tests {
     /// The root vault the CLI pays by default: the bundled network's own,
     /// on a devnet the one its manifest names, and none on a devnet whose
     /// manifest names none, where it pays the payment vault instead of
-    /// stopping.
-    #[test]
-    fn the_root_vault_paid_is_the_bundled_one_or_the_devnets() {
+    /// stopping. `--no-root-payments` pays the payment vault alone.
+    #[tokio::test]
+    async fn the_root_vault_paid_is_the_bundled_one_or_the_devnets() {
         const KEY: &str = "4c0883a69102937d6231471b5dbb6204fe5129617082792ae468d01a3f362318";
         let root: EvmAddress = "0x3333333333333333333333333333333333333333"
             .parse()
@@ -773,19 +760,40 @@ mod tests {
                 .parse()
                 .unwrap(),
         });
+        let node = create_client_node_raw(&[], true, true, false)
+            .await
+            .expect("a client node");
+        // A client as build_data_client makes it: naming the devnet's root
+        // vault, then paying with the wallet.
+        let paying = |network: &EvmNetwork, ctx: &DataCliContext, root_payments| {
+            let mut client = data_client(Arc::clone(&node), ClientConfig::default(), None, &[]);
+            if let Some(vault) = devnet_root_vault(ctx).unwrap() {
+                client = client.with_root_vault(vault);
+            }
+            let wallet = create_wallet(KEY, network.clone(), ctx).unwrap();
+            paying_with(client, wallet, root_payments)
+        };
+        let pays = |client: &Client| {
+            client
+                .root_wallet()
+                .map(|wallet| *wallet.network().payment_vault_address())
+        };
 
         let named = context(Some("local"), Some(manifest(Some(root))));
         assert_eq!(devnet_root_vault(&named).unwrap(), Some(root));
-        let wallet = create_root_wallet(KEY, &devnet, Some(root), &named)
-            .unwrap()
-            .expect("the devnet's root vault is paid");
-        assert_eq!(wallet.network().payment_vault_address(), &root);
+        let client = paying(&devnet, &named, true);
+        assert_eq!(pays(&client), Some(root), "the devnet's root vault is paid");
+        assert_eq!(
+            client.root_wallet().unwrap().address(),
+            client.wallet().unwrap().address()
+        );
+        let opted_out = paying(&devnet, &named, false);
+        assert_eq!(pays(&opted_out), None);
+        assert_eq!(opted_out.root_vault(), Some(root.0 .0), "still read");
 
         let unnamed = context(Some("local"), Some(manifest(None)));
         assert_eq!(devnet_root_vault(&unnamed).unwrap(), None);
-        assert!(create_root_wallet(KEY, &devnet, None, &unnamed)
-            .unwrap()
-            .is_none());
+        assert_eq!(pays(&paying(&devnet, &unnamed, true)), None);
         // The manifest's root vault is read only when it names the payment
         // network.
         let bundled_named = context(Some("robinhood"), Some(manifest(Some(root))));
@@ -793,9 +801,12 @@ mod tests {
 
         let bundled = ant_core::config::bundled_payment_network().unwrap();
         let built_in = ant_core::config::root_vault_address(&bundled).unwrap();
-        let wallet = create_root_wallet(KEY, &bundled, None, &context(None, None))
-            .unwrap()
-            .expect("the bundled network's root vault is paid");
-        assert_eq!(wallet.network().payment_vault_address(), &built_in);
+        let on_bundled = context(None, None);
+        assert_eq!(
+            pays(&paying(&bundled, &on_bundled, true)),
+            Some(built_in),
+            "the bundled network's root vault is paid"
+        );
+        assert_eq!(pays(&paying(&bundled, &on_bundled, false)), None);
     }
 }

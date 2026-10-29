@@ -6677,14 +6677,16 @@ mod payer_tests {
 
     /// An upload through an external payer that asks for root waves is
     /// quoted for the root vault, on a client that knows its network's root
-    /// vault, with no root vault's wallet: the assertions of
+    /// vault, with no root vault's wallet (it opted out,
+    /// `Client::without_root_payments`): the assertions of
     /// `a_payer_upload_on_a_root_client_pays_the_per_quote_vault_alone`
     /// flipped for such a payer. Plans that pay the root vault go to the
     /// payer, paying or reconciling; a payer that doesn't ask keeps the
     /// per-quote vault. A client that knows no root vault quotes even an
     /// asking payer's uploads for the per-quote vault. A payer's approvals
     /// count as exact unless it says otherwise; the client's own wallets'
-    /// never do.
+    /// never do. A client that pays the root vault by default quotes outside
+    /// payers' uploads just the same: by what each payer asks.
     #[tokio::test]
     async fn a_payer_that_asks_for_root_waves_is_quoted_for_the_root_vault() {
         use crate::data::client::native_payment::test_plans::{network, signed_plan};
@@ -6698,7 +6700,8 @@ mod payer_tests {
         let wallet = || ant_protocol::evm::Wallet::new_from_private_key(net.clone(), KEY).unwrap();
         let named = Client::from_node(std::sync::Arc::clone(node.node()), Default::default())
             .with_wallet(wallet())
-            .with_root_vault(ant_protocol::evm::Address::from([0x33; 20]));
+            .with_root_vault(ant_protocol::evm::Address::from([0x33; 20]))
+            .without_root_payments();
         assert!(named.root_wallet().is_none());
         assert_eq!(named.payment_vault(), PaymentVault::V2);
         let unnamed = Client::from_node(std::sync::Arc::clone(node.node()), Default::default())
@@ -6729,6 +6732,22 @@ mod payer_tests {
         assert_eq!(named.upload_vault(&through_wallet), PaymentVault::V2);
         assert_eq!(
             unnamed.upload_vault(&adapter(&unnamed, Some(&asking as &dyn UploadPayer))),
+            PaymentVault::V2
+        );
+        let rooted = Client::from_node(std::sync::Arc::clone(node.node()), Default::default())
+            .with_wallet(wallet())
+            .with_root_vault(ant_protocol::evm::Address::from([0x33; 20]));
+        assert_eq!(rooted.payment_vault(), PaymentVault::Root, "by default");
+        assert_eq!(
+            rooted.upload_vault(&adapter(&rooted, None)),
+            PaymentVault::Root
+        );
+        assert_eq!(
+            rooted.upload_vault(&adapter(&rooted, Some(&asking as &dyn UploadPayer))),
+            PaymentVault::Root
+        );
+        assert_eq!(
+            rooted.upload_vault(&adapter(&rooted, Some(&not_asking as &dyn UploadPayer))),
             PaymentVault::V2
         );
         assert!(through_asking.exact_approvals());
