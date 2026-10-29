@@ -1553,12 +1553,14 @@ mod tests {
     }
 
     /// A client may name its network's root vault without a wallet to pay
-    /// it (`with_root_vault`): it reads root payments there, and a journaled
-    /// root payment to it is reconciled through it. A root vault's wallet
-    /// must then pay that vault: one paying another is refused, and one set
-    /// earlier is dropped once another vault is named. The network's
-    /// per-quote vault is never taken as its root vault. On the bundled
-    /// network its own root vault stays the one read and paid.
+    /// it (`with_root_vault`, on a client that opted out of root payments):
+    /// it reads root payments there, and a journaled root payment to it is
+    /// reconciled through it. A root vault's wallet must then pay that
+    /// vault: one paying another is refused, and one set earlier is dropped
+    /// once another vault is named, the client then paying the vault named
+    /// through a wallet of its own signer. The network's per-quote vault is
+    /// never taken as its root vault. On the bundled network its own root
+    /// vault stays the one read and paid.
     #[tokio::test]
     async fn a_client_names_its_root_vault_without_a_root_wallet() {
         const KEY: &str = "0x4c0883a69102937d6231471b5dbb6204fe5129617082792ae468d01a3f362318";
@@ -1571,9 +1573,15 @@ mod tests {
         let client = || {
             Client::from_node(std::sync::Arc::clone(node.node()), Default::default())
                 .with_wallet(Wallet::new_from_private_key(net.clone(), KEY).unwrap())
+                .without_root_payments()
         };
         let paying = |vault| {
             Wallet::new_from_private_key(crate::config::network_paying(&net, vault), KEY).unwrap()
+        };
+        let pays = |client: &Client| {
+            client
+                .root_wallet()
+                .map(|root| *root.network().payment_vault_address())
         };
 
         assert_eq!(client().root_vault(), None);
@@ -1582,7 +1590,7 @@ mod tests {
         assert_eq!(
             named.payment_vault(),
             PaymentVault::V2,
-            "it pays nothing by naming"
+            "it pays nothing by naming, opted out"
         );
         assert_eq!(vault_named(&named, &root), Some(PaymentVault::Root));
         let v2 = *net.payment_vault_address();
@@ -1623,10 +1631,19 @@ mod tests {
         assert_eq!(rooted.payment_vault(), PaymentVault::Root);
         assert_eq!(rooted.root_vault(), Some(root.0 .0));
         // Naming the same vault again keeps the wallet; naming another drops
-        // it, and the client pays the per-quote vault.
+        // it, and the client, opted back in, pays the vault named through a
+        // wallet of its own signer; opted out, it pays the per-quote vault.
         let kept = rooted.with_root_vault(root);
         assert_eq!(kept.payment_vault(), PaymentVault::Root);
         let moved = kept.with_root_vault(other);
+        assert_eq!(pays(&moved), Some(other));
+        assert_eq!(moved.root_vault(), Some(other.0 .0));
+        let moved = client()
+            .with_root_vault(root)
+            .with_root_payments(paying(root))
+            .unwrap()
+            .without_root_payments()
+            .with_root_vault(other);
         assert!(moved.root_wallet().is_none());
         assert_eq!(moved.payment_vault(), PaymentVault::V2);
         assert_eq!(moved.root_vault(), Some(other.0 .0));
@@ -1635,6 +1652,12 @@ mod tests {
         let later = client()
             .with_root_payments(paying(other))
             .unwrap()
+            .with_root_vault(root);
+        assert_eq!(pays(&later), Some(root));
+        let later = client()
+            .with_root_payments(paying(other))
+            .unwrap()
+            .without_root_payments()
             .with_root_vault(root);
         assert!(later.root_wallet().is_none());
 
@@ -1657,11 +1680,12 @@ mod tests {
         assert_eq!(rooted.root_vault(), Some(built_in.0 .0));
     }
 
-    /// A library client opts in to root payments with one key in one call
+    /// A library client pays root with one key in one call
     /// (`with_root_payments_from_key`): both wallets from that key, the root
     /// vault's paying the bundled network's own, or on another network the
     /// one the client names. With none known, it is refused and nothing is
-    /// set; a client that doesn't opt in pays the per-quote vault.
+    /// set; a client given a wallet alone there pays the per-quote vault.
+    /// It opts a client back in after `without_root_payments`.
     #[tokio::test]
     async fn one_key_opts_a_client_in_to_root_payments() {
         const KEY: &str = "0x4c0883a69102937d6231471b5dbb6204fe5129617082792ae468d01a3f362318";
@@ -1673,7 +1697,11 @@ mod tests {
         let client = || Client::from_node(std::sync::Arc::clone(node.node()), Default::default());
 
         let plain = client().with_wallet(Wallet::new_from_private_key(net.clone(), KEY).unwrap());
-        assert_eq!(plain.payment_vault(), PaymentVault::V2, "opt-in only");
+        assert_eq!(
+            plain.payment_vault(),
+            PaymentVault::V2,
+            "no root vault known"
+        );
 
         let error = client()
             .with_root_payments_from_key(net.clone(), KEY, Some(31337))
@@ -1697,10 +1725,21 @@ mod tests {
 
         let bad_key = client()
             .with_root_vault(root)
-            .with_root_payments_from_key(net, "not a key", None)
+            .with_root_payments_from_key(net.clone(), "not a key", None)
             .err()
             .unwrap();
         assert!(bad_key.to_string().contains("wallet"), "{bad_key}");
+
+        let opted_back = client()
+            .with_root_vault(root)
+            .without_root_payments()
+            .with_root_payments_from_key(net.clone(), KEY, Some(31337))
+            .unwrap();
+        assert_eq!(opted_back.payment_vault(), PaymentVault::Root);
+        let still_out = opted_back
+            .without_root_payments()
+            .with_wallet(Wallet::new_from_private_key(net, KEY).unwrap());
+        assert_eq!(still_out.payment_vault(), PaymentVault::V2);
 
         let bundled = crate::config::bundled_payment_network().unwrap();
         let built_in = crate::config::root_vault_address(&bundled).unwrap();
@@ -1715,6 +1754,99 @@ mod tests {
                 .payment_vault_address(),
             &built_in
         );
+    }
+
+    /// A client given a wallet pays the root vault by default wherever its
+    /// network's root vault is known, through a wallet of its own signer, as
+    /// `with_root_payments_from_key` would make from the key: the bundled
+    /// network's root vault, or the one the client names, before the wallet
+    /// or after. Where none is known it pays the per-quote vault.
+    /// `without_root_payments` keeps the per-quote vault, before the wallet
+    /// or after, with the root vault still named and read. A wallet made
+    /// without a key string pays the root vault just the same.
+    #[tokio::test]
+    async fn a_client_with_a_wallet_pays_the_root_vault_by_default() {
+        const KEY: &str = "0x4c0883a69102937d6231471b5dbb6204fe5129617082792ae468d01a3f362318";
+        let root = ant_protocol::evm::Address::from([0x33; 20]);
+        let net = network(1);
+        let bundled = crate::config::bundled_payment_network().unwrap();
+        let built_in = crate::config::root_vault_address(&bundled).unwrap();
+        let node = crate::data::Network::unstarted(&[], true, false)
+            .await
+            .unwrap();
+        let client = || Client::from_node(std::sync::Arc::clone(node.node()), Default::default());
+        let wallet = |network: &Network| {
+            crate::config::wallet(
+                network.clone(),
+                KEY,
+                crate::config::chain_id(network).or(Some(31337)),
+            )
+            .unwrap()
+        };
+        let pays = |client: &Client| {
+            client
+                .root_wallet()
+                .map(|root| *root.network().payment_vault_address())
+        };
+
+        let on_bundled = client().with_wallet(wallet(&bundled));
+        assert_eq!(on_bundled.payment_vault(), PaymentVault::Root);
+        assert_eq!(pays(&on_bundled), Some(built_in));
+        let from_key = client()
+            .with_root_payments_from_key(bundled.clone(), KEY, crate::config::chain_id(&bundled))
+            .unwrap();
+        let (default, keyed) = (
+            on_bundled.root_wallet().unwrap(),
+            from_key.root_wallet().unwrap(),
+        );
+        assert_eq!(default.address(), keyed.address());
+        assert_eq!(default.network(), keyed.network());
+        assert!(on_bundled.wallet_paying(PaymentVault::Root).is_ok());
+        assert_eq!(on_bundled.root_vault(), Some(built_in.0 .0));
+
+        for named in [
+            client().with_root_vault(root).with_wallet(wallet(&net)),
+            client().with_wallet(wallet(&net)).with_root_vault(root),
+        ] {
+            assert_eq!(named.payment_vault(), PaymentVault::Root);
+            assert_eq!(pays(&named), Some(root));
+            assert_eq!(
+                named.root_wallet().unwrap().address(),
+                named.wallet().unwrap().address()
+            );
+        }
+        let unnamed = client().with_wallet(wallet(&net));
+        assert_eq!(unnamed.payment_vault(), PaymentVault::V2);
+        assert_eq!(unnamed.root_vault(), None);
+
+        let random = client()
+            .with_root_vault(root)
+            .with_wallet(Wallet::new_with_random_wallet(net.clone()));
+        assert_eq!(pays(&random), Some(root));
+
+        for opted_out in [
+            client()
+                .without_root_payments()
+                .with_wallet(wallet(&bundled)),
+            client()
+                .with_wallet(wallet(&bundled))
+                .without_root_payments(),
+            client()
+                .without_root_payments()
+                .with_wallet(wallet(&net))
+                .with_root_vault(root),
+            client()
+                .with_root_vault(root)
+                .with_wallet(wallet(&net))
+                .without_root_payments()
+                .with_wallet(wallet(&net)),
+        ] {
+            assert!(opted_out.root_wallet().is_none());
+            assert_eq!(opted_out.payment_vault(), PaymentVault::V2);
+            assert!(opted_out.root_vault().is_some(), "still read");
+            let error = opted_out.wallet_paying(PaymentVault::Root).err().unwrap();
+            assert!(error.to_string().contains("with_root_payments"), "{error}");
+        }
     }
 
     /// A wallet set after the root vault's keeps the root vault's wallet

@@ -285,6 +285,38 @@ pub fn root_wallet(
     wallet(network_paying(network, vault), private_key, chain_id)
 }
 
+/// The wallet that pays the root vault `vault` through `wallet`'s own
+/// signer, on `wallet`'s RPC and token: the wallet [`root_wallet`] makes
+/// from the key `wallet` was made from, signing for the same chain. A client
+/// holding `wallet` pays its root vault through it by default
+/// (`Client::with_wallet`).
+///
+/// None if `wallet`'s transaction settings (`Wallet::set_transaction_config`)
+/// are not evmlib's defaults: a wallet can't be asked for them, so they
+/// can't be carried over, and root payments would be sent with other gas
+/// settings than the wallet's own. Such a client pays the root vault only
+/// through a root vault's wallet it is given, configured as its own
+/// (`Client::with_root_payments`).
+#[must_use]
+pub fn root_wallet_of(wallet: &Wallet, vault: EvmAddress) -> Option<Wallet> {
+    use alloy::providers::WalletProvider;
+
+    if !shows_default_transaction_settings(&format!("{wallet:?}")) {
+        return None;
+    }
+    let signer = wallet.to_provider().wallet().clone();
+    Some(Wallet::new(network_paying(wallet.network(), vault), signer))
+}
+
+/// Whether a wallet's debug form, `shown`, shows evmlib's default
+/// transaction settings. A wallet shows its settings nowhere else; read this
+/// way, a change to how evmlib shows them reads as settings of the caller's
+/// own, and the client keeps the per-quote vault ([`root_wallet_of`]).
+fn shows_default_transaction_settings(shown: &str) -> bool {
+    let default = ant_protocol::evm::utils::TransactionConfig::default();
+    shown.contains(&format!("transaction_config: {default:?}"))
+}
+
 /// The timestamp, in Unix seconds, of the block `network`'s payment vault
 /// was deployed in: the bundled network's `payment_vault_deployment_time`,
 /// and none for any other network. No payment to the vault is in a block
@@ -836,6 +868,64 @@ mod tests {
         // No chain ID: the RPC's chain is signed for, as before.
         let unbound = wallet(network, &key, None).unwrap().to_provider();
         assert!(tx(1).build(unbound.wallet()).await.is_ok());
+    }
+
+    /// The root vault's wallet made from a wallet's own signer
+    /// (`root_wallet_of`) is the one `root_wallet` makes from its key: the
+    /// same address, RPC and token, paying the vault given, and signing only
+    /// for the chain the wallet signs for. A wallet whose transaction
+    /// settings were changed gets none, as they can't be carried over.
+    #[tokio::test]
+    async fn a_root_wallet_is_made_from_a_wallets_own_signer() {
+        use alloy::network::TransactionBuilder;
+        use alloy::providers::WalletProvider;
+        use alloy::rpc::types::TransactionRequest;
+
+        let tx = |chain| {
+            TransactionRequest::default()
+                .with_to(EvmAddress::ZERO)
+                .with_nonce(0)
+                .with_gas_limit(21_000)
+                .with_max_fee_per_gas(1)
+                .with_max_priority_fee_per_gas(1)
+                .with_chain_id(chain)
+        };
+        let network = bundled_payment_network().unwrap();
+        let vault = root_vault_address(&network).unwrap();
+        let key = Wallet::random_private_key();
+
+        let bound = wallet(network.clone(), &key, chain_id(&network)).unwrap();
+        let root = root_wallet_of(&bound, vault).expect("default settings");
+        let from_key = root_wallet(&network, vault, &key, chain_id(&network)).unwrap();
+        assert_eq!(root.address(), bound.address());
+        assert_eq!(root.network(), from_key.network());
+        assert_eq!(root.network().payment_vault_address(), &vault);
+        assert_eq!(root.network().rpc_url(), network.rpc_url());
+        assert_eq!(
+            root.network().payment_token_address(),
+            network.payment_token_address()
+        );
+        let signer = root.to_provider();
+        let refused = tx(1).build(signer.wallet()).await.unwrap_err().to_string();
+        assert!(refused.contains("chain ID (1)"), "{refused}");
+        assert!(tx(4663).build(signer.wallet()).await.is_ok());
+
+        // A wallet made without a key string has its signer read all the same.
+        let random = Wallet::new_with_random_wallet(network.clone());
+        assert_eq!(
+            root_wallet_of(&random, vault).unwrap().address(),
+            random.address()
+        );
+
+        // Settings of the caller's own, as a wallet shows them: evmlib's
+        // `MaxFeePerGas` isn't re-exported, so a wallet with them can't be
+        // built here, and its debug form is the default one's with the
+        // setting changed.
+        let shown = format!("{bound:?}");
+        assert!(shows_default_transaction_settings(&shown), "{shown}");
+        let capped = shown.replace("max_fee_per_gas: Auto", "max_fee_per_gas: LimitedAuto(1)");
+        assert_ne!(capped, shown, "{shown}");
+        assert!(!shows_default_transaction_settings(&capped));
     }
 
     #[test]

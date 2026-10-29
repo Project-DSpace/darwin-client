@@ -16,7 +16,8 @@
 //!   anything is signed.
 //! - **The payment.** The wave's leaves as one `payForQuotes` call, the
 //!   same calldata a payment to the per-quote vault takes, through a wallet
-//!   built for the root vault (`Client::with_root_payments`), journaled
+//!   built for the root vault (by default `Client::with_wallet`, or
+//!   `Client::with_root_payments`), journaled
 //!   as any payment is.
 //! - **The proof.** Each record's proof (tag 0x03) carries its quotes and
 //!   commitments as a single-node proof does, the transaction, and its

@@ -588,9 +588,14 @@ pub struct Client {
     network: Network,
     wallet: Option<Arc<Wallet>>,
     /// The wallet root payments go through: the same key as `wallet`,
-    /// paying the root vault ([`Client::with_root_payments`]). Set, every
-    /// payment this client makes pays the root vault.
+    /// paying the root vault ([`Client::with_root_payments`], or by default
+    /// [`Client::with_wallet`]). Set, every payment this client makes pays
+    /// the root vault.
     root_wallet: Option<Arc<Wallet>>,
+    /// Set by [`Client::without_root_payments`]: the client pays the
+    /// per-quote vault, and makes no root vault's wallet of its own until
+    /// [`Client::with_root_payments`] gives it one.
+    per_quote_only: bool,
     /// The root vault this client names for its payment network
     /// ([`Client::with_root_vault`]): where it reads root-paid records
     /// when it has no root wallet, and the only vault a root wallet may
@@ -661,6 +666,7 @@ impl Client {
             wallet: None,
             root_wallet: None,
             root_vault: None,
+            per_quote_only: false,
             evm_network: None,
             chunk_cache: ChunkCache::default(),
             holders: holders::HolderCache::default(),
@@ -711,6 +717,7 @@ impl Client {
             wallet: None,
             root_wallet: None,
             root_vault: None,
+            per_quote_only: false,
             evm_network: None,
             chunk_cache: ChunkCache::default(),
             holders: holders::HolderCache::default(),
@@ -772,6 +779,7 @@ impl Client {
             wallet: None,
             root_wallet: None,
             root_vault: None,
+            per_quote_only: false,
             evm_network: None,
             chunk_cache: ChunkCache::default(),
             holders: holders::HolderCache::default(),
@@ -815,11 +823,28 @@ impl Client {
     /// Also populates the EVM network from the wallet so that
     /// token approvals work without a separate `with_evm_network` call.
     ///
+    /// The client pays through the root vault by default wherever the root
+    /// vault of `wallet`'s network is known: the bundled network's, built in
+    /// (`crate::config::root_vault_address`), else the one the client names
+    /// ([`Self::with_root_vault`], before or after this call). It pays
+    /// through a root vault's wallet made from `wallet`'s own signer
+    /// (`crate::config::root_wallet_of`), as
+    /// [`Self::with_root_payments_from_key`] does from the key: every
+    /// payment pays the root vault in waves, after a one-time approval of
+    /// the root vault to spend the wallet's tokens. Where no root vault is
+    /// known it pays the per-quote vault, as before.
+    /// [`Self::without_root_payments`] opts out and keeps the per-quote
+    /// vault. A `wallet` whose transaction settings were changed
+    /// (`Wallet::set_transaction_config`) can't have them read and carried
+    /// over, so it gets no root vault's wallet by default and pays the
+    /// per-quote vault; give it one configured as its own with
+    /// [`Self::with_root_payments`].
+    ///
     /// A root vault's wallet set earlier ([`Self::with_root_payments`]) is
     /// kept only while it still passes that function's checks against
     /// `wallet`; one of another key, token, RPC or vault is dropped, and the
-    /// client pays the per-quote vault until `with_root_payments` is called
-    /// again. Root waves are never signed by another key than the wallet's.
+    /// client pays as a client given `wallet` alone would. Root waves are
+    /// never signed by another key than the wallet's.
     /// A root vault named earlier ([`Self::with_root_vault`]) that is
     /// `wallet`'s per-quote payment vault is dropped, as that function
     /// refuses it.
@@ -835,7 +860,57 @@ impl Client {
         }
         self.evm_network = Some(wallet.network().clone());
         self.wallet = Some(Arc::new(wallet));
+        self.pay_root_by_default();
         self
+    }
+
+    /// Pay the per-quote vault: drop the root vault's wallet, and make none
+    /// from the client's wallet ([`Self::with_wallet`]) from here on, so
+    /// every payment pays the per-quote vault, one record kept by the vault
+    /// for each quote paid. The client still reads root-paid records at its
+    /// network's root vault, or the one it names ([`Self::with_root_vault`]).
+    /// [`Self::with_root_payments`] or [`Self::with_root_payments_from_key`]
+    /// opt back in.
+    ///
+    /// A journaled payment to the root vault of an earlier upload is then
+    /// reconciled only by a client that pays the root vault.
+    #[must_use]
+    pub fn without_root_payments(mut self) -> Self {
+        self.per_quote_only = true;
+        self.root_wallet = None;
+        self
+    }
+
+    /// Give the client a root vault's wallet made from its wallet's own
+    /// signer ([`Self::with_wallet`]), if it has none, hasn't opted out
+    /// ([`Self::without_root_payments`]), and its network's root vault is
+    /// known: the bundled network's, else the one it names.
+    fn pay_root_by_default(&mut self) {
+        #[cfg(feature = "native")]
+        {
+            if self.per_quote_only || self.root_wallet.is_some() {
+                return;
+            }
+            let Some(wallet) = self.wallet.as_deref() else {
+                return;
+            };
+            let Some(vault) =
+                crate::config::root_vault_address(wallet.network()).or(self.root_vault)
+            else {
+                return;
+            };
+            let Some(root) = crate::config::root_wallet_of(wallet, vault) else {
+                tracing::info!(
+                    "the wallet's transaction settings aren't the defaults and can't be carried \
+                     over to a root vault's wallet: payments go through the per-quote vault \
+                     unless the client is given one (with_root_payments)"
+                );
+                return;
+            };
+            if root_wallet_mismatch(wallet, &root, self.root_vault).is_none() {
+                self.root_wallet = Some(Arc::new(root));
+            }
+        }
     }
 
     /// Pay through the root vault: every payment this client makes, of
@@ -860,12 +935,18 @@ impl Client {
     /// pays another token, pays the client's own payment vault, or pays a
     /// vault other than the bundled network's root vault, or on another
     /// network, the root vault the client names.
+    ///
+    /// A client given a wallet pays its network's root vault by default
+    /// ([`Self::with_wallet`]); this gives it a root vault's wallet of the
+    /// caller's own, such as one with its own transaction settings, and
+    /// opts a client back in after [`Self::without_root_payments`].
     pub fn with_root_payments(mut self, root_wallet: Wallet) -> Result<Self> {
         let wallet = self.require_wallet()?;
         if let Some(mismatch) = root_wallet_mismatch(wallet, &root_wallet, self.root_vault) {
             return Err(Error::Payment(mismatch.into()));
         }
         self.root_wallet = Some(Arc::new(root_wallet));
+        self.per_quote_only = false;
         Ok(self)
     }
 
@@ -874,16 +955,18 @@ impl Client {
     /// (`crate::config::manifest_root_vault`), or one a payer outside the
     /// client pays. The client reads root-paid records there, its own
     /// envelopes' records included, as it does at the root vault its root
-    /// wallet pays. It pays nothing by this alone: payments go to the root
-    /// vault only through [`Self::with_root_payments`], whose wallet must
-    /// then pay `vault`.
+    /// wallet pays. A client with a wallet then pays `vault` by default, as
+    /// [`Self::with_wallet`] says, unless it opted out
+    /// ([`Self::without_root_payments`]); one without a wallet pays nothing
+    /// by this alone. A root vault's wallet it is given
+    /// ([`Self::with_root_payments`]) must pay `vault`.
     ///
     /// A network whose root vault is built in (the bundled network,
     /// `crate::config::root_vault_address`) keeps that vault: `vault` is
     /// never read or paid there. A root vault's wallet set earlier that pays
     /// another vault than `vault` is dropped, as [`Self::with_wallet`] drops
-    /// one that no longer matches, and the client pays the per-quote vault
-    /// until `with_root_payments` is called again.
+    /// one that no longer matches, and the client pays `vault` as a client
+    /// naming it alone would.
     ///
     /// The network's per-quote payment vault is never its root vault: once
     /// the client's payment network is known (from [`Self::with_wallet`] or
@@ -913,6 +996,7 @@ impl Client {
         if mismatched {
             self.root_wallet = None;
         }
+        self.pay_root_by_default();
         self
     }
 
@@ -925,8 +1009,10 @@ impl Client {
     /// ([`Self::with_root_vault`]): on a devnet, name the vault its manifest
     /// names (`crate::config::manifest_root_vault`) first.
     ///
-    /// A library client pays the per-quote vault until it opts in, here or
-    /// through `with_root_payments`.
+    /// [`Self::with_wallet`] pays the root vault by default where one is
+    /// known; this call also opts a client back in after
+    /// [`Self::without_root_payments`], and refuses where no root vault is
+    /// known instead of paying the per-quote vault.
     ///
     /// # Errors
     ///
@@ -960,14 +1046,15 @@ impl Client {
     }
 
     /// The wallet root payments go through, if this client pays the root
-    /// vault ([`Self::with_root_payments`]).
+    /// vault ([`Self::with_wallet`], [`Self::with_root_payments`]).
     #[must_use]
     pub fn root_wallet(&self) -> Option<&Arc<Wallet>> {
         self.root_wallet.as_ref()
     }
 
-    /// The vault this client's payments go to: the root vault once
-    /// [`Self::with_root_payments`] set its wallet, else the per-quote vault.
+    /// The vault this client's payments go to: the root vault while it has
+    /// a root vault's wallet ([`Self::root_wallet`]), else the per-quote
+    /// vault.
     #[must_use]
     pub fn payment_vault(&self) -> root_payment::PaymentVault {
         if self.root_wallet.is_some() {
