@@ -562,13 +562,17 @@ pub(crate) async fn outside_root_payment(
                 Some(sender) if sender == payer.0 .0 => true,
                 Some(_) => {
                     tracing::warn!(
-                        "the root wave was recorded by transaction {recording}, sent from                          another address than the payer's {payer}: another payer recorded it                          first"
+                        "the root wave was recorded by transaction {recording}, sent from \
+                         another address than the payer's {payer}: another payer recorded it \
+                         first"
                     );
                     false
                 }
                 None => {
                     tracing::warn!(
-                        "the root wave was recorded by transaction {recording}, whose sender                          couldn't be read: whether the payer {payer} sent it can't be told, so                          the payment is reported as moving no tokens"
+                        "the root wave was recorded by transaction {recording}, whose sender \
+                         couldn't be read: whether the payer {payer} sent it can't be told, so \
+                         the payment is reported as moving no tokens"
                     );
                     false
                 }
@@ -580,14 +584,19 @@ pub(crate) async fn outside_root_payment(
                     Some(same) => {
                         if !same {
                             tracing::warn!(
-                                "the root wave was recorded by transaction {recording}, sent                                  from another address than this payment's own {own}: another                                  payer recorded it first"
+                                "the root wave was recorded by transaction {recording}, sent \
+                                 from another address than this payment's own {own}: another \
+                                 payer recorded it first"
                             );
                         }
                         same
                     }
                     None => {
                         tracing::warn!(
-                            "the root wave was recorded by transaction {recording}, not this                              payment's own {own}, and the sender of one of them couldn't be                              read: whether the payer's wallet replaced its own can't be told,                              so the payment is reported as moving no tokens"
+                            "the root wave was recorded by transaction {recording}, not this \
+                             payment's own {own}, and the sender of one of them couldn't be \
+                             read: whether the payer's wallet replaced its own can't be told, \
+                             so the payment is reported as moving no tokens"
                         );
                         false
                     }
@@ -812,13 +821,17 @@ async fn save_wave_journal<A: UploadAdapter>(
 /// send it, and tell the members how it ended.
 async fn lead(client: &Client, wallet: &Wallet, member: &Member) {
     // One transaction in flight per signing key: the wave stays open for
-    // others to join while an earlier one is in flight.
-    let _signing = root_payment::signing_lock(wallet.address())
-        .lock_owned()
-        .await;
-    // And the wallet's own lock inside it, as in `execute_once`: the lead
-    // prepares and sends the wave's payment (`Wallet::prepare_payment`).
-    let _wallet_lock = wallet.lock().await;
+    // others to join while an earlier one is in flight. And the client's
+    // wallet's own lock inside it, as in `execute_once`: the lead prepares
+    // and sends the wave's payment through that wallet, `wallet`
+    // (`Wallet::prepare_payment`).
+    let _locks = match client.lock_payments(None).await {
+        Ok(locks) => locks,
+        Err(error) => {
+            member.end(WaveEnd::NotSent(error));
+            return;
+        }
+    };
     let quotes = member.close(client.shared_waves()).await;
     if quotes.is_empty() {
         member.end(WaveEnd::NotSent(Error::Payment(
@@ -916,10 +929,9 @@ async fn reconcile_wave<A: UploadAdapter, F: Fn(&UploadState) -> bool + Send + S
     fresh: &F,
 ) -> Result<Option<(PaymentReceipt, usize)>> {
     let wallet = client.require_wallet()?;
-    let _signing = client.lock_signing().await?;
-    // And the wallet's own lock inside it, as in `execute_once`: the wave's
-    // transaction may be sent again below.
-    let _wallet_lock = wallet.lock().await;
+    // The key's lock, then the wallet's own, as in `execute_once`: the
+    // wave's transaction may be sent again below.
+    let _locks = client.lock_payments(None).await?;
     let file = super::shared_wave::read_wave_file(wave)?;
     let file_gone = file.is_none();
     let Some(signed) = super::shared_wave::wave_payment(file, own, quotes)? else {
@@ -1070,14 +1082,14 @@ async fn execute_once<A: UploadAdapter, F: Fn(&UploadState) -> bool + Send + Syn
     root: Option<RootKey>,
 ) -> Result<Executed> {
     let journal = journal_of(state)?;
-    // One transaction in flight per signing key, whichever vault it pays.
-    let _signing = root_payment::signing_lock(wallet.address())
-        .lock_owned()
-        .await;
-    // And the wallet's own lock inside it, as evmlib asks of a caller that
-    // prepares and sends a payment through a wallet it may share
-    // (`Wallet::prepare_payment`). Always taken after the signing lock.
-    let _wallet_lock = wallet.lock().await;
+    // One transaction in flight per signing key, whichever vault it pays;
+    // inside it the client's wallet's own lock, as evmlib asks of a caller
+    // that prepares and sends a payment through a wallet it may share
+    // (`Wallet::prepare_payment`), whichever wallet signs; and a root
+    // wave's wallet's own lock last (`Client::lock_payments`). A root wave
+    // (`root`) is paid through the root vault's wallet, any other payment
+    // through the client's wallet.
+    let _locks = client.lock_payments(root.map(|_| wallet)).await?;
     // True only for bytes signed below, in this call: they have never been
     // broadcast, so there is nothing on chain to observe before sending them.
     let (signed, unsent) = match journal {
@@ -2480,6 +2492,192 @@ mod tests {
         .unwrap();
         assert!(reconciled.is_none(), "nothing was signed: it starts afresh");
         assert_eq!(adapter.0.load(std::sync::atomic::Ordering::Relaxed), 1);
+    }
+
+    /// An upload attempt about to prepare its payment.
+    fn preparing() -> UploadState {
+        let mut state = UploadState::default();
+        state.start_payment(false, Vec::new()).unwrap();
+        initialize(state.pending_payment.as_mut().unwrap());
+        state
+    }
+
+    /// Pay `request` through `wallet` for an attempt whose quotes expired:
+    /// it takes every lock a payment takes, then ends without the chain.
+    async fn pay_expired(
+        client: &Client,
+        wallet: &Wallet,
+        adapter: &Counting,
+        request: &PaymentRequest,
+        root: Option<RootKey>,
+    ) {
+        let mut state = preparing();
+        let error = execute(
+            client,
+            wallet,
+            adapter,
+            request,
+            &mut state,
+            |_| false,
+            root,
+        )
+        .await
+        .err()
+        .expect("quotes that expired are never paid");
+        assert!(error.to_string().contains("expired"), "{error}");
+        assert!(state.pending_payment.is_none());
+    }
+
+    /// A client paying the root vault by default, through a root vault's
+    /// wallet it made from `signer` (`config::root_wallet_of`), which has a
+    /// lock of its own; and the node it is built on, kept while it is used.
+    async fn rooted_by_default(signer: &Wallet) -> (crate::data::Network, Client) {
+        let node = crate::data::Network::unstarted(&[], true, false)
+            .await
+            .unwrap();
+        let client = Client::from_node(std::sync::Arc::clone(node.node()), Default::default())
+            .with_root_vault([0x33; 20].into())
+            .with_wallet(signer.clone());
+        (node, client)
+    }
+
+    /// While a caller holds the lock of its own clone of the wallet it gave
+    /// the client (`Wallet::lock`), a root payment through the root vault's
+    /// wallet the client made from it by default waits for it, holding the
+    /// key's lock as it waits: that root vault's wallet has a lock of its
+    /// own, so the payment takes the client's wallet's lock too, between
+    /// the key's and the root vault's wallet's. Once the caller lets its
+    /// lock go, the payment goes on (here to end on quotes that expired).
+    #[tokio::test]
+    async fn a_default_root_payment_waits_for_the_callers_wallet_lock() {
+        // A key of its own, so no other test holds its locks.
+        let signer = Wallet::new_with_random_wallet(network(1));
+        let (_node, client) = rooted_by_default(&signer).await;
+        let root = client.wallet_paying(PaymentVault::Root).unwrap();
+        let vault = root.network().payment_vault_address().0 .0;
+        assert_eq!(
+            vault, [0x33; 20],
+            "the client pays the root vault by default"
+        );
+        let adapter = Counting::default();
+        let request = PaymentRequest::Quotes(Vec::new());
+        let key = Some((vault, [0x44; 32]));
+
+        let held = signer.lock().await;
+        let signing = root_payment::signing_lock(signer.address());
+        let (waited, ()) = futures::join!(
+            tokio::time::timeout(
+                Duration::from_millis(300),
+                pay_expired(&client, root, &adapter, &request, key),
+            ),
+            async {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                assert!(
+                    signing.try_lock().is_err(),
+                    "the payment holds the key's lock while it waits for the caller's"
+                );
+                assert!(
+                    tokio::time::timeout(Duration::from_millis(50), root.lock())
+                        .await
+                        .is_ok(),
+                    "and not yet the root vault's wallet's, taken last"
+                );
+            }
+        );
+        assert!(
+            waited.is_err(),
+            "the root payment waits for the caller's lock"
+        );
+        assert_eq!(adapter.0.load(std::sync::atomic::Ordering::Relaxed), 0);
+        assert!(
+            signing.try_lock().is_ok(),
+            "and lets the key's go when stopped"
+        );
+
+        drop(held);
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            pay_expired(&client, root, &adapter, &request, key),
+        )
+        .await
+        .expect("the payment goes on once the caller's lock is free");
+    }
+
+    /// Payments of every kind from one client paying the root vault by
+    /// default, run at once with a caller taking its own clone's lock
+    /// between them, all end: each takes the key's lock, then the client's
+    /// wallet's, then a root vault's wallet's, never in another order, so
+    /// none waits for a lock held by one waiting for its own. Root and
+    /// per-quote payments and merkle batches end on quotes that expired, a
+    /// shared wave's lead on a wave every payment left, and reconciling a
+    /// wave whose file is gone starts afresh, none of them with the chain.
+    #[tokio::test]
+    async fn payments_of_every_kind_at_once_never_deadlock() {
+        const ROUNDS: u8 = 8;
+        let signer = Wallet::new_with_random_wallet(network(1));
+        let (_node, client) = rooted_by_default(&signer).await;
+        let wallet = client.require_wallet().unwrap();
+        let root = client.wallet_paying(PaymentVault::Root).unwrap();
+        let vault = root.network().payment_vault_address().0 .0;
+        let adapter = Counting::default();
+        let quotes = PaymentRequest::Quotes(Vec::new());
+        let merkle = PaymentRequest::Merkle {
+            depth: 1,
+            pools: Vec::new(),
+            timestamp: 0,
+        };
+
+        let roots = async {
+            for round in 0..ROUNDS {
+                pay_expired(&client, root, &adapter, &quotes, Some((vault, [round; 32]))).await;
+                tokio::task::yield_now().await;
+            }
+        };
+        let per_quote = async {
+            for _ in 0..ROUNDS {
+                pay_expired(&client, wallet, &adapter, &quotes, None).await;
+                tokio::task::yield_now().await;
+            }
+        };
+        let merkle_batches = async {
+            for _ in 0..ROUNDS {
+                pay_expired(&client, wallet, &adapter, &merkle, None).await;
+                tokio::task::yield_now().await;
+            }
+        };
+        let leads = async {
+            for _ in 0..2 {
+                let member = client.shared_waves().join(1);
+                member.ready(Vec::new());
+                lead(&client, wallet, &member).await;
+            }
+        };
+        let reconciles = async {
+            let fresh = |_: &UploadState| true;
+            for _ in 0..ROUNDS {
+                let wave = hex::encode(rand::random::<[u8; 32]>());
+                let mut state = UploadState::default();
+                let reconciled =
+                    reconcile_wave(&client, &adapter, &wave, None, &[], &mut state, &fresh)
+                        .await
+                        .unwrap();
+                assert!(reconciled.is_none());
+                tokio::task::yield_now().await;
+            }
+        };
+        let caller = async {
+            for _ in 0..ROUNDS {
+                let held = signer.lock().await;
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                drop(held);
+                tokio::task::yield_now().await;
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(30), async {
+            futures::join!(roots, per_quote, merkle_batches, leads, reconciles, caller)
+        })
+        .await
+        .expect("no payment waits for another forever");
     }
 
     /// An external payer's payment of root plans, which names no wave, is

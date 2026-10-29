@@ -185,8 +185,8 @@ const ROOT_JOURNALED: &str = "Per-chunk payment in the network's token to the ro
     through the client's chain-bound wallet built for it: the payment's records as one wave, their \
     paid quotes as leaves in ascending quote-hash order, signed and journaled before it is sent, \
     never shared with another payment; each record's proof names its leaf, its place and its \
-    path. Signed and sent under the key's one lock, with the root vault's wallet's own lock \
-    inside it.";
+    path. Signed and sent under the key's one lock, then the client's wallet's own lock (shared \
+    with the caller's clones of that wallet), then the root vault's wallet's own lock.";
 const OUTSIDE_ROOT: &str = "Per-chunk payment in the network's token by an outside payer that \
     asked for root waves (UploadPayer::pays_root_waves), one payForQuotes call to the root vault a \
     wave: the root vault's record of the wave is read back and each record's proof names the \

@@ -32,7 +32,9 @@
 //!   one key go through two wallets, and either wallet's own lock covers
 //!   that wallet alone, so the client serialises the transactions its
 //!   payment paths send from a key through one lock per signing key
-//!   ([`signing_lock`], which names the paths that hold it).
+//!   ([`signing_lock`], which names the paths that hold it), and holds its
+//!   own wallet's lock inside it whichever wallet signs, so a caller
+//!   sharing that wallet is serialised with root payments too.
 
 // Browser builds pay through the page's wallet, which neither builds a wave
 // nor sends from a key of its own.
@@ -374,22 +376,29 @@ static SIGNING_LOCKS: Mutex<Option<HashMap<Address, Weak<tokio::sync::Mutex<()>>
 /// The lock of the signing key `address`: one per key in this process,
 /// shared by every client and every wallet built with that key, so one
 /// transaction of the paths that hold it is in flight per key whichever
-/// vault it pays. They hold it while they sign and send:
+/// vault it pays. They hold it while they sign and send, through
+/// `Client::lock_payments`, which takes the locks in one order: this one,
+/// then the client's own wallet's (`Wallet::lock`, shared by the clones of
+/// the wallet given to `Client::with_wallet`), then, for a root payment,
+/// the root vault's wallet's, never another order:
 ///
 /// - the upload engine's journaled payments (`native_payment`): a payment
-///   of its own, the lead of a shared wave, and the reconciling of a
-///   shared wave, each of which also holds the paying wallet's own lock
-///   (`Wallet::lock`) inside it, never the other way round;
+///   of its own, to either vault, a merkle batch, the lead of a shared
+///   wave, and the reconciling of a shared wave;
 /// - `Client::batch_pay`, which pays prepared chunks in one transaction,
-///   and the in-memory upload adapter's per-chunk payment
-///   (`MemoryUploadAdapter::pay`);
+///   and the in-memory upload adapter's payments
+///   (`MemoryUploadAdapter::pay` and `MemoryUploadAdapter::pay_merkle`);
+/// - `Client::pay_for_merkle_batch`, for each single batch it sends;
 /// - `Client::approve_token_spend`, for each vault it approves.
 ///
-/// Three paths send without it, as they did before root payments: merkle
-/// batch payments (`Client::pay_for_merkle_batch`'s single batches, and
-/// `MemoryUploadAdapter::pay_merkle`), which the network's nodes refuse,
-/// and `SingleNodeQuotePayment::pay`, a raw building block. Separate
-/// processes with one key are not serialised: one key per process.
+/// The client's wallet's lock is held whichever wallet signs, the root
+/// vault's included, since that wallet has a lock of its own: a caller
+/// holding the lock of its clone of the client's wallet while it pays
+/// with it (as evmlib asks, `Wallet::prepare_payment`) is serialised with
+/// every one of these, and must not call them while it holds that lock.
+/// `SingleNodeQuotePayment::pay`, a raw building block given a wallet,
+/// sends without these locks. Separate processes with one key are not
+/// serialised: one key per process.
 #[must_use]
 pub(crate) fn signing_lock(address: Address) -> Arc<tokio::sync::Mutex<()>> {
     let mut locks = SIGNING_LOCKS

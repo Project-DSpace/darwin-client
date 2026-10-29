@@ -699,12 +699,15 @@ impl Client {
     ///
     /// Returns an error if the wallet is not set or the approval transaction fails.
     /// A client paying the root vault ([`Client::with_root_payments`])
-    /// approves the root vault too. Each approval is sent under the signing
-    /// key's lock (`root_payment::signing_lock`).
+    /// approves the root vault too. The approvals are sent under the signing
+    /// key's lock (`root_payment::signing_lock`), the client's wallet's own
+    /// lock (`Wallet::lock`) and the root vault's wallet's, in that order.
     pub async fn approve_token_spend(&self) -> Result<()> {
         let wallet = self.require_wallet()?;
         let evm_network = self.require_evm_network()?;
-        let _signing = self.lock_signing().await?;
+        let _locks = self
+            .lock_payments(self.root_wallet().map(AsRef::as_ref))
+            .await?;
 
         let vault_address = evm_network.payment_vault_address();
         wallet

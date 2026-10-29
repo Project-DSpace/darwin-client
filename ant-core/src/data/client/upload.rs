@@ -1978,8 +1978,9 @@ impl UploadAdapter for MemoryUploadAdapter<'_> {
                     .map(|q| (q.quote_hash, q.rewards_address, q.amount))
             })
             .collect::<Vec<_>>();
-        // One transaction in flight per signing key, whichever vault.
-        let _signing = self.client.lock_signing().await?;
+        // One transaction in flight per signing key, whichever vault, and
+        // the wallet's own lock inside it (`Client::lock_payments`).
+        let _locks = self.client.lock_payments(None).await?;
         let (transactions, gas) = wallet.pay_for_quotes(payments).await.map_err(
             |ant_protocol::evm::PayForQuotesError(error, _)| Error::Payment(error.to_string()),
         )?;
@@ -1998,6 +1999,9 @@ impl UploadAdapter for MemoryUploadAdapter<'_> {
         &self,
         batch: &super::merkle::PreparedMerkleBatch,
     ) -> Result<MerkleUploadPayment> {
+        // One transaction in flight per signing key, and the wallet's own
+        // lock inside it (`Client::lock_payments`).
+        let _locks = self.client.lock_payments(None).await?;
         let (winner_pool, amount, gas) = self
             .client
             .require_wallet()?

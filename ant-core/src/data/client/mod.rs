@@ -848,6 +848,14 @@ impl Client {
     /// A root vault named earlier ([`Self::with_root_vault`]) that is
     /// `wallet`'s per-quote payment vault is dropped, as that function
     /// refuses it.
+    ///
+    /// The client prepares and sends every payment from `wallet`'s key,
+    /// through either vault's wallet, holding `wallet`'s own lock
+    /// (`Wallet::lock`, shared by its clones). A caller paying with a clone
+    /// of `wallet` under that lock, as evmlib asks of a shared wallet
+    /// (`Wallet::prepare_payment`), is therefore serialised with the
+    /// client's payments, default root payments included, and must not call
+    /// the client's payment methods while it holds the lock.
     #[must_use]
     pub fn with_wallet(mut self, wallet: Wallet) -> Self {
         self.drop_root_vault_paid_per_quote(wallet.network());
@@ -1091,16 +1099,43 @@ impl Client {
         }
     }
 
-    /// Hold the lock of the client's signing key
-    /// ([`root_payment::signing_lock`], which names the paths that sign and
-    /// send under it, through either vault's wallet).
+    /// Hold the locks a payment from the client's key is signed and sent
+    /// under, in the one order every path takes them: the key's lock
+    /// ([`root_payment::signing_lock`], which names the paths that hold
+    /// these), then the lock of the client's own wallet ([`Self::with_wallet`],
+    /// `Wallet::lock`, shared by every clone of it), then, for a payment
+    /// through the root vault's wallet (`root`), that wallet's own lock.
+    ///
+    /// The client's wallet's lock is taken whichever wallet signs: a root
+    /// vault's wallet signs with the same key but has a lock of its own
+    /// (every `Wallet::new` makes one, `crate::config::root_wallet_of`), so
+    /// a caller sharing the client's wallet, holding its lock while it pays
+    /// with it as evmlib asks (`Wallet::prepare_payment`), is serialised
+    /// with root payments as with per-quote ones. A root vault's wallet
+    /// never shares the client's wallet's lock: it pays another vault, and
+    /// a wallet's vault is fixed when it is made.
     ///
     /// # Errors
     ///
     /// If the client has no wallet.
-    pub(crate) async fn lock_signing(&self) -> Result<tokio::sync::OwnedMutexGuard<()>> {
-        let address = self.require_wallet()?.address();
-        Ok(root_payment::signing_lock(address).lock_owned().await)
+    pub(crate) async fn lock_payments<'a>(
+        &'a self,
+        root: Option<&'a Wallet>,
+    ) -> Result<PaymentLocks<'a>> {
+        let wallet = self.require_wallet()?;
+        let signing = root_payment::signing_lock(wallet.address())
+            .lock_owned()
+            .await;
+        let own = wallet.lock().await;
+        let root = match root {
+            Some(root) => Some(root.lock().await),
+            None => None,
+        };
+        Ok(PaymentLocks {
+            _root: root,
+            _own: own,
+            _signing: signing,
+        })
     }
 
     /// Set the EVM network without requiring a wallet.
@@ -1341,6 +1376,15 @@ impl Drop for Client {
         let snap = self.controller.snapshot();
         adaptive::save_snapshot_with_timeout(path, snap, DROP_SAVE_TIMEOUT);
     }
+}
+
+/// The locks a payment from a client's key is signed and sent under
+/// ([`Client::lock_payments`]), let go together when dropped, the last
+/// taken first.
+pub(crate) struct PaymentLocks<'a> {
+    _root: Option<tokio::sync::MutexGuard<'a, ()>>,
+    _own: tokio::sync::MutexGuard<'a, ()>,
+    _signing: tokio::sync::OwnedMutexGuard<()>,
 }
 
 /// Why `root_wallet` cannot pay the root vault for a client paying through

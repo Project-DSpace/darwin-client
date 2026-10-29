@@ -663,8 +663,9 @@ impl Client {
             all_payments.len()
         );
 
-        // One transaction in flight per signing key, whichever vault.
-        let _signing = self.lock_signing().await?;
+        // One transaction in flight per signing key, whichever vault, and
+        // the wallet's own lock inside it (`Client::lock_payments`).
+        let _locks = self.lock_payments(None).await?;
         let (tx_hash_map, gas_info) =
             wallet
                 .pay_for_quotes(all_payments)

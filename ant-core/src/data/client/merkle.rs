@@ -1176,6 +1176,9 @@ impl Client {
             "Submitting merkle batch payment on-chain (depth={})",
             prepared.depth
         );
+        // One transaction in flight per signing key, and the wallet's own
+        // lock inside it (`Client::lock_payments`).
+        let locks = self.lock_payments(None).await?;
         let (winner_pool_hash, amount, gas_info) = wallet
             .pay_for_merkle_tree(
                 prepared.depth,
@@ -1184,6 +1187,7 @@ impl Client {
             )
             .await
             .map_err(|e| Error::Payment(format!("Merkle batch payment failed: {e}")))?;
+        drop(locks);
 
         info!(
             "Merkle payment succeeded: winner pool {}",
