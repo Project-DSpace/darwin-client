@@ -471,13 +471,16 @@ fn earliest_quote(plans: &[ChunkPaymentPlan]) -> u64 {
 ///   that recorded it ([`Client::root_wave_transaction`]): the payer's own
 ///   when its receipt shows it recorded the wave, else the one the vault's
 ///   `RootPaid` log naming the key is in, also when the transaction the
-///   payer returned never gets a receipt. One sent from the same address
-///   as the payer's own (its wallet sped up or replaced it) moved the
-///   wave's total for this payment. When one from another address recorded
-///   the same leaves first, or the senders can't be read, the payer's moved
-///   no tokens (the vault records a key once and skips a wave it holds):
-///   the payment's amount is none, nothing is paid again, and the records
-///   are stored with proofs naming the recording transaction.
+///   payer returned never gets a receipt. One sent from the payer's address
+///   (`payer`, from `UploadPayer::payer_address`), or, when the payer names
+///   none, from the same address as the transaction it returned (its wallet
+///   sped up or replaced it) moved the wave's total for this payment. When
+///   one from another address recorded the same leaves first, or the
+///   senders can't be read, the payer's moved no tokens (the vault records
+///   a key once and skips a wave it holds): the payment's amount is none,
+///   nothing is paid again, and the records are stored with proofs naming
+///   the recording transaction. That amount is only the upload's cost: it
+///   changes neither what is paid nor whether the payment counts as made.
 /// - **The per-quote vault records every quote instead:** the wave's
 ///   calldata was sent there, which pays each quote as a quotes payment
 ///   does. Nodes accept a single-node proof for these quotes: a quote
@@ -500,6 +503,7 @@ pub(crate) async fn outside_root_payment(
     plans: &mut [ChunkPaymentPlan],
     state: &mut UploadState,
     payment: UploadPayment,
+    payer: Option<ant_protocol::evm::Address>,
 ) -> Result<UploadPayment> {
     if payment.root.is_some()
         || plans.is_empty()
@@ -545,33 +549,50 @@ pub(crate) async fn outside_root_payment(
                 .await?,
         );
         // Recorded by another transaction: the payer's own replacement of
-        // the one it returned (sent from the same address) moved the wave's
-        // total; one from another address recorded the leaves first, and
-        // this payment moved nothing. Where the senders can't be read, it
-        // is reported as moving nothing.
-        let recorded_by_payer = match own.filter(|own| *own != recording) {
-            None => false,
-            Some(own) => match client.same_sender(&own.0, &recording.0).await {
-                Some(same) => {
-                    if !same {
-                        tracing::warn!(
-                            "the root wave was recorded by transaction {recording}, sent from \
-                             another address than this payment's own {own}: another payer \
-                             recorded it first"
-                        );
-                    }
-                    same
-                }
-                None => {
+        // the one it returned moved the wave's total; one from another
+        // address recorded the leaves first, and this payment moved nothing.
+        // A payer that names its address is judged by the recording's
+        // sender alone, whether or not the one it returned can be read;
+        // otherwise by the senders of both. Where a sender needed can't be
+        // read, the payment is reported as moving nothing.
+        let recorded_by_payer = if own == Some(recording) {
+            false
+        } else if let Some(payer) = payer {
+            match client.transaction_sender(&recording.0).await {
+                Some(sender) if sender == payer.0 .0 => true,
+                Some(_) => {
                     tracing::warn!(
-                        "the root wave was recorded by transaction {recording}, not this \
-                         payment's own {own}, and the sender of one of them couldn't be read: \
-                         whether the payer's wallet replaced its own can't be told, so the \
-                         payment is reported as moving no tokens"
+                        "the root wave was recorded by transaction {recording}, sent from                          another address than the payer's {payer}: another payer recorded it                          first"
                     );
                     false
                 }
-            },
+                None => {
+                    tracing::warn!(
+                        "the root wave was recorded by transaction {recording}, whose sender                          couldn't be read: whether the payer {payer} sent it can't be told, so                          the payment is reported as moving no tokens"
+                    );
+                    false
+                }
+            }
+        } else {
+            match own {
+                None => false,
+                Some(own) => match client.same_sender(&own.0, &recording.0).await {
+                    Some(same) => {
+                        if !same {
+                            tracing::warn!(
+                                "the root wave was recorded by transaction {recording}, sent                                  from another address than this payment's own {own}: another                                  payer recorded it first"
+                            );
+                        }
+                        same
+                    }
+                    None => {
+                        tracing::warn!(
+                            "the root wave was recorded by transaction {recording}, not this                              payment's own {own}, and the sender of one of them couldn't be                              read: whether the payer's wallet replaced its own can't be told,                              so the payment is reported as moving no tokens"
+                        );
+                        false
+                    }
+                },
+            }
         };
         let quotes = root_payment::wave_quotes(&wave);
         let total = quotes
@@ -2477,6 +2498,10 @@ mod tests {
     ///   total;
     /// - recorded by another whose sender, or the payer's, can't be read:
     ///   as by another payer;
+    /// - with the payer's address named (`UploadPayer::payer_address`): a
+    ///   recording sent from it moved the wave's total, though the
+    ///   transaction the payer returned can't be read; one from another
+    ///   address, or whose sender can't be read, moved nothing;
     /// - no wave, and the per-quote vault records every quote (the request
     ///   paid there): the plans pay the per-quote vault from then on, in the
     ///   upload's state too, and get single-node proofs from the payer's
@@ -2587,7 +2612,7 @@ mod tests {
         chain.add_receipt(root_paid(own, 80));
         chain.failing = vec![("eth_getLogs", -32_603)];
         let (client, mut paying, mut state, chain) = settle(&node, chain, &plans, root).await;
-        let payment = outside_root_payment(&client, &mut paying, &mut state, paid_by(own))
+        let payment = outside_root_payment(&client, &mut paying, &mut state, paid_by(own), None)
             .await
             .unwrap();
         let calls = chain.lock().unwrap().calls.clone();
@@ -2624,7 +2649,7 @@ mod tests {
         });
         chain.add_receipt(root_paid(recording, 60));
         let (client, mut paying, mut state, chain) = settle(&node, chain, &plans, root).await;
-        let payment = outside_root_payment(&client, &mut paying, &mut state, paid_by(own))
+        let payment = outside_root_payment(&client, &mut paying, &mut state, paid_by(own), None)
             .await
             .unwrap();
         assert!(payment.amount.is_zero(), "nothing of this payment's moved");
@@ -2655,7 +2680,7 @@ mod tests {
         chain.senders.insert(own.0, [0xa1; 20]);
         chain.senders.insert(recording.0, [0xa1; 20]);
         let (client, mut paying, mut state, chain) = settle(&node, chain, &plans, root).await;
-        let payment = outside_root_payment(&client, &mut paying, &mut state, paid_by(own))
+        let payment = outside_root_payment(&client, &mut paying, &mut state, paid_by(own), None)
             .await
             .unwrap();
         assert_eq!(
@@ -2700,7 +2725,7 @@ mod tests {
         chain.senders.insert(own.0, [0xa1; 20]);
         chain.senders.insert(recording.0, [0xa1; 20]);
         let (client, mut paying, mut state, chain) = settle(&node, chain, &plans, root).await;
-        let payment = outside_root_payment(&client, &mut paying, &mut state, paid_by(own))
+        let payment = outside_root_payment(&client, &mut paying, &mut state, paid_by(own), None)
             .await
             .unwrap();
         assert_eq!(payment.amount, total, "the payer's next moved the total");
@@ -2735,7 +2760,7 @@ mod tests {
         chain.root_records.insert(key);
         chain.add_receipt(root_paid(recording, 60));
         let (client, mut paying, mut state, chain) = settle(&node, chain, &plans, root).await;
-        let payment = outside_root_payment(&client, &mut paying, &mut state, paid_by(own))
+        let payment = outside_root_payment(&client, &mut paying, &mut state, paid_by(own), None)
             .await
             .unwrap();
         assert!(payment.amount.is_zero(), "nothing of this payment's moved");
@@ -2764,6 +2789,84 @@ mod tests {
             "{calls:?}"
         );
 
+        // The payer names its address, and its wallet replaced the
+        // transaction it returned, which has no receipt and no sender the
+        // chain knows: the recording, sent from the payer's address, moved
+        // the wave's total. Without the address, the same chain reports
+        // nothing moved, as above. Either way nothing is paid again, and the
+        // proofs name the recording transaction.
+        let payer = Some(ant_protocol::evm::Address::from([0xa1; 20]));
+        for (named, moved) in [(payer, total), (None, ant_protocol::evm::Amount::ZERO)] {
+            let mut chain = MockChain::with_blocks(100, start);
+            chain.root_records.insert(key);
+            chain.add_receipt(root_paid(recording, 60));
+            chain.senders.insert(recording.0, [0xa1; 20]);
+            let (client, mut paying, mut state, chain) = settle(&node, chain, &plans, root).await;
+            let payment =
+                outside_root_payment(&client, &mut paying, &mut state, paid_by(own), named)
+                    .await
+                    .unwrap();
+            assert_eq!(payment.amount, moved, "payer address {named:?}");
+            assert_eq!(payment.root.as_ref().unwrap().transaction, recording);
+            assert!(payment.transactions.values().all(|tx| *tx == recording));
+            super::super::upload::validate_payment_total(&paying, &payment).unwrap();
+            state
+                .confirm_payment(&addresses, &payment, crate::runtime::system_time())
+                .unwrap();
+            for address in &addresses {
+                let proof = state.proof(address).unwrap();
+                assert_eq!(detect_proof_type(proof), Some(ProofType::Root));
+                let proof = ant_protocol::payment::deserialize_root_proof(proof).unwrap();
+                assert_eq!(proof.payment.tx_hashes, vec![recording]);
+            }
+            assert!(state.pending_payment.is_none());
+            let calls = chain.lock().unwrap().calls.clone();
+            assert!(
+                !calls.iter().any(|method| method.starts_with("eth_send")
+                    || method == "eth_getTransactionCount"
+                    || method == "eth_estimateGas"),
+                "{calls:?}"
+            );
+        }
+
+        // The payer names its address, and the recording was sent from
+        // another (its own transaction, from its address, recorded
+        // nothing), or the recording's sender can't be read: the payment
+        // moved nothing, and nothing is paid again.
+        for recorder in [Some([0xb2; 20]), None] {
+            let mut chain = MockChain::with_blocks(100, start);
+            chain.root_records.insert(key);
+            chain.senders.insert(own.0, [0xa1; 20]);
+            if let Some(recorder) = recorder {
+                chain.senders.insert(recording.0, recorder);
+            }
+            chain.add_receipt(ant_listings::PaymentReceipt {
+                tx_hash: own.0,
+                success: true,
+                block_number: 90,
+                logs: Vec::new(),
+            });
+            chain.add_receipt(root_paid(recording, 60));
+            let (client, mut paying, mut state, chain) = settle(&node, chain, &plans, root).await;
+            let payment =
+                outside_root_payment(&client, &mut paying, &mut state, paid_by(own), payer)
+                    .await
+                    .unwrap();
+            assert!(payment.amount.is_zero(), "recorder {recorder:?}");
+            assert_eq!(payment.root.as_ref().unwrap().transaction, recording);
+            assert!(payment.transactions.values().all(|tx| *tx == recording));
+            super::super::upload::validate_payment_total(&paying, &payment).unwrap();
+            state
+                .confirm_payment(&addresses, &payment, crate::runtime::system_time())
+                .unwrap();
+            assert!(state.pending_payment.is_none());
+            let calls = chain.lock().unwrap().calls.clone();
+            assert!(
+                !calls.iter().any(|method| method.starts_with("eth_send")),
+                "{calls:?}"
+            );
+        }
+
         // Paid at the per-quote vault: single-node proofs.
         let mut chain = MockChain::with_blocks(100, start);
         for plan in &plans {
@@ -2777,7 +2880,7 @@ mod tests {
             }
         }
         let (client, mut paying, mut state, _) = settle(&node, chain, &plans, root).await;
-        let payment = outside_root_payment(&client, &mut paying, &mut state, paid_by(own))
+        let payment = outside_root_payment(&client, &mut paying, &mut state, paid_by(own), None)
             .await
             .unwrap();
         assert!(payment.root.is_none());
@@ -2795,7 +2898,7 @@ mod tests {
         // Neither: nothing is paid again, and the payment stays pending.
         let (client, mut paying, mut state, chain) =
             settle(&node, MockChain::with_blocks(100, start), &plans, root).await;
-        let error = outside_root_payment(&client, &mut paying, &mut state, paid_by(own))
+        let error = outside_root_payment(&client, &mut paying, &mut state, paid_by(own), None)
             .await
             .unwrap_err()
             .to_string();
@@ -2814,7 +2917,7 @@ mod tests {
         let (client, mut paying, mut state, chain) =
             settle(&node, MockChain::with_blocks(100, start), &plans, root).await;
         let mut v2 = vec![signed_plan([7; 32], 1024, quoted)];
-        let kept = outside_root_payment(&client, &mut v2, &mut state, paid_by(own))
+        let kept = outside_root_payment(&client, &mut v2, &mut state, paid_by(own), None)
             .await
             .unwrap();
         assert!(kept.root.is_none());
@@ -2823,7 +2926,7 @@ mod tests {
             transaction: own,
             wave: wave.clone(),
         });
-        let kept = outside_root_payment(&client, &mut paying, &mut state, named)
+        let kept = outside_root_payment(&client, &mut paying, &mut state, named, None)
             .await
             .unwrap();
         assert_eq!(kept.root.unwrap().transaction, own);

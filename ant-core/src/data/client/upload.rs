@@ -146,6 +146,13 @@ pub trait UploadAdapter: AdapterBounds {
     fn exact_approvals(&self) -> bool {
         false
     }
+    /// The address an external payer's transactions are sent from
+    /// (`UploadPayer::payer_address`), if it names one: used only for the
+    /// cost of a root wave another of its transactions recorded
+    /// (`native_payment::outside_root_payment`).
+    fn payer_address(&self) -> Option<ant_protocol::evm::Address> {
+        None
+    }
     /// Submit while updating the shared journal. Existing adapters may keep their callback journal.
     async fn submit_payment(
         &self,
@@ -885,9 +892,14 @@ impl Client {
                 let mut plans = state.pending_plans()?;
                 let payment = adapter.reconcile_payment(&plans, state).await?;
                 #[cfg(feature = "native")]
-                let payment =
-                    super::native_payment::outside_root_payment(self, &mut plans, state, payment)
-                        .await?;
+                let payment = super::native_payment::outside_root_payment(
+                    self,
+                    &mut plans,
+                    state,
+                    payment,
+                    adapter.payer_address(),
+                )
+                .await?;
                 validate_payment_total(&plans, &payment)?;
                 // Records whose quote was occupied stay unpaid: the waves
                 // below quote them again.
@@ -1045,9 +1057,14 @@ impl Client {
             }
             let payment = adapter.submit_payment(&payable, state).await?;
             #[cfg(feature = "native")]
-            let payment =
-                super::native_payment::outside_root_payment(self, &mut payable, state, payment)
-                    .await?;
+            let payment = super::native_payment::outside_root_payment(
+                self,
+                &mut payable,
+                state,
+                payment,
+                adapter.payer_address(),
+            )
+            .await?;
             validate_payment_total(&payable, &payment)?;
             let occupied = self.occupied_quotes(&payable).await;
             let released = state.release_occupied(&occupied);

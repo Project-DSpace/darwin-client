@@ -2079,6 +2079,21 @@ pub trait UploadPayer: Send + Sync {
     fn exact_approvals(&self) -> bool {
         true
     }
+
+    /// The address this payer's transactions are sent from, if it has one.
+    /// It counts only toward an upload's cost: when the root vault's record
+    /// of a root wave was made by another transaction than the one
+    /// [`Self::pay_quotes`] returned (the payer's wallet sped up or replaced
+    /// it, and the returned one is often gone from the node), a recording
+    /// sent from this address counts the wave's total in the upload's cost,
+    /// and one sent from any other address counts nothing. `None` by
+    /// default: the wave's total then counts only when the returned
+    /// transaction and the recording one can both be read and were sent
+    /// from the same address. It never changes what is paid, nor whether a
+    /// payment is taken as made.
+    fn payer_address(&self) -> Option<ant_protocol::evm::Address> {
+        None
+    }
 }
 
 /// Where an upload's record bytes come from.
@@ -2182,6 +2197,10 @@ impl super::super::upload::UploadAdapter for SpillUploadAdapter<'_> {
     /// The client approves each vault without limit; a payer says.
     fn exact_approvals(&self) -> bool {
         self.payer.is_some_and(|payer| payer.exact_approvals())
+    }
+    /// An external payer's address, if it names one.
+    fn payer_address(&self) -> Option<ant_protocol::evm::Address> {
+        self.payer.and_then(|payer| payer.payer_address())
     }
     #[cfg(feature = "native")]
     async fn submit_payment(
@@ -6655,8 +6674,8 @@ mod payer_tests {
         assert_eq!(payer.0.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
-    /// A payer that counts the payments it is asked for, and asks for root
-    /// waves.
+    /// A payer that counts the payments it is asked for, asks for root
+    /// waves, and names its address.
     struct AskingPayer(std::sync::atomic::AtomicUsize);
 
     #[async_trait::async_trait]
@@ -6672,6 +6691,10 @@ mod payer_tests {
 
         fn pays_root_waves(&self) -> bool {
             true
+        }
+
+        fn payer_address(&self) -> Option<ant_protocol::evm::Address> {
+            Some([0xa1; 20].into())
         }
     }
 
@@ -6753,6 +6776,10 @@ mod payer_tests {
         assert!(through_asking.exact_approvals());
         assert!(through_not_asking.exact_approvals());
         assert!(!through_wallet.exact_approvals());
+        // A payer's address reaches the engine; none by default.
+        assert_eq!(through_asking.payer_address(), Some([0xa1; 20].into()));
+        assert_eq!(through_not_asking.payer_address(), None);
+        assert_eq!(through_wallet.payer_address(), None);
 
         let now = std::time::SystemTime::now();
         let mut plans = [
