@@ -2449,6 +2449,20 @@ pub struct RootRecord {
     pub payer: [u8; 20],
 }
 
+/// What a transaction's receipt shows of a root wave's recording
+/// ([`ListingChain::root_paid_in`]), with the receipt's block.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RootPaidReceipt {
+    /// It succeeded and holds the vault's `RootPaid` log naming the key: it
+    /// recorded the wave.
+    Recorded(u64),
+    /// It succeeded without that log: the vault found the wave already
+    /// recorded, by then, and recorded nothing.
+    Skipped(u64),
+    /// It reverted, and recorded nothing: the wave may be recorded later.
+    Reverted(u64),
+}
+
 /// What a search for the transaction that recorded a root wave found
 /// ([`ListingChain::root_paid_transaction`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3061,11 +3075,10 @@ impl ListingChain {
     }
 
     /// Whether transaction `tx_hash` recorded the root vault `vault`'s wave
-    /// under `key`, read from its receipt: `Some((true, block))` if it
-    /// succeeded and holds the vault's `RootPaid` log naming the key,
-    /// `Some((false, block))` if it is in `block` without one (it reverted,
-    /// or the vault found the wave already recorded and recorded nothing),
-    /// `None` if the chain doesn't know the transaction (yet).
+    /// under `key`, read from its receipt ([`RootPaidReceipt`]): it recorded
+    /// it, succeeded without recording it (the vault found the wave already
+    /// recorded), or reverted; `None` if the chain doesn't know the
+    /// transaction (yet).
     ///
     /// # Errors
     ///
@@ -3075,7 +3088,7 @@ impl ListingChain {
         tx_hash: &[u8; 32],
         vault: &[u8; 20],
         key: &[u8; 32],
-    ) -> std::result::Result<Option<(bool, u64)>, String> {
+    ) -> std::result::Result<Option<RootPaidReceipt>, String> {
         let answer = self
             .rpc
             .call(
@@ -3095,13 +3108,16 @@ impl ListingChain {
         let logs = answer["logs"]
             .as_array()
             .ok_or("the receipt has no logs list")?;
-        let records = success
-            && logs.iter().filter_map(parse_log).any(|log| {
-                log.address == *vault
-                    && log.topics.first() == Some(&ROOT_PAID_TOPIC)
-                    && log.topics.get(1) == Some(key)
-            });
-        Ok(Some((records, block)))
+        let records = logs.iter().filter_map(parse_log).any(|log| {
+            log.address == *vault
+                && log.topics.first() == Some(&ROOT_PAID_TOPIC)
+                && log.topics.get(1) == Some(key)
+        });
+        Ok(Some(match (success, records) {
+            (false, _) => RootPaidReceipt::Reverted(block),
+            (true, true) => RootPaidReceipt::Recorded(block),
+            (true, false) => RootPaidReceipt::Skipped(block),
+        }))
     }
 
     /// The address that sent transaction `tx_hash` (`eth_getTransactionByHash`),
@@ -3230,7 +3246,7 @@ impl ListingChain {
             }
             read.push(found.tx_hash);
             match self.root_paid_in(&found.tx_hash, vault, key).await? {
-                Some((true, _)) => return Ok(Some(found.tx_hash)),
+                Some(RootPaidReceipt::Recorded(_)) => return Ok(Some(found.tx_hash)),
                 shown => warn!(
                     "a RootPaid log of the root vault naming the key {} is in transaction {}, \
                      whose receipt reads {shown:?} rather than its recording; it is passed over",
@@ -5110,11 +5126,12 @@ mod tests {
             let reader = &reader;
             async move { reader.root_paid_in(&tx, &RV_VAULT, &key).await.unwrap() }
         };
-        assert_eq!(read(RV_RECORDING, RV_KEY).await, Some((true, 60)));
-        assert_eq!(read(RV_RECORDING, [0x5f; 32]).await, Some((false, 60)));
-        assert_eq!(read(RV_OWN, RV_KEY).await, Some((false, 90)));
-        assert_eq!(read([0x0c; 32], RV_KEY).await, Some((false, 70)));
-        assert_eq!(read([0x0d; 32], RV_KEY).await, Some((false, 80)));
+        use RootPaidReceipt::{Recorded, Reverted, Skipped};
+        assert_eq!(read(RV_RECORDING, RV_KEY).await, Some(Recorded(60)));
+        assert_eq!(read(RV_RECORDING, [0x5f; 32]).await, Some(Skipped(60)));
+        assert_eq!(read(RV_OWN, RV_KEY).await, Some(Skipped(90)));
+        assert_eq!(read([0x0c; 32], RV_KEY).await, Some(Skipped(70)));
+        assert_eq!(read([0x0d; 32], RV_KEY).await, Some(Reverted(80)));
         assert_eq!(read([0x0e; 32], RV_KEY).await, None);
     }
 
@@ -5374,8 +5391,26 @@ mod tests {
             via([0x0f; 32], true, None, [0x61; 32]).await.unwrap(),
             [0x0f; 32]
         );
-        // Its own confirmed transaction found the wave already recorded.
+        // Its own confirmed transaction found the wave already recorded: the
+        // search stops at its block, by which the wave was recorded.
         assert_eq!(via(RV_OWN, true, None, RV_KEY).await.unwrap(), RV_RECORDING);
+        let last_searched = || mock.lock().unwrap().log_filters.last().unwrap()["toBlock"].clone();
+        assert_eq!(last_searched(), json!(quantity(90)));
+        // Its own transaction's receipt (read as an outside payer's is)
+        // shows it reverted, in block 50, before another transaction
+        // recorded the wave in block 60: the search runs on to the latest
+        // block and finds the recording.
+        mock.lock().unwrap().add_receipt(PaymentReceipt {
+            tx_hash: [0x10; 32],
+            success: false,
+            block_number: 50,
+            logs: Vec::new(),
+        });
+        assert_eq!(
+            via([0x10; 32], true, None, RV_KEY).await.unwrap(),
+            RV_RECORDING
+        );
+        assert_eq!(last_searched(), json!(quantity(99)));
         // Its own transaction reverted.
         assert_eq!(
             via([0x0e; 32], false, None, RV_KEY).await.unwrap(),

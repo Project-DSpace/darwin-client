@@ -2551,6 +2551,48 @@ mod tests {
             "{calls:?}"
         );
 
+        // The transaction the payer returns reverted, in block 50, and its
+        // wallet's next transaction (from the same address) recorded the
+        // wave later, in block 80: the search for the RootPaid log runs past
+        // the reverted one's block, finds the recording, and the payment
+        // moved the wave's total, with nothing paid again.
+        let mut chain = MockChain::with_blocks(100, start);
+        chain.root_records.insert(key);
+        chain.add_receipt(ant_listings::PaymentReceipt {
+            tx_hash: own.0,
+            success: false,
+            block_number: 50,
+            logs: Vec::new(),
+        });
+        chain.add_receipt(root_paid(recording, 80));
+        chain.senders.insert(own.0, [0xa1; 20]);
+        chain.senders.insert(recording.0, [0xa1; 20]);
+        let (client, mut paying, mut state, chain) = settle(&node, chain, &plans, root).await;
+        let payment = outside_root_payment(&client, &mut paying, &mut state, paid_by(own))
+            .await
+            .unwrap();
+        assert_eq!(payment.amount, total, "the payer's next moved the total");
+        assert_eq!(payment.root.as_ref().unwrap().transaction, recording);
+        assert!(payment.transactions.values().all(|tx| *tx == recording));
+        super::super::upload::validate_payment_total(&paying, &payment).unwrap();
+        state
+            .confirm_payment(&addresses, &payment, crate::runtime::system_time())
+            .unwrap();
+        for address in &addresses {
+            let proof = state.proof(address).unwrap();
+            assert_eq!(detect_proof_type(proof), Some(ProofType::Root));
+            let proof = ant_protocol::payment::deserialize_root_proof(proof).unwrap();
+            assert_eq!(proof.payment.tx_hashes, vec![recording]);
+        }
+        assert!(state.pending_payment.is_none());
+        let calls = chain.lock().unwrap().calls.clone();
+        assert!(
+            !calls.iter().any(|method| method.starts_with("eth_send")
+                || method == "eth_getTransactionCount"
+                || method == "eth_estimateGas"),
+            "{calls:?}"
+        );
+
         // Recorded by another, and the payer's own transaction has no
         // receipt and no sender the chain knows (its wallet replaced it, or
         // an earlier attempt's transaction recorded the wave): the

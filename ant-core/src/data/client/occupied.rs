@@ -584,10 +584,11 @@ impl Client {
     /// in the transactions its proof names. That is `own`, the payment's own
     /// transaction, when it was confirmed (`own_confirmed`) and its receipt
     /// holds the vault's `RootPaid` log naming the key. Otherwise another
-    /// transaction recorded the same leaves first: `own` reverted or was
-    /// replaced (by `replaced_by`, if that is known), or the vault found the
-    /// wave already recorded and recorded nothing. That one is found by its
-    /// `RootPaid` log, filtered by the key ([`recording_transaction_via`]).
+    /// transaction recorded the same leaves: `own` reverted or was replaced
+    /// (by `replaced_by`, if that is known), or the vault found the wave
+    /// already recorded and recorded nothing. That one is found by its
+    /// `RootPaid` log, filtered by the key ([`recording_transaction_via`]),
+    /// in blocks up to `own`'s only in the last case.
     /// With `own_may_be_missing` (an outside payer's transaction, which its
     /// wallet may have sped up or replaced), `own`'s receipt is still read
     /// first, but one the chain doesn't have, or that can't be read, leads
@@ -674,17 +675,20 @@ pub(crate) struct RootWave<'a> {
 /// quote time less [`ant_listings::CLOCK_MARGIN`] (a quote hash covers its
 /// signed time, so the wave can't be recorded before its quotes, give or
 /// take a node's clock against the chain's, and is recorded soon after
-/// them) up to the block of `own`, where its receipt was read, else the
-/// latest ([`ListingChain::root_paid_transaction`]). A search that used all
-/// its calls before reaching its last block isn't made again: the error
-/// says so, apart from finding nothing.
+/// them) up to the block of `own` when its receipt shows it succeeded
+/// without recording the wave (the vault held the wave by then), else the
+/// latest ([`ListingChain::root_paid_transaction`]): a reverted `own`
+/// doesn't cap the search, since its payer may record the wave later in
+/// another transaction. A search that used all its calls before reaching
+/// its last block isn't made again: the error says so, apart from finding
+/// nothing.
 #[cfg(feature = "native")]
 pub(crate) async fn recording_transaction_via(
     chain: &ListingChain,
     wave: &RootWave<'_>,
     reads: usize,
 ) -> crate::data::error::Result<[u8; 32]> {
-    use super::listings::RootPaidSearch;
+    use super::listings::{RootPaidReceipt, RootPaidSearch};
     const PAUSE: std::time::Duration = std::time::Duration::from_secs(2);
 
     let RootWave {
@@ -698,16 +702,21 @@ pub(crate) async fn recording_transaction_via(
     } = *wave;
     let from_time = earliest_quote.saturating_sub(ant_listings::CLOCK_MARGIN);
     let mut until = None;
+    let mut own_read = !own_confirmed;
     let mut replacement_read = replaced_by.is_none();
     let mut problem = String::from("no RootPaid log names its key");
     for read in 0..reads {
         if read > 0 {
             crate::runtime::sleep(PAUSE).await;
         }
-        if own_confirmed && until.is_none() {
+        if !own_read {
             match chain.root_paid_in(own, vault, key).await {
-                Ok(Some((true, _))) => return Ok(*own),
-                Ok(Some((false, block))) => until = Some(block),
+                Ok(Some(RootPaidReceipt::Recorded(_))) => return Ok(*own),
+                Ok(Some(RootPaidReceipt::Skipped(block))) => {
+                    until = Some(block);
+                    own_read = true;
+                }
+                Ok(Some(RootPaidReceipt::Reverted(_))) => own_read = true,
                 Ok(None) => {
                     problem = "its own confirmed transaction's receipt isn't found".into();
                     if !own_may_be_missing {
@@ -724,7 +733,7 @@ pub(crate) async fn recording_transaction_via(
         }
         if let (Some(replacement), false) = (replaced_by, replacement_read) {
             match chain.root_paid_in(replacement, vault, key).await {
-                Ok(Some((true, _))) => return Ok(*replacement),
+                Ok(Some(RootPaidReceipt::Recorded(_))) => return Ok(*replacement),
                 Ok(_) => replacement_read = true,
                 Err(error) => {
                     problem = format!(

@@ -31,9 +31,9 @@ prints. Upstream's entries follow.
   by default) and the client knows the root vault; it pays each root wave in one `payForQuotes`
   call to the root vault, and the client reads the vault's record of the wave back, finds the
   transaction that recorded it (the payer's own from its receipt, else by the vault's `RootPaid`
-  log, so a returned transaction that never gets a receipt doesn't hold the wave back) and builds
-  each record's proof naming that transaction, paying nothing again when another transaction
-  recorded it first. The upload's cost counts the wave's total when the recording transaction was
+  log, so a returned transaction that reverted or never gets a receipt doesn't hold the wave
+  back) and builds each record's proof naming that transaction, paying nothing again when another
+  transaction recorded it. The upload's cost counts the wave's total when the recording transaction was
   sent from the payer's own address (its wallet sped up or replaced the one returned), and nothing
   when it came from another address or the senders can't be read. `exact_approvals` (true by
   default) says the payer approves each vault for exactly what it pays: its payments use both
