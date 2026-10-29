@@ -157,9 +157,7 @@ async fn run() -> anyhow::Result<()> {
             if !action.needs_network() {
                 // `prove` is offline; `verify` reads only the payment chain.
                 return action
-                    .execute_offline(json, || {
-                        resolve_evm_network_and_manifest(&data_ctx).map(|(network, _)| network)
-                    })
+                    .execute_offline(json, || listing_chain(&data_ctx))
                     .await;
             }
             let needs_wallet = matches!(action, commands::data::FileAction::Upload { .. });
@@ -219,8 +217,7 @@ async fn run() -> anyhow::Result<()> {
             // network.
             let earlier = args.load_earlier(json)?;
             let client = build_data_client(&data_ctx, false, json, None, None).await?;
-            let (network, _) = resolve_evm_network_and_manifest(&data_ctx)?;
-            let chain = ant_core::data::ListingChain::new(&network)?;
+            let chain = listing_chain(&data_ctx)?;
             let result = args.execute(&client, &chain, json, earlier).await;
             client.save_peer_cache().await;
             client.save_adaptive_snapshot();
@@ -228,8 +225,7 @@ async fn run() -> anyhow::Result<()> {
         }
         Commands::Listing(args) => {
             let client = build_data_client(&data_ctx, false, json, None, None).await?;
-            let (network, _) = resolve_evm_network_and_manifest(&data_ctx)?;
-            let chain = ant_core::data::ListingChain::new(&network)?;
+            let chain = listing_chain(&data_ctx)?;
             let result = args.execute(&client, &chain, json).await;
             client.save_peer_cache().await;
             client.save_adaptive_snapshot();
@@ -539,6 +535,18 @@ fn devnet_root_vault(ctx: &DataCliContext) -> anyhow::Result<Option<EvmAddress>>
     })
 }
 
+/// The payment-chain reader of `darwin listings`, `darwin listing` and
+/// `darwin file verify`: the selected network's per-quote vault and its root
+/// vault, the bundled network's built-in one or, on a devnet, the one its
+/// manifest names ([`devnet_root_vault`]), as uploads pay it.
+fn listing_chain(ctx: &DataCliContext) -> anyhow::Result<ant_core::data::ListingChain> {
+    let (network, _) = resolve_evm_network_and_manifest(ctx)?;
+    Ok(ant_core::data::ListingChain::new_with_root_vault(
+        &network,
+        devnet_root_vault(ctx)?,
+    )?)
+}
+
 /// `client` paying with `wallet`. By default through the root vault, as a
 /// client given a wallet pays (`Client::with_wallet`): the bundled network's
 /// built-in root vault (`ant_core::config::root_vault_address`), else the
@@ -808,5 +816,72 @@ mod tests {
             "the bundled network's root vault is paid"
         );
         assert_eq!(pays(&paying(&bundled, &on_bundled, false)), None);
+    }
+
+    /// `darwin listings`, `darwin listing` and `darwin file verify` read the
+    /// root vault uploads pay: on a devnet the one its manifest names, as
+    /// well as the per-quote vault, so root-paid records check out; on the
+    /// bundled network its built-in one, as before.
+    #[test]
+    fn the_readers_read_the_root_vault_uploads_pay() {
+        use ant_core::ant_listings::{RootVault, VaultSet};
+        use ant_core::data::ListingChain;
+        const TOKEN: [u8; 20] = [0x11; 20];
+        const VAULT: [u8; 20] = [0x22; 20];
+        const ROOT: [u8; 20] = [0x33; 20];
+        let dir = tempfile::tempdir().unwrap();
+        let manifest = |root_vault: Option<[u8; 20]>| {
+            let path = dir
+                .path()
+                .join(format!("manifest-{}.json", root_vault.is_some()));
+            let mut evm = serde_json::json!({
+                "rpc_url": "http://127.0.0.1:8545",
+                "wallet_private_key": "0x4c0883a69102937d6231471b5dbb6204fe5129617082792ae468d01a3f362318",
+                "payment_token_address": format!("{:#x}", EvmAddress::from(TOKEN)),
+                "payment_vault_address": format!("{:#x}", EvmAddress::from(VAULT)),
+                "chain_id": 31337,
+            });
+            if let Some(vault) = root_vault {
+                evm["root_vault_address"] = format!("{:#x}", EvmAddress::from(vault)).into();
+            }
+            let manifest = serde_json::json!({
+                "base_port": 12000,
+                "node_count": 5,
+                "bootstrap": [],
+                "data_dir": dir.path(),
+                "created_at": "0",
+                "evm": evm,
+            });
+            std::fs::write(&path, manifest.to_string()).unwrap();
+            path
+        };
+
+        let named = listing_chain(&context(Some("local"), Some(manifest(Some(ROOT))))).unwrap();
+        assert_eq!(
+            named.vaults(),
+            &VaultSet::with_root(
+                VAULT,
+                RootVault {
+                    address: ROOT,
+                    token: TOKEN,
+                }
+            )
+        );
+        // A devnet whose manifest names no root vault reads the per-quote
+        // vault alone.
+        let unnamed = listing_chain(&context(Some("local"), Some(manifest(None)))).unwrap();
+        assert_eq!(unnamed.vaults(), &VaultSet::v2_only(VAULT));
+
+        // The bundled network reads its built-in root vault, also when a
+        // devnet manifest naming another is given beside it.
+        let bundled = ant_core::config::bundled_payment_network().unwrap();
+        let built_in = ListingChain::new(&bundled).unwrap();
+        assert!(built_in.vaults().root.is_some());
+        for ctx in [
+            context(None, None),
+            context(Some("robinhood"), Some(manifest(Some(ROOT)))),
+        ] {
+            assert_eq!(listing_chain(&ctx).unwrap().vaults(), built_in.vaults());
+        }
     }
 }
