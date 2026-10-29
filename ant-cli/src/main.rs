@@ -9,13 +9,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use clap::Parser;
-use tracing::info;
+use tracing::{info, warn};
 use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
 use ant_core::data::{
     peer_cache::{self, BootstrapAddressFilter},
-    Client, ClientConfig, CoreNodeConfig, DevnetManifest, EvmNetwork, IPDiversityConfig, MultiAddr,
-    NodeMode, P2PNode, Wallet, MAX_WIRE_MESSAGE_SIZE,
+    Client, ClientConfig, CoreNodeConfig, DevnetManifest, EvmAddress, EvmNetwork,
+    IPDiversityConfig, MultiAddr, NodeMode, P2PNode, Wallet, MAX_WIRE_MESSAGE_SIZE,
 };
 use cli::{Cli, Commands};
 
@@ -87,7 +87,10 @@ async fn run() -> anyhow::Result<()> {
         verbose: _,
         evm_network,
         max_chunk_price,
-        root_payments,
+        no_root_payments,
+        // The default, asked for by name by commands written for earlier
+        // builds.
+        root_payments: _,
         quote_concurrency,
         store_concurrency,
     } = cli;
@@ -103,7 +106,7 @@ async fn run() -> anyhow::Result<()> {
         chunk_get_timeout_secs,
         evm_network,
         max_chunk_price,
-        root_payments,
+        root_payments: !no_root_payments,
         quote_concurrency,
         store_concurrency,
     };
@@ -265,7 +268,8 @@ struct DataCliContext {
     chunk_get_timeout_secs: Option<u64>,
     evm_network: Option<String>,
     max_chunk_price: Option<ant_core::data::U256>,
-    /// Pay through the root vault (`--root-payments`).
+    /// Pay through the root vault where one is known: the default, off with
+    /// `--no-root-payments`.
     root_payments: bool,
     quote_concurrency: Option<usize>,
     store_concurrency: Option<usize>,
@@ -441,6 +445,13 @@ async fn build_data_client(
     let peer_cache_path = use_peer_cache.then(peer_cache::cache_path).flatten();
     let mut client = data_client(node, config, peer_cache_path, &bootstrap);
 
+    // On a devnet, the root vault its manifest names: where the client reads
+    // root-paid records, and the one its root payments go to.
+    let devnet_root = devnet_root_vault(ctx)?;
+    if let Some(vault) = devnet_root {
+        client = client.with_root_vault(vault);
+    }
+
     if needs_wallet {
         let key = private_key
             .as_ref()
@@ -450,13 +461,22 @@ async fn build_data_client(
         info!("Wallet configured for EVM payments");
         client = client.with_wallet(wallet);
         if ctx.root_payments {
-            client = client
-                .with_root_payments(create_root_wallet(key, &network, ctx)?)
-                .map_err(|e| anyhow::anyhow!("Failed to pay through the root vault: {e}"))?;
-            info!("Payments go through the root vault");
+            match create_root_wallet(key, &network, devnet_root, ctx)? {
+                Some(root_wallet) => {
+                    client = client.with_root_payments(root_wallet).map_err(|e| {
+                        anyhow::anyhow!("Failed to pay through the root vault: {e}")
+                    })?;
+                    info!("Payments go through the root vault");
+                }
+                None => warn!(
+                    "No root vault is known for this payment network (a devnet manifest \
+                     names one as evm.root_vault_address): payments go through the \
+                     payment vault"
+                ),
+            }
+        } else {
+            info!("Payments go through the payment vault (--no-root-payments)");
         }
-    } else if ctx.root_payments {
-        anyhow::bail!("--root-payments is for commands that pay");
     }
 
     Ok(client)
@@ -525,19 +545,35 @@ fn wallet_chain_id(network: &EvmNetwork, ctx: &DataCliContext) -> anyhow::Result
     })
 }
 
+/// The root vault the devnet manifest names (`evm.root_vault_address`),
+/// when the payment network is the manifest's (`--evm-network local`), as
+/// [`wallet_chain_id`] reads its chain ID; none otherwise.
+fn devnet_root_vault(ctx: &DataCliContext) -> anyhow::Result<Option<EvmAddress>> {
+    Ok(match (ctx.evm_network.as_deref(), &ctx.devnet_manifest) {
+        (Some("local"), Some(path)) => {
+            ant_core::config::manifest_root_vault(&std::fs::read_to_string(path)?)?
+        }
+        _ => None,
+    })
+}
+
 /// The wallet of `private_key` that pays `network`'s root vault, signing
-/// for the chain [`create_wallet`]'s does. Only the bundled network names
-/// a root vault (`ant_core::config::root_vault_address`).
+/// for the chain [`create_wallet`]'s does: the bundled network's built-in
+/// root vault (`ant_core::config::root_vault_address`), else `devnet_root`,
+/// the one a devnet's manifest names ([`devnet_root_vault`]). None where
+/// no root vault is known: the client then pays the payment vault.
 fn create_root_wallet(
     private_key: &str,
     network: &EvmNetwork,
+    devnet_root: Option<EvmAddress>,
     ctx: &DataCliContext,
-) -> anyhow::Result<Wallet> {
-    let root = ant_core::config::root_vault_address(network).ok_or_else(|| {
-        anyhow::anyhow!("--root-payments needs the bundled network: no other names a root vault")
-    })?;
+) -> anyhow::Result<Option<Wallet>> {
+    let Some(root) = ant_core::config::root_vault_address(network).or(devnet_root) else {
+        return Ok(None);
+    };
     let chain_id = wallet_chain_id(network, ctx)?;
     ant_core::config::root_wallet(network, root, private_key, chain_id)
+        .map(Some)
         .map_err(|e| anyhow::anyhow!("Failed to create the root vault's wallet: {e}"))
 }
 
@@ -682,5 +718,84 @@ mod tests {
             .expect("a client node");
         let client = data_client(node, ClientConfig::default(), None, &seeds);
         assert_eq!(client.network().bootstrap_peers(), &seeds[..]);
+    }
+
+    fn context(evm_network: Option<&str>, devnet_manifest: Option<PathBuf>) -> DataCliContext {
+        DataCliContext {
+            bootstrap: Vec::new(),
+            devnet_manifest,
+            allow_loopback: true,
+            ipv4_only: false,
+            quote_timeout_secs: 10,
+            store_timeout_secs: None,
+            chunk_get_timeout_secs: None,
+            evm_network: evm_network.map(str::to_string),
+            max_chunk_price: None,
+            root_payments: true,
+            quote_concurrency: None,
+            store_concurrency: None,
+        }
+    }
+
+    /// The root vault the CLI pays by default: the bundled network's own,
+    /// on a devnet the one its manifest names, and none on a devnet whose
+    /// manifest names none, where it pays the payment vault instead of
+    /// stopping.
+    #[test]
+    fn the_root_vault_paid_is_the_bundled_one_or_the_devnets() {
+        const KEY: &str = "4c0883a69102937d6231471b5dbb6204fe5129617082792ae468d01a3f362318";
+        let root: EvmAddress = "0x3333333333333333333333333333333333333333"
+            .parse()
+            .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let manifest = |root_vault: Option<EvmAddress>| {
+            let path = dir
+                .path()
+                .join(format!("manifest-{}.json", root_vault.is_some()));
+            let mut evm = serde_json::json!({
+                "rpc_url": "http://127.0.0.1:8545",
+                "payment_token_address": "0x1111111111111111111111111111111111111111",
+                "payment_vault_address": "0x2222222222222222222222222222222222222222",
+                "chain_id": 31337,
+            });
+            if let Some(vault) = root_vault {
+                evm["root_vault_address"] = format!("{vault:#x}").into();
+            }
+            std::fs::write(&path, serde_json::json!({ "evm": evm }).to_string()).unwrap();
+            path
+        };
+        let devnet = EvmNetwork::Custom(ant_core::data::CustomNetwork {
+            rpc_url_http: "http://127.0.0.1:8545".parse().unwrap(),
+            payment_token_address: "0x1111111111111111111111111111111111111111"
+                .parse()
+                .unwrap(),
+            payment_vault_address: "0x2222222222222222222222222222222222222222"
+                .parse()
+                .unwrap(),
+        });
+
+        let named = context(Some("local"), Some(manifest(Some(root))));
+        assert_eq!(devnet_root_vault(&named).unwrap(), Some(root));
+        let wallet = create_root_wallet(KEY, &devnet, Some(root), &named)
+            .unwrap()
+            .expect("the devnet's root vault is paid");
+        assert_eq!(wallet.network().payment_vault_address(), &root);
+
+        let unnamed = context(Some("local"), Some(manifest(None)));
+        assert_eq!(devnet_root_vault(&unnamed).unwrap(), None);
+        assert!(create_root_wallet(KEY, &devnet, None, &unnamed)
+            .unwrap()
+            .is_none());
+        // The manifest's root vault is read only when it names the payment
+        // network.
+        let bundled_named = context(Some("robinhood"), Some(manifest(Some(root))));
+        assert_eq!(devnet_root_vault(&bundled_named).unwrap(), None);
+
+        let bundled = ant_core::config::bundled_payment_network().unwrap();
+        let built_in = ant_core::config::root_vault_address(&bundled).unwrap();
+        let wallet = create_root_wallet(KEY, &bundled, None, &context(None, None))
+            .unwrap()
+            .expect("the bundled network's root vault is paid");
+        assert_eq!(wallet.network().payment_vault_address(), &built_in);
     }
 }

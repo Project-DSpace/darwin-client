@@ -895,6 +895,49 @@ impl Client {
         self
     }
 
+    /// Pay through the root vault with one key, in one call: this client's
+    /// wallet on `network` ([`Self::with_wallet`]) and its root vault's
+    /// wallet ([`Self::with_root_payments`]), both made from `private_key`
+    /// (hex, `0x` optional) and, given a `chain_id`, signing for that chain
+    /// only (`crate::config::wallet`, `crate::config::root_wallet`). The root
+    /// vault is the bundled network's own, else the one this client names
+    /// ([`Self::with_root_vault`]): on a devnet, name the vault its manifest
+    /// names (`crate::config::manifest_root_vault`) first.
+    ///
+    /// A library client pays the per-quote vault until it opts in, here or
+    /// through `with_root_payments`.
+    ///
+    /// # Errors
+    ///
+    /// If `private_key` isn't a valid key, if no root vault is known for
+    /// `network`, or as [`Self::with_root_payments`].
+    #[cfg(feature = "native")]
+    pub fn with_root_payments_from_key(
+        self,
+        network: ant_protocol::evm::Network,
+        private_key: &str,
+        chain_id: Option<u64>,
+    ) -> Result<Self> {
+        let wallet = crate::config::wallet(network.clone(), private_key, chain_id)
+            .map_err(|e| Error::Config(format!("the client's wallet: {e}")))?;
+        let client = self.with_wallet(wallet);
+        let vault = client.root_vault().ok_or_else(|| {
+            Error::Config(
+                "no root vault is known for this payment network: name it with \
+                 with_root_vault first"
+                    .into(),
+            )
+        })?;
+        let root_wallet = crate::config::root_wallet(
+            &network,
+            ant_protocol::evm::Address::from(vault),
+            private_key,
+            chain_id,
+        )
+        .map_err(|e| Error::Config(format!("the root vault's wallet: {e}")))?;
+        client.with_root_payments(root_wallet)
+    }
+
     /// The wallet root payments go through, if this client pays the root
     /// vault ([`Self::with_root_payments`]).
     #[must_use]

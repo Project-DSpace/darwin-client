@@ -1587,6 +1587,66 @@ mod tests {
         assert_eq!(rooted.root_vault(), Some(built_in.0 .0));
     }
 
+    /// A library client opts in to root payments with one key in one call
+    /// (`with_root_payments_from_key`): both wallets from that key, the root
+    /// vault's paying the bundled network's own, or on another network the
+    /// one the client names. With none known, it is refused and nothing is
+    /// set; a client that doesn't opt in pays the per-quote vault.
+    #[tokio::test]
+    async fn one_key_opts_a_client_in_to_root_payments() {
+        const KEY: &str = "0x4c0883a69102937d6231471b5dbb6204fe5129617082792ae468d01a3f362318";
+        let root = ant_protocol::evm::Address::from([0x33; 20]);
+        let net = network(1);
+        let node = crate::data::Network::unstarted(&[], true, false)
+            .await
+            .unwrap();
+        let client = || Client::from_node(std::sync::Arc::clone(node.node()), Default::default());
+
+        let plain = client().with_wallet(Wallet::new_from_private_key(net.clone(), KEY).unwrap());
+        assert_eq!(plain.payment_vault(), PaymentVault::V2, "opt-in only");
+
+        let error = client()
+            .with_root_payments_from_key(net.clone(), KEY, Some(31337))
+            .err()
+            .unwrap();
+        assert!(error.to_string().contains("with_root_vault"), "{error}");
+
+        let rooted = client()
+            .with_root_vault(root)
+            .with_root_payments_from_key(net.clone(), KEY, Some(31337))
+            .unwrap();
+        assert_eq!(rooted.payment_vault(), PaymentVault::Root);
+        let wallet = rooted.wallet().unwrap();
+        let root_wallet = rooted.root_wallet().unwrap();
+        assert_eq!(wallet.address(), root_wallet.address());
+        assert_eq!(
+            wallet.network().payment_vault_address(),
+            net.payment_vault_address()
+        );
+        assert_eq!(root_wallet.network().payment_vault_address(), &root);
+
+        let bad_key = client()
+            .with_root_vault(root)
+            .with_root_payments_from_key(net, "not a key", None)
+            .err()
+            .unwrap();
+        assert!(bad_key.to_string().contains("wallet"), "{bad_key}");
+
+        let bundled = crate::config::bundled_payment_network().unwrap();
+        let built_in = crate::config::root_vault_address(&bundled).unwrap();
+        let on_bundled = client()
+            .with_root_payments_from_key(bundled, KEY, None)
+            .unwrap();
+        assert_eq!(
+            on_bundled
+                .root_wallet()
+                .unwrap()
+                .network()
+                .payment_vault_address(),
+            &built_in
+        );
+    }
+
     /// A wallet set after the root vault's keeps the root vault's wallet
     /// only while it passes the same checks: one of another key or network
     /// is dropped, and the client pays the per-quote vault, so root waves
