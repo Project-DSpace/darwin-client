@@ -21,10 +21,12 @@ prints. Upstream's entries follow.
   (`ant_core::config::root_wallet_of`), the wallet `with_root_payments_from_key` makes from the
   key. `Client::without_root_payments` opts out and keeps the payment vault;
   `with_root_payments` and `with_root_payments_from_key` opt back in, and a root vault's wallet the
-  caller gives is kept. Every payment the client sends, default root payments and merkle batches
-  included, holds the lock of the wallet given to `with_wallet` (`Wallet::lock`, shared by its
-  clones), after the key's lock and before the root vault's wallet's, so a caller paying with a
-  clone of that wallet under its lock is serialised with them. A wallet whose transaction settings
+  caller gives is kept. In native builds every payment the client sends, default root payments and
+  merkle batches included, holds the lock of the wallet given to `with_wallet` (`Wallet::lock`,
+  shared by its clones), after the key's lock and before the root vault's wallet's, so a caller
+  paying with a clone of that wallet under its lock is serialised with them. Browser builds
+  (without `native`) make no root payments, and their `pay_for_storage` and single-node payments
+  still take no lock, as before. A wallet whose transaction settings
   were changed (`Wallet::set_transaction_config`) gets no root vault's wallet by default and pays
   the payment vault, unless given one with `with_root_payments`. Outside payers stay opt-in
   (`UploadPayer::pays_root_waves`, false by default), and prepared uploads and chunks, external

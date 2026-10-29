@@ -849,8 +849,8 @@ impl Client {
     /// `wallet`'s per-quote payment vault is dropped, as that function
     /// refuses it.
     ///
-    /// The client prepares and sends every payment from `wallet`'s key,
-    /// through either vault's wallet, holding `wallet`'s own lock
+    /// In native builds the client prepares and sends every payment from
+    /// `wallet`'s key, through either vault's wallet, holding `wallet`'s own lock
     /// (`Wallet::lock`, shared by its clones). A caller paying with a clone
     /// of `wallet` under that lock, as evmlib asks of a shared wallet
     /// (`Wallet::prepare_payment`), is therefore serialised with the
