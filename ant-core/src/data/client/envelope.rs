@@ -587,22 +587,20 @@ impl super::Client {
     }
 
     /// The reader of `network`'s payments that checks this client's
-    /// envelope records: it reads the root vault this client pays
-    /// ([`super::Client::with_root_payments`]) beside the per-quote vault,
-    /// so the record of an envelope paid in a root wave is checked as one
-    /// paid alone is.
+    /// envelope records: it reads the client's root vault
+    /// ([`super::Client::root_vault`]: the one it pays through
+    /// [`super::Client::with_root_payments`], else its network's or the one
+    /// it names with [`super::Client::with_root_vault`]) beside the
+    /// per-quote vault, so the record of an envelope paid in a root wave is
+    /// checked as one paid alone is, whoever paid the wave.
     fn listing_chain(
         &self,
         network: &ant_protocol::evm::Network,
     ) -> crate::data::error::Result<super::listings::ListingChain> {
-        let chain = super::listings::ListingChain::new(network)?;
-        Ok(match self.root_wallet() {
-            Some(root) => chain.with_root_vault(ant_listings::RootVault {
-                address: root.network().payment_vault_address().into_array(),
-                token: root.network().payment_token_address().into_array(),
-            }),
-            None => chain,
-        })
+        super::listings::ListingChain::new_with_root_vault(
+            network,
+            self.root_vault().map(ant_protocol::evm::Address::from),
+        )
     }
 
     /// Note on an external-signer upload's envelope, before anything is
@@ -1275,6 +1273,88 @@ mod tests {
             assert!(chain.check_proof(&tampered).await.is_err());
             assert!(proof_data_map(&tampered).is_err());
         }
+    }
+
+    /// A client with no root wallet, on a devnet whose root vault it names
+    /// (`Client::with_root_vault`, as the devnet's manifest gives it), checks
+    /// the record of an envelope paid in a root wave, as a payer outside the
+    /// client pays one: its reader reads the root vault beside the per-quote
+    /// vault. A client that names no root vault on the same devnet keeps the
+    /// record unchecked.
+    #[cfg(feature = "native")]
+    #[tokio::test]
+    async fn a_client_naming_its_root_vault_checks_a_root_paid_record() {
+        use super::super::listings::test_chain::{
+            root_wave_receipt, serve, signed_quote, MockChain, VAULT,
+        };
+        const ROOT: [u8; 20] = [0x7a; 20];
+        const TOKEN: [u8; 20] = [0x11; 20];
+        let map = data_map();
+        let mut chain = MockChain::with_blocks(200, 1_800_000_000);
+        let paid = paid_envelope(&map, &EnvelopeOptions::unlisted());
+        let other = signed_quote([0x31; 32], 30);
+        let root = ant_listings::RootVault {
+            address: ROOT,
+            token: TOKEN,
+        };
+        chain.add_receipt(root_wave_receipt(
+            &root,
+            &[&paid.paid, &other],
+            paid.tx_hash,
+            120,
+        ));
+        let url = serve(std::sync::Arc::new(std::sync::Mutex::new(chain))).await;
+        let devnet = ant_protocol::evm::Network::Custom(crate::data::CustomNetwork {
+            rpc_url_http: url.parse().unwrap(),
+            payment_token_address: TOKEN.into(),
+            payment_vault_address: VAULT.into(),
+        });
+        let node = crate::data::Network::unstarted(&[], true, false)
+            .await
+            .unwrap();
+        let client = || {
+            super::super::Client::from_node(std::sync::Arc::clone(node.node()), Default::default())
+                .with_evm_network(devnet.clone())
+        };
+
+        let naming = client().with_root_vault(ROOT.into());
+        assert!(naming.root_wallet().is_none());
+        assert_eq!(naming.root_vault(), Some(ROOT));
+        let mut upload = UploadEnvelope::new(paid.upload.envelope.clone(), paid.upload.salt);
+        naming
+            .complete_upload_envelope(&mut upload, &map, Some(&paid.proof_bytes), Some(&devnet))
+            .await;
+        assert!(upload.proof_checked, "{:?}", upload.proof_problem);
+        assert_eq!(upload.proof_problem, None);
+        let record = upload.proof.clone().expect("record");
+        assert_eq!(record.tx_hash, paid.tx_hash, "the wave's transaction");
+        let quote: ant_protocol::evm::PaymentQuote = rmp_serde::from_slice(&record.quote).unwrap();
+        assert_eq!(quote.hash(), paid.paid.hash());
+        // Anyone reading the root vault checks it from the chain alone.
+        let reader =
+            super::super::listings::ListingChain::new_with_root_vault(&devnet, Some(ROOT.into()))
+                .unwrap();
+        let proven = reader.check_proof(&record).await.unwrap();
+        assert_eq!(proven.payment.block_number, 120);
+        // A kept record is checked again the same way.
+        let mut again = UploadEnvelope::new(upload.envelope.clone(), None);
+        naming
+            .reuse_upload_record(&mut again, record.clone(), &devnet)
+            .await;
+        assert!(again.proof_checked, "{:?}", again.proof_problem);
+
+        // Naming none, the client reads the per-quote vault alone.
+        let unnamed = client();
+        assert_eq!(unnamed.root_vault(), None);
+        let mut upload = UploadEnvelope::new(paid.upload.envelope.clone(), paid.upload.salt);
+        unnamed
+            .complete_upload_envelope(&mut upload, &map, Some(&paid.proof_bytes), Some(&devnet))
+            .await;
+        assert!(!upload.proof_checked);
+        assert!(upload
+            .proof_problem
+            .as_deref()
+            .is_some_and(|problem| problem.starts_with("not checked against the chain")));
     }
 
     #[tokio::test]

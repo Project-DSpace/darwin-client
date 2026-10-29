@@ -2645,12 +2645,47 @@ impl ListingChain {
     /// Returns an error if [`RPC_URLS_ENV`] holds something other than
     /// URLs, or the HTTP client can't be built.
     pub fn new(network: &EvmNetwork) -> Result<Self> {
+        Self::new_with_root_vault(network, None)
+    }
+
+    /// [`Self::new`], also reading the payments of `root_vault`, paid in
+    /// `network`'s token, where `network` has no root vault built in: a
+    /// devnet's, as its manifest names it
+    /// ([`crate::config::manifest_root_vault`]), or another custom
+    /// network's. A network whose root vault is built in
+    /// ([`crate::config::root_vault_address`]) reads that vault, whatever
+    /// `root_vault` is. With neither, the reader reads the per-quote vault
+    /// alone, as [`Self::new`] does on such a network.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::new`]; and if `root_vault` names another vault than the
+    /// root vault built in for `network`, or `network`'s own payment vault:
+    /// root payments are read only at the vault the network's storers read
+    /// them from.
+    pub fn new_with_root_vault(
+        network: &EvmNetwork,
+        root_vault: Option<ant_protocol::evm::Address>,
+    ) -> Result<Self> {
+        if root_vault.as_ref() == Some(network.payment_vault_address()) {
+            return Err(Error::Config(
+                "the root vault named is the network's per-quote payment vault".into(),
+            ));
+        }
+        let built_in = crate::config::root_vault_address(network);
+        if let (Some(built_in), Some(named)) = (built_in, root_vault) {
+            if built_in != named {
+                return Err(Error::Config(format!(
+                    "the root vault {named:#x} is not this network's root vault {built_in:#x}"
+                )));
+            }
+        }
         let listed = std::env::var(RPC_URLS_ENV).ok();
         let setup = rpc_setup(network, listed.as_deref()).map_err(Error::Network)?;
         let mut vault = [0u8; 20];
         vault.copy_from_slice(network.payment_vault_address().as_slice());
         let mut reader = Self::with_rpc_setup(setup, vault)?;
-        if let Some(root) = crate::config::root_vault_address(network) {
+        if let Some(root) = built_in.or(root_vault) {
             reader = reader.with_root_vault(RootVault {
                 address: root.into_array(),
                 token: network.payment_token_address().into_array(),
@@ -4805,6 +4840,75 @@ pub(crate) mod test_chain {
     pub(crate) fn reader(url: String) -> ListingChain {
         ListingChain::with_rpc(url, VAULT).expect("reader")
     }
+
+    /// The receipt of `tx_hash`, in block `block_number`, paying each of
+    /// `quotes` its price in one wave at the root vault `vault`, as the
+    /// vault logs a wave: each payment's `DataPaymentMade` in ascending
+    /// quote-hash order, then `RootPaid`, then the token's transfer from the
+    /// payer to each payee of its sum.
+    pub(crate) fn root_wave_receipt(
+        vault: &RootVault,
+        quotes: &[&ant_protocol::evm::PaymentQuote],
+        tx_hash: [u8; 32],
+        block_number: u64,
+    ) -> PaymentReceipt {
+        use ant_listings::root::{RootPayment, Wave, TRANSFER_TOPIC};
+        const PAYER: [u8; 20] = [0x50; 20];
+        let word = |address: &[u8; 20]| {
+            let mut word = [0u8; 32];
+            word[12..].copy_from_slice(address);
+            word
+        };
+        let mut payments: Vec<RootPayment> = quotes
+            .iter()
+            .map(|quote| RootPayment {
+                quote_hash: quote.hash().0,
+                payee: quote.rewards_address.0 .0,
+                amount: quote.price,
+            })
+            .collect();
+        payments.sort_by_key(|payment| payment.quote_hash);
+        let wave = Wave::new(payments).expect("a wave the root vault takes");
+        let mut logs: Vec<PaymentLog> = wave
+            .payments()
+            .iter()
+            .map(|payment| PaymentLog {
+                address: vault.address,
+                topics: vec![
+                    DATA_PAYMENT_MADE_TOPIC,
+                    word(&payment.payee),
+                    payment.amount.to_be_bytes::<32>(),
+                    payment.quote_hash,
+                ],
+                data: Vec::new(),
+                log_index: 0,
+            })
+            .collect();
+        let mut data = word(&PAYER).to_vec();
+        data.extend_from_slice(&Amount::from(wave.leaf_count()).to_be_bytes::<32>());
+        data.extend_from_slice(&wave.total().to_be_bytes::<32>());
+        logs.push(PaymentLog {
+            address: vault.address,
+            topics: vec![ROOT_PAID_TOPIC, wave.key(&vault.address)],
+            data,
+            log_index: 0,
+        });
+        logs.extend(wave.sums().into_iter().map(|(payee, sum)| PaymentLog {
+            address: vault.token,
+            topics: vec![TRANSFER_TOPIC, word(&PAYER), word(&payee)],
+            data: sum.to_be_bytes::<32>().to_vec(),
+            log_index: 0,
+        }));
+        for (log, log_index) in logs.iter_mut().zip(0..) {
+            log.log_index = log_index;
+        }
+        PaymentReceipt {
+            tx_hash,
+            success: true,
+            block_number,
+            logs,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -5298,6 +5402,105 @@ mod tests {
         assert!(error.contains("blocks 3648 to 4999 unsearched"), "{error}");
         assert!(error.contains("rather than pay twice"), "{error}");
         assert_eq!(mock.lock().unwrap().calls_to("eth_getLogs"), MAX_LOG_CALLS);
+    }
+
+    /// A devnet's reader, given the root vault its manifest names, reads
+    /// root-paid listings: it finds a root wave's payment of a quote among
+    /// the root vault's logs and checks a record paid in that wave, which
+    /// a reader of the per-quote vault alone, as `new` builds on a devnet,
+    /// finds no payment for. The root vault is read in the network's token.
+    #[tokio::test]
+    async fn a_devnet_reader_given_its_root_vault_reads_root_paid_listings() {
+        use super::test_chain::root_wave_receipt;
+        use crate::data::client::envelope::EnvelopeOptions;
+        use ant_listings::ProofError;
+        const ROOT: [u8; 20] = [0x7a; 20];
+        const TOKEN: [u8; 20] = [0x11; 20];
+        let (map, _) = self_encryption::encrypt(bytes::Bytes::from(vec![9u8; 4000])).unwrap();
+        let envelope = EnvelopeOptions::listed().envelope(&map, None).unwrap();
+        let paid = signed_quote(envelope.address(), 20);
+        let other = signed_quote([0x31; 32], 30);
+        let root = RootVault {
+            address: ROOT,
+            token: TOKEN,
+        };
+        let mut chain = MockChain::with_blocks(200, 1_800_000_000);
+        chain.add_receipt(root_wave_receipt(&root, &[&paid, &other], [0x41; 32], 120));
+        let url = serve(Arc::new(Mutex::new(chain))).await;
+        let devnet = EvmNetwork::Custom(crate::data::CustomNetwork {
+            rpc_url_http: url.parse().unwrap(),
+            payment_token_address: TOKEN.into(),
+            payment_vault_address: VAULT.into(),
+        });
+        let named = ListingChain::new_with_root_vault(&devnet, Some(ROOT.into())).unwrap();
+        assert_eq!(named.vaults(), &VaultSet::with_root(VAULT, root));
+        let v2_only = ListingChain::new(&devnet).unwrap();
+        assert_eq!(v2_only.vaults(), &VAULTS);
+        assert_eq!(
+            ListingChain::new_with_root_vault(&devnet, None)
+                .unwrap()
+                .vaults(),
+            &VAULTS
+        );
+
+        // The wave's payment of the quote, among the root vault's logs.
+        let topics = [
+            Some(DATA_PAYMENT_MADE_TOPIC),
+            None,
+            None,
+            Some(paid.hash().0),
+        ];
+        let found = named.vault_logs(&topics, 0, 199).await.unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].tx_hash, [0x41; 32]);
+        assert!(v2_only
+            .vault_logs(&topics, 0, 199)
+            .await
+            .unwrap()
+            .is_empty());
+
+        // The record of the envelope paid in the wave checks out.
+        let record = EnvelopeProof::new(&envelope, [0x41; 32], &paid).unwrap();
+        let proven = named.check_proof(&record).await.unwrap();
+        assert_eq!(proven.payment.tx_hash, [0x41; 32]);
+        assert_eq!(proven.payment.block_number, 120);
+        assert_eq!(
+            v2_only.check_proof(&record).await.err(),
+            Some(ProofError::Payment(PaymentError::NotPaid).to_string())
+        );
+    }
+
+    /// A root vault named for a network is read only where the network's
+    /// storers could read it: the bundled network reads its own root vault
+    /// and refuses another, and no network takes its per-quote vault as its
+    /// root vault.
+    #[test]
+    fn a_named_root_vault_never_replaces_the_bundled_one_or_the_per_quote_vault() {
+        let bundled = crate::config::bundled_payment_network().unwrap();
+        let built_in = crate::config::root_vault_address(&bundled).unwrap();
+        let same = ListingChain::new_with_root_vault(&bundled, Some(built_in)).unwrap();
+        assert_eq!(same.vaults(), ListingChain::new(&bundled).unwrap().vaults());
+        let other = ant_protocol::evm::Address::from([0x7a; 20]);
+        let Err(error) = ListingChain::new_with_root_vault(&bundled, Some(other)) else {
+            panic!("another root vault on the bundled network is refused");
+        };
+        assert!(
+            error.to_string().contains("not this network's root vault"),
+            "{error}"
+        );
+        let devnet = EvmNetwork::Custom(crate::data::CustomNetwork {
+            rpc_url_http: "http://127.0.0.1:8545".parse().unwrap(),
+            payment_token_address: [0x11; 20].into(),
+            payment_vault_address: VAULT.into(),
+        });
+        for network in [&bundled, &devnet] {
+            let Err(error) =
+                ListingChain::new_with_root_vault(network, Some(*network.payment_vault_address()))
+            else {
+                panic!("the per-quote vault is never the root vault");
+            };
+            assert!(error.to_string().contains("per-quote"), "{error}");
+        }
     }
 
     /// The bundled network's reader reads the root vault the network

@@ -522,11 +522,14 @@ impl MiniTestnet {
         ant_core::data::Client::from_node(node, config).with_wallet(self.wallet.clone())
     }
 
-    /// A client on [`CLIENT_NODE`] with [`test_client_config`], paying
-    /// through the root vault ([`ant_core::data::Client::with_root_payments`])
-    /// from the funded wallet.
+    /// A client on [`CLIENT_NODE`] with [`test_client_config`], naming the
+    /// devnet's root vault ([`ant_core::data::Client::with_root_vault`], as
+    /// a devnet's manifest gives it) and paying through it
+    /// ([`ant_core::data::Client::with_root_payments`]) from the funded
+    /// wallet.
     pub fn root_client(&self) -> ant_core::data::Client {
         self.client()
+            .with_root_vault(self.root_vault)
             .with_root_payments(self.root_wallet())
             .expect("a root client")
     }

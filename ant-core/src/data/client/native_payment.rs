@@ -480,21 +480,14 @@ fn journaled_to(signed: &SignedPayment) -> Result<ant_protocol::evm::Address> {
 
 /// Which of this client's vaults `to` is: the per-quote vault its wallet
 /// pays, or the root vault, as its root wallet pays it or, without one, as
-/// the client's network bundles it.
+/// the client's network bundles it or the client names it
+/// ([`Client::root_vault`]).
 fn vault_named(client: &Client, to: &ant_protocol::evm::Address) -> Option<PaymentVault> {
     let v2 = client
         .wallet_paying(PaymentVault::V2)
         .ok()
         .map(|wallet| *wallet.network().payment_vault_address());
-    let root = client
-        .root_wallet()
-        .map(|wallet| *wallet.network().payment_vault_address())
-        .or_else(|| {
-            client
-                .require_evm_network()
-                .ok()
-                .and_then(crate::config::root_vault_address)
-        });
+    let root = client.root_vault().map(ant_protocol::evm::Address::from);
     if Some(*to) == root {
         Some(PaymentVault::Root)
     } else if Some(*to) == v2 {
@@ -1374,6 +1367,94 @@ mod tests {
                 .payment_vault_address(),
             &root
         );
+    }
+
+    /// A client may name its network's root vault without a wallet to pay
+    /// it (`with_root_vault`): it reads root payments there, and a journaled
+    /// root payment to it is reconciled through it. A root vault's wallet
+    /// must then pay that vault: one paying another is refused, and one set
+    /// earlier is dropped once another vault is named. On the bundled
+    /// network its own root vault stays the one read and paid.
+    #[tokio::test]
+    async fn a_client_names_its_root_vault_without_a_root_wallet() {
+        const KEY: &str = "0x4c0883a69102937d6231471b5dbb6204fe5129617082792ae468d01a3f362318";
+        let root = ant_protocol::evm::Address::from([0x33; 20]);
+        let other = ant_protocol::evm::Address::from([0x44; 20]);
+        let net = network(1);
+        let node = crate::data::Network::unstarted(&[], true, false)
+            .await
+            .unwrap();
+        let client = || {
+            Client::from_node(std::sync::Arc::clone(node.node()), Default::default())
+                .with_wallet(Wallet::new_from_private_key(net.clone(), KEY).unwrap())
+        };
+        let paying = |vault| {
+            Wallet::new_from_private_key(crate::config::network_paying(&net, vault), KEY).unwrap()
+        };
+
+        assert_eq!(client().root_vault(), None);
+        let named = client().with_root_vault(root);
+        assert_eq!(named.root_vault(), Some(root.0 .0));
+        assert_eq!(
+            named.payment_vault(),
+            PaymentVault::V2,
+            "it pays nothing by naming"
+        );
+        assert_eq!(vault_named(&named, &root), Some(PaymentVault::Root));
+        let v2 = *net.payment_vault_address();
+        assert_eq!(vault_named(&named, &v2), Some(PaymentVault::V2));
+        assert_eq!(vault_named(&named, &other), None);
+        assert_eq!(vault_named(&client(), &root), None);
+        // Reconciling a root payment still needs the root vault's wallet.
+        let error = named.wallet_paying(PaymentVault::Root).err().unwrap();
+        assert!(error.to_string().contains("with_root_payments"), "{error}");
+
+        // A root vault's wallet must pay the vault named.
+        let error = client()
+            .with_root_vault(root)
+            .with_root_payments(paying(other))
+            .err()
+            .unwrap();
+        assert!(error.to_string().contains("with_root_vault"), "{error}");
+        let rooted = client()
+            .with_root_vault(root)
+            .with_root_payments(paying(root))
+            .unwrap();
+        assert_eq!(rooted.payment_vault(), PaymentVault::Root);
+        assert_eq!(rooted.root_vault(), Some(root.0 .0));
+        // Naming the same vault again keeps the wallet; naming another drops
+        // it, and the client pays the per-quote vault.
+        let kept = rooted.with_root_vault(root);
+        assert_eq!(kept.payment_vault(), PaymentVault::Root);
+        let moved = kept.with_root_vault(other);
+        assert!(moved.root_wallet().is_none());
+        assert_eq!(moved.payment_vault(), PaymentVault::V2);
+        assert_eq!(moved.root_vault(), Some(other.0 .0));
+        // A root vault's wallet set before a vault is named, paying another,
+        // is dropped once it is named.
+        let later = client()
+            .with_root_payments(paying(other))
+            .unwrap()
+            .with_root_vault(root);
+        assert!(later.root_wallet().is_none());
+
+        // On the bundled network, its own root vault is read and paid.
+        let bundled = crate::config::bundled_payment_network().unwrap();
+        let built_in = crate::config::root_vault_address(&bundled).unwrap();
+        let on_bundled = Client::from_node(std::sync::Arc::clone(node.node()), Default::default())
+            .with_wallet(Wallet::new_from_private_key(bundled.clone(), KEY).unwrap())
+            .with_root_vault(root);
+        assert_eq!(on_bundled.root_vault(), Some(built_in.0 .0));
+        let rooted = on_bundled
+            .with_root_payments(
+                Wallet::new_from_private_key(
+                    crate::config::network_paying(&bundled, built_in),
+                    KEY,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        assert_eq!(rooted.root_vault(), Some(built_in.0 .0));
     }
 
     /// A wallet set after the root vault's keeps the root vault's wallet

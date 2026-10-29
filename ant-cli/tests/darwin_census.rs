@@ -117,6 +117,7 @@ const WALLETS: Counting = &[
 /// chain, and every read of a vault's own records or logs.
 const VAULT_READS: Counting = &[
     (Some("ListingChain"), "new"),
+    (Some("ListingChain"), "new_with_root_vault"),
     (Some("ListingChain"), "with_rpc"),
     (Some("ListingChain"), "with_rpcs"),
     (None, "with_rpc_setup"),
@@ -1155,7 +1156,11 @@ const WALLET_SITES: &[Site] = &[
 ];
 
 const BOTH_VAULTS: &str = "Builds the reader of the network's payments that reads the vault set: \
-    ListingChain::new reads the per-quote vault and, on the bundled network, the root vault.";
+    ListingChain::new_with_root_vault (ListingChain::new naming none) reads the per-quote vault \
+    and, on the bundled network, its root vault, refusing another; on another network, the root \
+    vault named (a devnet's manifest names it), never the per-quote vault.";
+const DEVNET_ROOT: &str = "A devnet manifest's evm.root_vault_address, read beside its chain ID: \
+    the root vault a client on the devnet names (Client::with_root_vault).";
 const VERIFY_READER: &str = "`darwin file verify`: the reader of both vaults (ListingChain::new) \
     checks the upload proof, by the vault whose log it is.";
 const LISTINGS_READER: &str = "darwin's listings and listing commands read listings through the \
@@ -1177,9 +1182,10 @@ const ROOT_CONFIG: &str = "The bundled network's root vault address \
     vault, as the one root vault it may pay.";
 const ROOT_PAYER: &str = "A payer through the root vault (Client::with_root_payments) takes the \
     bundled network's root vault as the only one it pays, and reads its payments back there.";
-const ENVELOPE_ROOT: &str = "The envelope reader of a client paying the root vault adds the vault \
-    it pays to the reader of both vaults, so an envelope paid in a root wave is checked as one \
-    paid alone; on the bundled network it is the vault ListingChain::new already reads.";
+const ENVELOPE_ROOT: &str = "The envelope reader of a client reads the client's root vault \
+    (Client::root_vault: the one it pays, else its network's, else the one it names) beside the \
+    per-quote vault, so an envelope paid in a root wave is checked as one paid alone, whoever \
+    paid the wave; on the bundled network it is the vault ListingChain::new already reads.";
 const ROOT_LOGS: &str = "One eth_getLogs for every vault in the set (both addresses where a \
     root vault is read).";
 const LOGS_KIND: &str = "Sorts RPC calls by method, to send log queries to the RPCs that \
@@ -1238,6 +1244,13 @@ const VAULT_READ_SITES: &[Site] = &[
     ),
     (
         "ant-core/src/config.rs",
+        "manifest_root_vault",
+        "root_vault_address",
+        2,
+        DEVNET_ROOT,
+    ),
+    (
+        "ant-core/src/config.rs",
         "root_vault_address",
         "root_vault_address",
         1,
@@ -1246,21 +1259,7 @@ const VAULT_READ_SITES: &[Site] = &[
     (
         "ant-core/src/data/client/envelope.rs",
         "Client::listing_chain",
-        "ListingChain::new",
-        1,
-        ENVELOPE_READER,
-    ),
-    (
-        "ant-core/src/data/client/envelope.rs",
-        "Client::listing_chain",
-        "RootVault",
-        1,
-        ENVELOPE_ROOT,
-    ),
-    (
-        "ant-core/src/data/client/envelope.rs",
-        "Client::listing_chain",
-        "with_root_vault",
+        "ListingChain::new_with_root_vault",
         1,
         ENVELOPE_ROOT,
     ),
@@ -1322,28 +1321,28 @@ const VAULT_READ_SITES: &[Site] = &[
     ),
     (
         "ant-core/src/data/client/listings.rs",
-        "ListingChain::new",
+        "ListingChain::new_with_root_vault",
         "RootVault",
         1,
         BOTH_VAULTS,
     ),
     (
         "ant-core/src/data/client/listings.rs",
-        "ListingChain::new",
+        "ListingChain::new_with_root_vault",
         "root_vault_address",
         1,
         BOTH_VAULTS,
     ),
     (
         "ant-core/src/data/client/listings.rs",
-        "ListingChain::new",
+        "ListingChain::new_with_root_vault",
         "with_root_vault",
         1,
         BOTH_VAULTS,
     ),
     (
         "ant-core/src/data/client/listings.rs",
-        "ListingChain::new",
+        "ListingChain::new_with_root_vault",
         "with_rpc_setup",
         1,
         BOTH_VAULTS,
@@ -1461,13 +1460,6 @@ const VAULT_READ_SITES: &[Site] = &[
         ROOT_PAYER,
     ),
     (
-        "ant-core/src/data/client/native_payment.rs",
-        "vault_named",
-        "root_vault_address",
-        1,
-        ROOT_PAYER,
-    ),
-    (
         "ant-core/src/data/client/occupied.rs",
         "Client::root_vault",
         "root_vault_address",
@@ -1491,7 +1483,7 @@ const VAULT_READ_SITES: &[Site] = &[
     (
         "ant-core/src/data/client/occupied.rs",
         "read_back_chain",
-        "ListingChain::new",
+        "ListingChain::new_with_root_vault",
         1,
         PAYER_CHAIN,
     ),
@@ -3413,7 +3405,8 @@ fn every_payment_reader_reads_the_vault_set() {
         VAULT_READ_SITES,
         "Every reader of listings and payment records (the listings producer, `darwin file \
          verify`, envelope records, listing lookups) reads the vault set: the per-quote vault \
-         and, on the bundled network, the root vault (ListingChain::new), each payment checked \
+         and, on the bundled network, the root vault (ListingChain::new), or on a devnet the \
+         root vault its manifest names (ListingChain::new_with_root_vault), each payment checked \
          by the vault whose log it is. A reader of one vault alone is built only for another \
          network or in tests. A payer reads only the vault it paid (completed_payment reads the \
          per-quote vault's record of a quote it paid, root_record the root vault's record of a \

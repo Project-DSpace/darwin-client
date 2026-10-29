@@ -330,7 +330,7 @@ impl Client {
             }
             return Vec::new();
         };
-        match read_back_chain(network) {
+        match read_back_chain(network, self.root_vault()) {
             Ok(chain) => occupied_quotes_via(&chain, plans).await,
             Err(error) => {
                 tracing::warn!(
@@ -383,7 +383,7 @@ impl Client {
         let Some((_, hash, rewards)) = super::upload_state::paid_quote(proof) else {
             return KeptPayment::NotChecked;
         };
-        let chain = match read_back_chain(network) {
+        let chain = match read_back_chain(network, self.root_vault()) {
             Ok(chain) => chain,
             Err(error) => {
                 tracing::warn!("cannot read the kept proof's payment record ({error})");
@@ -411,7 +411,7 @@ impl Client {
         let Some(network) = self.evm_network.as_ref() else {
             return KeptPayment::NotChecked;
         };
-        let chain = match read_back_chain(network) {
+        let chain = match read_back_chain(network, self.root_vault()) {
             Ok(chain) => chain,
             Err(error) => {
                 tracing::warn!("cannot read the shared wave's payment records ({error})");
@@ -440,16 +440,22 @@ impl Client {
     }
 
     /// The root vault this client's root payments go to and its root proofs
-    /// are read at: its root wallet's vault, else the root vault built in
-    /// for its payment network ([`crate::config::root_vault_address`]).
+    /// and root-paid records are read at: its root wallet's vault, else the
+    /// root vault built in for its payment network
+    /// ([`crate::config::root_vault_address`]), else the one it names
+    /// ([`Self::with_root_vault`]), so a client with no root wallet, or on
+    /// a devnet, reads the root vault too.
     #[cfg(feature = "native")]
     #[must_use]
     pub(crate) fn root_vault(&self) -> Option<[u8; 20]> {
         if let Some(wallet) = self.root_wallet() {
             return Some(wallet.network().payment_vault_address().0 .0);
         }
-        let network = self.evm_network.as_ref()?;
-        crate::config::root_vault_address(network).map(|address| address.0 .0)
+        self.evm_network
+            .as_ref()
+            .and_then(crate::config::root_vault_address)
+            .or(self.root_vault)
+            .map(|address| address.0 .0)
     }
 
     /// Whether the root vault `vault` records a wave under `key`, read
@@ -470,7 +476,7 @@ impl Client {
         let Some(network) = self.evm_network.as_ref() else {
             return KeptPayment::NotChecked;
         };
-        let chain = match read_back_chain(network) {
+        let chain = match read_back_chain(network, self.root_vault()) {
             Ok(chain) => chain,
             Err(error) => {
                 tracing::warn!("cannot read the root vault's record ({error})");
@@ -528,7 +534,7 @@ impl Client {
         let network = self.evm_network.as_ref().ok_or_else(|| {
             Error::Payment("no EVM network to find the root wave's recording on".into())
         })?;
-        let chain = read_back_chain(network)?;
+        let chain = read_back_chain(network, self.root_vault())?;
         recording_transaction_via(
             &chain,
             &RootWave {
@@ -719,12 +725,14 @@ pub(crate) enum KeptPayment {
 
 /// The reader [`Client::occupied_quotes`] reads paid quotes back through:
 /// `network`'s RPC, then the RPCs it falls back to
-/// ([`crate::config::fallback_rpc_urls`]).
+/// ([`crate::config::fallback_rpc_urls`]), reading `root_vault`, the
+/// client's root vault ([`Client::root_vault`]), beside the per-quote vault.
 #[cfg(feature = "native")]
 fn read_back_chain(
     network: &ant_protocol::evm::Network,
+    root_vault: Option<[u8; 20]>,
 ) -> crate::data::error::Result<ListingChain> {
-    ListingChain::new(network)
+    ListingChain::new_with_root_vault(network, root_vault.map(ant_protocol::evm::Address::from))
 }
 
 /// [`Client::occupied_quotes`], reading through `chain`.
@@ -794,7 +802,7 @@ mod tests {
         assert!(!fallbacks.is_empty());
         let mut expected = vec![bundled.rpc_url().to_string()];
         expected.extend(fallbacks);
-        let chain = read_back_chain(&bundled).unwrap();
+        let chain = read_back_chain(&bundled, None).unwrap();
         assert_eq!(chain.rpc_urls(), expected.as_slice());
     }
     use crate::data::client::batch::SingleNodeQuotePayment;

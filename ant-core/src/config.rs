@@ -346,6 +346,35 @@ pub fn manifest_chain_id(manifest: &str) -> Result<Option<u64>> {
     Ok(manifest.evm.and_then(|evm| evm.chain_id))
 }
 
+/// The root vault a devnet manifest's `evm` block may name for payments on
+/// its network, as `root_vault_address`: the vault its storers read root
+/// payments from, which a client reads root-paid records at
+/// (`Client::with_root_vault`) and pays through its root wallet
+/// ([`root_wallet`]). Upstream's [`DevnetManifest`] has no such field, so it
+/// is read from the manifest's JSON, as [`manifest_chain_id`] is. A
+/// manifest naming none gives none: the devnet has no root vault.
+pub fn manifest_root_vault(manifest: &str) -> Result<Option<EvmAddress>> {
+    #[derive(serde::Deserialize)]
+    struct Manifest {
+        evm: Option<Evm>,
+    }
+    #[derive(serde::Deserialize)]
+    struct Evm {
+        root_vault_address: Option<String>,
+    }
+    let manifest: Manifest = serde_json::from_str(manifest)
+        .map_err(|e| Error::InvalidEvmManifest(format!("invalid root vault address: {e}")))?;
+    manifest
+        .evm
+        .and_then(|evm| evm.root_vault_address)
+        .map(|address| {
+            address
+                .parse()
+                .map_err(|e| Error::InvalidEvmManifest(format!("invalid root vault address: {e}")))
+        })
+        .transpose()
+}
+
 /// A wallet paying on `network` with `private_key` (hex, `0x` optional).
 /// With a `chain_id` it signs for that chain only: each transaction's chain
 /// ID is the RPC's `eth_chainId`, and the signer refuses one that differs,
@@ -700,6 +729,54 @@ mod tests {
             manifest_chain_id(&with_chain.to_string()),
             Err(Error::InvalidEvmManifest(_))
         ));
+    }
+
+    /// A devnet manifest's `evm` block may name its root vault, read beside
+    /// its chain ID; a manifest naming none, or with no `evm` block, gives
+    /// none, and one that isn't an address is refused.
+    #[test]
+    fn the_manifests_root_vault_is_read_beside_its_chain_id() {
+        let manifest = serde_json::to_value(manifest_with_evm()).unwrap();
+        assert_eq!(manifest_root_vault(&manifest.to_string()).unwrap(), None);
+        assert_eq!(manifest_root_vault("{}").unwrap(), None);
+        let mut named = manifest.clone();
+        named["evm"]["chain_id"] = 31337.into();
+        named["evm"]["root_vault_address"] = "0xf6675722f443132b045857546E57e35360Bb03b9".into();
+        assert_eq!(
+            manifest_root_vault(&named.to_string()).unwrap(),
+            Some(
+                "0xf6675722f443132b045857546E57e35360Bb03b9"
+                    .parse::<EvmAddress>()
+                    .unwrap()
+            )
+        );
+        assert_eq!(manifest_chain_id(&named.to_string()).unwrap(), Some(31337));
+        // The network the manifest gives stays the per-quote vault's.
+        let local = resolve_evm_network(
+            Some("local"),
+            Some(&serde_json::from_value(named.clone()).unwrap()),
+        )
+        .unwrap();
+        assert_eq!(
+            local.payment_vault_address(),
+            &manifest_with_evm()
+                .evm
+                .unwrap()
+                .payment_vault_address
+                .parse::<EvmAddress>()
+                .unwrap()
+        );
+        for bad in [json_str("0x1234"), json_str("not an address"), 7.into()] {
+            named["evm"]["root_vault_address"] = bad;
+            assert!(matches!(
+                manifest_root_vault(&named.to_string()),
+                Err(Error::InvalidEvmManifest(_))
+            ));
+        }
+    }
+
+    fn json_str(text: &str) -> serde_json::Value {
+        serde_json::Value::String(text.into())
     }
 
     #[tokio::test]

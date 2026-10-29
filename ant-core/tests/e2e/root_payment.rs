@@ -490,12 +490,16 @@ async fn a_file_with_the_default_envelope_pays_one_root_wave_and_its_record_name
     let client = testnet.root_client();
     let vault = testnet.root_vault();
     let per_quote_reader = ListingChain::new(testnet.evm_network()).expect("a reader");
-    let reader = ListingChain::new(testnet.evm_network())
-        .expect("a reader")
-        .with_root_vault(RootVault {
+    // The devnet's reader, given the root vault its manifest names.
+    let reader =
+        ListingChain::new_with_root_vault(testnet.evm_network(), Some(vault)).expect("a reader");
+    assert_eq!(
+        reader.vaults().root,
+        Some(RootVault {
             address: vault.into_array(),
             token: testnet.evm_network().payment_token_address().into_array(),
-        });
+        })
+    );
     let (file, map, roots) = root_file(&testnet).await;
     let content_records = map.infos().len();
 
