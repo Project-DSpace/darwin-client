@@ -3104,6 +3104,35 @@ impl ListingChain {
         Ok(Some((records, block)))
     }
 
+    /// The address that sent transaction `tx_hash` (`eth_getTransactionByHash`),
+    /// or `None` if the chain doesn't know the transaction, as for one its
+    /// wallet replaced before it was mined.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the call fails or the answer names no sender.
+    pub(crate) async fn transaction_sender(
+        &self,
+        tx_hash: &[u8; 32],
+    ) -> std::result::Result<Option<[u8; 20]>, String> {
+        let answer = self
+            .rpc
+            .call(
+                "eth_getTransactionByHash",
+                json!([format!("0x{}", hex::encode(tx_hash))]),
+            )
+            .await?
+            .value;
+        if answer.is_null() {
+            return Ok(None);
+        }
+        answer["from"]
+            .as_str()
+            .and_then(parse_bytes::<20>)
+            .map(Some)
+            .ok_or_else(|| "the transaction names no sender".into())
+    }
+
     /// The transaction that recorded the root vault `vault`'s wave under
     /// `key`: the one whose `RootPaid` log from the vault names the key, its
     /// one indexed topic. The vault records a key once, so there is at most
@@ -4443,6 +4472,8 @@ pub(crate) mod test_chain {
         /// The keys any root vault records a wave under, read through
         /// `records(bytes32)`.
         pub(crate) root_records: std::collections::HashSet<[u8; 32]>,
+        /// The sender of each transaction `eth_getTransactionByHash` knows.
+        pub(crate) senders: HashMap<[u8; 32], [u8; 20]>,
         /// The block the chain reports as finalized; the latest when
         /// `None`.
         pub(crate) finalized: Option<u64>,
@@ -4583,6 +4614,16 @@ pub(crate) mod test_chain {
                     Value::Array(logs)
                 }
                 "eth_call" => self.vault_call(&params[0]),
+                "eth_getTransactionByHash" => {
+                    let hash = params[0].as_str().and_then(parse_bytes::<32>);
+                    match hash.and_then(|hash| Some((hash, self.senders.get(&hash)?))) {
+                        Some((hash, from)) => json!({
+                            "hash": format!("0x{}", hex::encode(hash)),
+                            "from": format!("0x{}", hex::encode(from)),
+                        }),
+                        None => Value::Null,
+                    }
+                }
                 _ => Value::Null,
             }
         }
@@ -5320,6 +5361,7 @@ mod tests {
                     key: &key,
                     own: &own,
                     own_confirmed: confirmed,
+                    own_may_be_missing: false,
                     replaced_by: replaced_by.as_ref(),
                     earliest_quote: quoted,
                 };
@@ -5391,6 +5433,7 @@ mod tests {
             key: &RV_KEY,
             own: &[0x0e; 32],
             own_confirmed: false,
+            own_may_be_missing: false,
             replaced_by: None,
             earliest_quote: RV_PAST,
         };

@@ -898,7 +898,8 @@ impl Client {
             .or_else(|| self.wallet.as_deref().map(Wallet::network));
         if network.is_some_and(|network| network.payment_vault_address() == &vault) {
             tracing::warn!(
-                "{vault:#x} is the payment network's per-quote payment vault, not its root                  vault; it isn't taken as the root vault"
+                "{vault:#x} is the payment network's per-quote payment vault, not its root \
+                 vault; it isn't taken as the root vault"
             );
             return self;
         }
@@ -1036,7 +1037,8 @@ impl Client {
             .take_if(|vault| vault == network.payment_vault_address())
         {
             tracing::warn!(
-                "the root vault named, {vault:#x}, is the payment network's per-quote payment                  vault, not its root vault; it is dropped"
+                "the root vault named, {vault:#x}, is the payment network's per-quote payment \
+                 vault, not its root vault; it is dropped"
             );
         }
     }

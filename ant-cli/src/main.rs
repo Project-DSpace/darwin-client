@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use clap::Parser;
-use tracing::{info, warn};
+use tracing::info;
 use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
 use ant_core::data::{
@@ -468,10 +468,10 @@ async fn build_data_client(
                     })?;
                     info!("Payments go through the root vault");
                 }
-                None => warn!(
-                    "No root vault is known for this payment network (a devnet manifest \
-                     names one as evm.root_vault_address): payments go through the \
-                     payment vault"
+                None => eprintln!(
+                    "warning: no root vault is known for this payment network (a devnet \
+                     manifest names one as evm.root_vault_address): payments go through \
+                     the payment vault"
                 ),
             }
         } else {

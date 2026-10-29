@@ -447,7 +447,7 @@ impl Client {
     /// a devnet, reads the root vault too.
     #[cfg(feature = "native")]
     #[must_use]
-    pub(crate) fn root_vault(&self) -> Option<[u8; 20]> {
+    pub fn root_vault(&self) -> Option<[u8; 20]> {
         if let Some(wallet) = self.root_wallet() {
             return Some(wallet.network().payment_vault_address().0 .0);
         }
@@ -578,16 +578,20 @@ impl Client {
         }
     }
 
-    /// The transaction that recorded the root vault `vault`'s wave under
-    /// `key`, which a root wave's proofs and its envelope's payment record
-    /// name: storers check an envelope's payment in the transactions its
-    /// proof names. That is `own`, the payment's own transaction, when it
-    /// was confirmed (`own_confirmed`) and its receipt holds the vault's
-    /// `RootPaid` log naming the key. Otherwise another transaction recorded
-    /// the same leaves first: `own` reverted or was replaced (by
-    /// `replaced_by`, if that is known), or the vault found the wave already
-    /// recorded and recorded nothing. That one is found by its `RootPaid`
-    /// log, filtered by the key ([`recording_transaction_via`]).
+    /// The transaction that recorded the root vault's wave `wave` describes
+    /// (its `vault` and `key`), which a root wave's proofs and its
+    /// envelope's payment record name: storers check an envelope's payment
+    /// in the transactions its proof names. That is `own`, the payment's own
+    /// transaction, when it was confirmed (`own_confirmed`) and its receipt
+    /// holds the vault's `RootPaid` log naming the key. Otherwise another
+    /// transaction recorded the same leaves first: `own` reverted or was
+    /// replaced (by `replaced_by`, if that is known), or the vault found the
+    /// wave already recorded and recorded nothing. That one is found by its
+    /// `RootPaid` log, filtered by the key ([`recording_transaction_via`]).
+    /// With `own_may_be_missing` (an outside payer's transaction, which its
+    /// wallet may have sped up or replaced), `own`'s receipt is still read
+    /// first, but one the chain doesn't have, or that can't be read, leads
+    /// to that search rather than holding it back.
     ///
     /// # Errors
     ///
@@ -596,30 +600,39 @@ impl Client {
     #[cfg(feature = "native")]
     pub(crate) async fn root_wave_transaction(
         &self,
-        vault: &[u8; 20],
-        key: &[u8; 32],
-        own: &[u8; 32],
-        own_confirmed: bool,
-        replaced_by: Option<&[u8; 32]>,
-        earliest_quote: u64,
+        wave: &RootWave<'_>,
     ) -> crate::data::error::Result<[u8; 32]> {
         let network = self.evm_network.as_ref().ok_or_else(|| {
             Error::Payment("no EVM network to find the root wave's recording on".into())
         })?;
         let chain = read_back_chain(network, self.root_vault())?;
-        recording_transaction_via(
-            &chain,
-            &RootWave {
-                vault,
-                key,
-                own,
-                own_confirmed,
-                replaced_by,
-                earliest_quote,
-            },
-            ROOT_RECORDING_READS,
-        )
-        .await
+        recording_transaction_via(&chain, wave, ROOT_RECORDING_READS).await
+    }
+
+    /// Whether transactions `a` and `b` were sent from the same address,
+    /// read through the payment network's RPCs: `None` if either sender
+    /// can't be read, as for a transaction its wallet replaced before it was
+    /// mined, which the chain may no longer know.
+    #[cfg(feature = "native")]
+    pub(crate) async fn same_sender(&self, a: &[u8; 32], b: &[u8; 32]) -> Option<bool> {
+        let network = self.evm_network.as_ref()?;
+        let chain = read_back_chain(network, self.root_vault()).ok()?;
+        let sender = |tx: [u8; 32]| {
+            let chain = &chain;
+            async move {
+                match chain.transaction_sender(&tx).await {
+                    Ok(sender) => sender,
+                    Err(error) => {
+                        tracing::debug!(
+                            "the sender of transaction {} couldn't be read: {error}",
+                            hex::encode(tx)
+                        );
+                        None
+                    }
+                }
+            }
+        };
+        Some(sender(*a).await? == sender(*b).await?)
     }
 }
 
@@ -640,8 +653,14 @@ pub(crate) struct RootWave<'a> {
     pub(crate) key: &'a [u8; 32],
     /// The payment's own transaction.
     pub(crate) own: &'a [u8; 32],
-    /// Whether `own` was confirmed, rather than reverted or replaced.
+    /// Whether `own`'s receipt is read first: it was confirmed, rather than
+    /// reverted or replaced, or (with `own_may_be_missing`) it may have been.
     pub(crate) own_confirmed: bool,
+    /// Whether `own` may never get a receipt, as an outside payer's
+    /// transaction its wallet sped up or replaced: a receipt the chain
+    /// doesn't have, or that can't be read, then leads on to the search for
+    /// the `RootPaid` log in the same read rather than to another read.
+    pub(crate) own_may_be_missing: bool,
     /// The transaction that took `own`'s nonce, if `own` was replaced.
     pub(crate) replaced_by: Option<&'a [u8; 32]>,
     /// The wave's earliest quote time, in Unix seconds.
@@ -673,6 +692,7 @@ pub(crate) async fn recording_transaction_via(
         key,
         own,
         own_confirmed,
+        own_may_be_missing,
         replaced_by,
         earliest_quote,
     } = *wave;
@@ -690,11 +710,15 @@ pub(crate) async fn recording_transaction_via(
                 Ok(Some((false, block))) => until = Some(block),
                 Ok(None) => {
                     problem = "its own confirmed transaction's receipt isn't found".into();
-                    continue;
+                    if !own_may_be_missing {
+                        continue;
+                    }
                 }
                 Err(error) => {
                     problem = format!("its own transaction's receipt couldn't be read: {error}");
-                    continue;
+                    if !own_may_be_missing {
+                        continue;
+                    }
                 }
             }
         }

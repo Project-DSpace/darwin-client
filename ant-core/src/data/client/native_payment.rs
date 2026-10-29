@@ -5,7 +5,7 @@
 use super::{
     batch::{ChunkPaymentPlan, PAYMENT_WAVE_SIZE},
     merkle::PreparedMerkleBatch,
-    occupied::KeptPayment,
+    occupied::{KeptPayment, RootWave},
     root_payment::{self, PaymentVault, RootWavePayment},
     shared_wave::{Member, QuoteTuple, Step, WaveEnd, WaveSigned},
     upload::{MerkleUploadPayment, UploadAdapter, UploadPayment, UploadRecord},
@@ -378,14 +378,15 @@ async fn pay_root<A: UploadAdapter>(
     let own = receipt.transaction_hash;
     let recording = ant_protocol::evm::TxHash::from(
         client
-            .root_wave_transaction(
-                &vault,
-                &key,
-                &own.0,
+            .root_wave_transaction(&RootWave {
+                vault: &vault,
+                key: &key,
+                own: &own.0,
                 own_confirmed,
-                replaced_by.as_ref().map(|replacement| &replacement.0),
-                earliest_quote(plans),
-            )
+                own_may_be_missing: false,
+                replaced_by: replaced_by.as_ref().map(|replacement| &replacement.0),
+                earliest_quote: earliest_quote(plans),
+            })
             .await?,
     );
     let share = super::shared_wave::share_of(&receipt, &quotes, quotes.len())?;
@@ -393,6 +394,7 @@ async fn pay_root<A: UploadAdapter>(
         &quotes,
         own,
         recording,
+        false,
         wave,
         share.amount,
         share.gas,
@@ -401,18 +403,29 @@ async fn pay_root<A: UploadAdapter>(
 
 /// A root wave's payment, recorded by transaction `recording`: every
 /// record's proof, and so its envelope's payment record, names it. When
-/// that isn't the payment's own transaction (`own`), another recorded the
-/// same leaves first, and this payment moved no tokens: its `amount` is
-/// none, and only its `gas` was spent.
+/// that is the payment's own transaction (`own`), or another sent by the
+/// same payer (`recorded_by_payer`: its wallet sped up or replaced `own`),
+/// the payment moved `amount`. Otherwise another recorded the same leaves
+/// first, and this payment moved no tokens: its `amount` is none, and only
+/// its `gas` was spent.
 fn root_wave_payment(
     quotes: &[QuoteTuple],
     own: ant_protocol::evm::TxHash,
     recording: ant_protocol::evm::TxHash,
+    recorded_by_payer: bool,
     wave: ant_listings::root::Wave,
     amount: ant_protocol::evm::Amount,
     gas: u128,
 ) -> UploadPayment {
     let amount = if recording == own {
+        amount
+    } else if recorded_by_payer {
+        tracing::info!(
+            "the root wave was recorded by transaction {recording}, sent by the same payer as \
+             this payment's own {own}, which it sped up or replaced: the payment moved the \
+             wave's total, and its records' proofs and its envelope's payment record name the \
+             recording transaction"
+        );
         amount
     } else {
         tracing::warn!(
@@ -455,11 +468,13 @@ fn earliest_quote(plans: &[ChunkPaymentPlan]) -> u64 {
 /// - **The root vault records the wave** (its record under the wave's key,
 ///   read again while empty, as after the client's own root payment): the
 ///   proofs, and so the envelope's payment record, name the transaction
-///   that recorded it ([`Client::root_wave_transaction`]), found by the
-///   vault's `RootPaid` log naming the key whether or not the transaction
-///   the payer returned has a receipt; it is the payer's own when that one
-///   recorded the wave. When
-///   another transaction recorded the same leaves first, the payer's moved
+///   that recorded it ([`Client::root_wave_transaction`]): the payer's own
+///   when its receipt shows it recorded the wave, else the one the vault's
+///   `RootPaid` log naming the key is in, also when the transaction the
+///   payer returned never gets a receipt. One sent from the same address
+///   as the payer's own (its wallet sped up or replaced it) moved the
+///   wave's total for this payment. When one from another address recorded
+///   the same leaves first, or the senders can't be read, the payer's moved
 ///   no tokens (the vault records a key once and skips a wave it holds):
 ///   the payment's amount is none, nothing is paid again, and the records
 ///   are stored with proofs naming the recording transaction.
@@ -506,28 +521,58 @@ pub(crate) async fn outside_root_payment(
         .root_wave_recorded(&vault, &key, ROOT_READS_AFTER_PAYMENT)
         .await;
     if read == KeptPayment::Recorded {
-        // A payer names one transaction for a wave. The recording
-        // transaction is found by its RootPaid log, never by the payer's
-        // transaction's receipt: a payer's wallet may have sped up or
-        // replaced the transaction it returns, or an earlier attempt's
-        // recorded the wave, and that hash then never gets a receipt. The
-        // vault records a key once, so the log names the one recording
-        // transaction, the payer's own when it recorded the wave.
+        // A payer names one transaction for a wave. Its receipt is read
+        // first, and shows when it recorded the wave without searching the
+        // logs. A payer's wallet may have sped up or replaced the
+        // transaction it returns, or an earlier attempt's recorded the wave,
+        // and that hash then never gets a receipt: the recording transaction
+        // is then found by its RootPaid log. The vault records a key once,
+        // so the log names the one recording transaction.
         let mut sent = payment.transactions.values().copied();
         let first = sent.next();
         let own = first.filter(|first| sent.all(|tx| tx == *first));
         let recording = ant_protocol::evm::TxHash::from(
             client
-                .root_wave_transaction(
-                    &vault,
-                    &key,
-                    &own.map_or([0; 32], |own| own.0),
-                    false,
-                    None,
-                    earliest_quote(plans),
-                )
+                .root_wave_transaction(&RootWave {
+                    vault: &vault,
+                    key: &key,
+                    own: &own.map_or([0; 32], |own| own.0),
+                    own_confirmed: own.is_some(),
+                    own_may_be_missing: true,
+                    replaced_by: None,
+                    earliest_quote: earliest_quote(plans),
+                })
                 .await?,
         );
+        // Recorded by another transaction: the payer's own replacement of
+        // the one it returned (sent from the same address) moved the wave's
+        // total; one from another address recorded the leaves first, and
+        // this payment moved nothing. Where the senders can't be read, it
+        // is reported as moving nothing.
+        let recorded_by_payer = match own.filter(|own| *own != recording) {
+            None => false,
+            Some(own) => match client.same_sender(&own.0, &recording.0).await {
+                Some(same) => {
+                    if !same {
+                        tracing::warn!(
+                            "the root wave was recorded by transaction {recording}, sent from \
+                             another address than this payment's own {own}: another payer \
+                             recorded it first"
+                        );
+                    }
+                    same
+                }
+                None => {
+                    tracing::warn!(
+                        "the root wave was recorded by transaction {recording}, not this \
+                         payment's own {own}, and the sender of one of them couldn't be read: \
+                         whether the payer's wallet replaced its own can't be told, so the \
+                         payment is reported as moving no tokens"
+                    );
+                    false
+                }
+            },
+        };
         let quotes = root_payment::wave_quotes(&wave);
         let total = quotes
             .iter()
@@ -541,6 +586,7 @@ pub(crate) async fn outside_root_payment(
             &quotes,
             own.unwrap_or_default(),
             recording,
+            recorded_by_payer,
             wave,
             total,
             payment.gas,
@@ -1737,7 +1783,7 @@ mod tests {
         let own = ant_protocol::evm::TxHash::from([0x0a; 32]);
         let recording = ant_protocol::evm::TxHash::from([0x0b; 32]);
 
-        let elsewhere = root_wave_payment(&quotes, own, recording, wave.clone(), total, 7);
+        let elsewhere = root_wave_payment(&quotes, own, recording, false, wave.clone(), total, 7);
         assert!(elsewhere.amount.is_zero(), "no tokens of this payment's");
         assert_eq!(elsewhere.gas, 7, "its own transaction's gas was spent");
         assert_eq!(elsewhere.transactions.len(), quotes.len());
@@ -1753,7 +1799,7 @@ mod tests {
         }
         super::super::upload::validate_payment_total(&plans, &elsewhere).unwrap();
 
-        let own_wave = root_wave_payment(&quotes, own, own, wave, total, 7);
+        let own_wave = root_wave_payment(&quotes, own, own, false, wave, total, 7);
         assert_eq!(own_wave.amount, total);
         assert!(own_wave.transactions.values().all(|tx| *tx == own));
         assert_eq!(own_wave.root.unwrap().transaction, own);
@@ -2287,11 +2333,18 @@ mod tests {
     /// settled from the chain ([`outside_root_payment`]):
     ///
     /// - the wave recorded by the payer's own transaction: every record's
-    ///   root proof names it, with the wave's total;
-    /// - the wave recorded first by another transaction, the payer's own
-    ///   recording nothing: the proofs name the recording transaction, and
-    ///   the payment moved no tokens, so nothing is paid twice, also when
-    ///   the transaction the payer returns never gets a receipt;
+    ///   root proof names it, with the wave's total, read from its receipt
+    ///   without a search of the logs;
+    /// - the wave recorded first by another payer's transaction, the
+    ///   payer's own recording nothing: the proofs name the recording
+    ///   transaction, and the payment moved no tokens, so nothing is paid
+    ///   twice;
+    /// - the wave recorded by the payer's replacement of the transaction it
+    ///   returns, which never gets a receipt: the proofs name the
+    ///   replacement, found by its log, and the payment moved the wave's
+    ///   total;
+    /// - recorded by another whose sender, or the payer's, can't be read:
+    ///   as by another payer;
     /// - no wave, and the per-quote vault records every quote (the request
     ///   paid there): the plans pay the per-quote vault from then on, in the
     ///   upload's state too, and get single-node proofs from the payer's
@@ -2395,14 +2448,21 @@ mod tests {
             .unwrap();
         let addresses = plans.iter().map(|plan| plan.address).collect::<Vec<_>>();
 
-        // Recorded by the payer's own transaction.
+        // Recorded by the payer's own transaction: its receipt shows it,
+        // with no search of the logs (an RPC failing every eth_getLogs).
         let mut chain = MockChain::with_blocks(100, start);
         chain.root_records.insert(key);
         chain.add_receipt(root_paid(own, 80));
-        let (client, mut paying, mut state, _) = settle(&node, chain, &plans, root).await;
+        chain.failing = vec![("eth_getLogs", -32_603)];
+        let (client, mut paying, mut state, chain) = settle(&node, chain, &plans, root).await;
         let payment = outside_root_payment(&client, &mut paying, &mut state, paid_by(own))
             .await
             .unwrap();
+        let calls = chain.lock().unwrap().calls.clone();
+        assert!(
+            !calls.iter().any(|method| method == "eth_getLogs"),
+            "{calls:?}"
+        );
         assert_eq!(payment.amount, total);
         assert_eq!(payment.gas, 3);
         assert_eq!(payment.root.as_ref().unwrap().transaction, own);
@@ -2418,10 +2478,12 @@ mod tests {
         }
         assert!(state.pending_payment.is_none());
 
-        // Recorded first by another: the payer's own transaction recorded
-        // nothing, and moved nothing.
+        // Recorded first by another payer (another address): the payer's
+        // own transaction recorded nothing, and moved nothing.
         let mut chain = MockChain::with_blocks(100, start);
         chain.root_records.insert(key);
+        chain.senders.insert(own.0, [0xa1; 20]);
+        chain.senders.insert(recording.0, [0xb2; 20]);
         chain.add_receipt(ant_listings::PaymentReceipt {
             tx_hash: own.0,
             success: true,
@@ -2451,10 +2513,50 @@ mod tests {
             "{calls:?}"
         );
 
+        // Recorded by a payer's replacement of its own transaction (sent
+        // from the same address; the one it returned has no receipt): the
+        // recording transaction is found by its RootPaid log, and the
+        // payment moved the wave's total.
+        let mut chain = MockChain::with_blocks(100, start);
+        chain.root_records.insert(key);
+        chain.add_receipt(root_paid(recording, 60));
+        chain.senders.insert(own.0, [0xa1; 20]);
+        chain.senders.insert(recording.0, [0xa1; 20]);
+        let (client, mut paying, mut state, chain) = settle(&node, chain, &plans, root).await;
+        let payment = outside_root_payment(&client, &mut paying, &mut state, paid_by(own))
+            .await
+            .unwrap();
+        assert_eq!(
+            payment.amount, total,
+            "the replacement moved the wave's total"
+        );
+        assert_eq!(payment.root.as_ref().unwrap().transaction, recording);
+        assert!(payment.transactions.values().all(|tx| *tx == recording));
+        super::super::upload::validate_payment_total(&paying, &payment).unwrap();
+        state
+            .confirm_payment(&addresses, &payment, crate::runtime::system_time())
+            .unwrap();
+        for address in &addresses {
+            let proof = state.proof(address).unwrap();
+            let proof = ant_protocol::payment::deserialize_root_proof(proof).unwrap();
+            assert_eq!(proof.payment.tx_hashes, vec![recording]);
+        }
+        let calls = chain.lock().unwrap().calls.clone();
+        assert!(
+            calls.iter().any(|method| method == "eth_getLogs"),
+            "{calls:?}"
+        );
+        assert!(
+            !calls.iter().any(|method| method.starts_with("eth_send")),
+            "{calls:?}"
+        );
+
         // Recorded by another, and the payer's own transaction has no
-        // receipt (its wallet replaced it, or an earlier attempt's
-        // transaction recorded the wave): the recording transaction is
-        // found by its RootPaid log, and nothing is paid again.
+        // receipt and no sender the chain knows (its wallet replaced it, or
+        // an earlier attempt's transaction recorded the wave): the
+        // recording transaction is found by its RootPaid log, nothing is
+        // paid again, and since whose it is can't be told, the payment is
+        // reported as moving nothing.
         let mut chain = MockChain::with_blocks(100, start);
         chain.root_records.insert(key);
         chain.add_receipt(root_paid(recording, 60));

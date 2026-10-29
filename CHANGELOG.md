@@ -18,16 +18,24 @@ prints. Upstream's entries follow.
   check a root proof, and the split and envelope rules of v0.3.11+ds.6 are unchanged. On a devnet
   (`--evm-network local`) the CLI reads and pays the root vault its manifest names
   (`evm.root_vault_address`, read by `ant_core::config::manifest_root_vault`); where none is
-  known, it pays the payment vault and logs a warning instead of stopping. The library's default
+  known, it pays the payment vault and prints a warning instead of stopping. The library's default
   stays the payment vault: `Client::with_root_payments` opts in as before, and the new
   `Client::with_root_payments_from_key` builds both wallets from one key. A client can name a root
   vault without a wallet to pay it (`Client::with_root_vault`, read by `Client::root_vault`;
   `ListingChain::new_with_root_vault` for a reader), and its envelope records and payment
-  read-backs read that vault. An outside payer (`UploadPayer`) is quoted for the root vault only
-  when it asks (`pays_root_waves`, false by default) and the client knows the root vault; it pays
-  each root wave in one `payForQuotes` call to the root vault, and the client reads the vault's
-  record of the wave back and builds each record's proof naming the transaction that recorded it,
-  paying nothing again when another transaction recorded it first. `exact_approvals` (true by
+  read-backs read that vault. The network's payment vault is never taken as its root vault:
+  `with_root_vault` ignores it with a warning once the network is known, `with_wallet` and
+  `with_evm_network` drop a root vault named earlier that the new network pays per quote, and
+  `manifest_root_vault` refuses a manifest naming its payment vault as its root vault. An outside
+  payer (`UploadPayer`) is quoted for the root vault only when it asks (`pays_root_waves`, false
+  by default) and the client knows the root vault; it pays each root wave in one `payForQuotes`
+  call to the root vault, and the client reads the vault's record of the wave back, finds the
+  transaction that recorded it (the payer's own from its receipt, else by the vault's `RootPaid`
+  log, so a returned transaction that never gets a receipt doesn't hold the wave back) and builds
+  each record's proof naming that transaction, paying nothing again when another transaction
+  recorded it first. The upload's cost counts the wave's total when the recording transaction was
+  sent from the payer's own address (its wallet sped up or replaced the one returned), and nothing
+  when it came from another address or the senders can't be read. `exact_approvals` (true by
   default) says the payer approves each vault for exactly what it pays: its payments use both
   vaults only from 5 records that can pay the root vault (3 for the client's own wallets).
   Prepared uploads and chunks finished with `finalize_upload*` or `finalize_chunk`, other external
