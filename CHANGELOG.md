@@ -11,6 +11,28 @@ Our changes on top of upstream 0.3.11 (ant-core 0.13.0). Releases are tagged `vX
 ant-cli's version set to match; other builds are told apart by the commit `darwin --version`
 prints. Upstream's entries follow.
 
+- `v0.3.11+ds.9`, the producer's lists: ant-cli's version is 0.3.11+ds.9 (ant-core stays
+  0.13.0). `darwin listings serve` takes three new options, all off by default. `--hide-list
+  FILE` names addresses the producer publishes nothing of: no entry, support, row in
+  `rejected.json` or feed record, in any file or its `.gz` and `.zst` copies. `--hold-until-cleared
+  FILE` holds each new readable entry, published in no file, until its address is on that list,
+  and then publishes it at its own key, keeping its listing time; entries published before stay
+  published, and an address on both lists is hidden (Dan, 2026-10-30, choosing to hold new entries
+  rather than publish them first: "1. hold"). It needs `--held-file FILE`, outside the out dir,
+  where the entries held are written whole at every cycle, each with its data map and
+  `held_since`, under `generated_at` and `lists_read_at`. Both lists take one address per line,
+  any case, `0x` or not, with `#` comments; each is read again when its file changes, and the last
+  list read is kept in the producer's state while its file is missing or unreadable. The feed
+  starts again under a new epoch, keeping every published entry not hidden, when asked with the
+  new `darwin listings new-epoch --state-dir DIR` and at the start of any cycle at which a hidden
+  address has an entry published, so a hidden entry leaves the index with no removal record. A new
+  epoch deletes the time pages and feed segments it doesn't name at once, rather than a day later,
+  and finishes that at the next start if the producer stopped part way. In the library these are
+  `ServeOptions` with `Producer::open_with` (`Producer::open` takes the defaults),
+  `Producer::request_new_epoch` (its file is `listings_serve::NEW_EPOCH_FILE`),
+  `Publisher::start_epoch` and `ant_core::data::client::listings_lists`. `docs/listings-v1.md` describes what readers see. It
+  is tested against darwin-node 0.23.0+ds.20 (`363640e`), the revision its tests pin. Its notes are
+  `release-notes/v0.3.11+ds.9.md`.
 - `v0.3.11+ds.8`, root by default in the library: ant-cli's version is 0.3.11+ds.8 (ant-core
   stays 0.13.0). After upgrading, a library client given a wallet (`Client::with_wallet`) pays
   through the root vault wherever its network's root vault is known (the bundled network's, or

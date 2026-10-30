@@ -88,9 +88,12 @@ keep them (they are served to be cached for a day). Every other file can
 change at any time: revalidate it (`If-None-Match` or `If-Modified-Since`);
 an unchanged one is answered `304 Not Modified`, with no body. That includes
 full feed segments: a full segment doesn't change within its epoch, but a new
-epoch (a producer that starts without its state begins one) writes its
-segments under the same names, so segments are served to be revalidated, not
-cached.
+epoch (see **How the producer keeps the files** for when one begins) writes
+its segments under the same names, so segments are served to be revalidated,
+not cached. A new epoch also deletes the time pages of the epoch before, and
+its feed segments past the new epoch's last, at once, as soon as the new
+epoch's files are in place: what a reader kept from them is void anyway, as
+the new `epoch` says.
 
 A web page on another origin reads the files only where the server allows
 its origin (`Access-Control-Allow-Origin`). It can revalidate by hand,
@@ -331,7 +334,11 @@ entries, in key order. Its name is its first entry's key, as text, then the
 BLAKE3 hash of the page's bytes (the JSON file itself, uncompressed), as 64
 hex digits, so its content never changes, and a page whose entries change is
 written under a new name. A page `pages.json` no longer lists stays for at
-least a day, for readers part way through.
+least a day, for readers part way through, except when a new epoch begins:
+then every page the new epoch's `pages.json` doesn't list is deleted at once,
+with its `.gz` and `.zst` copies, once the new epoch's files are in place. A
+reader part way through then finds a page missing, or an `epoch` that
+differs from its own, and starts again (see **Following changes**).
 
 ```json
 { "epoch": "8c1f0e2d3b4a5968", "seq": 12, "count": 2, "pages": [{
@@ -371,12 +378,20 @@ share it. Applying records 1 to `n`, in order, to an empty index gives the
 index after record `n`. A removal of an address that has no entry changes
 nothing.
 
+Within an epoch, an entry leaves the index only by a removal. A new epoch
+starts the feed again at record 1 and holds only the entries it keeps: one
+begun by a producer that keeps its state (see **How the producer keeps the
+files**) starts with one put for each entry it keeps, in key order, all with
+`at` set to when it began. An entry it doesn't keep has no record in the new
+epoch, and no removal reason is added for it.
+
 Records are kept in segments of 1,000: `feed/1.json` holds records 1 to
 1,000, `feed/1001.json` records 1,001 to 2,000, and so on, so the segment
 holding record `s` starts at `⌊(s − 1) / 1,000⌋ × 1,000 + 1`. A segment is
 `{"epoch": "…", "first": 1001, "records": [...]}`. The latest grows until it
 holds 1,000 records; from then on it doesn't change within its epoch, though
-a new epoch writes its own segments under the same names. `feed/index.json`
+a new epoch writes its own segments under the same names, and deletes at
+once the segments of the epoch before past its own last. `feed/index.json`
 lists the segments: `{"epoch", "seq", "segments": [{"path", "first", "last"}]}`.
 
 ```json
@@ -570,16 +585,83 @@ Files are fetched one at a time, so a file can be newer than the
   nodes that last served it confirm it (`no_longer_served`), or when
   deciding the address again rejects it, or the entry shows a payment from
   before the payment vault was deployed (`rejected`). An entry it can't
-  confirm otherwise is kept, marked `carried` in its support file.
+  confirm otherwise is kept, marked `carried` in its support file. (An entry
+  whose address is hidden leaves with no removal, in a new epoch: see
+  below.)
 - An entry whose file's data map is shrunk is published without a `size`
   until the producer has read the file's root map, and is then put again
   with it, in a later cycle or between cycles. A data map whose root map
   can't give a size leaves it without (see `size`).
 - It writes a file only when its bytes change; the files a change touches
   first, then `pages.json`, `feed/index.json` and `head.json`. Time pages
-  that `pages.json` no longer lists are deleted a day later.
+  that `pages.json` no longer lists are deleted a day later, except on a new
+  epoch, when they go at once (below).
 - `rejected.json` is written when a rejection or deferral changes, and
   `status.json` every cycle, last: once every other file of the cycle is in
   place and the producer has recorded it as written. A cycle that can't
   write its files leaves `status.json` as it was, so its `generated_at` goes
   stale.
+
+The producer's operator may also give it two lists, each a file in the same
+format: one address per line, as 64 hex digits in any case, with or without
+`0x`; `#` starts a comment, to the end of its line; blank lines are ignored,
+and a line that isn't an address is skipped (only its number is logged).
+Each list's file is looked at again at the start of each cycle and before
+each publication between cycles, and read again when its modification time
+or length changed. The last list read is kept in the producer's state: while
+a list's file is missing or can't be read, that list stays as it was, after
+a restart too, with one warning for as long as it stays so.
+
+- **A hide list** (`darwin listings serve --hide-list FILE`). The producer
+  publishes nothing of an address on it: no entry, support, row in
+  `rejected.json` or feed record, in any file or its `.gz` and `.zst`
+  copies, and it no longer reads the file's root map for its size. The
+  network keeps the file and its listing whatever the list says; the list
+  changes only what this producer publishes. An address taken off the list
+  is decided again at the next cycle and, if listed, published at its own
+  key, keeping its listing `time`. A producer started without the option has
+  an empty hide list.
+- **Holding until cleared** (`--hold-until-cleared FILE`, which needs
+  `--held-file`). Each readable entry the producer hasn't published is held,
+  published in no file, until its address is on this list, the cleared list;
+  and while entries are held, a readable address neither cleared nor
+  published has no row in `rejected.json` either, held or not. Once its
+  address is cleared, the next cycle publishes
+  it at its own key, keeping its listing `time`, with a put whose `at` is
+  that publication's start: it may sit below `head.json`'s newest 50, as any
+  late arrival may. Entries published before stay published, and entries
+  that aren't readable are never held. An address on both lists is hidden.
+  A producer started again without the option publishes the entries it
+  held.
+- **The held file** (`--held-file FILE`, never inside the out dir). The
+  entries held, rewritten whole at every cycle (on Unix readable by its
+  owner and group only), for whatever decides what to clear:
+  `{"generated_at": …, "lists_read_at": …, "held": [...]}`. Each held entry
+  is as its address's shard holds it, with its `data_map`, and one more
+  field, `held_since`: when the publication that first held it began. An
+  entry leaves the file when it is published, hidden, or no longer served.
+  `lists_read_at` is the start of the latest cycle at which every list given
+  could be read, changed or not, so a reader of the held file can tell how
+  current the lists behind it are. All three times are Unix seconds.
+
+**A new epoch.** The feed starts again under a new `epoch` when the producer
+starts without its state; when its operator asks for one with `darwin
+listings new-epoch --state-dir DIR`, at its next cycle's start (or its first
+after it starts again); and at the start of any cycle, once the lists are
+read, at which an address on the hide list has an entry published. The last
+is a check of what the producer holds, not of what changed, so a hide list
+read between cycles, or while the producer was stopped, is acted on too. A
+producer keeping its state begins a new epoch this way: its feed starts
+again at record 1, with one put for each entry it keeps (every entry
+published whose address isn't hidden), in key order, all with `at` set to
+when the epoch began; an entry it doesn't keep leaves the index with its
+support, and no record names it. Every file is written again (each only if
+its bytes change), `status.json` last. Then every time page the new
+`pages.json` doesn't list is deleted at once, with its copies, and so is
+every feed segment past the new last one. A producer stopped part way
+finishes deleting them when it next starts, if the new epoch's files are all
+in place, and otherwise once its next publication has written them. Entries
+held stay held. A request for a new epoch is the file `new-epoch` in the
+state directory, which the producer removes once it has taken it; each
+request is taken once, and one made no later than the latest new epoch
+began is already answered.
