@@ -24,7 +24,7 @@ pub use client::listings_census::{Census, CensusNode};
 #[cfg(feature = "native")]
 pub use client::listings_publish::{Publication, Published, Publisher};
 #[cfg(feature = "native")]
-pub use client::listings_serve::{CycleReport, Producer};
+pub use client::listings_serve::{CycleReport, Producer, ServeOptions};
 #[cfg(feature = "native")]
 pub use client::listings_store::ListingsStore;
 pub use client::{Client, ClientConfig};

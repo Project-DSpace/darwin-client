@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use ant_core::ant_listings::{CheckLevel, Listing, ListingKey, PaymentField, QUORUM_THRESHOLD};
 use ant_core::data::{
     paid_quote_hash, Carry, CheckedListing, Client, ListingChain, ListingLookup, PendingCopy,
-    Producer, RejectedListing, WalkOutcome, WalkState, XorName, NEAREST_NODES,
+    Producer, RejectedListing, ServeOptions, WalkOutcome, WalkState, XorName, NEAREST_NODES,
 };
 use clap::{Args, Subcommand};
 use serde::Serialize;
@@ -75,13 +75,35 @@ pub struct ServeArgs {
     /// holds an index.
     #[arg(long, value_name = "FILE")]
     pub carry: Option<PathBuf>,
+    /// Publish nothing of the addresses in this file: no entry, support,
+    /// row or feed record in any file. One address per line (64 hex digits,
+    /// any case, `0x` or not), `#` starting a comment; other lines are
+    /// skipped. Read again when it changes; while it is missing or can't be
+    /// read, the last list read stays.
+    #[arg(long, value_name = "FILE")]
+    pub hide_list: Option<PathBuf>,
+    /// Hold each new readable entry, publishing it in no file, until its
+    /// address is in this file, in the hide list's format; then publish it
+    /// at its own key. Entries published before stay published. An address
+    /// also on the hide list is hidden. Needs `--held-file`.
+    #[arg(long, value_name = "FILE", requires = "held_file")]
+    pub hold_until_cleared: Option<PathBuf>,
+    /// Where to write the entries held, as JSON, at every cycle: each with
+    /// its data map and since when it is held. Not inside the out dir.
+    #[arg(long, value_name = "FILE")]
+    pub held_file: Option<PathBuf>,
 }
 
 impl ServeArgs {
     /// Run the producer on `client` (which must have an EVM network) until
     /// SIGINT, or SIGTERM where there is one.
     pub async fn execute(&self, client: Client) -> anyhow::Result<()> {
-        let mut producer = Producer::open(&self.state_dir, &self.out_dir, client)?;
+        let options = ServeOptions {
+            hide_list: self.hide_list.clone(),
+            cleared_list: self.hold_until_cleared.clone(),
+            held_file: self.held_file.clone(),
+        };
+        let mut producer = Producer::open_with(&self.state_dir, &self.out_dir, client, options)?;
         if let Some(previous) = &self.carry {
             let taken = producer.carry_from(previous)?;
             if taken > 0 {

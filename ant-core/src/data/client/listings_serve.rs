@@ -184,6 +184,19 @@
 //! kept mirrors, listings, facts and envelopes, fetching nothing it fetched
 //! before. The nodes whose copies counted when an address was last decided
 //! are kept across starts, for drops, and so are the sizes still to read.
+//!
+//! **Lists** ([`ServeOptions`], [`listings_lists`](super::listings_lists)).
+//! An operator may give the producer a hide list, whose addresses it
+//! publishes nothing of, and a cleared list, with which it holds each new
+//! readable entry until its address is cleared, writing the entries it holds
+//! to a held file outside the output directory. The lists are looked at
+//! again at the start of each cycle and before each publication between
+//! cycles. What they say is applied as each batch's publication is made,
+//! before anything is counted, alerted on or staged, and again as the
+//! publisher records it: a hidden address has no entry, support, row or
+//! record in any file, and is no longer read for its size; a held entry gets
+//! no put. An address that is newly cleared, or no longer hidden, is made
+//! pending, so the next cycle decides it and publishes it at its own key.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::hash::{DefaultHasher, Hash, Hasher};
@@ -219,6 +232,7 @@ use super::listings::{
 };
 use super::listings_census::{user_agent_of, Census, Refusal};
 use super::listings_feeds::{FeedNode, Feeds, PollReport};
+use super::listings_lists::{resolved, write_held_file, ListFile, Looked, Rules};
 use super::listings_publish::{IndexChange, Publication, Publisher, RejectedChange};
 use super::listings_store::{store_error, ListingsStore};
 use super::listings_v1::{
@@ -748,6 +762,21 @@ impl Drop for SizeJob {
     }
 }
 
+/// What a producer is given besides its directories and client
+/// ([`Producer::open_with`]); by default, none of it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ServeOptions {
+    /// A hide list: the producer publishes nothing of its addresses
+    /// ([`listings_lists`](super::listings_lists)).
+    pub hide_list: Option<PathBuf>,
+    /// A cleared list: with it, each readable entry not published yet is
+    /// held until its address is on it. Needs `held_file`.
+    pub cleared_list: Option<PathBuf>,
+    /// Where to write the entries held, at every cycle: outside the output
+    /// directory.
+    pub held_file: Option<PathBuf>,
+}
+
 /// The listings producer. See the module docs.
 pub struct Producer {
     client: Arc<Client>,
@@ -828,6 +857,12 @@ pub struct Producer {
     /// Where a request to refresh the census is left
     /// ([`CENSUS_REFRESH_FILE`] in the state directory).
     refresh_request: PathBuf,
+    /// The hide list's file, if there is one.
+    hide_list: Option<ListFile>,
+    /// The cleared list's file, if entries are held until cleared.
+    cleared_list: Option<ListFile>,
+    /// Where the entries held are written, if anywhere.
+    held_file: Option<PathBuf>,
 }
 
 impl Producer {
@@ -841,12 +876,43 @@ impl Producer {
     /// If `client` has no EVM network, another process has the store open,
     /// or the store or `out_dir` can't be opened.
     pub fn open(state_dir: &Path, out_dir: &Path, client: Client) -> Result<Self> {
+        Self::open_with(state_dir, out_dir, client, ServeOptions::default())
+    }
+
+    /// [`Self::open`], with `options`: the lists are read at once, so they
+    /// apply to [`Self::carry_from`] too, and then at the start of each cycle
+    /// and before each publication between cycles.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::open`]; and before opening anything, if `options` has a
+    /// cleared list but no held file, or a held file inside `out_dir`.
+    pub fn open_with(
+        state_dir: &Path,
+        out_dir: &Path,
+        client: Client,
+        options: ServeOptions,
+    ) -> Result<Self> {
+        if options.cleared_list.is_some() && options.held_file.is_none() {
+            return Err(Error::Config(
+                "holding entries until cleared needs a file to write the entries held to".into(),
+            ));
+        }
+        if let Some(held_file) = &options.held_file {
+            if resolved(held_file)?.starts_with(resolved(out_dir)?) {
+                return Err(Error::Config(format!(
+                    "the held file {} is inside the output directory {}, which is published",
+                    held_file.display(),
+                    out_dir.display()
+                )));
+            }
+        }
         let network = client.require_evm_network()?.clone();
         let store = ListingsStore::open(&state_dir.join(STORE_DIR))?;
         let chain = ListingChain::new(&network)?.with_store(&store)?;
         let census = Census::open(&store)?;
         let feeds = Feeds::open(&store)?;
-        let publisher = Publisher::open(out_dir, &store)?;
+        let mut publisher = Publisher::open(out_dir, &store)?;
         let since: Database<Bytes, U64<BigEndian>> = store.database(SINCE_DB)?;
         let holders: Database<Bytes, Bytes> = store.database(HOLDERS_DB)?;
         let listings: Database<Bytes, Bytes> = store.database(LISTINGS_DB)?;
@@ -862,7 +928,13 @@ impl Producer {
         let (sink, pushes) = push_channel(PUSH_CAPACITY);
         let now = unix_now();
         let traffic_counted = listings_traffic();
-        Ok(Self {
+        // The lists last read apply until the files are read.
+        let (hidden, cleared) = publisher.saved_lists()?;
+        publisher.set_rules(Rules {
+            hidden,
+            cleared: options.cleared_list.is_some().then_some(cleared),
+        })?;
+        let mut producer = Self {
             client: Arc::new(client),
             chain,
             store,
@@ -900,7 +972,104 @@ impl Producer {
             totals: Totals::default(),
             traffic_counted,
             refresh_request: state_dir.join(CENSUS_REFRESH_FILE),
-        })
+            hide_list: options
+                .hide_list
+                .map(|path| ListFile::new("hide list", path)),
+            cleared_list: options
+                .cleared_list
+                .map(|path| ListFile::new("cleared list", path)),
+            held_file: options.held_file,
+        };
+        producer.read_lists(None)?;
+        Ok(producer)
+    }
+
+    /// Look at the lists' files again ([`ListFile::look`]) and apply what
+    /// they say from now on ([`Publisher::set_rules`]): no list is an empty
+    /// one, and a file missing or unreadable keeps the last list read. An
+    /// address no longer hidden, or newly cleared, is made pending, so the
+    /// next cycle decides it and publishes it at its own key; one newly
+    /// hidden is no longer read for its size. While entries aren't held,
+    /// any held before are made pending, to be published. With `cycle_at`,
+    /// the start of a cycle, and both lists read (changed or not), it is
+    /// kept as when they were last read ([`Publisher::set_lists_read_at`]).
+    ///
+    /// # Errors
+    ///
+    /// If the store can't be read or written.
+    fn read_lists(&mut self, cycle_at: Option<u64>) -> Result<()> {
+        let old = self.publisher.rules();
+        let mut read_all = true;
+        let mut looked = |file: Option<&mut ListFile>, kept: usize| match file {
+            None => Some(None),
+            Some(file) => match file.look(kept) {
+                Looked::Read(addresses) => Some(Some(addresses)),
+                Looked::Unchanged => None,
+                Looked::Failed => {
+                    read_all = false;
+                    None
+                }
+            },
+        };
+        let hidden = looked(self.hide_list.as_mut(), old.hidden.len())
+            .map(Option::unwrap_or_default)
+            .filter(|hidden| *hidden != old.hidden);
+        let cleared_kept = old.cleared.as_ref().map_or(0, HashSet::len);
+        let cleared = looked(self.cleared_list.as_mut(), cleared_kept)
+            .filter(|cleared| *cleared != old.cleared);
+        if hidden.is_some() || cleared.is_some() {
+            let rules = Rules {
+                hidden: hidden.unwrap_or_else(|| old.hidden.clone()),
+                cleared: cleared.unwrap_or_else(|| old.cleared.clone()),
+            };
+            let mut again: Vec<XorName> = old.hidden.difference(&rules.hidden).copied().collect();
+            if let (Some(before), Some(now)) = (&old.cleared, &rules.cleared) {
+                again.extend(now.difference(before).copied());
+            }
+            let newly_hidden: Vec<XorName> =
+                rules.hidden.difference(&old.hidden).copied().collect();
+            self.publisher.set_rules(rules)?;
+            let mut txn = self.store.env().write_txn().map_err(store_error)?;
+            for address in &newly_hidden {
+                self.size_wanted
+                    .delete(&mut txn, address)
+                    .map_err(store_error)?;
+            }
+            txn.commit().map_err(store_error)?;
+            self.feeds.mark_pending(&again)?;
+        }
+        if !self.publisher.rules().holding() {
+            let held: Vec<XorName> = self
+                .publisher
+                .held_entries()?
+                .iter()
+                .filter_map(|held| held.entry.entry.listing.address())
+                .collect();
+            self.feeds.mark_pending(&held)?;
+        }
+        if let (Some(at), true) = (cycle_at, read_all) {
+            self.publisher.set_lists_read_at(at)?;
+        }
+        Ok(())
+    }
+
+    /// Write the held file, if there is one, from the entries held: a file
+    /// that can't be written is logged, and written again at the next
+    /// publication.
+    ///
+    /// # Errors
+    ///
+    /// If the store can't be read.
+    fn write_held(&self) -> Result<()> {
+        let Some(path) = &self.held_file else {
+            return Ok(());
+        };
+        let held = self.publisher.held_entries()?;
+        let lists_read_at = self.publisher.lists_read_at()?;
+        if let Err(e) = write_held_file(path, unix_now(), lists_read_at, &held) {
+            warn!("{e}");
+        }
+        Ok(())
     }
 
     /// Ask the producer keeping its state in `state_dir` to refresh its
@@ -1007,7 +1176,8 @@ impl Producer {
     /// were taken: none, without reading `previous`, once the store holds an
     /// index, and none if `previous` doesn't exist. Entries marked as failing
     /// their checks (`"valid": false`) are not taken; every other one is, as
-    /// it was published.
+    /// it was published, but for what the lists say: a hidden address is not
+    /// taken, and an entry held is held instead (neither is counted).
     ///
     /// # Errors
     ///
@@ -1198,6 +1368,7 @@ impl Producer {
         self.fetch_budget.clear();
 
         self.take_refresh_request()?;
+        self.read_lists(Some(at))?;
         if let Err(e) = Box::pin(self.census.maintain(&self.client)).await {
             warn!("The census's upkeep failed in part: {e}");
         }
@@ -1599,7 +1770,9 @@ impl Producer {
         }
         let staged = !publication.changes.is_empty()
             || !publication.support.is_empty()
-            || !publication.rejected.is_empty();
+            || !publication.rejected.is_empty()
+            || !publication.held.is_empty()
+            || !publication.released.is_empty();
         if staged {
             self.publisher.stage(&publication)?;
         }
@@ -2177,9 +2350,14 @@ impl Producer {
                         forget.push(*address);
                     }
                     Err(refusal) => {
-                        info!(
-                            "Keeping {}, which its nearest nodes no longer serve: {refusal}",
+                        // A hidden address is never named.
+                        let named = if self.publisher.rules().hides(address) {
+                            "an address".to_string()
+                        } else {
                             hex::encode(address)
+                        };
+                        info!(
+                            "Keeping {named}, which its nearest nodes no longer serve: {refusal}"
                         );
                         kept.insert(*address);
                         self.set_backoff(address, drop_backoff(&refusal, backoff, inputs, now))?;
@@ -2492,19 +2670,44 @@ impl Producer {
             unlisted,
             known,
             waiting,
+            forget,
             ..
         } = decided;
+        let rules = self.publisher.rules();
+        // A hidden address is left out of all that is published or counted.
         let listed: BTreeMap<XorName, &CheckedListing> = index
             .listings
             .iter()
+            .filter(|checked| !rules.hides(&checked.listing.address))
             .map(|checked| (checked.listing.address, checked))
             .collect();
-        let publication = {
+        let mut publication = {
             let txn = self.store.env().read_txn().map_err(store_error)?;
             let sizes = |address: &XorName| self.sizes.get(&txn, address).ok().flatten();
             read_publication(&self.publisher, index, &listed, unlisted, sizes, at, tally)?
         };
-        tally.deferred.extend(waiting.iter().copied());
+        // A held entry no node serves any more goes from the held set.
+        for address in forget.iter() {
+            if self.publisher.held_entry(address)?.is_some() {
+                publication.released.push(*address);
+            }
+        }
+        // What is held is published nowhere, and counted as nothing listed.
+        let held: HashSet<XorName> = publication
+            .held
+            .iter()
+            .filter_map(|held| held.entry.listing.address())
+            .collect();
+        let listed: BTreeMap<XorName, &CheckedListing> = listed
+            .into_iter()
+            .filter(|(address, _)| !held.contains(address))
+            .collect();
+        tally.deferred.extend(
+            waiting
+                .iter()
+                .filter(|(address, _)| !rules.hides(address))
+                .copied(),
+        );
         self.update_since(&listed, &publication, addresses, at, tally)?;
         for (address, known) in known.iter_mut() {
             if let Some(known) = known {
@@ -2746,6 +2949,7 @@ impl Producer {
         if !self.guard_ok {
             return Ok(());
         }
+        self.read_lists(None)?;
         let at = unix_now();
         let mut tally = Tally::default();
         let (decided, staged) =
@@ -3050,10 +3254,25 @@ impl Producer {
         if read.is_empty() {
             return Ok(());
         }
+        self.read_lists(None)?;
+        let rules = self.publisher.rules();
+        let mut unnamed: HashSet<XorName> = HashSet::new();
+        for (address, _) in &read {
+            if rules.hides(address) || self.publisher.held_entry(address)?.is_some() {
+                unnamed.insert(*address);
+            }
+        }
         let now = unix_now();
         let mut sized: Vec<(XorName, u64)> = Vec::new();
         let mut txn = self.store.env().write_txn().map_err(store_error)?;
         for (address, read) in read {
+            if unnamed.contains(&address) {
+                // Hidden while it was read, or held: neither read nor named.
+                self.size_wanted
+                    .delete(&mut txn, &address)
+                    .map_err(store_error)?;
+                continue;
+            }
             match read {
                 SizeRead::Sized(size) => {
                     self.sizes
@@ -3120,7 +3339,8 @@ impl Producer {
 
     /// Write what was staged, and `status`, once the clock is past the
     /// second in which the latest publication ended: so each file written
-    /// again is written in a later second than before.
+    /// again is written in a later second than before. Then the held file
+    /// ([`Self::write_held`]).
     ///
     /// # Errors
     ///
@@ -3129,7 +3349,9 @@ impl Producer {
         wait_past(self.published_second).await;
         let published = self.publisher.write_staged(at, status);
         self.published_second = unix_now();
-        published.map(|_| ())
+        let held = self.write_held();
+        published?;
+        held
     }
 
     /// Note since when each address of `addresses`, a batch, has been
@@ -4158,7 +4380,11 @@ fn log_cycle(report: &CycleReport) {
 /// support; a kept one is marked carried in its support. Unless the read
 /// found too few nodes, its rejections and deferrals go to `rejected.json`
 /// ([`rejected_changes`]), from the rows of the addresses the read is about.
-/// What it does is counted into `tally`.
+/// What it does is counted into `tally`. What the publisher's lists say
+/// ([`Publisher::rules`]) comes first: a hidden address is left out of all
+/// of it, and a held entry is put in the publication's held set instead,
+/// counted as nothing; one held before that the read decided and didn't
+/// list, or showed no longer served, is released.
 ///
 /// # Errors
 ///
@@ -4172,23 +4398,33 @@ fn read_publication(
     at: u64,
     tally: &mut Tally,
 ) -> Result<Publication> {
+    let rules = publisher.rules();
     let mut publication = Publication {
         at,
         ..Publication::default()
     };
+    let mut shown = 0u64;
     for checked in &index.listings {
         let address = checked.listing.address;
+        if rules.hides(&address) {
+            continue;
+        }
         let mut entry = Entry::new(&checked.listing, checked.level, at);
-        if let Some(map) = shrunk_map(checked) {
+        let shrunk = shrunk_map(checked);
+        if shrunk.is_some() {
             entry.listing.size = sizes(&address);
-            if entry.listing.size.is_none() {
-                tally.wanted_sizes.push((address, map.clone()));
-            }
         }
         let fresh = ShardEntry::new(entry, &checked.envelope);
-        let unchanged = publisher
-            .entry(&address)?
-            .is_some_and(|old| same_entry(&old, &fresh));
+        let old = publisher.entry(&address)?;
+        if rules.holds(&address, fresh.entry.listing.readable, old.is_some()) {
+            publication.held.push(fresh);
+            continue;
+        }
+        shown += 1;
+        if let Some(map) = shrunk.filter(|_| fresh.entry.listing.size.is_none()) {
+            tally.wanted_sizes.push((address, map.clone()));
+        }
+        let unchanged = old.is_some_and(|old| same_entry(&old, &fresh));
         if !unchanged {
             publication.changes.push(IndexChange::Put(Box::new(fresh)));
             tally.put += 1;
@@ -4207,6 +4443,9 @@ fn read_publication(
     let mut carried = HashSet::new();
     for (key, removal) in unlisted {
         let address = key.address;
+        if rules.hides(&address) {
+            continue;
+        }
         if let Some(reason) = *removal {
             publication
                 .changes
@@ -4234,9 +4473,16 @@ fn read_publication(
         for address in &about {
             rows.extend(publisher.rejected_entry(address)?);
         }
-        publication.rejected = rejected_changes(rows, index, listed, &carried, at, tally);
+        publication.rejected = rejected_changes(rows, index, listed, &carried, &rules, at, tally);
+        // A held entry whose address the read decided and didn't list, or
+        // showed no longer served, goes from the held set.
+        for address in index.decided_addresses() {
+            if !listed.contains_key(&address) && publisher.held_entry(&address)?.is_some() {
+                publication.released.push(address);
+            }
+        }
     }
-    tally.decided = listed.len() as u64 + tally.rejected_for_good;
+    tally.decided = shown + tally.rejected_for_good;
     Ok(publication)
 }
 
@@ -4390,12 +4636,14 @@ fn paid_before_vault(copies: &[PendingCopy]) -> bool {
 /// not, is counted into `tally`, as deferred (for `status.json`'s deferred
 /// groups) or as rejected for good. A row is cleared once its address is
 /// listed or carried, decided without a rejection, or walked past by its
-/// whole close group.
+/// whole close group. An address `rules` hides gets no row, and isn't
+/// counted: any row it has is cleared.
 fn rejected_changes(
     existing: Vec<RejectedEntry>,
     index: &ListingsIndex,
     listed: &BTreeMap<XorName, &CheckedListing>,
     carried: &HashSet<XorName>,
+    rules: &Rules,
     at: u64,
     tally: &mut Tally,
 ) -> Vec<RejectedChange> {
@@ -4407,7 +4655,7 @@ fn rejected_changes(
     let mut seen = HashSet::new();
     for rejected in &index.rejected {
         let address = rejected.listing.address;
-        if listed.contains_key(&address) || !seen.insert(address) {
+        if rules.hides(&address) || listed.contains_key(&address) || !seen.insert(address) {
             continue;
         }
         let copies = index
@@ -4449,7 +4697,7 @@ fn rejected_changes(
         let Some(address) = old.listing.address() else {
             continue;
         };
-        if listed.contains_key(&address) || carried.contains(&address) {
+        if rules.hides(&address) || listed.contains_key(&address) || carried.contains(&address) {
             changes.push(RejectedChange::Clear(address));
             continue;
         }
@@ -4646,13 +4894,25 @@ fn carry_into(publisher: &mut Publisher, previous: &Path, status: Status) -> Res
     };
     let at = unix_now();
     let carried = previous_entries(&bytes, at)?;
-    let taken = carried.len();
+    let rules = publisher.rules();
+    let mut taken = 0;
     let mut publication = Publication {
         at,
         status,
         ..Publication::default()
     };
     for (entry, support) in carried {
+        // A hidden address is taken in nowhere, and a held entry is held.
+        if let Some(address) = entry.entry.listing.address() {
+            if rules.hides(&address) {
+                continue;
+            }
+            if rules.holds(&address, entry.entry.listing.readable, false) {
+                publication.held.push(entry);
+                continue;
+            }
+        }
+        taken += 1;
         publication.changes.push(IndexChange::Put(Box::new(entry)));
         publication.support.push(support);
     }
@@ -4931,6 +5191,7 @@ mod tests {
             &index,
             &BTreeMap::new(),
             &HashSet::new(),
+            &Rules::default(),
             AT,
             &mut tally,
         );
@@ -4963,6 +5224,7 @@ mod tests {
             &index,
             &BTreeMap::new(),
             &HashSet::new(),
+            &Rules::default(),
             AT + 60,
             &mut next,
         );
@@ -4993,6 +5255,7 @@ mod tests {
             &index,
             &BTreeMap::new(),
             &HashSet::new(),
+            &Rules::default(),
             AT,
             &mut tally,
         );
@@ -5559,6 +5822,7 @@ mod tests {
                 index,
                 &BTreeMap::new(),
                 &HashSet::new(),
+                &Rules::default(),
                 AT + 60,
                 &mut Tally::default(),
             )
@@ -6007,10 +6271,18 @@ mod tests {
     /// payment vault was deployed in ([`VAULT_BLOCK`]). Also returns the
     /// node, to keep it alive.
     async fn offline_producer(dir: &Path) -> (Producer, crate::data::Network) {
-        let closed = {
-            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-            listener.local_addr().unwrap().port()
-        };
+        offline_producer_with(dir, ServeOptions::default()).await
+    }
+
+    /// A port nothing listens on.
+    async fn closed_port() -> u16 {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        listener.local_addr().unwrap().port()
+    }
+
+    /// A client whose node never started and whose payment RPC is `closed`,
+    /// with the node, to keep it alive.
+    async fn offline_client(closed: u16) -> (Client, crate::data::Network) {
         let node = crate::data::Network::unstarted(&[], true, false)
             .await
             .unwrap();
@@ -6018,7 +6290,18 @@ mod tests {
             .with_evm_network(crate::data::client::native_payment::test_plans::network(
                 closed,
             ));
-        let mut producer = Producer::open(&dir.join("state"), &dir.join("v1"), client).unwrap();
+        (client, node)
+    }
+
+    /// [`offline_producer`], opened with `options`.
+    async fn offline_producer_with(
+        dir: &Path,
+        options: ServeOptions,
+    ) -> (Producer, crate::data::Network) {
+        let closed = closed_port().await;
+        let (client, node) = offline_client(closed).await;
+        let mut producer =
+            Producer::open_with(&dir.join("state"), &dir.join("v1"), client, options).unwrap();
         producer.publisher.set_flush(false);
         producer.chain = ListingChain::with_rpc(format!("http://127.0.0.1:{closed}"), [0x22; 20])
             .unwrap()
@@ -9108,5 +9391,736 @@ mod tests {
             .unwrap();
         assert_eq!(decided, 1);
         assert_eq!(producer.feeds.pending_count().unwrap(), k - 1);
+    }
+
+    // The lists: a hide list, a cleared list and the held file.
+
+    use crate::data::client::listings_v1::{
+        key_hex, Change, FeedIndex, FeedSegment, Pages, FEED_INDEX_FILE, HEAD_FILE, PAGES_FILE,
+    };
+
+    /// Options naming a hide list, a cleared list and a held file in `dir`,
+    /// beside the output directory.
+    fn list_options(dir: &Path) -> ServeOptions {
+        ServeOptions {
+            hide_list: Some(dir.join("hidden.txt")),
+            cleared_list: Some(dir.join("cleared.txt")),
+            held_file: Some(dir.join("held.json")),
+        }
+    }
+
+    /// Write `addresses` to the list at `path` as an operator might, `0x`
+    /// and uppercase, with comments: one of them differs each time, so each
+    /// version has a length of its own, whatever the clock's resolution.
+    fn write_list(path: &Path, addresses: &[XorName]) {
+        static VERSION: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let version = VERSION.fetch_add(1, Ordering::Relaxed);
+        let mut text = format!("# version {}\n", "x".repeat(version));
+        for address in addresses {
+            text.push_str(&format!(
+                "0x{}  # a comment\n",
+                hex::encode(address).to_uppercase()
+            ));
+        }
+        std::fs::write(path, text).unwrap();
+    }
+
+    /// A readable envelope named `name`, of type `content_type`, showing no
+    /// payment field: its listings are reported, with no chain call.
+    fn readable_envelope(name: &str, content_type: &str) -> Envelope {
+        Envelope::readable(
+            &three_chunks(1_024, false),
+            Metadata {
+                content_type: Some(content_type.to_string()),
+                name: Some(name.to_string()),
+            },
+            ShownFields::NONE,
+            true,
+        )
+        .unwrap()
+    }
+
+    /// The listing of `envelope`, first stored in the hour of `first_seen`.
+    fn listing_of(envelope: &Envelope, first_seen: u64) -> Listing {
+        Listing {
+            address: envelope.address(),
+            flags: envelope.flags(),
+            metadata: envelope.metadata().clone(),
+            size: envelope.file_size(),
+            payment: ListingPayment::default(),
+            first_seen: Some(first_seen - first_seen % 3_600),
+        }
+    }
+
+    /// What fake nodes serve: each listing, with its envelope, served by as
+    /// many of its nearest nodes.
+    type Served<'a> = [(&'a Envelope, &'a Listing, usize)];
+
+    /// A producer opened with `options` in `dir` over a census of 8 fake
+    /// nodes, its requests routed, keeping the envelope and full listing of
+    /// each of `served`.
+    async fn lists_producer(
+        dir: &Path,
+        options: ServeOptions,
+        served: &Served<'_>,
+    ) -> (Producer, crate::data::Network) {
+        let (mut producer, node) = offline_producer_with(dir, options).await;
+        census_nodes(&mut producer, 8);
+        producer.start_requests();
+        for (envelope, listing, _) in served {
+            producer
+                .chain
+                .keep_envelope(&listing.address, &envelope.to_bytes());
+            keep_listing(&producer, listing);
+        }
+        (producer, node)
+    }
+
+    /// The fake nodes of `producer`'s census, serving `served`.
+    fn lists_net(producer: &Producer, served: &Served<'_>) -> FakeNet {
+        let mut entries: BTreeMap<PeerId, Vec<DigestEntry>> = BTreeMap::new();
+        for (_, listing, holders) in served {
+            for peer in producer
+                .census
+                .nearest(&listing.address, NEAREST_NODES)
+                .into_iter()
+                .take(*holders)
+            {
+                entries
+                    .entry(peer)
+                    .or_default()
+                    .push(DigestEntry::new(listing));
+            }
+        }
+        FakeNet::with(
+            producer
+                .census
+                .nodes()
+                .map(|node| node.peer)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .map(|peer| {
+                    let served = entries.remove(&peer).unwrap_or_default();
+                    (peer, FakeNode::serving(Behaviour::Honest, served))
+                })
+                .collect(),
+        )
+    }
+
+    /// A cycle as [`Producer::cycle`] runs one, over fake nodes
+    /// ([`fake_cycle`]): the lists read at its start, `source` decided, then
+    /// the files and the held file written.
+    async fn lists_cycle(producer: &mut Producer, net: &FakeNet, now: u64, source: Source) {
+        producer.read_lists(Some(now)).unwrap();
+        fake_cycle(producer, net, now, source).await;
+        producer
+            .write_spaced(now, &Status::default())
+            .await
+            .unwrap();
+    }
+
+    /// Every file published in `dir`, each `.gz` and `.zst` copy
+    /// decompressed, as text, by its path.
+    fn published_files(dir: &Path) -> BTreeMap<PathBuf, String> {
+        use std::io::Read as _;
+        let mut files = BTreeMap::new();
+        let mut dirs = vec![dir.to_path_buf()];
+        while let Some(dir) = dirs.pop() {
+            for entry in std::fs::read_dir(&dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    dirs.push(path);
+                    continue;
+                }
+                let bytes = std::fs::read(&path).unwrap();
+                let bytes = match path.extension().and_then(|e| e.to_str()) {
+                    Some("gz") => {
+                        let mut plain = Vec::new();
+                        flate2::read::GzDecoder::new(&bytes[..])
+                            .read_to_end(&mut plain)
+                            .unwrap();
+                        plain
+                    }
+                    Some("zst") => zstd::decode_all(&bytes[..]).unwrap(),
+                    _ => bytes,
+                };
+                files.insert(path, String::from_utf8_lossy(&bytes).into_owned());
+            }
+        }
+        files
+    }
+
+    /// Whether any file published in `dir` names `address`.
+    fn named_in(dir: &Path, address: &XorName) -> bool {
+        published_files(dir)
+            .values()
+            .any(|text| text.contains(&hex::encode(address)))
+    }
+
+    /// Assert that files were published in `dir`, and none names any of
+    /// `addresses`, compressed copies included.
+    fn named_nowhere(dir: &Path, addresses: &[XorName]) {
+        let files = published_files(dir);
+        assert!(files.keys().any(|path| path.ends_with(HEAD_FILE)));
+        assert!(files.keys().any(|path| path.ends_with("head.json.gz")));
+        assert!(files.keys().any(|path| path.ends_with("head.json.zst")));
+        for (path, text) in &files {
+            for address in addresses {
+                assert!(
+                    !text.contains(&hex::encode(address)),
+                    "{} names {}",
+                    path.display(),
+                    hex::encode(address)
+                );
+            }
+        }
+    }
+
+    /// The held file at `path`.
+    fn read_held(path: &Path) -> Value {
+        serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_hidden_address_is_in_no_published_file() {
+        let now = unix_now();
+        let dir = tempfile::tempdir().unwrap();
+        let hide_list = dir.path().join("hidden.txt");
+        let options = ServeOptions {
+            hide_list: Some(hide_list.clone()),
+            ..ServeOptions::default()
+        };
+        // Hidden: one a quorum serves, which would be listed, and one too few
+        // serve, which would have a row in rejected.json; and one of each
+        // not hidden.
+        let envelopes: Vec<Envelope> = ["h.png", "c.png", "h2.png", "c2.png"]
+            .iter()
+            .map(|name| readable_envelope(name, "image/png"))
+            .collect();
+        let listings: Vec<Listing> = envelopes
+            .iter()
+            .map(|envelope| listing_of(envelope, now - 10 * 3_600))
+            .collect();
+        let served: Vec<(&Envelope, &Listing, usize)> = envelopes
+            .iter()
+            .zip(&listings)
+            .zip([7, 7, 2, 2])
+            .map(|((envelope, listing), holders)| (envelope, listing, holders))
+            .collect();
+        let (h, c, h2, c2) = (
+            envelopes[0].address(),
+            envelopes[1].address(),
+            envelopes[2].address(),
+            envelopes[3].address(),
+        );
+        write_list(&hide_list, &[h, h2]);
+        let (mut producer, _node) = lists_producer(dir.path(), options, &served).await;
+        let net = lists_net(&producer, &served);
+        lists_cycle(&mut producer, &net, now, Source::All).await;
+        lists_cycle(&mut producer, &net, now + 60, Source::All).await;
+
+        let out = dir.path().join("v1");
+        named_nowhere(&out, &[h, h2]);
+        assert!(producer.publisher.entry(&h).unwrap().is_none());
+        assert!(producer.publisher.rejected_entry(&h2).unwrap().is_none());
+        // What isn't hidden is published.
+        assert!(producer.publisher.entry(&c).unwrap().is_some());
+        assert!(producer.publisher.rejected_entry(&c2).unwrap().is_some());
+        assert!(named_in(&out, &c) && named_in(&out, &c2));
+    }
+
+    #[tokio::test]
+    async fn a_held_entry_is_in_no_published_file_and_in_the_held_file() {
+        let now = unix_now();
+        let dir = tempfile::tempdir().unwrap();
+        write_list(&dir.path().join("hidden.txt"), &[]);
+        write_list(&dir.path().join("cleared.txt"), &[]);
+        let x = readable_envelope("x.png", "image/png");
+        // A private file: there is nothing to check, so it is never held.
+        let p = hidden_envelope(0x63);
+        let (lx, lp) = (
+            listing_of(&x, now - 10 * 3_600),
+            listing_of(&p, now - 10 * 3_600),
+        );
+        let served = [(&x, &lx, 7), (&p, &lp, 7)];
+        let (mut producer, _node) =
+            lists_producer(dir.path(), list_options(dir.path()), &served).await;
+        let net = lists_net(&producer, &served);
+        lists_cycle(&mut producer, &net, now, Source::All).await;
+
+        let out = dir.path().join("v1");
+        named_nowhere(&out, &[x.address()]);
+        assert!(producer.publisher.entry(&x.address()).unwrap().is_none());
+        assert!(
+            producer.publisher.entry(&p.address()).unwrap().is_some(),
+            "an unreadable entry isn't held"
+        );
+        let held = read_held(&dir.path().join("held.json"));
+        let entries = held["held"].as_array().unwrap();
+        assert_eq!(entries.len(), 1);
+        let entry = &entries[0];
+        assert_eq!(entry["address"], hex::encode(x.address()));
+        assert_eq!(entry["content_type"], "image/png");
+        assert_eq!(entry["size"], 3 * 1_024);
+        assert_eq!(entry["name"], "x.png");
+        assert_eq!(entry["time"], lx.first_seen.unwrap());
+        assert_eq!(entry["data_map"], hex::encode(x.data_map_bytes().unwrap()));
+        assert_eq!(entry["held_since"], now);
+        assert_eq!(held["lists_read_at"], now);
+        assert!(held["generated_at"].as_u64().unwrap() >= now);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let meta = std::fs::metadata(dir.path().join("held.json")).unwrap();
+            assert_eq!(meta.permissions().mode() & 0o777, 0o640);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_cleared_entry_is_published_at_its_own_key_after_its_page_was_written() {
+        let now = unix_now();
+        let dir = tempfile::tempdir().unwrap();
+        let cleared_list = dir.path().join("cleared.txt");
+        write_list(&dir.path().join("hidden.txt"), &[]);
+        let x = readable_envelope("x.png", "image/png");
+        let others: Vec<Envelope> = (0..5)
+            .map(|n| readable_envelope(&format!("o{n}.png"), "image/png"))
+            .collect();
+        // X was stored before the others: its key is the oldest.
+        let lx = listing_of(&x, now - 10 * 3_600);
+        let lo: Vec<Listing> = others
+            .iter()
+            .map(|envelope| listing_of(envelope, now - 5 * 3_600))
+            .collect();
+        let mut served = vec![(&x, &lx, 7)];
+        served.extend(others.iter().zip(&lo).map(|(e, l)| (e, l, 7)));
+        let mut cleared: Vec<XorName> = others.iter().map(Envelope::address).collect();
+        write_list(&cleared_list, &cleared);
+        let (mut producer, _node) =
+            lists_producer(dir.path(), list_options(dir.path()), &served).await;
+        let net = lists_net(&producer, &served);
+        lists_cycle(&mut producer, &net, now, Source::All).await;
+
+        let out = dir.path().join("v1");
+        let read = |path: &str| std::fs::read_to_string(out.join(path)).unwrap();
+        let before: Pages = serde_json::from_str(&read(PAGES_FILE)).unwrap();
+        assert_eq!(before.count, 5);
+        assert!(!named_in(&out, &x.address()));
+
+        // Cleared: the next cycle publishes it, deciding what is pending.
+        cleared.push(x.address());
+        write_list(&cleared_list, &cleared);
+        let at = now + 60;
+        lists_cycle(&mut producer, &net, at, Source::Pending { again: true }).await;
+
+        let after: Pages = serde_json::from_str(&read(PAGES_FILE)).unwrap();
+        assert_eq!(after.count, 6);
+        let key = key_hex(&lx.key());
+        let holding = after
+            .pages
+            .iter()
+            .find(|page| page.first <= key && key <= page.last)
+            .unwrap();
+        let old: BTreeSet<&str> = before.pages.iter().map(|page| page.path.as_str()).collect();
+        assert!(
+            !old.contains(holding.path.as_str()),
+            "the page holding its key has a new name"
+        );
+        assert!(out.join(&holding.path).exists());
+        for page in &after.pages {
+            assert!(page.path == holding.path || old.contains(page.path.as_str()));
+        }
+        // One put, keeping its listing's time, at the publication's.
+        let index: FeedIndex = serde_json::from_str(&read(FEED_INDEX_FILE)).unwrap();
+        let mut puts = Vec::new();
+        for segment in &index.segments {
+            let segment: FeedSegment = serde_json::from_str(&read(&segment.path)).unwrap();
+            for record in segment.records {
+                if let Change::Put { listing } = &record.change {
+                    if listing.listing.address == hex::encode(x.address()) {
+                        puts.push((record.at, listing.listing.time));
+                    }
+                }
+            }
+        }
+        assert_eq!(puts, vec![(at, lx.first_seen.unwrap())]);
+        let held = read_held(&dir.path().join("held.json"));
+        assert!(held["held"].as_array().unwrap().is_empty());
+        assert!(producer.publisher.held_entries().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn entries_published_before_the_hold_stay_published() {
+        let now = unix_now();
+        let dir = tempfile::tempdir().unwrap();
+        let x = readable_envelope("x.png", "image/png");
+        let lx = listing_of(&x, now - 10 * 3_600);
+        let served = [(&x, &lx, 7)];
+        let (mut producer, node) =
+            lists_producer(dir.path(), ServeOptions::default(), &served).await;
+        let net = lists_net(&producer, &served);
+        lists_cycle(&mut producer, &net, now, Source::All).await;
+        assert!(producer.publisher.entry(&x.address()).unwrap().is_some());
+        drop(producer);
+        drop(node);
+
+        // Held from now on, with nothing cleared.
+        write_list(&dir.path().join("hidden.txt"), &[]);
+        write_list(&dir.path().join("cleared.txt"), &[]);
+        let (mut producer, _node) =
+            lists_producer(dir.path(), list_options(dir.path()), &served).await;
+        lists_cycle(&mut producer, &net, now + 60, Source::All).await;
+        lists_cycle(&mut producer, &net, now + 120, Source::All).await;
+        assert!(producer.publisher.entry(&x.address()).unwrap().is_some());
+        let head = std::fs::read_to_string(dir.path().join("v1").join(HEAD_FILE)).unwrap();
+        assert!(head.contains(&hex::encode(x.address())));
+        let held = read_held(&dir.path().join("held.json"));
+        assert!(held["held"].as_array().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_address_on_both_lists_is_hidden() {
+        let now = unix_now();
+        let dir = tempfile::tempdir().unwrap();
+        let x = readable_envelope("x.png", "image/png");
+        let lx = listing_of(&x, now - 10 * 3_600);
+        write_list(&dir.path().join("hidden.txt"), &[x.address()]);
+        write_list(&dir.path().join("cleared.txt"), &[x.address()]);
+        let served = [(&x, &lx, 7)];
+        let (mut producer, _node) =
+            lists_producer(dir.path(), list_options(dir.path()), &served).await;
+        let net = lists_net(&producer, &served);
+        lists_cycle(&mut producer, &net, now, Source::All).await;
+        named_nowhere(&dir.path().join("v1"), &[x.address()]);
+        assert!(producer.publisher.entry(&x.address()).unwrap().is_none());
+        // Hidden, it isn't held either.
+        assert!(producer.publisher.held_entries().unwrap().is_empty());
+        let held = read_held(&dir.path().join("held.json"));
+        assert!(held["held"].as_array().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_missing_list_keeps_the_last_one_after_a_restart() {
+        let now = unix_now();
+        let dir = tempfile::tempdir().unwrap();
+        let hide_list = dir.path().join("hidden.txt");
+        let options = ServeOptions {
+            hide_list: Some(hide_list.clone()),
+            ..ServeOptions::default()
+        };
+        let h = readable_envelope("h.png", "image/png");
+        let c = readable_envelope("c.png", "image/png");
+        let (lh, lc) = (
+            listing_of(&h, now - 10 * 3_600),
+            listing_of(&c, now - 10 * 3_600),
+        );
+        let served = [(&h, &lh, 7), (&c, &lc, 7)];
+        write_list(&hide_list, &[h.address()]);
+        let (mut producer, node) = lists_producer(dir.path(), options.clone(), &served).await;
+        let net = lists_net(&producer, &served);
+        lists_cycle(&mut producer, &net, now, Source::All).await;
+        assert!(producer.publisher.entry(&h.address()).unwrap().is_none());
+        drop(producer);
+        drop(node);
+
+        // The file goes; a restart keeps the list last read.
+        std::fs::remove_file(&hide_list).unwrap();
+        let (mut producer, _node) = lists_producer(dir.path(), options, &served).await;
+        assert!(producer.publisher.rules().hides(&h.address()));
+        lists_cycle(&mut producer, &net, now + 60, Source::All).await;
+        lists_cycle(&mut producer, &net, now + 120, Source::All).await;
+        named_nowhere(&dir.path().join("v1"), &[h.address()]);
+        assert!(producer.publisher.entry(&c.address()).unwrap().is_some());
+        // When the lists were last read stays at the cycle that read them.
+        assert_eq!(producer.publisher.lists_read_at().unwrap(), now);
+    }
+
+    #[tokio::test]
+    async fn a_held_entry_stays_in_the_held_file_across_cycles_and_restarts() {
+        let now = unix_now();
+        let dir = tempfile::tempdir().unwrap();
+        write_list(&dir.path().join("hidden.txt"), &[]);
+        write_list(&dir.path().join("cleared.txt"), &[]);
+        let x = readable_envelope("x.png", "image/png");
+        let lx = listing_of(&x, now - 10 * 3_600);
+        let served = [(&x, &lx, 7)];
+        let held_since = |dir: &Path| {
+            let held = read_held(&dir.join("held.json"));
+            let entries = held["held"].as_array().unwrap().clone();
+            assert_eq!(entries.len(), 1);
+            entries[0]["held_since"].as_u64().unwrap()
+        };
+        let (mut producer, node) =
+            lists_producer(dir.path(), list_options(dir.path()), &served).await;
+        let net = lists_net(&producer, &served);
+        lists_cycle(&mut producer, &net, now, Source::All).await;
+        assert_eq!(held_since(dir.path()), now);
+        lists_cycle(&mut producer, &net, now + 60, Source::All).await;
+        lists_cycle(
+            &mut producer,
+            &net,
+            now + 120,
+            Source::Pending { again: true },
+        )
+        .await;
+        assert_eq!(held_since(dir.path()), now);
+        drop(producer);
+        drop(node);
+
+        let (mut producer, _node) =
+            lists_producer(dir.path(), list_options(dir.path()), &served).await;
+        lists_cycle(&mut producer, &net, now + 180, Source::All).await;
+        assert_eq!(held_since(dir.path()), now);
+        assert!(producer.publisher.entry(&x.address()).unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn unhiding_republishes_without_waiting_for_the_daily_sweep() {
+        let now = unix_now();
+        let dir = tempfile::tempdir().unwrap();
+        let hide_list = dir.path().join("hidden.txt");
+        let options = ServeOptions {
+            hide_list: Some(hide_list.clone()),
+            ..ServeOptions::default()
+        };
+        let x = readable_envelope("x.png", "image/png");
+        let lx = listing_of(&x, now - 10 * 3_600);
+        let served = [(&x, &lx, 7)];
+        write_list(&hide_list, &[x.address()]);
+        let (mut producer, _node) = lists_producer(dir.path(), options, &served).await;
+        let net = lists_net(&producer, &served);
+        lists_cycle(&mut producer, &net, now, Source::All).await;
+        // Decided, it isn't decided again until its inputs change.
+        lists_cycle(
+            &mut producer,
+            &net,
+            now + 60,
+            Source::Pending { again: true },
+        )
+        .await;
+        assert!(producer.publisher.entry(&x.address()).unwrap().is_none());
+        assert!(!producer.feeds.is_pending(&x.address()).unwrap());
+
+        // No longer hidden: the next cycle decides it, as what is pending.
+        write_list(&hide_list, &[]);
+        lists_cycle(
+            &mut producer,
+            &net,
+            now + 120,
+            Source::Pending { again: true },
+        )
+        .await;
+        let entry = producer.publisher.entry(&x.address()).unwrap().unwrap();
+        assert_eq!(entry.entry.listing.time, lx.first_seen.unwrap());
+        assert!(named_in(&dir.path().join("v1"), &x.address()));
+    }
+
+    /// Log lines, written where a test can read them.
+    #[derive(Clone, Default)]
+    struct Captured(Arc<Mutex<Vec<u8>>>);
+
+    impl Captured {
+        fn text(&self) -> String {
+            String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
+        }
+    }
+
+    impl std::io::Write for Captured {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Captured {
+        type Writer = Captured;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    #[tokio::test]
+    async fn alerts_and_size_logs_never_name_a_hidden_or_held_address() {
+        let dir = tempfile::tempdir().unwrap();
+        let hide_list = dir.path().join("hidden.txt");
+        let (h, y, z, w): (XorName, XorName, XorName, XorName) =
+            ([0x61; 32], [0x62; 32], [0x63; 32], [0x64; 32]);
+        write_list(&hide_list, &[]);
+        write_list(&dir.path().join("cleared.txt"), &[h, z, w]);
+        let (mut producer, _node) =
+            offline_producer_with(dir.path(), list_options(dir.path())).await;
+        // H and Z are published, their sizes to read; Y is held.
+        let mut index = ListingsIndex::default();
+        for address in [h, y, z] {
+            index.listings.push(shrunk_listing(address));
+        }
+        let publication = producer
+            .publication(&mut Decided::of(index), AT, &mut Tally::default())
+            .unwrap();
+        producer.publisher.stage(&publication).unwrap();
+        assert!(producer.publisher.entry(&h).unwrap().is_some());
+        assert!(producer.publisher.held_entry(&y).unwrap().is_some());
+        // H is hidden.
+        write_list(&hide_list, &[h]);
+        producer.read_lists(None).unwrap();
+
+        let captured = Captured::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(captured.clone())
+            .with_max_level(tracing::Level::TRACE)
+            .with_ansi(false)
+            .finish();
+        {
+            let _logged = tracing::subscriber::set_default(subscriber);
+            // A batch deciding all four again, W new: the alert names what
+            // changed unexplained, W alone.
+            let mut index = ListingsIndex::default();
+            for address in [h, y, z, w] {
+                index.listings.push(shrunk_listing(address));
+            }
+            let publication = producer
+                .publication(&mut Decided::of(index), AT + 60, &mut Tally::default())
+                .unwrap();
+            alert_unexplained(&publication, &BTreeSet::new());
+            producer.publisher.stage(&publication).unwrap();
+            // Root maps that can never give a size are logged, by address.
+            producer.last_status = Some(Status::default());
+            producer
+                .take_sizes(vec![
+                    (h, SizeRead::Never),
+                    (y, SizeRead::Never),
+                    (z, SizeRead::Never),
+                ])
+                .await
+                .unwrap();
+        }
+        let logs = captured.text();
+        assert!(logs.contains(&hex::encode(w)), "the alert: {logs}");
+        assert!(logs.contains(&hex::encode(z)), "the size log: {logs}");
+        assert!(!logs.contains(&hex::encode(h)), "{logs}");
+        assert!(!logs.contains(&hex::encode(y)), "{logs}");
+        // Nor is the hidden one read for its size any more.
+        let txn = producer.store.env().read_txn().unwrap();
+        assert!(producer.size_wanted.get(&txn, &h).unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn carry_from_leaves_out_hidden_and_held() {
+        let dir = tempfile::tempdir().unwrap();
+        let (h, y, c, p): (XorName, XorName, XorName, XorName) =
+            ([0xaa; 32], [0xbb; 32], [0xcc; 32], [0xdd; 32]);
+        write_list(&dir.path().join("hidden.txt"), &[h]);
+        write_list(&dir.path().join("cleared.txt"), &[c]);
+        let entry = |address: &XorName| printed("").replace(ADDRESS, &hex::encode(address));
+        // A private file's entry: never held.
+        let private = entry(&p)
+            .replace(r#""readable":true"#, r#""readable":false"#)
+            .replace(r#","data_map":"abcd""#, "");
+        let previous = dir.path().join("listings.json");
+        std::fs::write(
+            &previous,
+            format!("[{},{},{},{private}]", entry(&h), entry(&y), entry(&c)),
+        )
+        .unwrap();
+        let (mut producer, _node) =
+            offline_producer_with(dir.path(), list_options(dir.path())).await;
+        assert_eq!(producer.carry_from(&previous).unwrap(), 2);
+        named_nowhere(&dir.path().join("v1"), &[h, y]);
+        assert!(producer.publisher.entry(&c).unwrap().is_some());
+        assert!(producer.publisher.entry(&p).unwrap().is_some());
+        let held = producer.publisher.held_entries().unwrap();
+        assert_eq!(held.len(), 1);
+        assert_eq!(held[0].entry.entry.listing.address, hex::encode(y));
+    }
+
+    #[tokio::test]
+    async fn held_file_inside_out_dir_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, out) = (dir.path().join("state"), dir.path().join("v1"));
+        let closed = closed_port().await;
+        let inside = [
+            out.join("held.json"),
+            out.join("sub").join("..").join("held.json"),
+            dir.path().join("x").join("..").join("v1").join("held.json"),
+        ];
+        for held in inside {
+            let (client, _node) = offline_client(closed).await;
+            let options = ServeOptions {
+                held_file: Some(held.clone()),
+                ..list_options(dir.path())
+            };
+            let refused = Producer::open_with(&state, &out, client, options);
+            assert!(
+                matches!(refused, Err(Error::Config(_))),
+                "{}",
+                held.display()
+            );
+        }
+        // A cleared list needs a held file.
+        let (client, _node) = offline_client(closed).await;
+        let options = ServeOptions {
+            held_file: None,
+            ..list_options(dir.path())
+        };
+        let refused = Producer::open_with(&state, &out, client, options);
+        assert!(matches!(refused, Err(Error::Config(_))));
+        assert!(!state.exists(), "refused before anything is opened");
+        // Beside the output directory, it is taken.
+        let (client, _node) = offline_client(closed).await;
+        assert!(Producer::open_with(&state, &out, client, list_options(dir.path())).is_ok());
+    }
+
+    #[tokio::test]
+    async fn lists_read_at_advances_with_unchanged_lists() {
+        let now = unix_now();
+        let dir = tempfile::tempdir().unwrap();
+        let hide_list = dir.path().join("hidden.txt");
+        write_list(&hide_list, &[]);
+        write_list(&dir.path().join("cleared.txt"), &[]);
+        let x = readable_envelope("x.png", "image/png");
+        let lx = listing_of(&x, now - 10 * 3_600);
+        let served = [(&x, &lx, 7)];
+        let held_file = dir.path().join("held.json");
+        let (mut producer, _node) =
+            lists_producer(dir.path(), list_options(dir.path()), &served).await;
+        let net = lists_net(&producer, &served);
+        lists_cycle(&mut producer, &net, now, Source::All).await;
+        let first = read_held(&held_file);
+        assert_eq!(first["lists_read_at"], now);
+        assert_eq!(first["held"].as_array().unwrap().len(), 1);
+
+        // Neither list changed: the held file is written again, and says
+        // they were read.
+        lists_cycle(
+            &mut producer,
+            &net,
+            now + 60,
+            Source::Pending { again: true },
+        )
+        .await;
+        let second = read_held(&held_file);
+        assert_eq!(second["lists_read_at"], now + 60);
+        assert!(second["generated_at"].as_u64() >= first["generated_at"].as_u64());
+        assert_eq!(second["held"], first["held"]);
+
+        // One can't be read: the file is written, saying when they last
+        // could be.
+        std::fs::remove_file(&hide_list).unwrap();
+        lists_cycle(
+            &mut producer,
+            &net,
+            now + 120,
+            Source::Pending { again: true },
+        )
+        .await;
+        let third = read_held(&held_file);
+        assert_eq!(third["lists_read_at"], now + 60);
+        assert!(third["generated_at"].as_u64() >= second["generated_at"].as_u64());
+        assert_eq!(third["held"], first["held"]);
     }
 }

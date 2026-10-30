@@ -1520,7 +1520,7 @@ const VAULT_READ_SITES: &[Site] = &[
     ),
     (
         "ant-core/src/data/client/listings_serve.rs",
-        "Producer::open",
+        "Producer::open_with",
         "ListingChain::new",
         1,
         PRODUCER_READER,

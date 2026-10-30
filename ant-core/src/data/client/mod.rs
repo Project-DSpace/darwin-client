@@ -28,6 +28,8 @@ pub(crate) mod listings_facts;
 #[cfg(feature = "native")]
 pub mod listings_feeds;
 #[cfg(feature = "native")]
+pub mod listings_lists;
+#[cfg(feature = "native")]
 pub(crate) mod listings_mirror;
 #[cfg(feature = "native")]
 pub mod listings_publish;

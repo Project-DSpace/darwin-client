@@ -37,7 +37,12 @@
 //! - time pages that `pages.json` no longer lists are deleted
 //!   [`SUPERSEDED_KEPT`] after the `pages.json` written last listed them.
 //!
-//! There is no hide list: every listed entry is published.
+//! What the producer's lists ([`listings_lists`](super::listings_lists))
+//! say is applied as each publication is recorded ([`Publisher::set_rules`]):
+//! a hidden address gets no put, removal, support or row in `rejected.json`
+//! (a row it had is cleared), and a held entry gets no put, but is kept in
+//! the held set ([`HELD_DB`]) until it is published, hidden, or decided
+//! gone ([`Publication::released`]).
 //!
 //! **Work follows what changed, not the size of the index.** A shard is
 //! built again only when one of its entries changed, and a content type's
@@ -60,6 +65,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::ops::Bound;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use ant_listings::{ListingKey, LISTING_KEY_LEN};
 use ant_protocol::XorName;
@@ -70,6 +76,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 use super::listings::unix_now;
+use super::listings_lists::{HeldEntry, Rules};
 use super::listings_store::{store_error, ListingsStore};
 use super::listings_v1::{
     address_shard_path, ends_page, file_bytes, key_hex, name_shard_path, new_epoch, page_path,
@@ -111,6 +118,14 @@ pub const SIDE_DB: &str = "publish_side";
 
 /// The feed's records, by number.
 pub const FEED_DB: &str = "publish_feed";
+
+/// The entries held until cleared, by address ([`HeldEntry`]).
+pub const HELD_DB: &str = "publish_held";
+
+/// The lists last read ([`Rules`]): each address on the hide list
+/// ([`HIDDEN_TAG`]) and on the cleared list ([`CLEARED_TAG`]), and when the
+/// lists were last read at a cycle's start ([`LISTS_READ_AT`]).
+pub const LISTS_DB: &str = "publish_lists";
 
 /// The key of the epoch in [`META_TEXT_DB`].
 const EPOCH: &str = "epoch";
@@ -157,6 +172,13 @@ const REJECTED_TAG: u8 = b'r';
 /// key, 0 and its address (no value). Kept with the rows, and made the
 /// rows' own again at every open ([`Dbs::order_rejected`]).
 const REJECTED_ORDER_TAG: u8 = b'R';
+/// [`LISTS_DB`]: an address on the hide list (no value).
+const HIDDEN_TAG: u8 = b'h';
+/// [`LISTS_DB`]: an address on the cleared list (no value).
+const CLEARED_TAG: u8 = b'c';
+/// The key in [`LISTS_DB`] of the start of the latest cycle in which both
+/// lists were read (Unix seconds, big-endian).
+const LISTS_READ_AT: &[u8] = b"read_at";
 
 /// How many rows of the rejections, or of their order, are held at a time
 /// while each is checked against the other at an open
@@ -195,6 +217,12 @@ pub struct Publication {
     /// Changes to `rejected.json`: each address's latest rejection or
     /// deferral, or none once it is listed or no longer served.
     pub rejected: Vec<RejectedChange>,
+    /// Entries held until cleared, as they were decided: kept in the held
+    /// set, with when they were first held, until published.
+    pub held: Vec<ShardEntry>,
+    /// Addresses whose held entries go: decided and not listed, or no
+    /// longer served.
+    pub released: Vec<XorName>,
     /// How the producer is doing, for `status.json`, which every
     /// publication writes, after its other files: a publication between
     /// cycles passes the latest cycle's. The publisher fills in `epoch`,
@@ -276,6 +304,8 @@ pub struct Publisher {
     generated_at: Option<u64>,
     support_at: Option<u64>,
     feed_written: u64,
+    /// What the lists say, as last given ([`Self::set_rules`]).
+    rules: Arc<Rules>,
     /// Unix seconds now: `status.json`'s `generated_at`.
     clock: fn() -> u64,
 }
@@ -346,8 +376,149 @@ impl Publisher {
             generated_at,
             support_at,
             feed_written,
+            rules: Arc::new(Rules::default()),
             clock: unix_now,
         })
+    }
+
+    /// What the lists say, as last given ([`Self::set_rules`]): nothing is
+    /// hidden or held until they are.
+    #[must_use]
+    pub fn rules(&self) -> Arc<Rules> {
+        Arc::clone(&self.rules)
+    }
+
+    /// Apply `rules` to every publication from now on, and keep them in the
+    /// store as the lists last read ([`Self::saved_lists`]). Held entries
+    /// whose addresses they hide go, and so do their rows in `rejected.json`,
+    /// at the next write. Entries published already aren't changed here.
+    ///
+    /// # Errors
+    ///
+    /// If the store can't be written.
+    pub fn set_rules(&mut self, rules: Rules) -> Result<()> {
+        let dbs = self.dbs;
+        let mut txn = self.store.env().write_txn().map_err(store_error)?;
+        for tag in [HIDDEN_TAG, CLEARED_TAG] {
+            let from = [tag];
+            let end = [tag + 1];
+            let range = (Bound::Included(&from[..]), Bound::Excluded(&end[..]));
+            dbs.lists
+                .delete_range(&mut txn, &range)
+                .map_err(store_error)?;
+        }
+        // A hidden address's row in rejected.json goes at the next write.
+        let mut pending = dbs.pending(&txn)?;
+        for address in &rules.hidden {
+            dbs.lists
+                .put(&mut txn, &tagged(HIDDEN_TAG, address), &[])
+                .map_err(store_error)?;
+            dbs.held
+                .delete(&mut txn, &address[..])
+                .map_err(store_error)?;
+            dbs.set_rejected(&mut txn, &RejectedChange::Clear(*address), &mut pending)?;
+        }
+        dbs.save_pending(&mut txn, &pending)?;
+        for address in rules.cleared.iter().flatten() {
+            dbs.lists
+                .put(&mut txn, &tagged(CLEARED_TAG, address), &[])
+                .map_err(store_error)?;
+        }
+        txn.commit().map_err(store_error)?;
+        self.rules = Arc::new(rules);
+        Ok(())
+    }
+
+    /// The lists last read, as kept in the store ([`Self::set_rules`]): the
+    /// hide list's addresses, and the cleared list's (none while entries
+    /// weren't held).
+    ///
+    /// # Errors
+    ///
+    /// If the store can't be read.
+    pub fn saved_lists(&self) -> Result<(HashSet<XorName>, HashSet<XorName>)> {
+        let txn = self.store.env().read_txn().map_err(store_error)?;
+        let read = |tag: u8| -> Result<HashSet<XorName>> {
+            let mut addresses = HashSet::new();
+            for row in self
+                .dbs
+                .lists
+                .remap_data_type::<heed::types::DecodeIgnore>()
+                .prefix_iter(&txn, &[tag])
+                .map_err(store_error)?
+            {
+                let (key, ()) = row.map_err(store_error)?;
+                if let Some(address) = key.get(1..).and_then(|rest| XorName::try_from(rest).ok()) {
+                    addresses.insert(address);
+                }
+            }
+            Ok(addresses)
+        };
+        Ok((read(HIDDEN_TAG)?, read(CLEARED_TAG)?))
+    }
+
+    /// The start of the latest cycle in which both lists could be read, as
+    /// kept ([`Self::set_lists_read_at`]); 0 if none could.
+    ///
+    /// # Errors
+    ///
+    /// If the store can't be read.
+    pub fn lists_read_at(&self) -> Result<u64> {
+        let txn = self.store.env().read_txn().map_err(store_error)?;
+        Ok(self
+            .dbs
+            .lists
+            .get(&txn, LISTS_READ_AT)
+            .map_err(store_error)?
+            .and_then(|bytes| <[u8; 8]>::try_from(bytes).ok())
+            .map_or(0, u64::from_be_bytes))
+    }
+
+    /// Keep `at` as the start of the latest cycle in which both lists could
+    /// be read.
+    ///
+    /// # Errors
+    ///
+    /// If the store can't be written.
+    pub fn set_lists_read_at(&mut self, at: u64) -> Result<()> {
+        let mut txn = self.store.env().write_txn().map_err(store_error)?;
+        self.dbs
+            .lists
+            .put(&mut txn, LISTS_READ_AT, &at.to_be_bytes())
+            .map_err(store_error)?;
+        txn.commit().map_err(store_error)
+    }
+
+    /// Every entry held, in address order.
+    ///
+    /// # Errors
+    ///
+    /// If the store can't be read.
+    pub fn held_entries(&self) -> Result<Vec<HeldEntry>> {
+        let txn = self.store.env().read_txn().map_err(store_error)?;
+        let held = self
+            .dbs
+            .held
+            .iter(&txn)
+            .map_err(store_error)?
+            .map(|row| parse(row.map_err(store_error)?.1))
+            .collect();
+        held
+    }
+
+    /// The entry held at `address`, if one is.
+    ///
+    /// # Errors
+    ///
+    /// If the store can't be read.
+    pub fn held_entry(&self, address: &XorName) -> Result<Option<HeldEntry>> {
+        let txn = self.store.env().read_txn().map_err(store_error)?;
+        self.dbs
+            .held
+            .get(&txn, &address[..])
+            .map_err(store_error)?
+            .map(parse)
+            .transpose()
     }
 
     /// Publish `publication`: number its changes in the feed after the
@@ -542,14 +713,61 @@ impl Publisher {
             count: self.count,
             moved: Vec::new(),
         };
+        let rules = Arc::clone(&self.rules);
         for change in &publication.changes {
+            if let Some(address) = change.address() {
+                if rules.hides(&address) {
+                    // No record names it: not even its removal.
+                    dbs.held
+                        .delete(&mut txn, &address[..])
+                        .map_err(store_error)?;
+                    continue;
+                }
+                if let IndexChange::Put(entry) = change {
+                    let published = dbs.is_listed(&txn, &address)?;
+                    if rules.holds(&address, entry.entry.listing.readable, published) {
+                        dbs.hold(&mut txn, &address, entry, at)?;
+                        continue;
+                    }
+                }
+                dbs.held
+                    .delete(&mut txn, &address[..])
+                    .map_err(store_error)?;
+            }
             dbs.apply(&mut txn, change, at, &mut applied, &mut pending)?;
         }
+        for entry in &publication.held {
+            let address = address_of(&entry.entry.listing.address)?;
+            let published = dbs.is_listed(&txn, &address)?;
+            if rules.holds(&address, entry.entry.listing.readable, published) {
+                dbs.hold(&mut txn, &address, entry, at)?;
+            }
+        }
+        for address in &publication.released {
+            dbs.held
+                .delete(&mut txn, &address[..])
+                .map_err(store_error)?;
+        }
         for support in &publication.support {
+            if rules.hides(&address_of(&support.address)?) {
+                continue;
+            }
             dbs.set_support(&mut txn, support, &mut pending)?;
         }
         for change in &publication.rejected {
-            dbs.set_rejected(&mut txn, change, &mut pending)?;
+            match change {
+                // A hidden address has no row: one it had goes.
+                RejectedChange::Set(entry) => {
+                    let address = address_of(&entry.listing.address)?;
+                    if rules.hides(&address) {
+                        let clear = RejectedChange::Clear(address);
+                        dbs.set_rejected(&mut txn, &clear, &mut pending)?;
+                        continue;
+                    }
+                    dbs.set_rejected(&mut txn, change, &mut pending)?;
+                }
+                RejectedChange::Clear(_) => dbs.set_rejected(&mut txn, change, &mut pending)?,
+            }
         }
         dbs.repage(&mut txn, applied.moved, &mut pending)?;
         let generated_at = if applied.seq > self.seq {
@@ -951,6 +1169,8 @@ struct Dbs {
     pages: Database<Bytes, Bytes>,
     side: Database<Bytes, Bytes>,
     feed: Database<U64<BigEndian>, Bytes>,
+    held: Database<Bytes, Bytes>,
+    lists: Database<Bytes, Bytes>,
 }
 
 impl Dbs {
@@ -963,7 +1183,35 @@ impl Dbs {
             pages: store.database(PAGES_DB)?,
             side: store.database(SIDE_DB)?,
             feed: store.database(FEED_DB)?,
+            held: store.database(HELD_DB)?,
+            lists: store.database(LISTS_DB)?,
         })
+    }
+
+    /// Whether the index holds an entry at `address`.
+    fn is_listed(&self, txn: &RoTxn, address: &XorName) -> Result<bool> {
+        Ok(self
+            .entries
+            .remap_data_type::<heed::types::DecodeIgnore>()
+            .get(txn, &address[..])
+            .map_err(store_error)?
+            .is_some())
+    }
+
+    /// Keep `entry`, the entry at `address`, in the held set as it is now:
+    /// held since it was first held, or since `at` if it wasn't.
+    fn hold(&self, txn: &mut RwTxn, address: &XorName, entry: &ShardEntry, at: u64) -> Result<()> {
+        let held_since = match self.held.get(txn, &address[..]).map_err(store_error)? {
+            Some(row) => parse::<HeldEntry>(row)?.held_since,
+            None => at,
+        };
+        let held = HeldEntry {
+            entry: entry.clone(),
+            held_since,
+        };
+        self.held
+            .put(txn, &address[..], &json(&held)?)
+            .map_err(store_error)
     }
 
     fn pending(&self, txn: &RoTxn) -> Result<Pending> {
@@ -3010,6 +3258,7 @@ mod tests {
             support: vec![support(&"11".repeat(32), 7), support(&"a0".repeat(32), 6)],
             rejected: vec![RejectedChange::Set(Box::new(deferred()))],
             status: status(AT),
+            ..Publication::default()
         }
     }
 
