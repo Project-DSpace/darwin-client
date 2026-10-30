@@ -195,8 +195,10 @@
 //! before anything is counted, alerted on or staged, and again as the
 //! publisher records it: a hidden address has no entry, support, row or
 //! record in any file, and is no longer read for its size; a held entry gets
-//! no put. An address that is newly cleared, or no longer hidden, is made
-//! pending, so the next cycle decides it and publishes it at its own key.
+//! no put, and a readable address not cleared and not published, held or
+//! not, has no row in `rejected.json`. An address that is newly cleared, or
+//! no longer hidden, is made pending, so the next cycle decides it and
+//! publishes it at its own key.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::hash::{DefaultHasher, Hash, Hasher};
@@ -4473,7 +4475,30 @@ fn read_publication(
         for address in &about {
             rows.extend(publisher.rejected_entry(address)?);
         }
-        publication.rejected = rejected_changes(rows, index, listed, &carried, &rules, at, tally);
+        // While readable entries are held until cleared, one not cleared and
+        // not published yet is in no published file: not in rejected.json
+        // either, whether it is held, deferred or rejected.
+        let mut withheld = HashSet::new();
+        if rules.holding() {
+            let readable = index
+                .rejected
+                .iter()
+                .map(|row| (row.listing.address, !row.listing.flags.withheld))
+                .chain(
+                    rows.iter()
+                        .filter_map(|row| Some((row.listing.address()?, row.listing.readable))),
+                );
+            for (address, readable) in readable {
+                if readable
+                    && !withheld.contains(&address)
+                    && rules.holds(&address, true, publisher.entry(&address)?.is_some())
+                {
+                    withheld.insert(address);
+                }
+            }
+        }
+        publication.rejected =
+            rejected_changes(rows, index, listed, &carried, &rules, &withheld, at, tally);
         // A held entry whose address the read decided and didn't list, or
         // showed no longer served, goes from the held set.
         for address in index.decided_addresses() {
@@ -4637,13 +4662,17 @@ fn paid_before_vault(copies: &[PendingCopy]) -> bool {
 /// groups) or as rejected for good. A row is cleared once its address is
 /// listed or carried, decided without a rejection, or walked past by its
 /// whole close group. An address `rules` hides gets no row, and isn't
-/// counted: any row it has is cleared.
+/// counted: any row it has is cleared. An address `withheld`, readable and
+/// not cleared while entries are held until cleared ([`Rules::holds`]), gets
+/// no row either, and any it has is cleared, but it is counted.
+#[allow(clippy::too_many_arguments)]
 fn rejected_changes(
     existing: Vec<RejectedEntry>,
     index: &ListingsIndex,
     listed: &BTreeMap<XorName, &CheckedListing>,
     carried: &HashSet<XorName>,
     rules: &Rules,
+    withheld: &HashSet<XorName>,
     at: u64,
     tally: &mut Tally,
 ) -> Vec<RejectedChange> {
@@ -4676,11 +4705,11 @@ fn rejected_changes(
             tally.rejected_for_good += 1;
             tally.for_good.insert(address);
         }
-        if carried.contains(&address) {
-            // Still listed, unconfirmed, and counted above: it gets no row,
-            // and any it has is cleared below. (An entry that itself shows a
-            // payment from before the vault isn't kept carried: it goes,
-            // rejected ([`removal`]).)
+        if carried.contains(&address) || withheld.contains(&address) {
+            // Still listed, unconfirmed, or kept out until cleared, and
+            // counted above: it gets no row, and any it has is cleared below.
+            // (An entry that itself shows a payment from before the vault
+            // isn't kept carried: it goes, rejected ([`removal`]).)
             continue;
         }
         let unchanged = existing.get(&entry.listing.address).is_some_and(|old| {
@@ -4697,7 +4726,11 @@ fn rejected_changes(
         let Some(address) = old.listing.address() else {
             continue;
         };
-        if rules.hides(&address) || listed.contains_key(&address) || carried.contains(&address) {
+        if rules.hides(&address)
+            || withheld.contains(&address)
+            || listed.contains_key(&address)
+            || carried.contains(&address)
+        {
             changes.push(RejectedChange::Clear(address));
             continue;
         }
@@ -5192,6 +5225,7 @@ mod tests {
             &BTreeMap::new(),
             &HashSet::new(),
             &Rules::default(),
+            &HashSet::new(),
             AT,
             &mut tally,
         );
@@ -5225,6 +5259,7 @@ mod tests {
             &BTreeMap::new(),
             &HashSet::new(),
             &Rules::default(),
+            &HashSet::new(),
             AT + 60,
             &mut next,
         );
@@ -5256,6 +5291,7 @@ mod tests {
             &BTreeMap::new(),
             &HashSet::new(),
             &Rules::default(),
+            &HashSet::new(),
             AT,
             &mut tally,
         );
@@ -5823,6 +5859,7 @@ mod tests {
                 &BTreeMap::new(),
                 &HashSet::new(),
                 &Rules::default(),
+                &HashSet::new(),
                 AT + 60,
                 &mut Tally::default(),
             )
@@ -9674,6 +9711,71 @@ mod tests {
             let meta = std::fs::metadata(dir.path().join("held.json")).unwrap();
             assert_eq!(meta.permissions().mode() & 0o777, 0o640);
         }
+    }
+
+    #[tokio::test]
+    async fn a_readable_entry_not_cleared_has_no_rejected_row_while_held() {
+        let now = unix_now();
+        let dir = tempfile::tempdir().unwrap();
+        write_list(&dir.path().join("hidden.txt"), &[]);
+        write_list(&dir.path().join("cleared.txt"), &[]);
+        // X: a quorum serves it, so it is held. Y: a new upload too few
+        // serve yet, deferred before it was ever held. P: a private file too
+        // few serve, never held, so it keeps its row in rejected.json.
+        let x = readable_envelope("x.png", "image/png");
+        let y = readable_envelope("y.png", "image/png");
+        let p = hidden_envelope(0x64);
+        let (lx, ly, lp) = (
+            listing_of(&x, now - 10 * 3_600),
+            listing_of(&y, now - 10 * 3_600),
+            listing_of(&p, now - 10 * 3_600),
+        );
+        let served = [(&x, &lx, 7), (&y, &ly, 2), (&p, &lp, 2)];
+        let (mut producer, _node) =
+            lists_producer(dir.path(), list_options(dir.path()), &served).await;
+        let net = lists_net(&producer, &served);
+        lists_cycle(&mut producer, &net, now, Source::All).await;
+
+        let out = dir.path().join("v1");
+        named_nowhere(&out, &[x.address(), y.address()]);
+        assert!(producer
+            .publisher
+            .rejected_entry(&y.address())
+            .unwrap()
+            .is_none());
+        assert!(producer
+            .publisher
+            .rejected_entry(&p.address())
+            .unwrap()
+            .is_some());
+        assert!(named_in(&out, &p.address()));
+
+        // X drops below a quorum: still held, and still in no published
+        // file, rejected.json included.
+        let fewer = [(&x, &lx, 2), (&y, &ly, 2), (&p, &lp, 2)];
+        let net = lists_net(&producer, &fewer);
+        lists_cycle(&mut producer, &net, now + 60, Source::All).await;
+
+        named_nowhere(&out, &[x.address(), y.address()]);
+        assert!(producer
+            .publisher
+            .rejected_entry(&x.address())
+            .unwrap()
+            .is_none());
+        assert!(producer
+            .publisher
+            .rejected_entry(&y.address())
+            .unwrap()
+            .is_none());
+        assert!(producer
+            .publisher
+            .rejected_entry(&p.address())
+            .unwrap()
+            .is_some());
+        let held = read_held(&dir.path().join("held.json"));
+        let held: Vec<&Value> = held["held"].as_array().unwrap().iter().collect();
+        assert_eq!(held.len(), 1);
+        assert_eq!(held[0]["address"], hex::encode(x.address()));
     }
 
     #[tokio::test]

@@ -42,7 +42,9 @@
 //! a hidden address gets no put, removal, support or row in `rejected.json`
 //! (a row it had is cleared), and a held entry gets no put, but is kept in
 //! the held set ([`HELD_DB`]) until it is published, hidden, or decided
-//! gone ([`Publication::released`]).
+//! gone ([`Publication::released`]). While entries are held, a readable
+//! address not cleared and not published has no row in `rejected.json`
+//! either, held or not ([`Rules::holds`]).
 //!
 //! **Work follows what changed, not the size of the index.** A shard is
 //! built again only when one of its entries changed, and a content type's
@@ -391,7 +393,9 @@ impl Publisher {
     /// Apply `rules` to every publication from now on, and keep them in the
     /// store as the lists last read ([`Self::saved_lists`]). Held entries
     /// whose addresses they hide go, and so do their rows in `rejected.json`,
-    /// at the next write. Entries published already aren't changed here.
+    /// at the next write, as do the rows of readable addresses they hold
+    /// ([`Rules::holds`]): not cleared and not published. Entries published
+    /// already aren't changed here.
     ///
     /// # Errors
     ///
@@ -417,6 +421,30 @@ impl Publisher {
                 .delete(&mut txn, &address[..])
                 .map_err(store_error)?;
             dbs.set_rejected(&mut txn, &RejectedChange::Clear(*address), &mut pending)?;
+        }
+        // So does the row of a readable address held until cleared.
+        if rules.holding() {
+            let mut withheld = Vec::new();
+            for row in dbs
+                .side
+                .prefix_iter(&txn, &[REJECTED_TAG])
+                .map_err(store_error)?
+            {
+                let (key, bytes) = row.map_err(store_error)?;
+                let Some(address) = key.get(1..).and_then(|rest| XorName::try_from(rest).ok())
+                else {
+                    continue;
+                };
+                let entry: RejectedEntry = parse(bytes)?;
+                if entry.listing.readable && rules.holds(&address, true, false) {
+                    withheld.push(address);
+                }
+            }
+            for address in withheld {
+                if !dbs.is_listed(&txn, &address)? {
+                    dbs.set_rejected(&mut txn, &RejectedChange::Clear(address), &mut pending)?;
+                }
+            }
         }
         dbs.save_pending(&mut txn, &pending)?;
         for address in rules.cleared.iter().flatten() {
@@ -756,10 +784,18 @@ impl Publisher {
         }
         for change in &publication.rejected {
             match change {
-                // A hidden address has no row: one it had goes.
+                // A hidden address has no row, nor has a readable one not
+                // cleared and not published while entries are held until
+                // cleared: one it had goes.
                 RejectedChange::Set(entry) => {
                     let address = address_of(&entry.listing.address)?;
-                    if rules.hides(&address) {
+                    if rules.hides(&address)
+                        || rules.holds(
+                            &address,
+                            entry.listing.readable,
+                            dbs.is_listed(&txn, &address)?,
+                        )
+                    {
                         let clear = RejectedChange::Clear(address);
                         dbs.set_rejected(&mut txn, &clear, &mut pending)?;
                         continue;
@@ -5238,5 +5274,66 @@ mod tests {
         let mut written = Vec::new();
         f.publisher.dbs.write_rejected(&txn, &mut written).unwrap();
         assert_eq!(written, f.publisher.dbs.rejected(&txn).unwrap());
+    }
+
+    #[test]
+    fn a_readable_address_held_until_cleared_has_no_rejected_row() {
+        let mut f = Fixture::new();
+        let readable = |seed: u64| {
+            let mut entry = deferral(seed, 1_791_000_000 + seed);
+            entry.listing.readable = true;
+            entry
+        };
+        // Rows from before the hold: a readable address it will hold, one
+        // it will have cleared, and an unreadable one, which is never held.
+        let (held, cleared, unreadable) = (address(1), address(2), address(3));
+        f.publish(&Publication {
+            at: AT,
+            rejected: vec![
+                RejectedChange::Set(Box::new(readable(1))),
+                RejectedChange::Set(Box::new(readable(2))),
+                RejectedChange::Set(Box::new(deferral(3, 1_791_000_003))),
+            ],
+            status: status(AT),
+            ..Publication::default()
+        });
+        assert_eq!(f.publisher.rejected_entries().unwrap().len(), 3);
+        let rows = |f: &Fixture| -> BTreeSet<String> {
+            f.publisher
+                .rejected_entries()
+                .unwrap()
+                .into_iter()
+                .map(|entry| entry.listing.address)
+                .collect()
+        };
+        let named = |f: &Fixture, address: &XorName| {
+            String::from_utf8(f.bytes(REJECTED_FILE))
+                .unwrap()
+                .contains(&hex::encode(address))
+        };
+
+        // The hold begins: the held address's row goes at the next write.
+        f.publisher
+            .set_rules(Rules {
+                hidden: HashSet::new(),
+                cleared: Some(HashSet::from([cleared])),
+            })
+            .unwrap();
+        f.publish(&quiet(AT + 60));
+        let kept = BTreeSet::from([hex::encode(cleared), hex::encode(unreadable)]);
+        assert_eq!(rows(&f), kept);
+        assert!(!named(&f, &held));
+        assert!(named(&f, &cleared) && named(&f, &unreadable));
+
+        // A row set for it while it is held is cleared instead.
+        f.publish(&Publication {
+            at: AT + 120,
+            rejected: vec![RejectedChange::Set(Box::new(readable(1)))],
+            status: status(AT + 120),
+            ..Publication::default()
+        });
+        assert_eq!(rows(&f), kept);
+        assert!(!named(&f, &held));
+        assert_lists_built_whole(&f);
     }
 }
