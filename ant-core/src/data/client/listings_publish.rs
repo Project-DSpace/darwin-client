@@ -35,7 +35,10 @@
 //!   the other files can therefore be there a moment before the first
 //!   `status.json` is;
 //! - time pages that `pages.json` no longer lists are deleted
-//!   [`SUPERSEDED_KEPT`] after the `pages.json` written last listed them.
+//!   [`SUPERSEDED_KEPT`] after the `pages.json` written last listed them;
+//! - but on a new epoch ([`Publisher::start_epoch`]), every time page the
+//!   new `pages.json` doesn't list, and every feed segment past its last, is
+//!   deleted at once, once the new epoch's files are written.
 //!
 //! What the producer's lists ([`listings_lists`](super::listings_lists))
 //! say is applied as each publication is recorded ([`Publisher::set_rules`]):
@@ -152,6 +155,16 @@ const SUPPORT_AT: &str = "support_at";
 /// The key in [`META_NUMBERS_DB`] of the latest record the written files
 /// hold.
 const FEED_WRITTEN: &str = "feed_written";
+
+/// The key in [`META_NUMBERS_DB`] of when the latest new epoch began
+/// ([`Publisher::start_epoch`]; absent: none has).
+const EPOCH_AT: &str = "epoch_at";
+
+/// The key in [`META_TEXT_DB`] of the flag a new epoch sets
+/// ([`Publisher::start_epoch`]) and clears once the files of the epoch
+/// before it are deleted: a publisher that opens to find it set (a process
+/// stopped part way) deletes them then.
+const EPOCH_CLEANUP: &str = "epoch_cleanup";
 
 /// [`ORDER_DB`]: a key, in key order (no value).
 const KEY_TAG: u8 = b'k';
@@ -308,8 +321,30 @@ pub struct Publisher {
     feed_written: u64,
     /// What the lists say, as last given ([`Self::set_rules`]).
     rules: Arc<Rules>,
+    /// When the latest new epoch began, 0 if none has
+    /// ([`Self::start_epoch`]).
+    epoch_at: u64,
+    /// Whether the files of the epoch before this one are still to delete
+    /// ([`EPOCH_CLEANUP`]).
+    cleanup: bool,
+    /// The status last written, or given ([`Self::set_status`]): what a new
+    /// epoch's `status.json` says, but for the feed's fields.
+    status: Option<Status>,
     /// Unix seconds now: `status.json`'s `generated_at`.
     clock: fn() -> u64,
+    /// Where a new epoch stops, as a process stopped part way would.
+    #[cfg(test)]
+    stop_epoch: Option<EpochStop>,
+}
+
+/// Where a test stops a new epoch ([`Publisher::start_epoch`]).
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EpochStop {
+    /// Once the store has the new epoch, before any file is written.
+    BeforeWrite,
+    /// Once its files are written, before the old ones are deleted.
+    BeforeCleanup,
 }
 
 impl Publisher {
@@ -341,6 +376,12 @@ impl Publisher {
         let number = |key: &str| dbs.meta_numbers.get(&txn, key).map_err(store_error);
         let seq = number(SEQ)?.unwrap_or(0);
         let count = number(COUNT)?.unwrap_or(0);
+        let epoch_at = number(EPOCH_AT)?.unwrap_or(0);
+        let cleanup = dbs
+            .meta_text
+            .get(&txn, EPOCH_CLEANUP)
+            .map_err(store_error)?
+            .is_some();
         let generated_at = number(GENERATED_AT)?;
         let mut support_at = number(SUPPORT_AT)?;
         let mut feed_written = number(FEED_WRITTEN)?.unwrap_or(0);
@@ -368,7 +409,7 @@ impl Publisher {
             }
         }
         txn.commit().map_err(store_error)?;
-        Ok(Self {
+        let mut publisher = Self {
             store: store.clone(),
             dbs,
             files,
@@ -379,8 +420,185 @@ impl Publisher {
             support_at,
             feed_written,
             rules: Arc::new(Rules::default()),
+            epoch_at,
+            cleanup,
+            status: None,
             clock: unix_now,
-        })
+            #[cfg(test)]
+            stop_epoch: None,
+        };
+        if publisher.cleanup {
+            // A new epoch was stopped part way: the time pages and feed
+            // segments it leaves out go now, not a day later.
+            publisher.finish_epoch_cleanup()?;
+        }
+        Ok(publisher)
+    }
+
+    /// Start the feed again under a new epoch ([`new_epoch`]), keeping the
+    /// published entries `keep` keeps. As an epoch's first publication, its
+    /// records are one put per entry kept, in key order, numbered from 1,
+    /// all at when this began; the entries not kept leave the index, with
+    /// their support, and no record names them. Every file is written again
+    /// (each only if its bytes change), `status.json` last, with the status
+    /// last written or given ([`Self::set_status`]); then every time page
+    /// the new `pages.json` doesn't list is deleted at once, with its copies,
+    /// and so is every feed segment past the new last one. The store notes
+    /// that cleanup ([`EPOCH_CLEANUP`]) in the transaction that changes the
+    /// epoch, before changing it: a process stopped part way does it when
+    /// its publisher next opens. Entries held stay held.
+    ///
+    /// # Errors
+    ///
+    /// If the store can't be read or written, or a file can't be written or
+    /// deleted: the next publication writes what was left to write, and then
+    /// deletes the old files.
+    pub fn start_epoch(&mut self, keep: &dyn Fn(&XorName) -> bool) -> Result<()> {
+        let at = unix_now();
+        let dbs = self.dbs;
+        let mut epoch = new_epoch();
+        while epoch == self.epoch {
+            epoch = new_epoch();
+        }
+        let mut txn = self.store.env().write_txn().map_err(store_error)?;
+        dbs.meta_text
+            .put(&mut txn, EPOCH_CLEANUP, "1")
+            .map_err(store_error)?;
+        let mut pending = dbs.pending(&txn)?;
+        dbs.carry_types(&txn, &mut pending)?;
+        let keys = dbs
+            .order
+            .prefix_iter(&txn, &[KEY_TAG])
+            .map_err(store_error)?
+            .map(|row| row_key(&row.map_err(store_error)?.0[1..]))
+            .collect::<Result<Vec<Key>>>()?;
+        dbs.feed.clear(&mut txn).map_err(store_error)?;
+        let mut applied = Applied {
+            seq: 0,
+            count: self.count,
+            moved: Vec::new(),
+        };
+        for key in &keys {
+            let address = key_address(key);
+            let entry = dbs.listed(&txn, &address)?;
+            if keep(&address) {
+                applied.seq += 1;
+                let record = FeedRecord {
+                    seq: applied.seq,
+                    at,
+                    change: Change::Put {
+                        listing: Box::new(entry),
+                    },
+                };
+                dbs.feed
+                    .put(&mut txn, &applied.seq, &json(&record)?)
+                    .map_err(store_error)?;
+            } else {
+                dbs.unlist(&mut txn, &address, &entry, &mut applied, &mut pending)?;
+                dbs.set_rejected(&mut txn, &RejectedChange::Clear(address), &mut pending)?;
+            }
+        }
+        dbs.repage(&mut txn, applied.moved, &mut pending)?;
+        dbs.pend_everything(&txn, &mut pending)?;
+        // The pages the new `pages.json` doesn't list go once it is written,
+        // and so do those superseded before.
+        pending.superseded.clear();
+        dbs.forget_superseded(&mut txn)?;
+        let (seq, count) = (applied.seq, applied.seq);
+        dbs.meta_text
+            .put(&mut txn, EPOCH, &epoch)
+            .map_err(store_error)?;
+        for (key, value) in [
+            (SEQ, seq),
+            (COUNT, count),
+            (GENERATED_AT, at),
+            (FEED_WRITTEN, 0),
+            (EPOCH_AT, at),
+        ] {
+            dbs.meta_numbers
+                .put(&mut txn, key, &value)
+                .map_err(store_error)?;
+        }
+        dbs.meta_numbers
+            .delete(&mut txn, SUPPORT_AT)
+            .map_err(store_error)?;
+        dbs.save_pending(&mut txn, &pending)?;
+        txn.commit().map_err(store_error)?;
+        self.epoch = epoch;
+        self.seq = seq;
+        self.count = count;
+        self.generated_at = Some(at);
+        self.feed_written = 0;
+        self.support_at = None;
+        self.epoch_at = at;
+        self.cleanup = true;
+        #[cfg(test)]
+        if self.stop_epoch == Some(EpochStop::BeforeWrite) {
+            return Ok(());
+        }
+        let status = self.status.clone().unwrap_or_default();
+        self.write(at, &status, pending, false)?;
+        Ok(())
+    }
+
+    /// Delete the files of the epoch before this one, at once: every time
+    /// page `pages.json` doesn't list, with its copies, and every feed
+    /// segment past the last; forget the pages superseded, and clear
+    /// [`EPOCH_CLEANUP`].
+    fn finish_epoch_cleanup(&mut self) -> Result<()> {
+        let dbs = self.dbs;
+        let txn = self.store.env().read_txn().map_err(store_error)?;
+        let mut gone = Vec::new();
+        for path in self.files.stray_pages()? {
+            if !dbs.lists_page(&txn, &path)? {
+                gone.push(path);
+            }
+        }
+        drop(txn);
+        let last = if self.seq == 0 {
+            0
+        } else {
+            segment_first(self.seq)
+        };
+        for first in self.files.segments()? {
+            if first > last {
+                gone.push(segment_path(first));
+            }
+        }
+        for path in &gone {
+            self.files.remove(path)?;
+        }
+        let mut txn = self.store.env().write_txn().map_err(store_error)?;
+        dbs.forget_superseded(&mut txn)?;
+        dbs.meta_text
+            .delete(&mut txn, EPOCH_CLEANUP)
+            .map_err(store_error)?;
+        txn.commit().map_err(store_error)?;
+        self.cleanup = false;
+        Ok(())
+    }
+
+    /// When the latest new epoch began ([`Self::start_epoch`]), in Unix
+    /// seconds; 0 if none has.
+    #[must_use]
+    pub fn epoch_at(&self) -> u64 {
+        self.epoch_at
+    }
+
+    /// Take `status` as the status last given: a new epoch's `status.json`
+    /// says it ([`Self::start_epoch`]) until a publication gives another.
+    pub fn set_status(&mut self, status: Status) {
+        self.status = Some(status);
+    }
+
+    /// Whether the index holds an entry at `address`.
+    ///
+    /// # Errors
+    ///
+    /// If the store can't be read.
+    pub fn lists(&self, address: &XorName) -> Result<bool> {
+        let txn = self.store.env().read_txn().map_err(store_error)?;
+        self.dbs.is_listed(&txn, address)
     }
 
     /// What the lists say, as last given ([`Self::set_rules`]): nothing is
@@ -1066,6 +1284,16 @@ impl Publisher {
         if support_written {
             self.support_at = (!carry).then_some(at);
         }
+        // Once a new epoch's files are all in place, the files of the epoch
+        // before it that none of them names go.
+        #[cfg(test)]
+        let cleanup = self.cleanup && self.stop_epoch != Some(EpochStop::BeforeCleanup);
+        #[cfg(not(test))]
+        let cleanup = self.cleanup;
+        if cleanup {
+            self.finish_epoch_cleanup()?;
+        }
+        self.status = Some(status.clone());
         // Last of all, once the files above are in place and the store has
         // them as written: a `status.json` that is fresh says so, and one a
         // failed write leaves stale says it isn't.
@@ -1098,6 +1326,12 @@ impl Publisher {
     #[cfg(test)]
     fn set_clock(&mut self, clock: fn() -> u64) {
         self.clock = clock;
+    }
+
+    /// Stop new epochs at `stop`, as a process stopped there would.
+    #[cfg(test)]
+    fn set_stop_epoch(&mut self, stop: Option<EpochStop>) {
+        self.stop_epoch = stop;
     }
 }
 
@@ -1354,16 +1588,7 @@ impl Dbs {
                 let Some(old) = self.entry(txn, address)? else {
                     return Ok(());
                 };
-                self.unindex(txn, address, &old.entry, applied, pending)?;
-                self.entries.delete(txn, address).map_err(store_error)?;
-                if self
-                    .side
-                    .delete(txn, &tagged(SUPPORT_TAG, address))
-                    .map_err(store_error)?
-                {
-                    pending.support.insert(shard_of(address));
-                }
-                applied.count = applied.count.saturating_sub(1);
+                self.unlist(txn, address, &old.entry, applied, pending)?;
                 let change = Change::Remove {
                     address: hex::encode(address),
                     reason: *reason,
@@ -1382,6 +1607,39 @@ impl Dbs {
             .map_err(store_error)?;
         pending.address.insert(shard_of(&address));
         pending.lists = true;
+        Ok(())
+    }
+
+    /// Take `entry`, the entry at `address`, out of the index, with its
+    /// support.
+    fn unlist(
+        &self,
+        txn: &mut RwTxn,
+        address: &XorName,
+        entry: &Entry,
+        applied: &mut Applied,
+        pending: &mut Pending,
+    ) -> Result<()> {
+        self.unindex(txn, address, entry, applied, pending)?;
+        self.entries.delete(txn, address).map_err(store_error)?;
+        if self
+            .side
+            .delete(txn, &tagged(SUPPORT_TAG, address))
+            .map_err(store_error)?
+        {
+            pending.support.insert(shard_of(address));
+        }
+        pending.address.insert(shard_of(address));
+        applied.count = applied.count.saturating_sub(1);
+        Ok(())
+    }
+
+    /// Forget every time page noted as superseded ([`SUPERSEDED_TAG`]): on
+    /// a new epoch, they go at once.
+    fn forget_superseded(&self, txn: &mut RwTxn) -> Result<()> {
+        let (from, end) = ([SUPERSEDED_TAG], [SUPERSEDED_TAG + 1]);
+        let range = (Bound::Included(&from[..]), Bound::Excluded(&end[..]));
+        self.pages.delete_range(txn, &range).map_err(store_error)?;
         Ok(())
     }
 
@@ -2349,6 +2607,35 @@ impl Files {
             }
         }
         Ok(pages)
+    }
+
+    /// The first record numbers of the feed segments in the directory.
+    fn segments(&self) -> Result<BTreeSet<u64>> {
+        let dir = self.dir.join("feed");
+        let entries = match fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(BTreeSet::new()),
+            Err(e) => return Err(io_error(&dir, &e)),
+        };
+        let mut segments = BTreeSet::new();
+        for entry in entries {
+            let name = entry.map_err(|e| io_error(&dir, &e))?.file_name();
+            let name = name.to_string_lossy();
+            let base = name
+                .strip_suffix(".gz")
+                .or_else(|| name.strip_suffix(".zst"))
+                .unwrap_or(&name);
+            let first = base
+                .strip_suffix(".json")
+                .and_then(|first| first.parse::<u64>().ok());
+            if let Some(first) = first {
+                // Only names the feed gives: not `01.json`.
+                if segment_path(first) == format!("feed/{base}") {
+                    segments.insert(first);
+                }
+            }
+        }
+        Ok(segments)
     }
 
     /// Write `bytes` as the file at `path` (from the directory), with its
@@ -5335,5 +5622,231 @@ mod tests {
         assert_eq!(rows(&f), kept);
         assert!(!named(&f, &held));
         assert_lists_built_whole(&f);
+    }
+
+    // New epochs.
+
+    /// Every time page in the directory, as paths from it.
+    fn pages_on_disk(f: &Fixture) -> BTreeSet<String> {
+        f.publisher.files.stray_pages().unwrap()
+    }
+
+    /// The paths of the time pages `pages.json` lists.
+    fn pages_listed(f: &Fixture) -> BTreeSet<String> {
+        f.file::<Pages>(PAGES_FILE)
+            .pages
+            .into_iter()
+            .map(|page| page.path)
+            .collect()
+    }
+
+    /// Whether the store still notes a new epoch's cleanup to do.
+    fn cleanup_noted(f: &Fixture) -> bool {
+        let meta: Database<Str, Str> = f.store.database(META_TEXT_DB).unwrap();
+        let txn = f.store.env().read_txn().unwrap();
+        meta.get(&txn, EPOCH_CLEANUP).unwrap().is_some()
+    }
+
+    /// Whether any file in the directory names `address`, its compressed
+    /// copies read too.
+    fn named_anywhere(f: &Fixture, address: &XorName) -> bool {
+        let hex = hex::encode(address);
+        tree(&f.out()).into_iter().any(|(name, bytes)| {
+            let plain = if name.ends_with(".gz") {
+                gunzip(&bytes)
+            } else if name.ends_with(".zst") {
+                zstd::decode_all(&bytes[..]).unwrap()
+            } else {
+                bytes
+            };
+            String::from_utf8_lossy(&plain).contains(&hex)
+        })
+    }
+
+    /// A put of a lean entry at `address(seed)` for each seed, sorting at
+    /// its seed's time, decided at `decided_at`.
+    fn lean_batch(seeds: Range<u64>, decided_at: u64, at: u64) -> Publication {
+        Publication {
+            changes: seeds
+                .map(|seed| {
+                    let mut entry = lean(address(seed), 1_700_000_000 + seed);
+                    entry.entry.decided_at = decided_at;
+                    put(entry)
+                })
+                .collect(),
+            ..quiet(at)
+        }
+    }
+
+    #[test]
+    fn a_new_epoch_has_a_new_id_and_starts_the_feed_again() {
+        let mut f = Fixture::new();
+        f.publish(&first_publication());
+        let third = lean(address(1), 1_791_300_000);
+        f.publish(&Publication {
+            changes: vec![put(third.clone()), remove([0xa0; 32])],
+            ..quiet(AT + 60)
+        });
+        assert_eq!((f.publisher.seq(), f.publisher.count()), (4, 2));
+
+        f.publisher.start_epoch(&|_| true).unwrap();
+        let epoch = f.publisher.epoch().to_string();
+        assert_ne!(epoch, EPOCH_TEXT);
+        assert_eq!(epoch.len(), 16);
+        assert_eq!((f.publisher.seq(), f.publisher.count()), (2, 2));
+        let at = f.publisher.epoch_at();
+        assert!(at > 0);
+        // One put per entry, in key order, numbered from 1, at the epoch's
+        // start: an epoch's first publication.
+        let segment: FeedSegment = f.file("feed/1.json");
+        assert_eq!((segment.epoch.as_str(), segment.first), (epoch.as_str(), 1));
+        let keys: Vec<ListingKey> = f.publisher.keys().unwrap();
+        assert_eq!(keys.len(), 2);
+        assert_eq!(segment.records.len(), 2);
+        for (n, (record, key)) in segment.records.iter().zip(&keys).enumerate() {
+            assert_eq!((record.seq, record.at), (n as u64 + 1, at));
+            match &record.change {
+                Change::Put { listing } => assert_eq!(listing.key(), Some(*key)),
+                Change::Remove { .. } => panic!("a removal in a new epoch"),
+            }
+        }
+        let head: Head = f.file(HEAD_FILE);
+        assert_eq!(
+            (head.epoch.as_str(), head.seq, head.count, head.generated_at),
+            (epoch.as_str(), 2, 2, at)
+        );
+        let index: FeedIndex = f.file(FEED_INDEX_FILE);
+        assert_eq!((index.epoch.as_str(), index.seq), (epoch.as_str(), 2));
+        let pages: Pages = f.file(PAGES_FILE);
+        assert_eq!(
+            (pages.epoch.as_str(), pages.seq, pages.count),
+            (epoch.as_str(), 2, 2)
+        );
+        // status.json last, with the status last written.
+        let status: Status = f.file(STATUS_FILE);
+        assert_eq!((status.epoch.as_str(), status.seq), (epoch.as_str(), 2));
+        assert_eq!(status.cycle.started_at, AT + 60);
+        // The entries are those it had, data maps and all.
+        assert_eq!(f.publisher.entry(&[0x11; 32]).unwrap(), Some(shown()));
+        assert_eq!(f.publisher.entry(&address(1)).unwrap(), Some(third));
+        assert!(!cleanup_noted(&f));
+
+        // Kept across an open, and the feed goes on from there.
+        f.reopen();
+        assert_eq!(
+            (f.publisher.epoch(), f.publisher.seq()),
+            (epoch.as_str(), 2)
+        );
+        assert_eq!(f.publisher.epoch_at(), at);
+        f.publish(&Publication {
+            changes: vec![put(lean(address(2), 1_791_300_100))],
+            ..quiet(AT + 120)
+        });
+        assert_eq!(f.publisher.seq(), 3);
+        assert_eq!(f.file::<FeedSegment>("feed/1.json").records.len(), 3);
+
+        // An entry not kept leaves the index, and no record names it.
+        f.publisher
+            .start_epoch(&|kept| *kept != address(1))
+            .unwrap();
+        assert_ne!(f.publisher.epoch(), epoch);
+        assert_eq!((f.publisher.seq(), f.publisher.count()), (2, 2));
+        assert_eq!(f.publisher.entry(&address(1)).unwrap(), None);
+        assert!(!named_anywhere(&f, &address(1)));
+        assert!(named_anywhere(&f, &address(2)));
+    }
+
+    #[test]
+    fn a_new_epoch_deletes_old_segments_and_unlisted_pages_at_once() {
+        let mut f = Fixture::new();
+        // Enough entries for two segments, over several time pages: 600, and
+        // two that end a page.
+        let enders = addresses_ending(true, 2, 1_000..100_000);
+        let mut first = lean_batch(0..600, AT, AT);
+        for (n, ender) in enders.iter().enumerate() {
+            first
+                .changes
+                .push(put(lean(*ender, 1_700_000_100 + 200 * n as u64)));
+        }
+        f.publish(&first);
+        // Each entry decided again: 600 records more, and every page holding
+        // them changes, the pages before superseded but kept for a day.
+        f.publish(&lean_batch(0..600, AT + 60, AT + 60));
+        assert_eq!(f.publisher.seq(), 1_202);
+        assert!(f.exists("feed/1001.json"));
+        let listed = pages_listed(&f);
+        assert!(listed.len() >= 3, "{listed:?}");
+        let before = pages_on_disk(&f);
+        assert!(before.len() > listed.len(), "superseded pages are kept");
+
+        f.publisher
+            .start_epoch(&|kept| *kept != address(0))
+            .unwrap();
+        assert_eq!(f.publisher.seq(), 601);
+        // No segment past the last: feed/1001.json and its copies are gone.
+        let index: FeedIndex = f.file(FEED_INDEX_FILE);
+        assert_eq!(index.segments.len(), 1);
+        assert_eq!(index.segments[0].last, 601);
+        for path in ["feed/1001.json", "feed/1001.json.gz", "feed/1001.json.zst"] {
+            assert!(!f.exists(path), "{path}");
+        }
+        assert_eq!(f.publisher.files.segments().unwrap(), BTreeSet::from([1]));
+        // Every page there is one pages.json lists: the superseded ones, and
+        // the one that held the entry left out, went at once, with their
+        // copies.
+        let listed = pages_listed(&f);
+        assert_eq!(pages_on_disk(&f), listed);
+        for path in &before {
+            if !listed.contains(path) {
+                for suffix in ["", ".gz", ".zst"] {
+                    assert!(!f.exists(&format!("{path}{suffix}")), "{path}{suffix}");
+                }
+            }
+        }
+        assert!(!named_anywhere(&f, &address(0)));
+        // And nothing is left to delete a day later.
+        f.publish(&quiet(AT + SUPERSEDED_KEPT.as_secs() + 120));
+        assert_eq!(pages_on_disk(&f), pages_listed(&f));
+    }
+
+    #[test]
+    fn a_new_epoch_interrupted_before_cleanup_finishes_it_at_open() {
+        for stop in [EpochStop::BeforeWrite, EpochStop::BeforeCleanup] {
+            let mut f = Fixture::new();
+            f.publish(&lean_batch(0..1_001, AT, AT));
+            assert!(f.exists("feed/1001.json"));
+            let old = pages_listed(&f);
+            f.publisher.set_stop_epoch(Some(stop));
+            f.publisher
+                .start_epoch(&|kept| *kept != address(0))
+                .unwrap();
+            let epoch = f.publisher.epoch().to_string();
+            // Stopped part way: the old files are still there.
+            assert!(cleanup_noted(&f), "{stop:?}");
+            assert!(f.exists("feed/1001.json"), "{stop:?}");
+            assert!(old.iter().all(|path| f.exists(path)), "{stop:?}");
+
+            // The next open deletes them at once, and clears the flag.
+            f.reopen();
+            assert!(!cleanup_noted(&f), "{stop:?}");
+            assert_eq!(f.publisher.epoch(), epoch);
+            assert!(!f.exists("feed/1001.json"), "{stop:?}");
+            assert!(!f.exists("feed/1001.json.gz"), "{stop:?}");
+            {
+                let txn = f.store.env().read_txn().unwrap();
+                for path in pages_on_disk(&f) {
+                    assert!(f.publisher.dbs.lists_page(&txn, &path).unwrap(), "{path}");
+                }
+            }
+            // The next publication writes what is left to write.
+            f.publish(&quiet(AT + 60));
+            let head: Head = f.file(HEAD_FILE);
+            assert_eq!((head.epoch.as_str(), head.seq), (epoch.as_str(), 1_000));
+            let segment: FeedSegment = f.file("feed/1.json");
+            assert_eq!(segment.epoch, epoch);
+            assert_eq!(segment.records.len(), 1_000);
+            assert_eq!(pages_on_disk(&f), pages_listed(&f));
+            assert!(!named_anywhere(&f, &address(0)), "{stop:?}");
+        }
     }
 }

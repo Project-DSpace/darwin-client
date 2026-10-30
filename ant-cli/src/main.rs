@@ -211,6 +211,9 @@ async fn run() -> anyhow::Result<()> {
                 Some(commands::data::listings::ListingsCommand::RefreshCensus(refresh)) => {
                     return refresh.execute(json);
                 }
+                Some(commands::data::listings::ListingsCommand::NewEpoch(new_epoch)) => {
+                    return new_epoch.execute(json);
+                }
                 None => {}
             }
             // A --state or --carry file that can't be used fails before the

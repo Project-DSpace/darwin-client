@@ -485,7 +485,7 @@ mod bootstrap_tests {
 #[cfg(test)]
 mod listings_tests {
     use super::*;
-    use crate::commands::data::listings::{ListingsCommand, RefreshCensusArgs};
+    use crate::commands::data::listings::{ListingsCommand, NewEpochArgs, RefreshCensusArgs};
 
     fn listings(cli: Cli) -> ListingsArgs {
         match cli.command {
@@ -599,6 +599,63 @@ mod listings_tests {
         std::fs::create_dir(dir.path().join("listings.mdb")).unwrap();
         args.execute(true).unwrap();
         let held = std::fs::read_to_string(dir.path().join("census-refresh")).unwrap();
+        assert!(held.trim().parse::<u64>().is_ok(), "{held:?}");
+    }
+
+    #[test]
+    fn new_epoch_takes_the_producers_state_directory_and_nothing_else() {
+        let args = listings(
+            Cli::try_parse_from([
+                "darwin",
+                "listings",
+                "new-epoch",
+                "--state-dir",
+                "/var/lib/listings",
+            ])
+            .unwrap(),
+        );
+        match args.command {
+            Some(ListingsCommand::NewEpoch(new_epoch)) => {
+                assert_eq!(new_epoch.state_dir, PathBuf::from("/var/lib/listings"));
+            }
+            _ => panic!("no new-epoch"),
+        }
+        for argv in [
+            &["darwin", "listings", "new-epoch"][..],
+            &[
+                "darwin",
+                "listings",
+                "new-epoch",
+                "--state-dir",
+                "s",
+                "--out-dir",
+                "o",
+            ][..],
+            &[
+                "darwin",
+                "listings",
+                "--all",
+                "new-epoch",
+                "--state-dir",
+                "s",
+            ][..],
+        ] {
+            assert!(Cli::try_parse_from(argv).is_err(), "{argv:?}");
+        }
+    }
+
+    #[test]
+    fn new_epoch_leaves_its_request_only_in_a_producers_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let args = NewEpochArgs {
+            state_dir: dir.path().to_path_buf(),
+        };
+        // No store there: refused, and nothing is left.
+        assert!(args.execute(false).is_err());
+        assert!(!dir.path().join("new-epoch").exists());
+        std::fs::create_dir(dir.path().join("listings.mdb")).unwrap();
+        args.execute(true).unwrap();
+        let held = std::fs::read_to_string(dir.path().join("new-epoch")).unwrap();
         assert!(held.trim().parse::<u64>().is_ok(), "{held:?}");
     }
 }

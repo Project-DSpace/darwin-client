@@ -198,7 +198,13 @@
 //! no put, and a readable address not cleared and not published, held or
 //! not, has no row in `rejected.json`. An address that is newly cleared, or
 //! no longer hidden, is made pending, so the next cycle decides it and
-//! publishes it at its own key.
+//! publishes it at its own key. An entry published before its address was
+//! hidden leaves the index with no removal record: at the start of each
+//! cycle, once the lists are read, a hidden address with an entry published
+//! starts the feed again under a new epoch ([`Publisher::start_epoch`]),
+//! keeping every entry published that isn't hidden. A new epoch can also be
+//! asked for ([`Producer::request_new_epoch`], `darwin listings
+//! new-epoch`), and is started at the next cycle's start.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::hash::{DefaultHasher, Hash, Hasher};
@@ -322,6 +328,16 @@ pub const CENSUS_REFRESH_FILE: &str = "census-refresh";
 /// The most of a request to refresh the census that is read: its time, and
 /// room to spare.
 const CENSUS_REFRESH_BYTES: u64 = 64;
+
+/// The file in the state directory that asks the producer to start its feed
+/// again under a new epoch ([`Producer::request_new_epoch`]): its next cycle
+/// does ([`Publisher::start_epoch`]), keeping every entry published that
+/// isn't hidden, and then removes the file. It holds when it was asked for,
+/// in Unix seconds; one that holds no time it could have been made at is
+/// dated by its modification time, or now. A request is taken once: one
+/// made no later than the latest new epoch began is answered, so one whose
+/// file can't be removed isn't taken again, after a restart either.
+pub const NEW_EPOCH_FILE: &str = "new-epoch";
 
 /// Since when each address has been deferred, or listed below full
 /// support: a tag ([`DEFERRED_TAG`] or [`BELOW_FULL_TAG`]) and the
@@ -859,6 +875,9 @@ pub struct Producer {
     /// Where a request to refresh the census is left
     /// ([`CENSUS_REFRESH_FILE`] in the state directory).
     refresh_request: PathBuf,
+    /// Where a request for a new epoch is left ([`NEW_EPOCH_FILE`] in the
+    /// state directory).
+    epoch_request: PathBuf,
     /// The hide list's file, if there is one.
     hide_list: Option<ListFile>,
     /// The cleared list's file, if entries are held until cleared.
@@ -974,6 +993,7 @@ impl Producer {
             totals: Totals::default(),
             traffic_counted,
             refresh_request: state_dir.join(CENSUS_REFRESH_FILE),
+            epoch_request: state_dir.join(NEW_EPOCH_FILE),
             hide_list: options
                 .hide_list
                 .map(|path| ListFile::new("hide list", path)),
@@ -1163,6 +1183,137 @@ impl Producer {
             ),
         }
         Ok(taken)
+    }
+
+    /// Ask the producer keeping its state in `state_dir` to start its feed
+    /// again under a new epoch: its next cycle does, keeping every entry
+    /// published that isn't hidden ([`Publisher::start_epoch`]). A producer
+    /// that isn't running does so in the first cycle after it starts. The
+    /// request is a file there ([`NEW_EPOCH_FILE`]), which the producer
+    /// removes once it has taken it; asking again before then asks once.
+    /// Returns the file's path.
+    ///
+    /// # Errors
+    ///
+    /// If `state_dir` holds no producer's store ([`STORE_DIR`]), or the file
+    /// can't be written.
+    pub fn request_new_epoch(state_dir: &Path) -> Result<PathBuf> {
+        if !state_dir.join(STORE_DIR).is_dir() {
+            return Err(Error::NotFound(format!(
+                "no listings producer keeps its state in {} (it has no {STORE_DIR})",
+                state_dir.display()
+            )));
+        }
+        let path = state_dir.join(NEW_EPOCH_FILE);
+        std::fs::write(&path, format!("{}\n", unix_now())).map_err(|e| {
+            Error::Storage(format!(
+                "could not write the new epoch request {}: {e}",
+                path.display()
+            ))
+        })?;
+        Ok(path)
+    }
+
+    /// Whether a request for a new epoch ([`Self::request_new_epoch`]) is
+    /// waiting and not answered yet: made later than the latest new epoch
+    /// began. `None` if there is none, or its file can't be read (logged).
+    fn epoch_requested(&self) -> Option<bool> {
+        use std::io::Read as _;
+        let path = &self.epoch_request;
+        let file = match std::fs::File::open(path) {
+            Ok(file) => file,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+            Err(e) => {
+                warn!(
+                    "Could not read the new epoch request {}: {e}",
+                    path.display()
+                );
+                return None;
+            }
+        };
+        let modified = file
+            .metadata()
+            .and_then(|meta| meta.modified())
+            .ok()
+            .and_then(|at| at.duration_since(UNIX_EPOCH).ok())
+            .map(|at| at.as_secs());
+        let mut held = Vec::new();
+        if let Err(e) = file.take(CENSUS_REFRESH_BYTES).read_to_end(&mut held) {
+            warn!(
+                "Could not read the new epoch request {}: {e}",
+                path.display()
+            );
+            return None;
+        }
+        let now = unix_now();
+        let asked_at = request_time(&held, now)
+            .or_else(|| modified.filter(|at| *at <= now))
+            .unwrap_or(now);
+        Some(asked_at > self.publisher.epoch_at())
+    }
+
+    /// At a cycle's start, after the lists are read: start the feed again
+    /// under a new epoch ([`Publisher::start_epoch`]), keeping every entry
+    /// published that isn't hidden, if a request for one is waiting
+    /// ([`Self::request_new_epoch`]) or an address hidden has an entry
+    /// published. That is a check of the state, not of what changed, so a
+    /// hide list read between cycles, or before a restart, is acted on too.
+    /// The request's file is then removed. Returns whether a new epoch began.
+    ///
+    /// # Errors
+    ///
+    /// If the store can't be read or written, or the new epoch's files can't
+    /// be written; a request is then left, to be taken at the next cycle.
+    async fn new_epoch_if_due(&mut self) -> Result<bool> {
+        let asked = self.epoch_requested();
+        let rules = self.publisher.rules();
+        let mut hidden_listed = false;
+        for address in &rules.hidden {
+            if self.publisher.lists(address)? {
+                hidden_listed = true;
+                break;
+            }
+        }
+        let start = asked == Some(true) || hidden_listed;
+        if start {
+            let before = self.publisher.count();
+            let status = self
+                .last_status
+                .clone()
+                .unwrap_or_else(|| self.base_status());
+            self.publisher.set_status(status);
+            wait_past(self.published_second).await;
+            let started = self
+                .publisher
+                .start_epoch(&|address: &XorName| !rules.hides(address));
+            self.published_second = unix_now();
+            started?;
+            let kept = self.publisher.count();
+            info!(
+                "Listings: the feed starts again under a new epoch, {}, with {kept} entries ({} \
+                 left out){}",
+                self.publisher.epoch(),
+                before.saturating_sub(kept),
+                if asked == Some(true) {
+                    ", as asked"
+                } else {
+                    ""
+                }
+            );
+        }
+        if asked.is_some() {
+            let path = &self.epoch_request;
+            match std::fs::remove_file(path) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => warn!(
+                    "Could not remove the new epoch request {}: {e}; it is left, and not taken \
+                     again",
+                    path.display()
+                ),
+            }
+        }
+        Ok(start)
     }
 
     /// On a first start, while the store holds no index yet, take the
@@ -1371,6 +1522,7 @@ impl Producer {
 
         self.take_refresh_request()?;
         self.read_lists(Some(at))?;
+        self.new_epoch_if_due().await?;
         if let Err(e) = Box::pin(self.census.maintain(&self.client)).await {
             warn!("The census's upkeep failed in part: {e}");
         }
@@ -4917,7 +5069,9 @@ fn rss_bytes() -> Option<u64> {
 ///
 /// As [`Producer::carry_from`].
 fn carry_into(publisher: &mut Publisher, previous: &Path, status: Status) -> Result<usize> {
-    if publisher.seq() > 0 || publisher.count() > 0 {
+    // A feed started again under a new epoch is no first start, even with
+    // nothing left in it.
+    if publisher.seq() > 0 || publisher.count() > 0 || publisher.epoch_at() > 0 {
         return Ok(0);
     }
     let bytes = match std::fs::read(previous) {
@@ -9545,10 +9699,12 @@ mod tests {
     }
 
     /// A cycle as [`Producer::cycle`] runs one, over fake nodes
-    /// ([`fake_cycle`]): the lists read at its start, `source` decided, then
-    /// the files and the held file written.
+    /// ([`fake_cycle`]): the lists read at its start, and a new epoch
+    /// started if one is due, `source` decided, then the files and the held
+    /// file written.
     async fn lists_cycle(producer: &mut Producer, net: &FakeNet, now: u64, source: Source) {
         producer.read_lists(Some(now)).unwrap();
+        producer.new_epoch_if_due().await.unwrap();
         fake_cycle(producer, net, now, source).await;
         producer
             .write_spaced(now, &Status::default())
@@ -10224,5 +10380,228 @@ mod tests {
         assert_eq!(third["lists_read_at"], now + 60);
         assert!(third["generated_at"].as_u64() >= second["generated_at"].as_u64());
         assert_eq!(third["held"], first["held"]);
+    }
+
+    // New epochs.
+
+    /// Assert that the files in `out` are all of the feed's epoch `epoch`:
+    /// `head.json`, `pages.json` and `feed/index.json` give it, every time
+    /// page there is one `pages.json` lists, and no feed segment there holds
+    /// a removal.
+    fn all_of_epoch(out: &Path, epoch: &str) {
+        let read = |path: &str| std::fs::read_to_string(out.join(path)).unwrap();
+        let head: Value = serde_json::from_str(&read(HEAD_FILE)).unwrap();
+        assert_eq!(head["epoch"], epoch);
+        let index: FeedIndex = serde_json::from_str(&read(FEED_INDEX_FILE)).unwrap();
+        assert_eq!(index.epoch, epoch);
+        let pages: Pages = serde_json::from_str(&read(PAGES_FILE)).unwrap();
+        assert_eq!(pages.epoch, epoch);
+        let listed: BTreeSet<String> = pages.pages.into_iter().map(|page| page.path).collect();
+        for entry in std::fs::read_dir(out.join("pages")).unwrap() {
+            let name = entry.unwrap().file_name().to_string_lossy().into_owned();
+            let base = name
+                .strip_suffix(".gz")
+                .or_else(|| name.strip_suffix(".zst"))
+                .unwrap_or(&name);
+            assert!(listed.contains(&format!("pages/{base}")), "pages/{name}");
+        }
+        for (path, text) in published_files(out) {
+            if path.parent().is_some_and(|dir| dir.ends_with("feed")) {
+                assert!(!text.contains(r#""op":"remove""#), "{}", path.display());
+            }
+        }
+    }
+
+    /// Two readable entries, X and C, published by a producer with a hide
+    /// list naming nothing, in `dir`.
+    async fn published_pair(
+        dir: &Path,
+        now: u64,
+    ) -> (Producer, crate::data::Network, FakeNet, XorName, XorName) {
+        let hide_list = dir.join("hidden.txt");
+        write_list(&hide_list, &[]);
+        let options = ServeOptions {
+            hide_list: Some(hide_list),
+            ..ServeOptions::default()
+        };
+        let x = readable_envelope("x.png", "image/png");
+        let c = readable_envelope("c.png", "image/png");
+        let (lx, lc) = (
+            listing_of(&x, now - 10 * 3_600),
+            listing_of(&c, now - 9 * 3_600),
+        );
+        let served = [(&x, &lx, 7), (&c, &lc, 7)];
+        let (mut producer, node) = lists_producer(dir, options, &served).await;
+        let net = lists_net(&producer, &served);
+        lists_cycle(&mut producer, &net, now, Source::All).await;
+        assert!(producer.publisher.entry(&x.address()).unwrap().is_some());
+        assert!(producer.publisher.entry(&c.address()).unwrap().is_some());
+        (producer, node, net, x.address(), c.address())
+    }
+
+    #[tokio::test]
+    async fn hiding_a_published_entry_starts_a_new_epoch_without_it_and_no_remove_record() {
+        let now = unix_now();
+        let dir = tempfile::tempdir().unwrap();
+        let (mut producer, _node, net, x, c) = published_pair(dir.path(), now).await;
+        let out = dir.path().join("v1");
+        assert!(named_in(&out, &x));
+        let old_epoch = producer.publisher.epoch().to_string();
+
+        write_list(&dir.path().join("hidden.txt"), &[x]);
+        lists_cycle(
+            &mut producer,
+            &net,
+            now + 60,
+            Source::Pending { again: true },
+        )
+        .await;
+
+        let epoch = producer.publisher.epoch().to_string();
+        assert_ne!(epoch, old_epoch);
+        named_nowhere(&out, &[x]);
+        all_of_epoch(&out, &epoch);
+        assert!(producer.publisher.entry(&x).unwrap().is_none());
+        assert!(producer.publisher.entry(&c).unwrap().is_some());
+        assert_eq!(
+            (producer.publisher.seq(), producer.publisher.count()),
+            (1, 1)
+        );
+        // Once it is out, later cycles start no other epoch.
+        lists_cycle(&mut producer, &net, now + 120, Source::All).await;
+        assert_eq!(producer.publisher.epoch(), epoch);
+        named_nowhere(&out, &[x]);
+    }
+
+    #[tokio::test]
+    async fn a_hide_read_between_cycles_still_starts_the_epoch() {
+        let now = unix_now();
+        let dir = tempfile::tempdir().unwrap();
+        let (mut producer, _node, net, x, c) = published_pair(dir.path(), now).await;
+        let old_epoch = producer.publisher.epoch().to_string();
+
+        // Read between cycles, as before a publication of pushes: the entry
+        // stays as it is until the next cycle starts.
+        write_list(&dir.path().join("hidden.txt"), &[x]);
+        producer.read_lists(None).unwrap();
+        assert!(producer.publisher.rules().hides(&x));
+        assert!(producer.publisher.entry(&x).unwrap().is_some());
+        assert_eq!(producer.publisher.epoch(), old_epoch);
+
+        // The list is unchanged at the cycle's start: the state still says
+        // a hidden address is published.
+        lists_cycle(
+            &mut producer,
+            &net,
+            now + 60,
+            Source::Pending { again: true },
+        )
+        .await;
+        let epoch = producer.publisher.epoch().to_string();
+        assert_ne!(epoch, old_epoch);
+        let out = dir.path().join("v1");
+        named_nowhere(&out, &[x]);
+        all_of_epoch(&out, &epoch);
+        assert!(producer.publisher.entry(&c).unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn a_hide_read_before_a_restart_still_starts_the_epoch_after_it() {
+        let now = unix_now();
+        let dir = tempfile::tempdir().unwrap();
+        let (mut producer, node, net, x, c) = published_pair(dir.path(), now).await;
+        let old_epoch = producer.publisher.epoch().to_string();
+        let hide_list = dir.path().join("hidden.txt");
+        write_list(&hide_list, &[x]);
+        producer.read_lists(None).unwrap();
+        drop(producer);
+        drop(node);
+
+        // Started again, with the list's file gone: the list last read
+        // stays, and the first cycle acts on it.
+        std::fs::remove_file(&hide_list).unwrap();
+        let options = ServeOptions {
+            hide_list: Some(hide_list),
+            ..ServeOptions::default()
+        };
+        let (mut producer, _node) = offline_producer_with(dir.path(), options).await;
+        assert!(producer.publisher.rules().hides(&x));
+        assert!(producer.publisher.entry(&x).unwrap().is_some());
+        assert_eq!(producer.publisher.epoch(), old_epoch);
+        census_nodes(&mut producer, 8);
+        producer.start_requests();
+        lists_cycle(
+            &mut producer,
+            &net,
+            now + 60,
+            Source::Pending { again: true },
+        )
+        .await;
+        let epoch = producer.publisher.epoch().to_string();
+        assert_ne!(epoch, old_epoch);
+        let out = dir.path().join("v1");
+        named_nowhere(&out, &[x]);
+        all_of_epoch(&out, &epoch);
+        assert!(producer.publisher.entry(&c).unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn a_new_epoch_request_is_taken_once() {
+        let now = unix_now();
+        let dir = tempfile::tempdir().unwrap();
+        let (mut producer, node, _net, x, c) = published_pair(dir.path(), now).await;
+        let state = dir.path().join("state");
+        let out = dir.path().join("v1");
+        assert!(
+            !producer.new_epoch_if_due().await.unwrap(),
+            "none asked for"
+        );
+        assert_eq!(producer.publisher.epoch_at(), 0);
+
+        // One holding no time is dated by its file.
+        let file = state.join(NEW_EPOCH_FILE);
+        std::fs::write(&file, "please\n").unwrap();
+        let epoch = producer.publisher.epoch().to_string();
+        assert!(producer.new_epoch_if_due().await.unwrap());
+        assert_ne!(producer.publisher.epoch(), epoch);
+        assert!(!file.exists(), "taken and removed");
+        assert!(!producer.new_epoch_if_due().await.unwrap());
+
+        // Asked for by the command's call: taken once, every entry kept.
+        wait_past(producer.publisher.epoch_at()).await;
+        assert_eq!(Producer::request_new_epoch(&state).unwrap(), file);
+        let epoch = producer.publisher.epoch().to_string();
+        assert!(producer.new_epoch_if_due().await.unwrap());
+        let new = producer.publisher.epoch().to_string();
+        assert_ne!(new, epoch);
+        assert!(!file.exists());
+        assert!(!producer.new_epoch_if_due().await.unwrap());
+        assert_eq!(producer.publisher.epoch(), new);
+        assert_eq!(
+            (producer.publisher.seq(), producer.publisher.count()),
+            (2, 2)
+        );
+        assert!(named_in(&out, &x) && named_in(&out, &c));
+        all_of_epoch(&out, &new);
+
+        // A request made no later than the latest new epoch began is
+        // answered: removed, and not taken, after a restart too.
+        let at = producer.publisher.epoch_at();
+        std::fs::write(&file, format!("{at}\n")).unwrap();
+        assert!(!producer.new_epoch_if_due().await.unwrap());
+        assert!(!file.exists());
+        std::fs::write(&file, format!("{at}\n")).unwrap();
+        drop(producer);
+        drop(node);
+        let (mut producer, _node) =
+            offline_producer_with(dir.path(), ServeOptions::default()).await;
+        assert!(!producer.new_epoch_if_due().await.unwrap());
+        assert_eq!(producer.publisher.epoch(), new);
+        assert!(!file.exists());
+
+        // Only a producer's state takes a request.
+        let elsewhere = tempfile::tempdir().unwrap();
+        assert!(Producer::request_new_epoch(elsewhere.path()).is_err());
+        assert!(!elsewhere.path().join(NEW_EPOCH_FILE).exists());
     }
 }

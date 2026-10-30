@@ -1721,4 +1721,173 @@ mod tests {
             assert_ne!(epoch, "0".repeat(16));
         }
     }
+
+    /// A reader following the files as **Following changes** in
+    /// `docs/listings-v1.md` says: the entries it holds, by address, at the
+    /// record `seq` of the feed `epoch`.
+    #[derive(Default)]
+    struct Follower {
+        epoch: String,
+        seq: u64,
+        entries: std::collections::BTreeMap<String, Entry>,
+        /// How many times it read `pages.json` and its pages.
+        starts: u32,
+    }
+
+    impl Follower {
+        fn read<T: DeserializeOwned>(dir: &std::path::Path, path: &str) -> Option<T> {
+            std::fs::read(dir.join(path))
+                .ok()
+                .map(|bytes| serde_json::from_slice(&bytes).unwrap())
+        }
+
+        /// Step 1: `pages.json` and every page it lists.
+        fn start(&mut self, dir: &std::path::Path) {
+            let pages: Pages = Self::read(dir, PAGES_FILE).unwrap();
+            self.entries.clear();
+            for page in &pages.pages {
+                let page: Page = Self::read(dir, &page.path).expect("a page pages.json lists");
+                for entry in page.listings {
+                    self.entries.insert(entry.listing.address.clone(), entry);
+                }
+            }
+            self.epoch = pages.epoch;
+            self.seq = pages.seq;
+            self.starts += 1;
+        }
+
+        /// Steps 2 and 3: `head.json`, then the segments holding the records
+        /// after ours, starting again at step 1 on another epoch.
+        fn follow(&mut self, dir: &std::path::Path) {
+            let head: Head = Self::read(dir, HEAD_FILE).unwrap();
+            if head.epoch != self.epoch {
+                return self.start(dir);
+            }
+            let mut first = segment_first(self.seq + 1);
+            while first <= head.seq {
+                let Some(segment) = Self::read::<FeedSegment>(dir, &segment_path(first)) else {
+                    return self.start(dir);
+                };
+                if segment.epoch != self.epoch {
+                    return self.start(dir);
+                }
+                for record in segment.records {
+                    if record.seq <= self.seq {
+                        continue;
+                    }
+                    match record.change {
+                        Change::Put { listing } => {
+                            self.entries
+                                .insert(listing.listing.address.clone(), *listing);
+                        }
+                        Change::Remove { address, .. } => {
+                            self.entries.remove(&address);
+                        }
+                    }
+                    self.seq = record.seq;
+                }
+                first += FEED_SEGMENT_RECORDS;
+            }
+        }
+
+        fn addresses(&self) -> Vec<String> {
+            self.entries.keys().cloned().collect()
+        }
+    }
+
+    #[test]
+    fn a_follower_starts_again_from_pages_json_on_a_new_epoch() {
+        use crate::data::client::listings_publish::{IndexChange, Publication, Publisher};
+        use crate::data::client::listings_store::ListingsStore;
+
+        let dir = tempfile::tempdir().unwrap();
+        let store =
+            ListingsStore::open_with_map_size(&dir.path().join("store"), 64 * 1024 * 1024).unwrap();
+        let out = dir.path().join("v1");
+        let mut publisher = Publisher::open(&out, &store).unwrap();
+        publisher.set_flush(false);
+        let put = |byte: u8| {
+            IndexChange::Put(Box::new(ShardEntry {
+                entry: Entry {
+                    listing: ListingFields {
+                        address: hex::encode([byte; 32]),
+                        name: None,
+                        content_type: None,
+                        size: Some(1),
+                        readable: true,
+                        hidden: Vec::new(),
+                        tx_hash: None,
+                        block_number: Some(1),
+                        block_timestamp: Some(1_791_300_000 + u64::from(byte)),
+                        log_index: Some(0),
+                        quote_hash: None,
+                        first_seen: None,
+                        time: 1_791_300_000 + u64::from(byte),
+                    },
+                    check: CheckLevel::Verified,
+                    decided_at: 1_791_324_060,
+                },
+                data_map: None,
+            }))
+        };
+        let publish = |publisher: &mut Publisher, at: u64, changes: Vec<IndexChange>| {
+            publisher
+                .publish(&Publication {
+                    at,
+                    changes,
+                    ..Publication::default()
+                })
+                .unwrap();
+        };
+        let hex = |byte: u8| hex::encode([byte; 32]);
+        publish(&mut publisher, 1_791_324_060, vec![put(1), put(2), put(3)]);
+        let mut follower = Follower::default();
+        follower.start(&out);
+        assert_eq!(follower.addresses(), [hex(1), hex(2), hex(3)]);
+
+        // It follows the feed: a put and a removal.
+        publish(
+            &mut publisher,
+            1_791_324_120,
+            vec![
+                put(4),
+                IndexChange::Remove {
+                    address: [1; 32],
+                    reason: RemoveReason::NoLongerServed,
+                },
+            ],
+        );
+        follower.follow(&out);
+        assert_eq!(follower.starts, 1);
+        assert_eq!(follower.seq, publisher.seq());
+        assert_eq!(follower.addresses(), [hex(2), hex(3), hex(4)]);
+
+        // A new epoch without one entry: the follower sees the epoch change
+        // at head.json and starts again from pages.json, which doesn't name
+        // the entry left out.
+        publisher
+            .start_epoch(&|address| *address != [2; 32])
+            .unwrap();
+        follower.follow(&out);
+        assert_eq!(follower.starts, 2);
+        assert_eq!(
+            (follower.epoch.as_str(), follower.seq),
+            (publisher.epoch(), 2)
+        );
+        assert_eq!(follower.addresses(), [hex(3), hex(4)]);
+
+        // And follows the new epoch's feed from there.
+        publish(&mut publisher, 1_791_324_180, vec![put(5)]);
+        follower.follow(&out);
+        assert_eq!(follower.starts, 2);
+        assert_eq!(follower.addresses(), [hex(3), hex(4), hex(5)]);
+        // A reader following the feed from record 1 gets the same.
+        let mut replayer = Follower {
+            epoch: publisher.epoch().to_string(),
+            ..Follower::default()
+        };
+        replayer.follow(&out);
+        assert_eq!((replayer.starts, replayer.seq), (0, 3));
+        assert_eq!(replayer.entries, follower.entries);
+    }
 }

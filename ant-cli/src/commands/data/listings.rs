@@ -53,6 +53,10 @@ pub enum ListingsCommand {
     /// Ask the producer (`darwin listings serve`) to refresh its census of
     /// nodes at its next cycle, or its next start if it isn't running
     RefreshCensus(RefreshCensusArgs),
+    /// Ask the producer (`darwin listings serve`) to start its feed again
+    /// under a new epoch at its next cycle, or its next start if it isn't
+    /// running, keeping every entry published that isn't hidden
+    NewEpoch(NewEpochArgs),
 }
 
 /// Arguments of `darwin listings serve`.
@@ -146,6 +150,41 @@ impl RefreshCensusArgs {
             println!(
                 "Asked the producer using {} to refresh its census: its next cycle closes every \
                  leaf again ({} until it does)",
+                self.state_dir.display(),
+                path.display()
+            );
+        }
+        Ok(())
+    }
+}
+
+/// Arguments of `darwin listings new-epoch`.
+#[derive(Args)]
+pub struct NewEpochArgs {
+    /// The producer's state directory, as given to `darwin listings serve
+    /// --state-dir`. The request is left there, as the file new-epoch, which
+    /// the producer removes once it takes it.
+    #[arg(long, value_name = "DIR")]
+    pub state_dir: PathBuf,
+}
+
+impl NewEpochArgs {
+    /// Leave the request: the producer's next cycle starts its feed again
+    /// under a new epoch, with one record for each entry it keeps, and
+    /// deletes the time pages and feed segments the new epoch doesn't name.
+    /// Readers following the feed start again from `pages.json`. Needs no
+    /// network.
+    pub fn execute(&self, json: bool) -> anyhow::Result<()> {
+        let path = Producer::request_new_epoch(&self.state_dir)?;
+        if json {
+            println!(
+                "{}",
+                serde_json::json!({ "requested": true, "file": path.display().to_string() })
+            );
+        } else {
+            println!(
+                "Asked the producer using {} to start its feed again under a new epoch at its \
+                 next cycle ({} until it does)",
                 self.state_dir.display(),
                 path.display()
             );
