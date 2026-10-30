@@ -385,7 +385,8 @@ impl Publisher {
         let generated_at = number(GENERATED_AT)?;
         let mut support_at = number(SUPPORT_AT)?;
         let mut feed_written = number(FEED_WRITTEN)?.unwrap_or(0);
-        if fresh || !files.holds(&epoch, feed_written, seq) {
+        let held = !fresh && files.holds(&epoch, feed_written, seq);
+        if !held {
             // Every file is written again, as on the first publication.
             let mut pending = dbs.pending(&txn)?;
             dbs.pend_everything(&txn, &mut pending)?;
@@ -408,6 +409,9 @@ impl Publisher {
                 }
             }
         }
+        // The directory has all of this epoch's files only if they are its
+        // and nothing is left to write.
+        let in_place = held && dbs.pending(&txn)? == Pending::default();
         txn.commit().map_err(store_error)?;
         let mut publisher = Self {
             store: store.clone(),
@@ -427,9 +431,12 @@ impl Publisher {
             #[cfg(test)]
             stop_epoch: None,
         };
-        if publisher.cleanup {
-            // A new epoch was stopped part way: the time pages and feed
-            // segments it leaves out go now, not a day later.
+        if publisher.cleanup && in_place {
+            // A new epoch was stopped once its files were written: the time
+            // pages and feed segments it leaves out go now, not a day later.
+            // Stopped before, the old epoch's `pages.json`, `feed/index.json`
+            // and `head.json` still name them, so they go once the next
+            // publication has written the new ones ([`Self::write`]).
             publisher.finish_epoch_cleanup()?;
         }
         Ok(publisher)
@@ -446,7 +453,9 @@ impl Publisher {
     /// and so is every feed segment past the new last one. The store notes
     /// that cleanup ([`EPOCH_CLEANUP`]) in the transaction that changes the
     /// epoch, before changing it: a process stopped part way does it when
-    /// its publisher next opens. Entries held stay held.
+    /// its publisher next opens, if the new files are all in place, and
+    /// otherwise once its next publication has written them. Entries held
+    /// stay held.
     ///
     /// # Errors
     ///
@@ -5810,7 +5819,7 @@ mod tests {
     }
 
     #[test]
-    fn a_new_epoch_interrupted_before_cleanup_finishes_it_at_open() {
+    fn a_new_epoch_interrupted_before_cleanup_finishes_it_once_its_files_are_in_place() {
         for stop in [EpochStop::BeforeWrite, EpochStop::BeforeCleanup] {
             let mut f = Fixture::new();
             f.publish(&lean_batch(0..1_001, AT, AT));
@@ -5826,10 +5835,21 @@ mod tests {
             assert!(f.exists("feed/1001.json"), "{stop:?}");
             assert!(old.iter().all(|path| f.exists(path)), "{stop:?}");
 
-            // The next open deletes them at once, and clears the flag.
             f.reopen();
-            assert!(!cleanup_noted(&f), "{stop:?}");
             assert_eq!(f.publisher.epoch(), epoch);
+            if stop == EpochStop::BeforeWrite {
+                // The old epoch's index files still name the old files, so
+                // they stay until the next publication writes the new ones.
+                assert!(cleanup_noted(&f));
+                assert!(f.exists("feed/1001.json"));
+                assert!(old.iter().all(|path| f.exists(path)));
+                let index: serde_json::Value = f.file(FEED_INDEX_FILE);
+                assert_ne!(index["epoch"], epoch.as_str());
+                f.publish(&quiet(AT + 60));
+            }
+            // With the new files in place, the old ones go and the flag is
+            // cleared: at the open itself if they were already written.
+            assert!(!cleanup_noted(&f), "{stop:?}");
             assert!(!f.exists("feed/1001.json"), "{stop:?}");
             assert!(!f.exists("feed/1001.json.gz"), "{stop:?}");
             {
@@ -5839,7 +5859,7 @@ mod tests {
                 }
             }
             // The next publication writes what is left to write.
-            f.publish(&quiet(AT + 60));
+            f.publish(&quiet(AT + 120));
             let head: Head = f.file(HEAD_FILE);
             assert_eq!((head.epoch.as_str(), head.seq), (epoch.as_str(), 1_000));
             let segment: FeedSegment = f.file("feed/1.json");
