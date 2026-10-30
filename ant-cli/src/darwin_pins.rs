@@ -184,15 +184,26 @@ const COMMANDS: &[Reviewed] = &[
     ("pointer resolve", NoPayment, &["address"]),
     ("listings", NoPayment, &["since", "all", "state", "carry"]),
     // Reads nodes and the payment chain, and writes files on this machine
-    // only: it stores nothing on the network.
+    // only: it stores nothing on the network. The hide list and the held
+    // file are local files too.
     (
         "listings serve",
         NoPayment,
-        &["state_dir", "out_dir", "carry"],
+        &[
+            "state_dir",
+            "out_dir",
+            "carry",
+            "hide_list",
+            "hold_until_cleared",
+            "held_file",
+        ],
     ),
     // Leaves a file in the producer's state directory, on this machine: no
     // network, no store, no payment.
     ("listings refresh-census", NoPayment, &["state_dir"]),
+    // Leaves a request in the producer's state directory, on this machine:
+    // no network, no store, no payment.
+    ("listings new-epoch", NoPayment, &["state_dir"]),
     ("listing", NoPayment, &["address"]),
     ("manifest", NoPayment, &[]),
     (
