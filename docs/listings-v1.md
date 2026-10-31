@@ -605,7 +605,8 @@ Files are fetched one at a time, so a file can be newer than the
 The producer's operator may also give it two lists, each a file in the same
 format: one address per line, as 64 hex digits in any case, with or without
 `0x`; `#` starts a comment, to the end of its line; blank lines are ignored,
-and a line that isn't an address is skipped (only its number is logged).
+a UTF-8 byte order mark at the start of the file is skipped, and a line that
+isn't an address is skipped (only its number is logged).
 Each list's file is looked at again at the start of each cycle and before
 each publication between cycles, and read again when its modification time
 or length changed. The last list read is kept in the producer's state: while

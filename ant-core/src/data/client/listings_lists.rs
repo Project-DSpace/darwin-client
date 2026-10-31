@@ -17,8 +17,9 @@
 //!
 //! Both lists are in the same format: one address per line, as 64 hex digits
 //! in any case, with or without `0x`, `#` starting a comment, blank lines
-//! ignored ([`AddressList::parse`]). A line that isn't an address is skipped,
-//! and only its number is logged. Each list's file is looked at again at the
+//! ignored, a byte order mark at the start of the file skipped
+//! ([`AddressList::parse`]). A line that isn't an address is skipped, and
+//! only its number is logged. Each list's file is looked at again at the
 //! start of each cycle and before each publication between cycles, and read
 //! again when its modification time or length changed. The last list read is
 //! kept in the producer's store: a file that is missing or can't be read keeps
@@ -46,10 +47,13 @@ impl AddressList {
     /// that aren't one. Anything after a `#` is a comment, and blank lines
     /// are ignored. An address is 64 hex digits, in any case, after any
     /// leading `0x`, with nothing else on its line but spaces and a comment.
+    /// A UTF-8 byte order mark at the start, which an editor may put there,
+    /// is skipped, as the gateway skips it; one anywhere else is not.
     #[must_use]
     pub fn parse(text: &str) -> (HashSet<XorName>, Vec<usize>) {
         let mut addresses = HashSet::new();
         let mut skipped = Vec::new();
+        let text = text.strip_prefix('\u{feff}').unwrap_or(text);
         for (index, line) in text.lines().enumerate() {
             let entry = line.split_once('#').map_or(line, |(entry, _)| entry).trim();
             if entry.is_empty() {
@@ -350,6 +354,16 @@ mod tests {
             AddressList::parse("0x\n   # only a comment\n"),
             (HashSet::new(), vec![1])
         );
+        // Saved with a byte order mark: its first line still counts, and a
+        // mark anywhere else is not skipped.
+        let (addresses, skipped) = AddressList::parse(&format!(
+            "\u{feff}{}\n\u{feff}{}\n",
+            hex::encode(a),
+            hex::encode(b)
+        ));
+        assert_eq!(addresses, HashSet::from([a]));
+        assert_eq!(skipped, vec![2]);
+        assert_eq!(AddressList::parse("\u{feff}"), (HashSet::new(), Vec::new()));
     }
 
     #[test]
