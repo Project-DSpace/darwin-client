@@ -90,9 +90,9 @@ an unchanged one is answered `304 Not Modified`, with no body. That includes
 full feed segments: a full segment doesn't change within its epoch, but a new
 epoch (see **How the producer keeps the files** for when one begins) writes
 its segments under the same names, so segments are served to be revalidated,
-not cached. A new epoch also deletes the time pages of the epoch before, and
-its feed segments past the new epoch's last, at once, as soon as the new
-epoch's files are in place: what a reader kept from them is void anyway, as
+not cached. A new epoch also deletes the time pages of the epoch before that
+its own `pages.json` doesn't list, and the feed segments past its own last,
+at once, as soon as the new epoch's files are in place: what a reader kept from them is void anyway, as
 the new `epoch` says.
 
 A web page on another origin reads the files only where the server allows
@@ -639,7 +639,8 @@ a restart too, with one warning for as long as it stays so.
   `{"generated_at": …, "lists_read_at": …, "held": [...]}`. Each held entry
   is as its address's shard holds it, with its `data_map`, and one more
   field, `held_since`: when the publication that first held it began. An
-  entry leaves the file when it is published, hidden, or no longer served.
+  entry leaves the file when it is published, hidden, no longer served, or
+  rejected when its address is decided again.
   `lists_read_at` is the start of the latest cycle at which every list given
   could be read, changed or not, so a reader of the held file can tell how
   current the lists behind it are. All three times are Unix seconds.
@@ -660,8 +661,11 @@ its bytes change), `status.json` last. Then every time page the new
 `pages.json` doesn't list is deleted at once, with its copies, and so is
 every feed segment past the new last one. A producer stopped part way
 finishes deleting them when it next starts, if the new epoch's files are all
-in place, and otherwise once its next publication has written them. Entries
-held stay held. A request for a new epoch is the file `new-epoch` in the
+in place, and otherwise once its next publication has written them. A
+producer started without its state, over an out dir holding an earlier
+feed's files, deletes them the same way once its first publication has
+written its own: every time page its `pages.json` doesn't list, and every
+feed segment past its last. Entries held stay held. A request for a new epoch is the file `new-epoch` in the
 state directory, which the producer removes once it has taken it; each
 request is taken once, and one made no later than the latest new epoch
 began is already answered.

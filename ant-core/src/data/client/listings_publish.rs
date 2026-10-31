@@ -36,16 +36,18 @@
 //!   `status.json` is;
 //! - time pages that `pages.json` no longer lists are deleted
 //!   [`SUPERSEDED_KEPT`] after the `pages.json` written last listed them;
-//! - but on a new epoch ([`Publisher::start_epoch`]), every time page the
-//!   new `pages.json` doesn't list, and every feed segment past its last, is
+//! - but on a new epoch ([`Publisher::start_epoch`], or a first start over
+//!   an earlier feed's files: [`Publisher::open`]), every time page the new
+//!   `pages.json` doesn't list, and every feed segment past its last, is
 //!   deleted at once, once the new epoch's files are written.
 //!
 //! What the producer's lists ([`listings_lists`](super::listings_lists))
 //! say is applied as each publication is recorded ([`Publisher::set_rules`]):
 //! a hidden address gets no put, removal, support or row in `rejected.json`
 //! (a row it had is cleared), and a held entry gets no put, but is kept in
-//! the held set ([`HELD_DB`]) until it is published, hidden, or decided
-//! gone ([`Publication::released`]). While entries are held, a readable
+//! the held set ([`HELD_DB`]) until it is published, hidden, no longer
+//! served, or rejected when its address is decided again
+//! ([`Publication::released`]). While entries are held, a readable
 //! address not cleared and not published has no row in `rejected.json`
 //! either, held or not ([`Rules::holds`]).
 //!
@@ -352,7 +354,10 @@ impl Publisher {
     /// directory itself), keeping the published index in `store`. The
     /// first time, it starts a feed under a new epoch ([`new_epoch`]), with
     /// no records and no entries, and its first publication writes every
-    /// file. Leftovers of an interrupted write are removed.
+    /// file; then, if `out_dir` held an earlier feed's files, every time
+    /// page the new `pages.json` doesn't list and every feed segment past
+    /// the new last one is deleted at once, as on [`Self::start_epoch`].
+    /// Leftovers of an interrupted write are removed.
     ///
     /// # Errors
     ///
@@ -377,7 +382,7 @@ impl Publisher {
         let seq = number(SEQ)?.unwrap_or(0);
         let count = number(COUNT)?.unwrap_or(0);
         let epoch_at = number(EPOCH_AT)?.unwrap_or(0);
-        let cleanup = dbs
+        let mut cleanup = dbs
             .meta_text
             .get(&txn, EPOCH_CLEANUP)
             .map_err(store_error)?
@@ -385,6 +390,18 @@ impl Publisher {
         let generated_at = number(GENERATED_AT)?;
         let mut support_at = number(SUPPORT_AT)?;
         let mut feed_written = number(FEED_WRITTEN)?.unwrap_or(0);
+        if fresh && !(files.stray_pages()?.is_empty() && files.segments()?.is_empty()) {
+            // Files of an earlier feed in the directory: this feed is a new
+            // epoch, so the time pages its `pages.json` doesn't list, and
+            // the feed segments past its last, go at once when its first
+            // publication has written its files, as a new epoch's do
+            // ([`Self::start_epoch`]), not a day later. Noted in the store,
+            // so a process stopped before then does it at the next one.
+            dbs.meta_text
+                .put(&mut txn, EPOCH_CLEANUP, "1")
+                .map_err(store_error)?;
+            cleanup = true;
+        }
         let held = !fresh && files.holds(&epoch, feed_written, seq);
         if !held {
             // Every file is written again, as on the first publication.
@@ -399,15 +416,6 @@ impl Publisher {
             dbs.meta_numbers
                 .delete(&mut txn, SUPPORT_AT)
                 .map_err(store_error)?;
-            if fresh {
-                // Time pages of an earlier feed in the directory go as any
-                // page `pages.json` no longer lists does.
-                for path in files.stray_pages()? {
-                    dbs.pages
-                        .put(&mut txn, &superseded_row(unix_now(), &path), &[])
-                        .map_err(store_error)?;
-                }
-            }
         }
         // The directory has all of this epoch's files only if they are its
         // and nothing is left to write.
@@ -5029,12 +5037,10 @@ mod tests {
         let mut publisher = open(&out, &store);
         assert!(!temp.exists());
         assert_eq!(publisher.files_bytes(), 2);
-        // The earlier feed's page goes a day after the new feed begins.
-        publisher.publish(&quiet(unix_now())).unwrap();
+        // The earlier feed's page goes once the new feed's first files are
+        // in place, not a day later.
         assert!(stray.exists());
-        publisher
-            .publish(&quiet(unix_now() + SUPERSEDED_KEPT.as_secs() + 60))
-            .unwrap();
+        publisher.publish(&quiet(unix_now())).unwrap();
         assert!(!stray.exists());
     }
 
@@ -5816,6 +5822,51 @@ mod tests {
         // And nothing is left to delete a day later.
         f.publish(&quiet(AT + SUPERSEDED_KEPT.as_secs() + 120));
         assert_eq!(pages_on_disk(&f), pages_listed(&f));
+    }
+
+    #[test]
+    fn a_first_start_over_an_earlier_feed_deletes_its_files_at_once() {
+        let mut f = Fixture::new();
+        // An earlier feed: two segments, over time pages.
+        f.publish(&lean_batch(0..1_001, AT, AT));
+        assert!(f.exists("feed/1001.json"));
+        let old = pages_on_disk(&f);
+        assert!(!old.is_empty());
+        // Started again without its state, on the same out dir.
+        let store =
+            ListingsStore::open_with_map_size(&f.dir.path().join("store-new"), TEST_MAP).unwrap();
+        f.publisher = open(&f.out(), &store);
+        f.store = store;
+        assert_ne!(f.publisher.epoch(), EPOCH_TEXT);
+        // Noted in the store, and kept across a restart before the first
+        // publication: the earlier feed's index files still name its files,
+        // so they stay until the new ones are written.
+        assert!(cleanup_noted(&f));
+        f.reopen();
+        assert!(cleanup_noted(&f));
+        assert!(f.exists("feed/1001.json"));
+        assert!(old.iter().all(|path| f.exists(path)));
+
+        f.publish(&lean_batch(0..3, AT + 60, AT + 60));
+        assert!(!cleanup_noted(&f));
+        // No segment past the new last one, and no page the new pages.json
+        // doesn't list, with their copies.
+        for path in ["feed/1001.json", "feed/1001.json.gz", "feed/1001.json.zst"] {
+            assert!(!f.exists(path), "{path}");
+        }
+        assert_eq!(f.publisher.files.segments().unwrap(), BTreeSet::from([1]));
+        let listed = pages_listed(&f);
+        assert_eq!(pages_on_disk(&f), listed);
+        let gone: Vec<&String> = old.difference(&listed).collect();
+        assert!(!gone.is_empty());
+        for path in gone {
+            for suffix in ["", ".gz", ".zst"] {
+                assert!(!f.exists(&format!("{path}{suffix}")), "{path}{suffix}");
+            }
+        }
+        // An entry only the earlier feed had is named in no file.
+        assert!(!named_anywhere(&f, &address(5)));
+        assert!(named_anywhere(&f, &address(1)));
     }
 
     #[test]
