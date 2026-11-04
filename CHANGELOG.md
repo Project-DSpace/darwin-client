@@ -11,6 +11,20 @@ Our changes on top of upstream 0.3.11 (ant-core 0.13.0). Releases are tagged `vX
 ant-cli's version set to match; other builds are told apart by the commit `darwin --version`
 prints. Upstream's entries follow.
 
+- Unreleased, after `v0.3.11+ds.9`: `darwin listings serve` starts again on a new socket when a
+  node that left its census ignores its own. A node can keep ignoring every new connection from
+  one socket (an address and port), as after a relay that socket reached it through closed, while
+  it answers any other; the producer keeps one socket for as long as it runs, so such a node
+  answered none of its probes until the producer was restarted, and `refresh-census` didn't help.
+  Each cycle's census upkeep now also probes the nodes that left 10 minutes ago or more and don't
+  answer the producer's own probe from a node started for that round alone (client mode, port 0,
+  a new identity, the client's transport settings, no bootstrap peers, shut down after the round),
+  at most once every 10 minutes. If one answers it, then once the cycle ends the producer logs a
+  warning naming the nodes, stops as on SIGTERM (ending its watches and saving its peer cache) and
+  exits with an error, so that its service manager (systemd's `Restart=always`) starts it again,
+  on a new socket, from its state. In the library: `listings_census::probe_fresh`,
+  `listings_census::FRESH_PROBE_AFTER` and `CensusChange::ignored_socket`, and `Producer::run`
+  returns that error.
 - `v0.3.11+ds.9`, the producer's lists: ant-cli's version is 0.3.11+ds.9 (ant-core stays
   0.13.0). `darwin listings serve` takes three new options, all off by default. `--hide-list
   FILE` names addresses the producer publishes nothing of: no entry, support, row in

@@ -10,14 +10,19 @@
 //! probed runs on a tokio runtime of its own, so stopping that runtime drops
 //! its tasks where they stand: no connection is closed and its peers are told
 //! nothing, as when a process is killed.
+//!
+//! Also the census's probe from a fresh socket
+//! (`listings_census::probe_fresh`): from a node started for the probe alone,
+//! it reaches a node by its address and reads its id there.
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-use ant_core::data::client::listings_census::{probe_peer, PROBE_TIMEOUT};
+use ant_core::data::client::listings_census::{probe_fresh, probe_peer, PROBE_TIMEOUT};
 use ant_core::data::Network;
 use ant_protocol::transport::{
     CoreNodeConfig, IPDiversityConfig, MultiAddr, NodeIdentity, P2PNode, PeerId,
 };
+use std::collections::BTreeSet;
 use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -151,4 +156,49 @@ fn a_node_restarted_on_its_port_answers_a_probe_over_a_stale_connection() {
     });
 
     restarted.kill();
+}
+
+#[test]
+fn a_fresh_probe_reaches_a_node_by_address_and_reads_its_id() {
+    let port = free_port();
+    let identity = Arc::new(NodeIdentity::generate().expect("an identity"));
+    let probed = OwnRuntimeNode::start(identity, port).expect("start the node");
+    let peer = probed.peer_id;
+    let address = MultiAddr::quic(SocketAddr::new(Ipv4Addr::LOCALHOST.into(), port));
+    let other = *NodeIdentity::generate()
+        .expect("another identity")
+        .peer_id();
+
+    let client = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("a runtime");
+    client.block_on(async {
+        let node = P2PNode::new(node_config(0, None))
+            .await
+            .expect("the client's node");
+        node.start().await.expect("start the client's node");
+        let network = Network::from_node(Arc::new(node));
+        let started = Instant::now();
+        let answered = probe_fresh(&network, &[(peer, vec![address.clone()])]).await;
+        assert_eq!(
+            answered,
+            BTreeSet::from([peer]),
+            "the node must answer at its address, as itself (took {:?})",
+            started.elapsed()
+        );
+        assert!(
+            !network.is_peer_connected(&peer).await,
+            "the probe must come from a node of its own, not the client's"
+        );
+        assert!(
+            probe_fresh(&network, &[(other, vec![address.clone()])])
+                .await
+                .is_empty(),
+            "a node that gives another id at the address isn't the one probed"
+        );
+        assert!(probe_fresh(&network, &[]).await.is_empty());
+    });
+
+    probed.kill();
 }
