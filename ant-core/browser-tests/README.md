@@ -53,9 +53,9 @@ The test starts seven real darwin-node nodes and an isolated Anvil chain, then
 uses Chromium's real WebRTC implementation. [`node-revision`](node-revision)
 pins the node: darwin-node's repository, then the revision. It is the revision
 `ant-core/Cargo.toml` pins for the tests and the devnet, so the browser and the
-native suites run the same nodes (the native suite's nodes dial in upstream's order;
-the workspace `Cargo.toml` says why, beside its `webrtc` patch);
-`scripts/darwin-node-pin.py`, which CI runs, checks that the pins agree. It is
+native suites run the same nodes, which dial a verified direct address before a
+relay in both (the native suite's are built with `vendor/saorsa-core`, darwin-node's
+copy); `scripts/darwin-node-pin.py`, which CI runs, checks that the pins agree. It is
 currently `363640e`: darwin-node's `main` released as `v0.23.0+ds.20`, which
 brings the price curve (100 DARWIN per GB of full chunks on empty nodes,
 divisor 2,000, quoted from its switch time, both curves accepted) and root

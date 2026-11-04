@@ -5,8 +5,8 @@
 # workflow artifact. Also checks that upstream's installers stay deleted, that
 # the vendored ant-listings and saorsa-core are the git objects their
 # VENDORED.md records, that the darwin-node revision the tests run is pinned
-# alike everywhere, with vendor/ant-protocol equal to its copy, and that the
-# release gate holds (scripts/check-workflows.sh).
+# alike everywhere, with vendor/ant-protocol and vendor/saorsa-core equal to
+# its copies, and that the release gate holds (scripts/check-workflows.sh).
 #
 # The artifact is CI output, made whether or not test.yml's end-to-end and
 # browser tests pass: for trying a commit, not for deployment. Deployments
@@ -95,11 +95,12 @@ jobs:
       # ant-core's tests and devnet build darwin-node at one revision, which
       # browser-tests/node-revision, ant-core/Cargo.toml, the webrtc patch and
       # Cargo.lock must all name. The workspace's [patch] builds that
-      # darwin-node against this repository's vendor/ant-protocol, so a copy
-      # that drifted from darwin-node's would never show in a build: the
-      # script fetches the revision and compares the two as git trees, every
-      # file byte for byte as committed.
-      - name: One darwin-node revision, and vendor/ant-protocol is its copy
+      # darwin-node against this repository's vendor/ant-protocol and
+      # vendor/saorsa-core, so a copy that drifted from darwin-node's would
+      # never show in a build: the script fetches the revision and compares
+      # each copy with darwin-node's as git trees, every file byte for byte as
+      # committed.
+      - name: One darwin-node revision, and vendor/ant-protocol and vendor/saorsa-core are its copies
         run: python3 scripts/darwin-node-pin.py --vendored
 
       # The release gate: release.yml publishes a client only after the
@@ -130,13 +131,15 @@ jobs:
           components: clippy
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       # Clippy lints this repository's own crates, ant-core and ant-cli.
-      # --no-deps leaves out the vendored crates, copies kept as they were
-      # vendored, which are workspace members only so that their own tests run
-      # under this lock: clippy lints every member it builds, and
-      # vendor/saorsa-core, upstream's code, has findings such as
-      # too_many_arguments. RUSTFLAGS still turns rustc's own warnings into
-      # errors in them.
+      # --no-deps leaves out the workspace members they build:
+      # vendor/saorsa-core, upstream's code kept as darwin-node vendors it,
+      # which is a member only so that its own tests run under this lock and
+      # has clippy findings such as too_many_arguments, and vendor/ant-listings,
+      # which the next run lints. RUSTFLAGS still turns rustc's own warnings
+      # into errors in both.
       - run: cargo clippy --locked --all-targets --all-features --no-deps -- -D warnings
+      # vendor/ant-listings alone, with the same flags, so it is still linted.
+      - run: cargo clippy --locked -p ant-listings --all-targets --all-features --no-deps -- -D warnings
 
   linux-x64:
     # Pinned to the servers' Ubuntu release: a binary built against a newer

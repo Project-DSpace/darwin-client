@@ -12,11 +12,12 @@ script checks agree:
 - Cargo.lock: every package resolved from darwin-node.
 
 With --vendored it also fetches that revision, into a temporary repository,
-and checks that this repository's vendor/ant-protocol, as committed at HEAD,
-is darwin-node's vendor/ant-protocol at the revision: the same git tree, so
-every file is byte for byte the same, as committed. The workspace's `[patch]`
-builds darwin-node against this repository's copy, so a copy that drifted
-from darwin-node's would never show in a build.
+and checks that this repository's vendor/ant-protocol and vendor/saorsa-core,
+as committed at HEAD, are darwin-node's at the revision: the same git trees,
+so every file is byte for byte the same, as committed. The workspace's
+`[patch]` builds darwin-node against this repository's copies, so a copy that
+drifted from darwin-node's would never show in a build, and a change to
+either copy alone, here or in darwin-node, fails this check.
 
 With --release, which release.yml runs before a client is published, it also
 checks that the revision is on darwin-node's main (a released node, never an
@@ -24,7 +25,7 @@ unmerged branch commit) and has NODE_RELEASE_1A, node release 1a's commit on
 that main, as an ancestor or is that commit.
 
     darwin-node-pin.py             check that the pins agree
-    darwin-node-pin.py --vendored  and that vendor/ant-protocol is darwin-node's
+    darwin-node-pin.py --vendored  and that both vendored copies are darwin-node's
     darwin-node-pin.py --release   and that the revision may be released against
 
 Needs Python 3.11+ (tomllib), and git for --vendored.
@@ -39,7 +40,10 @@ import tomllib
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 NODE_REVISION = ROOT / "ant-core" / "browser-tests" / "node-revision"
-VENDORED = "vendor/ant-protocol"
+# The copies of darwin-node's vendored crates: its price curve's protocol
+# crate, and the network library that dials a verified direct address before
+# a relay.
+VENDORED = ("vendor/ant-protocol", "vendor/saorsa-core")
 
 # The oldest darwin-node revision a client release may be tested against:
 # node release 1a's commit on darwin-node's main. Client release 1a's busy
@@ -127,28 +131,46 @@ def tree_entries(tree, cwd):
     return entries
 
 
-def check_vendored(repository, revision):
-    """This repository's vendor/ant-protocol at HEAD is darwin-node's at `revision`."""
-    ours = git("rev-parse", f"HEAD:{VENDORED}")
+def object_id(name, cwd):
+    """The object `name` (such as HEAD:vendor/x) names, or None if none."""
+    found = subprocess.run(
+        ["git", "rev-parse", "--verify", "--quiet", name],
+        cwd=cwd, capture_output=True, text=True,
+    )
+    return found.stdout.strip() if found.returncode == 0 else None
+
+
+def check_vendored(repository, revision, root=ROOT):
+    """Each of VENDORED in the repository at `root`, as committed at HEAD, is
+    darwin-node's at `revision`: the same git tree. Returns {copy: tree}."""
+    ours = {copy: object_id(f"HEAD:{copy}", root) for copy in VENDORED}
+    lines = []
     with tempfile.TemporaryDirectory() as scratch:
         git("init", "--quiet", "--bare", scratch, cwd=scratch)
         git("fetch", "--quiet", "--depth", "1", "--no-tags", repository, revision, cwd=scratch)
-        theirs = git("rev-parse", f"{revision}:{VENDORED}", cwd=scratch)
-        if ours == theirs:
-            return ours
-        their_files = tree_entries(theirs, scratch)
-    our_files = tree_entries(ours, ROOT)
-    lines = [
-        f"{VENDORED} at HEAD is tree {ours}; darwin-node's at {revision} is {theirs}:"
-    ]
-    for path in sorted(our_files.keys() | their_files.keys()):
-        if path not in their_files:
-            lines.append(f"  only here: {path}")
-        elif path not in our_files:
-            lines.append(f"  only in darwin-node: {path}")
-        elif our_files[path] != their_files[path]:
-            lines.append(f"  differs: {path}")
-    raise Mismatch("\n".join(lines))
+        for copy in VENDORED:
+            theirs = object_id(f"{revision}:{copy}", scratch)
+            if ours[copy] is None or theirs is None:
+                side = "HEAD here" if ours[copy] is None else f"darwin-node at {revision}"
+                lines.append(f"{copy} is missing from {side}")
+                continue
+            if ours[copy] == theirs:
+                continue
+            their_files = tree_entries(theirs, scratch)
+            our_files = tree_entries(ours[copy], root)
+            lines.append(
+                f"{copy} at HEAD is tree {ours[copy]}; darwin-node's at {revision} is {theirs}:"
+            )
+            for path in sorted(our_files.keys() | their_files.keys()):
+                if path not in their_files:
+                    lines.append(f"  only here: {path}")
+                elif path not in our_files:
+                    lines.append(f"  only in darwin-node: {path}")
+                elif our_files[path] != their_files[path]:
+                    lines.append(f"  differs: {path}")
+    if lines:
+        raise Mismatch("\n".join(lines))
+    return ours
 
 
 def check_release(repository, revision, oldest=NODE_RELEASE_1A):
@@ -196,8 +218,8 @@ def main(argv):
         packages = check_pins(repository, revision)
         print(f"darwin-node {revision} ({repository}): {', '.join(packages)}")
         if argv[1:] in (["--vendored"], ["--release"]):
-            tree = check_vendored(repository, revision)
-            print(f"{VENDORED} is darwin-node's at {revision} (tree {tree})")
+            for copy, tree in check_vendored(repository, revision).items():
+                print(f"{copy} is darwin-node's at {revision} (tree {tree})")
         if argv[1:] == ["--release"]:
             check_release(repository, revision)
             print(f"darwin-node {revision} is on its main, and may be released against")

@@ -140,7 +140,8 @@ ant-cli/src/
 ```bash
 cargo check              # Fast compilation check
 cargo test --all         # Run all unit and integration tests
-cargo clippy --all-targets --all-features --no-deps -- -D warnings  # Lint (not the vendored crates)
+cargo clippy --all-targets --all-features --no-deps -- -D warnings  # Lint our crates (not vendor/saorsa-core)
+cargo clippy -p ant-listings --all-targets --all-features --no-deps -- -D warnings  # Lint vendor/ant-listings
 cargo fmt --all -- --check  # Format check
 cargo run --bin darwin -- --help  # Run the CLI
 ```

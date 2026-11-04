@@ -30,10 +30,14 @@ prints. Upstream's entries follow.
   is optimised in dev and test builds as the other dependencies are. The Build workflow runs those
   tests (`cargo test --locked -p saorsa-core --lib`) and checks the copy's git objects against its
   `VENDORED.md`, and `lock_pins` pins the patch, the one saorsa-core in `Cargo.lock`, the address
-  priority and the copy's tests of the order. Its clippy job, and the lint command in the README,
-  take `--no-deps`, so that clippy lints this repository's own crates and not the vendored ones:
-  clippy lints every workspace member it builds, and upstream's code has findings such as
-  `too_many_arguments`. saorsa-transport stays 0.38.2.
+  priority and the copy's tests of the order. `scripts/darwin-node-pin.py --vendored` checks that
+  `vendor/saorsa-core`, like `vendor/ant-protocol`, is darwin-node's copy at the revision the tests
+  run, the same git tree. The Build workflow's clippy run, and the lint command in the README,
+  take `--no-deps`, so that clippy doesn't lint `vendor/saorsa-core`: clippy lints every workspace
+  member it builds, and upstream's code has findings such as `too_many_arguments`.
+  `vendor/ant-listings`, which that run linted before as a member ant-core builds, gets a run of
+  its own with the same flags (`cargo clippy -p ant-listings --all-targets --all-features
+  --no-deps -- -D warnings`). saorsa-transport stays 0.38.2.
 - `v0.3.11+ds.10`, the producer on a new socket: ant-cli's version is 0.3.11+ds.10 (ant-core stays
   0.13.0). `darwin listings serve` starts again on a new socket when a
   node that left its census ignores its own. A node can keep ignoring every new connection from

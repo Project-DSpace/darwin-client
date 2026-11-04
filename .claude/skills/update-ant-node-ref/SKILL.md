@@ -1,6 +1,6 @@
 ---
 name: update-ant-node-ref
-description: Move ant-core's tests, devnet and browser harness to another darwin-node revision, keeping every pin alike and vendor/ant-protocol equal to darwin-node's copy, then verify and commit. Use when asked to update ant-node or darwin-node, or /update-ant-node-ref.
+description: Move ant-core's tests, devnet and browser harness to another darwin-node revision, keeping every pin alike and vendor/ant-protocol and vendor/saorsa-core equal to darwin-node's copies, then verify and commit. Use when asked to update ant-node or darwin-node, or /update-ant-node-ref.
 allowed-tools: Bash, Read, Edit, Glob, Grep, AskUserQuestion
 ---
 
@@ -9,7 +9,8 @@ allowed-tools: Bash, Read, Edit, Glob, Grep, AskUserQuestion
 ant-core's tests (the `ant-node` dev-dependency), its `devnet` feature (the `ant-node`
 dependency), the workspace's `webrtc` patch and the browser harness all build darwin-node, the
 Darwin network's node, at one git revision. `scripts/darwin-node-pin.py`, which CI runs, fails
-unless every pin names it and `vendor/ant-protocol` equals darwin-node's copy at it.
+unless every pin names it and `vendor/ant-protocol` and `vendor/saorsa-core` equal darwin-node's
+copies at it.
 
 ## Procedure
 
@@ -34,14 +35,15 @@ cargo update -p ant-node
 
 Never a bare `cargo update`: it moves every dependency.
 
-### Step 4: Check the pins and the vendored copy
+### Step 4: Check the pins and the vendored copies
 
 ```bash
 python3 scripts/darwin-node-pin.py --vendored
 ```
 
-If `vendor/ant-protocol` differs from darwin-node's, stop and report the files the script lists:
-the client's copy follows the node's in a change of its own, reviewed against the fork features.
+If `vendor/ant-protocol` or `vendor/saorsa-core` differs from darwin-node's, stop and report the
+files the script lists: the client's copy follows the node's in a change of its own, reviewed
+against the fork features.
 
 ### Step 5: Build and test
 

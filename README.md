@@ -1169,8 +1169,10 @@ cargo build
 # Run all tests
 cargo test --all
 
-# Lint this repository's own crates (--no-deps leaves out the vendored ones)
+# Lint this repository's own crates, then vendor/ant-listings (--no-deps leaves
+# out vendor/saorsa-core, upstream's code kept as darwin-node vendors it)
 cargo clippy --all-targets --all-features --no-deps -- -D warnings
+cargo clippy -p ant-listings --all-targets --all-features --no-deps -- -D warnings
 
 # Format check
 cargo fmt --all -- --check
@@ -1188,7 +1190,8 @@ it; `cargo test -p ant-core --features test-utils --test e2e -- refusals` runs
 one group (`storage`, `envelopes`, `refusals`, `pointers`, `committed`). CI runs every test target:
 `scripts/test-targets.py` lists where each one runs, or why it is skipped, and
 `scripts/darwin-node-pin.py` checks that the darwin-node revision is pinned
-alike everywhere and that `vendor/ant-protocol` is darwin-node's copy. Before a
+alike everywhere and that `vendor/ant-protocol` and `vendor/saorsa-core` are
+darwin-node's copies at it. Before a
 client release is published, its `--release` check also requires the revision to
 be on darwin-node's main and to be node release 1a's commit there or a later one:
 client release 1a's busy handling has never run against a node from before it.
@@ -1290,8 +1293,10 @@ as darwin-node vendors it, changed only in this (its `VENDORED.md` says how),
 and the workspace's `[patch.crates-io]` puts it in place of the crates.io
 release, for the client and for the in-process nodes of the tests and devnet.
 Its own tests pin the order. The Build workflow runs them
-(`cargo test --locked -p saorsa-core --lib`) and checks the copy's files against
-the git objects its `VENDORED.md` records, and ant-core's `lock_pins` tests pin
+(`cargo test --locked -p saorsa-core --lib`), checks the copy's files against
+the git objects its `VENDORED.md` records and checks that the copy is
+darwin-node's at the revision the tests run (`scripts/darwin-node-pin.py
+--vendored`), and ant-core's `lock_pins` tests pin
 the address priority, that those tests stay and run, and that `Cargo.lock` holds
 one saorsa-core, the vendored copy.
 
