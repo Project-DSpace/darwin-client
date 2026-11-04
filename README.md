@@ -784,7 +784,7 @@ ant-core = { path = "ant-core" }
 ```
 
 From another project, take `ant-core` by a release tag, and repeat this repository's
-`[patch.crates-io]` entry for `ant-protocol` from the same tag:
+`[patch.crates-io]` entries for `ant-protocol` and `saorsa-core` from the same tag:
 
 ```toml
 [dependencies]
@@ -792,9 +792,10 @@ ant-core = { git = "https://github.com/Project-DSpace/darwin-client", tag = "<ta
 
 [patch.crates-io]
 ant-protocol = { git = "https://github.com/Project-DSpace/darwin-client", tag = "<tag>" }
+saorsa-core = { git = "https://github.com/Project-DSpace/darwin-client", tag = "<tag>" }
 ```
 
-`<tag>` is a release's tag, such as `v0.3.11+ds.1`, the same in both lines. The patch puts
+`<tag>` is a release's tag, such as `v0.3.11+ds.1`, the same in every line. The first patch puts
 `vendor/ant-protocol`, upstream's protocol crate with this network's pricing (its price
 curve, the earlier curve it still accepts, and payment by record size), in place
 of the crates.io release. Cargo applies a `[patch]` only in the top-level workspace, so taking
@@ -803,8 +804,15 @@ exactly `ant-protocol` 5.0.0, the vendored copy's version, so a later crates.io 
 take the patch's place, for `ant-core` or for any other crate in your build that uses
 `ant-protocol`.
 
-A project that enables `ant-core`'s `devnet` feature also repeats the other entry of this
-repository's `[patch.crates-io]`, `webrtc` from darwin-node, with the `rev` from the same tag's
+The second puts `vendor/saorsa-core`, the network library saorsa-core 0.29.1 as darwin-node
+vendors it, in place of the crates.io release, so that the client dials a peer's verified direct
+address before its relay (see [Bootstrap multiaddresses and browser
+defaults](#bootstrap-multiaddresses-and-browser-defaults)). Without it, `ant-core` still
+compiles, and dials a relay first, as upstream's does. Releases up to `v0.3.11+ds.10` have no
+`vendor/saorsa-core`: with one of those, leave the `saorsa-core` line out.
+
+A project that enables `ant-core`'s `devnet` feature also repeats this repository's
+`[patch.crates-io]` entry for `webrtc`, from darwin-node, with the `rev` from the same tag's
 `Cargo.toml`:
 
 ```toml
@@ -1161,8 +1169,10 @@ cargo build
 # Run all tests
 cargo test --all
 
-# Lint
-cargo clippy --all-targets --all-features -- -D warnings
+# Lint this repository's own crates, then vendor/ant-listings (--no-deps leaves
+# out vendor/saorsa-core, upstream's code kept as darwin-node vendors it)
+cargo clippy --all-targets --all-features --no-deps -- -D warnings
+cargo clippy -p ant-listings --all-targets --all-features --no-deps -- -D warnings
 
 # Format check
 cargo fmt --all -- --check
@@ -1180,7 +1190,8 @@ it; `cargo test -p ant-core --features test-utils --test e2e -- refusals` runs
 one group (`storage`, `envelopes`, `refusals`, `pointers`, `committed`). CI runs every test target:
 `scripts/test-targets.py` lists where each one runs, or why it is skipped, and
 `scripts/darwin-node-pin.py` checks that the darwin-node revision is pinned
-alike everywhere and that `vendor/ant-protocol` is darwin-node's copy. Before a
+alike everywhere and that `vendor/ant-protocol` and `vendor/saorsa-core` are
+darwin-node's copies at it. Before a
 client release is published, its `--release` check also requires the revision to
 be on darwin-node's main and to be node release 1a's commit there or a later one:
 client release 1a's busy handling has never run against a node from before it.
@@ -1267,6 +1278,27 @@ minutes a seed whose dial fails is, and the next seed in the random order is
 dialled in its place. A read whose possible holders declined waits for the
 first of them to come back, up to three times, and then reports the holders
 busy, to try again shortly, rather than the chunk missing.
+
+A native client dials each peer's addresses in this order: a LAN address first
+when the peer is behind the client's own public IP address; then the peer's
+verified direct address; then its relay, skipped when the relay is behind the
+client's own public IP address; then an unverified address; and a LAN address
+only when nothing else is known. The client's own requests and lookups order a
+peer's addresses the same way (`DHTNode::addresses_by_priority`). Upstream's
+client dials a relay first, so it reached even a node it could reach directly
+through another node's relay, and depended on that relay staying up. A node
+behind NAT has no verified direct address, so its relay is still dialled first.
+The order is the network library's: `vendor/saorsa-core` is saorsa-core 0.29.1
+as darwin-node vendors it, changed only in this (its `VENDORED.md` says how),
+and the workspace's `[patch.crates-io]` puts it in place of the crates.io
+release, for the client and for the in-process nodes of the tests and devnet.
+Its own tests pin the order. The Build workflow runs them
+(`cargo test --locked -p saorsa-core --lib`), checks the copy's files against
+the git objects its `VENDORED.md` records and checks that the copy is
+darwin-node's at the revision the tests run (`scripts/darwin-node-pin.py
+--vendored`), and ant-core's `lock_pins` tests pin
+the address priority, that those tests stay and run, and that `Cargo.lock` holds
+one saorsa-core, the vendored copy.
 
 The config directory is `ant`'s: `~/.config/ant` on Linux,
 `~/Library/Application Support/ant` on macOS, `%APPDATA%\ant` on Windows.

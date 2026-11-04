@@ -827,7 +827,7 @@ dependencies = [
 
 [[package]]
 name = "ant-cli"
-version = "0.3.11+ds.10"
+version = "0.3.11+ds.11"
 dependencies = [
  "ant-core",
  "anyhow",
@@ -5614,8 +5614,6 @@ dependencies = [
 [[package]]
 name = "saorsa-core"
 version = "0.29.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "96eb0b46528062e949d16000877f27e37a535d2c431c49e102e73268f503a104"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -5640,6 +5638,7 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tracing",
+ "tracing-subscriber",
  "uuid",
  "wyz",
 ]

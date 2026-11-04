@@ -3,9 +3,10 @@
 # client binary (from the ant-cli crate) and uploads it,
 # with its licence files and third-party notices, as the `darwin-linux-x64`
 # workflow artifact. Also checks that upstream's installers stay deleted, that
-# the darwin-node revision the tests run is pinned alike everywhere, with
-# vendor/ant-protocol equal to its copy, and that the release gate holds
-# (scripts/check-workflows.sh).
+# the vendored ant-listings and saorsa-core are the git objects their
+# VENDORED.md records, that the darwin-node revision the tests run is pinned
+# alike everywhere, with vendor/ant-protocol and vendor/saorsa-core equal to
+# its copies, and that the release gate holds (scripts/check-workflows.sh).
 #
 # The artifact is CI output, made whether or not test.yml's end-to-end and
 # browser tests pass: for trying a commit, not for deployment. Deployments
@@ -62,14 +63,44 @@ jobs:
             fi
           done
 
+      # vendor/saorsa-core is saorsa-core 0.29.1 from crates.io with only the
+      # dial order changed, as darwin-node vendors it
+      # (vendor/saorsa-core/VENDORED.md): the four patched files and the rest
+      # of the copy are the git objects that file records.
+      - name: Check the vendored saorsa-core
+        shell: bash
+        run: |
+          dir=vendor/saorsa-core
+          patched="src/client_routing.rs src/dht/core_engine.rs src/dht_network_manager.rs src/peer_record.rs"
+          fail=0
+          check() {
+            if [[ -z "$2" || "$3" != "$2" ]]; then
+              echo "::error::$1 is $3; $dir/VENDORED.md records ${2:-none}"
+              fail=1
+            fi
+          }
+          for file in $patched; do
+            recorded=$(sed -n "s|^- $file blob: \([0-9a-f]\{40\}\)\$|\1|p" $dir/VENDORED.md)
+            check "$dir/$file" "$recorded" "$(git rev-parse "HEAD:$dir/$file")"
+          done
+          recorded=$(sed -n "s/^- rest sha256: \([0-9a-f]\{64\}\)\$/\1/p" $dir/VENDORED.md)
+          actual=$(git ls-tree -r HEAD $dir \
+            | awk -F'\t' -v dir="$dir" -v skip="VENDORED.md $patched" '
+                BEGIN { n = split(skip, s, " "); for (i = 1; i <= n; i++) drop[dir "/" s[i]] = 1 }
+                !($2 in drop)' \
+            | sha256sum | cut -d' ' -f1)
+          check "the rest of $dir" "$recorded" "$actual"
+          exit $fail
+
       # ant-core's tests and devnet build darwin-node at one revision, which
       # browser-tests/node-revision, ant-core/Cargo.toml, the webrtc patch and
       # Cargo.lock must all name. The workspace's [patch] builds that
-      # darwin-node against this repository's vendor/ant-protocol, so a copy
-      # that drifted from darwin-node's would never show in a build: the
-      # script fetches the revision and compares the two as git trees, every
-      # file byte for byte as committed.
-      - name: One darwin-node revision, and vendor/ant-protocol is its copy
+      # darwin-node against this repository's vendor/ant-protocol and
+      # vendor/saorsa-core, so a copy that drifted from darwin-node's would
+      # never show in a build: the script fetches the revision and compares
+      # each copy with darwin-node's as git trees, every file byte for byte as
+      # committed.
+      - name: One darwin-node revision, and vendor/ant-protocol and vendor/saorsa-core are its copies
         run: python3 scripts/darwin-node-pin.py --vendored
 
       # The release gate: release.yml publishes a client only after the
@@ -99,7 +130,16 @@ jobs:
           toolchain: stable
           components: clippy
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-      - run: cargo clippy --locked --all-targets --all-features -- -D warnings
+      # Clippy lints this repository's own crates, ant-core and ant-cli.
+      # --no-deps leaves out the workspace members they build:
+      # vendor/saorsa-core, upstream's code kept as darwin-node vendors it,
+      # which is a member only so that its own tests run under this lock and
+      # has clippy findings such as too_many_arguments, and vendor/ant-listings,
+      # which the next run lints. RUSTFLAGS still turns rustc's own warnings
+      # into errors in both.
+      - run: cargo clippy --locked --all-targets --all-features --no-deps -- -D warnings
+      # vendor/ant-listings alone, with the same flags, so it is still linted.
+      - run: cargo clippy --locked -p ant-listings --all-targets --all-features --no-deps -- -D warnings
 
   linux-x64:
     # Pinned to the servers' Ubuntu release: a binary built against a newer
@@ -148,6 +188,14 @@ jobs:
       # here.
       - name: Vendored ant-listings
         run: cargo test --locked -p ant-listings
+
+      # vendor/saorsa-core's own unit tests, under this repository's Cargo.lock
+      # too: the network library the client is built from, the order it dials
+      # a peer's addresses in among them (a verified direct address before a
+      # relay). Its integration tests start networks of nodes and are left out,
+      # as darwin-node leaves them out.
+      - name: Vendored saorsa-core
+        run: cargo test --locked -p saorsa-core --lib
 
       # vendor/ant-protocol's payment tests, below, start Anvil. Pinned, as
       # test.yml pins it.

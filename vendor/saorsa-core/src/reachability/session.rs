@@ -1,0 +1,161 @@
+// Copyright 2024 Saorsa Labs Limited
+//
+// This software is licensed under the MIT license <LICENSE-MIT or
+// https://opensource.org/licenses/MIT> or the Apache License, Version 2.0
+// <LICENSE-APACHE or https://www.apache.org/licenses/LICENSE-2.0>, at your
+// option. This file may not be copied, modified, or distributed except
+// according to those terms.
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under these licenses is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+
+//! MASQUE relay acquisition candidate walk.
+//!
+//! Every non-client node tries to acquire a MASQUE relay from an XOR-closest
+//! peer after bootstrap. Candidates on the same WAN as this node are filtered
+//! out because they do not provide a distinct public route. A candidate whose
+//! Direct address is unreachable will simply fail to accept the CONNECT-UDP
+//! request, and the walker moves to the next-closest peer.
+//!
+//! The acquisition walk only proves that the local node can reserve relay
+//! service from a candidate. The driver must still run third-party canaries
+//! before publishing the relay-allocated address.
+//!
+//! The acquisition walk is a thin wrapper around the reusable
+//! [`RelayAcquisition`] coordinator: build a filtered candidate list from
+//! the routing table, hand it off, and return the outcome.
+
+use std::collections::HashSet;
+use std::sync::Arc;
+use std::time::Duration;
+
+use rand::Rng;
+use tracing::{debug, info, warn};
+
+use crate::PeerId;
+use crate::dht_network_manager::DhtNetworkManager;
+use crate::reachability::acquisition::{AcquiredRelay, RelayAcquisition, RelayCandidate};
+use crate::transport_handle::TransportHandle;
+
+/// Upper bound on the random startup jitter applied before the first
+/// acquisition attempt.
+///
+/// Decorrelates bootstrap-time acquisition stampedes: when many private
+/// nodes come online simultaneously, this prevents them all from hammering
+/// the same 2–3 close public peers in lock-step and tripping per-relay
+/// capacity limits. 2 seconds is short enough to be imperceptible to users
+/// but wide enough to spread load at the tens-of-milliseconds resolution
+/// that matters for QUIC dial handling.
+const STARTUP_JITTER_UPPER_MS: u64 = 2000;
+
+/// Outcome of a single relay acquisition attempt.
+#[derive(Debug, Clone)]
+pub(crate) enum RelayAcquisitionOutcome {
+    /// A MASQUE relay session was successfully established.
+    ///
+    /// The caller (acquisition driver) is responsible for:
+    ///
+    /// 1. Storing the relayer peer ID for the K-closest eviction monitor.
+    /// 2. Publishing the full typed self-record (relay-allocated address
+    ///    tagged [`AddressType::Relay`] first, then one best non-relay
+    ///    address per IP family) to K closest peers.
+    /// 3. Disabling local relay serving so this node does not form a
+    ///    relay loop by accepting reservations while its own traffic
+    ///    tunnels through someone else.
+    Acquired(AcquiredRelay),
+    /// Acquisition did not succeed. The driver should publish the
+    /// direct-only address set (so the network still has some way to
+    /// reach this node) and arm a backoff retry.
+    ///
+    /// `reason` is a human-readable diagnostic for logs / metrics — no
+    /// programmatic consumer switches on its contents.
+    Failed(String),
+}
+
+/// Run a single unconditional relay-acquisition attempt.
+///
+/// Walks the XOR-closest peers in the local routing table, filters to those
+/// advertising at least one `Direct` address that is not on this node's own
+/// WAN IP, and tries each in order via the [`RelayAcquisition`] coordinator
+/// until one accepts a MASQUE CONNECT-UDP reservation.
+///
+/// The "is this candidate public?" check is implicit: a private candidate's
+/// Direct address is unreachable from outside its NAT, so the QUIC dial
+/// fails and the walker advances to the next candidate.
+///
+/// A small randomized startup jitter is applied before the first dial to
+/// prevent correlated bootstrap-time stampedes against the same close-group
+/// peers.
+pub(crate) async fn run_relay_acquisition(
+    dht: &DhtNetworkManager,
+    transport: &Arc<TransportHandle>,
+    excluded_relayers: &HashSet<PeerId>,
+) -> RelayAcquisitionOutcome {
+    let jitter_ms = rand::thread_rng().gen_range(0..STARTUP_JITTER_UPPER_MS);
+    if jitter_ms > 0 {
+        tokio::time::sleep(Duration::from_millis(jitter_ms)).await;
+    }
+
+    let own_key = *dht.peer_id().to_bytes();
+    let closest = dht.find_closest_nodes_local(&own_key, dht.k_value()).await;
+    let local_address_context = dht.local_dial_address_context().await;
+
+    debug!(
+        closest_count = closest.len(),
+        excluded_relayers = excluded_relayers.len(),
+        "relay acquisition: evaluating closest peers for Direct relay candidates"
+    );
+
+    let mut candidates: Vec<RelayCandidate> = Vec::new();
+    for node in &closest {
+        if excluded_relayers.contains(&node.peer_id) {
+            debug!(
+                peer = %node.peer_id.to_hex(),
+                "relay acquisition: skipping relayer rejected by canary in this round"
+            );
+            continue;
+        }
+
+        let typed = node.typed_addresses();
+        let direct =
+            DhtNetworkManager::first_direct_dialable_for_relay(node, &local_address_context);
+        debug!(
+            peer = %node.peer_id.to_hex(),
+            typed_addresses = ?typed,
+            selected_direct = ?direct,
+            "relay acquisition: evaluated peer as relay candidate"
+        );
+        if let Some(direct) = direct {
+            candidates.push(RelayCandidate::new(node.peer_id, direct));
+        }
+    }
+
+    if candidates.is_empty() {
+        warn!("relay acquisition: no direct-addressable candidates in routing table");
+        return RelayAcquisitionOutcome::Failed(
+            "no direct-addressable candidates in routing table".to_string(),
+        );
+    }
+
+    debug!(
+        candidate_count = candidates.len(),
+        "relay acquisition: starting XOR-closest walk"
+    );
+
+    let coordinator = RelayAcquisition::new(Arc::clone(transport));
+    match coordinator.acquire(candidates).await {
+        Ok(relay) => {
+            info!(
+                relayer = ?relay.relayer,
+                allocated = %relay.allocation.public_addr(),
+                "relay acquisition: session established"
+            );
+            RelayAcquisitionOutcome::Acquired(relay)
+        }
+        Err(e) => {
+            warn!(error = %e, "relay acquisition: all candidates failed");
+            RelayAcquisitionOutcome::Failed(e.to_string())
+        }
+    }
+}

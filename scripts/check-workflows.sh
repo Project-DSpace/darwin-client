@@ -232,6 +232,7 @@ else
         'targets=$(python3 scripts/test-targets.py no-nodes)' \
         'cargo test --locked -p ant-core --no-fail-fast $targets' \
         'run: cargo test --locked -p ant-listings' \
+        'run: cargo test --locked -p saorsa-core --lib' \
         'run: cargo test --locked --manifest-path vendor/ant-protocol/Cargo.toml --target-dir target' \
         'run: cargo build --release --locked -p ant-cli --bin darwin --bin darwin-nodes' \
         'run: bash scripts/check-darwin-nodes.sh target/release/darwin-nodes' \
