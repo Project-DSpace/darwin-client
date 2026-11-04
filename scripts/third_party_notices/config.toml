@@ -116,6 +116,10 @@ note = "a modified copy of the crates.io release, kept in vendor/ant-protocol of
 version = "0.4.0"
 note = "a copy of Project-DSpace/darwin-listings v0.4.0 (commit a58de649e66584c0ed7d6e3868d79f37f3aeac40), which is not published on crates.io, kept in vendor/ant-listings of the repository this build is made from; its Source above is that copy. Its files are those of that commit, without the .github folder, plus a VENDORED.md saying where they come from."
 
+[remark.saorsa-core]
+version = "0.29.1"
+note = "a modified copy of the crates.io release, kept in vendor/saorsa-core of the repository this build is made from; its Source above is that copy. The one change is the order a peer's addresses are dialled in, a verified direct address before a relay: AddressType::priority in src/peer_record.rs, the dial plan in src/dht_network_manager.rs and the stored order in src/dht/core_engine.rs, with upstream's order kept as AddressType::tag_rank for re-tagging and the lookup tie-break in src/client_routing.rs (see vendor/saorsa-core/VENDORED.md)."
+
 # Crates whose published files and repository contain no text of any licence
 # they are offered under. Each entry is for one reviewed version; it supplies
 # the canonical text of one of those licences, pinned by checksum, and says

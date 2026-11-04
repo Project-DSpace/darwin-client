@@ -278,6 +278,10 @@ edit "${BUILD}" '        run: cargo test --locked -p ant-core --lib && cargo tes
 expect "ant-cli's tests left out" "linux-x64 job no longer runs every test before the build it uploads"
 
 fresh
+edit "${BUILD}" '        run: cargo test --locked -p saorsa-core --lib' '        run: "true"'
+expect "the vendored saorsa-core's tests not run" "(missing: run: cargo test --locked -p saorsa-core --lib)"
+
+fresh
 edit "${BUILD}" '        run: bash scripts/check-darwin-nodes.sh target/release/darwin-nodes' '        run: "true"'
 expect "the release darwin-nodes not checked" "(missing: run: bash scripts/check-darwin-nodes.sh target/release/darwin-nodes)"
 

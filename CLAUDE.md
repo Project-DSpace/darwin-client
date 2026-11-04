@@ -140,7 +140,7 @@ ant-cli/src/
 ```bash
 cargo check              # Fast compilation check
 cargo test --all         # Run all unit and integration tests
-cargo clippy --all-targets --all-features -- -D warnings  # Lint
+cargo clippy --all-targets --all-features --no-deps -- -D warnings  # Lint (not the vendored crates)
 cargo fmt --all -- --check  # Format check
 cargo run --bin darwin -- --help  # Run the CLI
 ```

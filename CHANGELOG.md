@@ -11,6 +11,29 @@ Our changes on top of upstream 0.3.11 (ant-core 0.13.0). Releases are tagged `vX
 ant-cli's version set to match; other builds are told apart by the commit `darwin --version`
 prints. Upstream's entries follow.
 
+- Unreleased, after `v0.3.11+ds.10`: the client dials a peer's verified direct address before its
+  relay. `vendor/saorsa-core` is the network library saorsa-core 0.29.1 as darwin-node vendors it
+  (since its ds.17; this copy is its `v0.23.0+ds.20`'s, byte for byte), changed only in the order
+  a peer's addresses are dialled in (its `VENDORED.md`), and the workspace's `[patch.crates-io]`
+  puts it in place of the crates.io release. A native client now dials a LAN address first when
+  the peer is behind the client's own public IP address, then a verified direct address, then the
+  relay (skipped when the relay is behind the client's own public IP address), then an unverified
+  address, and a LAN address only when nothing else is known. Upstream's dials the relay first, so
+  the client reached even nodes it could reach directly through other nodes' relays, and depended
+  on those relays staying up. A node behind NAT has no verified direct address, so its relay is
+  still dialled first. The library orders a peer's addresses the same way
+  (`AddressType::priority`, `DHTNode::addresses_by_priority`), and the in-process nodes of the
+  tests and devnet are built with the copy, as darwin-node's nodes are. A project that takes
+  `ant-core` by git repeats the new `saorsa-core` entry of `[patch.crates-io]` from the same tag
+  (README, "Rust Library API"); without it, the library dials a relay first, as before.
+  `vendor/saorsa-core` is a workspace member, so that its own unit tests run under this lock, and
+  is optimised in dev and test builds as the other dependencies are. The Build workflow runs those
+  tests (`cargo test --locked -p saorsa-core --lib`) and checks the copy's git objects against its
+  `VENDORED.md`, and `lock_pins` pins the patch, the one saorsa-core in `Cargo.lock`, the address
+  priority and the copy's tests of the order. Its clippy job, and the lint command in the README,
+  take `--no-deps`, so that clippy lints this repository's own crates and not the vendored ones:
+  clippy lints every workspace member it builds, and upstream's code has findings such as
+  `too_many_arguments`. saorsa-transport stays 0.38.2.
 - `v0.3.11+ds.10`, the producer on a new socket: ant-cli's version is 0.3.11+ds.10 (ant-core stays
   0.13.0). `darwin listings serve` starts again on a new socket when a
   node that left its census ignores its own. A node can keep ignoring every new connection from

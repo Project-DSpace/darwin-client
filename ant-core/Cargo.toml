@@ -101,12 +101,13 @@ sysinfo = { version = "0.32", default-features = false, features = ["system"], o
 # the same revision as the dev-dependency below and
 # `browser-tests/node-revision`, so the devnet and every test run the nodes
 # the network runs, not upstream's. The workspace's `[patch.crates-io]`
-# compiles it against this repository's `vendor/ant-protocol` and darwin-node's
-# patched webrtc; CI checks that `vendor/ant-protocol` equals darwin-node's copy
-# at this revision. It must track the same `saorsa-core` / `ant-protocol` line
-# as the `ant-protocol` pin above — a version skew pulls a second copy of
-# `saorsa-core` into the graph and makes `ant_node`'s and `ant_protocol`'s
-# `MultiAddr` mutually incompatible in `node/devnet.rs`.
+# compiles it against this repository's `vendor/ant-protocol` and
+# `vendor/saorsa-core` and darwin-node's patched webrtc; CI checks that
+# `vendor/ant-protocol` equals darwin-node's copy at this revision. It must
+# track the same `saorsa-core` / `ant-protocol` line as the `ant-protocol` pin
+# above — a version skew pulls a second copy of `saorsa-core` into the graph
+# and makes `ant_node`'s and `ant_protocol`'s `MultiAddr` mutually
+# incompatible in `node/devnet.rs`.
 ant-node = { git = "https://github.com/Project-DSpace/darwin-node.git", rev = "363640e5eb997844e34b673878d32a3c160d28ff", optional = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = true }
 
