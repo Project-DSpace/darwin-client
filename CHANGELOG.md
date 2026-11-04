@@ -11,7 +11,8 @@ Our changes on top of upstream 0.3.11 (ant-core 0.13.0). Releases are tagged `vX
 ant-cli's version set to match; other builds are told apart by the commit `darwin --version`
 prints. Upstream's entries follow.
 
-- Unreleased, after `v0.3.11+ds.9`: `darwin listings serve` starts again on a new socket when a
+- `v0.3.11+ds.10`, the producer on a new socket: ant-cli's version is 0.3.11+ds.10 (ant-core stays
+  0.13.0). `darwin listings serve` starts again on a new socket when a
   node that left its census ignores its own. A node can keep ignoring every new connection from
   one socket (an address and port), as after a relay that socket reached it through closed, while
   it answers any other; the producer keeps one socket for as long as it runs, so such a node
