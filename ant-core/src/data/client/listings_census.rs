@@ -80,7 +80,8 @@
 //!   it at most once in that time. When a round may be made, the upkeep
 //!   probes the nodes out that long first, those no round probed before
 //!   those a round probed longest ago, so the rounds take a list longer
-//!   than [`PROBE_CONCURRENCY`] in turn.
+//!   than [`PROBE_CONCURRENCY`] in turn. Each round's counts are reported
+//!   ([`CensusChange::fresh_round`]), and the producer logs them.
 //! - **Drops.** A published listing is dropped only on evidence for its
 //!   address within one cycle ([`Census::confirm_drop`]): all
 //!   [`NEAREST_NODES`] of the census's nodes nearest it answered and serve no
@@ -157,7 +158,7 @@ use rand::{Rng, SeedableRng};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 
-use crate::data::client::listings::{unix_now, ListingsRequests, RECENT_READS};
+use crate::data::client::listings::{unix_now, ListingsRequests, RECENT_READS, REQUEST_TIMEOUT};
 use crate::data::client::listings_store::{store_error, ListingsStore};
 use crate::data::client::listings_v1::{CensusStatus, SilentNode, VersionCount};
 use crate::data::client::Client;
@@ -327,6 +328,22 @@ pub struct CensusChange {
     /// this process's probe, in the same upkeep: they ignore this process's
     /// socket. They stay on the list, as only a new socket reaches them.
     pub ignored_socket: Vec<PeerId>,
+    /// The fresh round the upkeep made ([`probe_fresh`]), if it made one:
+    /// how many nodes it probed and how many answered, whether or not any
+    /// did. Where changes are added up ([`Self::absorb`]), so are the counts
+    /// of their rounds.
+    pub fresh_round: Option<FreshRoundOutcome>,
+}
+
+/// What a fresh round did ([`probe_fresh`], [`CensusChange::fresh_round`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FreshRoundOutcome {
+    /// How many nodes it probed: those on the re-probe list, out
+    /// [`FRESH_PROBE_AFTER`] or longer, that answered no probe from this
+    /// process.
+    pub probed: usize,
+    /// How many of them answered the round's probe.
+    pub answered: usize,
 }
 
 impl CensusChange {
@@ -339,7 +356,7 @@ impl CensusChange {
     /// Add what `later` changed after this: a node that joined and then
     /// left counts as left, and one that left and then joined as joined. A
     /// node that ignored this process's socket and then joined no longer
-    /// does.
+    /// does. The counts of fresh rounds are added.
     pub fn absorb(&mut self, later: CensusChange) {
         let joined: BTreeSet<PeerId> = later.joined.iter().copied().collect();
         let left: BTreeSet<PeerId> = later.left.iter().copied().collect();
@@ -364,6 +381,15 @@ impl CensusChange {
         for peer in later.unanswered {
             if !self.unanswered.contains(&peer) {
                 self.unanswered.push(peer);
+            }
+        }
+        if let Some(round) = later.fresh_round {
+            match &mut self.fresh_round {
+                Some(earlier) => {
+                    earlier.probed += round.probed;
+                    earlier.answered += round.answered;
+                }
+                None => self.fresh_round = Some(round),
             }
         }
     }
@@ -908,7 +934,7 @@ impl Census {
                 self.set_user_agent(&peer, agent);
             }
         }
-        change.ignored_socket = self.fresh_round(lookups, &silent, now).await;
+        change.absorb(self.fresh_round(lookups, &silent, now).await);
         change
     }
 
@@ -924,16 +950,18 @@ impl Census {
     /// this upkeep's probes didn't reach, from a node of their own
     /// ([`Lookups::probe_fresh`]), at `now` (Unix seconds), unless a round
     /// may not be made yet ([`Self::fresh_round_open`]). Each node probed is
-    /// noted as probed so now. Returns those that answered it: they ignore
-    /// this process's socket, and are kept for [`Self::take_changes`] too.
+    /// noted as probed so now. Returns what the round found: the nodes that
+    /// answered it, which ignore this process's socket, and the round's
+    /// counts ([`CensusChange::fresh_round`]), nothing if none was made. It
+    /// is kept for [`Self::take_changes`] too.
     async fn fresh_round<L: Lookups>(
         &mut self,
         lookups: &L,
         silent: &[(PeerId, Vec<MultiAddr>)],
         now: u64,
-    ) -> Vec<PeerId> {
+    ) -> CensusChange {
         if silent.is_empty() || !self.fresh_round_open(now) {
-            return Vec::new();
+            return CensusChange::default();
         }
         self.fresh_round_at = Some(now);
         for (peer, _) in silent {
@@ -951,13 +979,17 @@ impl Census {
             silent.len(),
             ignored.len()
         );
-        if !ignored.is_empty() {
-            self.changes.absorb(CensusChange {
-                ignored_socket: ignored.clone(),
-                ..CensusChange::default()
-            });
-        }
-        ignored
+        let outcome = FreshRoundOutcome {
+            probed: silent.len(),
+            answered: ignored.len(),
+        };
+        let found = CensusChange {
+            ignored_socket: ignored,
+            fresh_round: Some(outcome),
+            ..CensusChange::default()
+        };
+        self.changes.absorb(found.clone());
+        found
     }
 
     /// Take `peer` off the re-probe list. Returns it, if it was on it.
@@ -1688,7 +1720,8 @@ impl Census {
     /// reading the nodes that joined and stops reading those that left.
     /// After a restart it starts from [`Self::nodes`] instead. It also gives
     /// the nodes the upkeeps since found ignoring this process's socket
-    /// ([`CensusChange::ignored_socket`]), but those that joined after.
+    /// ([`CensusChange::ignored_socket`]), but those that joined after, and
+    /// the fresh rounds they made ([`CensusChange::fresh_round`]).
     pub fn take_changes(&mut self) -> CensusChange {
         std::mem::take(&mut self.changes)
     }
@@ -2203,6 +2236,14 @@ async fn probe_within(
 /// a relay that socket reached it through closed, while it answers any
 /// other: such a node answers this probe, and not [`probe_peer`] through
 /// `network`. None answer when the round's node can't be started.
+///
+/// The round's node is made, started and stopped within a listings request's
+/// timeout (`REQUEST_TIMEOUT`) each, as the producer waits for the answers
+/// that end its watches: a call of the transport that hung would hold the
+/// upkeep, and so the producer, which would stay alive without going on, and
+/// never be started again by its service manager. A node not made or
+/// started in time answers none; one that doesn't stop in time is left, and
+/// may keep its socket.
 pub async fn probe_fresh(
     network: &Network,
     nodes: &[(PeerId, Vec<MultiAddr>)],
@@ -2212,32 +2253,52 @@ pub async fn probe_fresh(
     }
     let config = fresh_config(network.node().config());
     // Boxed, as the transport's other futures are: they are large.
-    let fresh = match Box::pin(P2PNode::new(config)).await {
-        Ok(fresh) => fresh,
-        Err(e) => {
+    let made = tokio::time::timeout(REQUEST_TIMEOUT, Box::pin(P2PNode::new(config))).await;
+    let fresh = match made {
+        Ok(Ok(fresh)) => fresh,
+        Ok(Err(e)) => {
             warn!("Census: no node could be made to probe from a fresh socket: {e}");
             return BTreeSet::new();
         }
+        Err(_) => {
+            warn!(
+                "Census: no node was made within {REQUEST_TIMEOUT:?} to probe from a fresh socket"
+            );
+            return BTreeSet::new();
+        }
     };
-    let answered = match Box::pin(fresh.start()).await {
-        Ok(()) => {
+    let started = tokio::time::timeout(REQUEST_TIMEOUT, Box::pin(fresh.start())).await;
+    let answered = match started {
+        Ok(Ok(())) => {
             let fresh = &fresh;
             each_reached(nodes, move |peer, addresses| {
                 fresh_dial(fresh, peer, addresses)
             })
             .await
         }
-        Err(e) => {
+        Ok(Err(e)) => {
             warn!("Census: the node to probe from a fresh socket could not start: {e}");
             BTreeSet::new()
         }
+        Err(_) => {
+            warn!(
+                "Census: the node to probe from a fresh socket did not start within \
+                 {REQUEST_TIMEOUT:?}"
+            );
+            BTreeSet::new()
+        }
     };
-    if let Err(e) = Box::pin(fresh.shutdown()).await {
-        // Its stop can end before its transport's, leaving its socket open.
-        warn!(
+    // Its stop can end before its transport's, leaving its socket open.
+    match tokio::time::timeout(REQUEST_TIMEOUT, Box::pin(fresh.shutdown())).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => warn!(
             "Census: the node that probed from a fresh socket failed to stop, and may keep its \
              socket: {e}"
-        );
+        ),
+        Err(_) => warn!(
+            "Census: the node that probed from a fresh socket did not stop within \
+             {REQUEST_TIMEOUT:?}, and may keep its socket"
+        ),
     }
     answered
 }
@@ -5028,6 +5089,12 @@ mod tests {
         census.reprobing().map(|node| node.peer).collect()
     }
 
+    /// What a fresh round reports when it probed `probed` nodes and
+    /// `answered` of them answered.
+    fn outcome(probed: usize, answered: usize) -> FreshRoundOutcome {
+        FreshRoundOutcome { probed, answered }
+    }
+
     /// A node out ten minutes that this process's probe doesn't reach, but
     /// one from a fresh socket does, ignores this process's socket: it is
     /// reported, and stays on the re-probe list, while one this process
@@ -5044,6 +5111,8 @@ mod tests {
         let change = run(census.maintain_with(&sockets, now, &mut rng(1))).unwrap();
         assert_eq!(change.ignored_socket, vec![ignoring]);
         assert_eq!(change.joined, vec![back]);
+        // The round probed the one node this process's probe didn't reach.
+        assert_eq!(change.fresh_round, Some(outcome(1, 1)));
         // Polled through this socket, it would only leave again.
         assert!(census.get(&ignoring).is_none());
         assert_eq!(listed(&census), vec![ignoring]);
@@ -5057,10 +5126,12 @@ mod tests {
         let change = run(census.maintain_with(&sockets, now + 60, &mut rng(2))).unwrap();
         assert_eq!(change.joined, vec![ignoring]);
         assert!(change.ignored_socket.is_empty());
+        assert_eq!(change.fresh_round, None, "no round this time");
         assert!(sockets.take_rounds().is_empty());
         let taken = census.take_changes();
         assert_eq!(taken.joined, vec![back, ignoring]);
         assert!(taken.ignored_socket.is_empty(), "{taken:?}");
+        assert_eq!(taken.fresh_round, Some(outcome(1, 1)), "the first round");
     }
 
     /// A node out less than ten minutes isn't probed from a fresh socket,
@@ -5076,10 +5147,12 @@ mod tests {
         let sockets = Sockets::new(&[], &[gone]);
         let change = run(census.maintain_with(&sockets, now, &mut rng(1))).unwrap();
         assert!(change.ignored_socket.is_empty());
+        assert_eq!(change.fresh_round, None, "no round reported");
         assert!(sockets.take_rounds().is_empty(), "no fresh round");
         assert!(census.take_changes().ignored_socket.is_empty());
         let change = run(census.maintain_with(&sockets, now + 1, &mut rng(2))).unwrap();
         assert_eq!(change.ignored_socket, vec![gone]);
+        assert_eq!(change.fresh_round, Some(outcome(1, 1)));
         assert_eq!(sockets.take_rounds(), vec![vec![gone]]);
     }
 
@@ -5095,19 +5168,26 @@ mod tests {
         let mut census = with_left(&store, now, &[(gone, now - 600)]);
         let sockets = Sockets::new(&[], &[gone]);
         let mut rng = rng(1);
-        run(census.maintain_with(&sockets, now, &mut rng)).unwrap();
+        let change = run(census.maintain_with(&sockets, now, &mut rng)).unwrap();
+        assert_eq!(change.fresh_round, Some(outcome(1, 1)));
         assert_eq!(sockets.take_rounds(), vec![vec![gone]]);
         assert_eq!(census.take_changes().ignored_socket, vec![gone]);
         for at in [now + 60, now + 599] {
             let change = run(census.maintain_with(&sockets, at, &mut rng)).unwrap();
             assert!(change.ignored_socket.is_empty(), "at {at}");
+            assert_eq!(change.fresh_round, None, "at {at}");
             assert!(sockets.take_rounds().is_empty(), "at {at}");
-            assert!(census.take_changes().ignored_socket.is_empty(), "at {at}");
+            let taken = census.take_changes();
+            assert!(taken.ignored_socket.is_empty(), "at {at}");
+            assert_eq!(taken.fresh_round, None, "at {at}");
         }
         let change = run(census.maintain_with(&sockets, now + 600, &mut rng)).unwrap();
         assert_eq!(change.ignored_socket, vec![gone]);
+        assert_eq!(change.fresh_round, Some(outcome(1, 1)));
         assert_eq!(sockets.take_rounds(), vec![vec![gone]]);
-        assert_eq!(census.take_changes().ignored_socket, vec![gone]);
+        let taken = census.take_changes();
+        assert_eq!(taken.ignored_socket, vec![gone]);
+        assert_eq!(taken.fresh_round, Some(outcome(1, 1)));
     }
 
     /// A process counts a node's time out from its own start when the node
@@ -5217,8 +5297,71 @@ mod tests {
         assert_eq!(sockets.take_rounds(), vec![vec![gone]], "probed afresh");
         assert!(change.ignored_socket.is_empty());
         assert!(change.is_empty());
-        assert!(census.take_changes().ignored_socket.is_empty());
+        // The round is reported all the same: it probed one node, and none
+        // answered.
+        assert_eq!(change.fresh_round, Some(outcome(1, 0)));
+        let taken = census.take_changes();
+        assert!(taken.ignored_socket.is_empty());
+        assert_eq!(taken.fresh_round, Some(outcome(1, 0)));
         assert_eq!(listed(&census), vec![gone]);
+    }
+
+    /// Each fresh round is reported with how many nodes it probed and how
+    /// many answered, and none where no round was made; the counts of rounds
+    /// that changes add up are added.
+    #[test]
+    fn a_fresh_round_is_reported_with_how_many_nodes_it_probed_and_how_many_answered() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ListingsStore::open_with_map_size(dir.path(), TEST_MAP).unwrap();
+        let now = 10_000;
+        let (ignoring, gone, recent) = (peer(1), peer(2), peer(3));
+        let mut census = with_left(
+            &store,
+            now,
+            &[
+                (ignoring, now - 600),
+                (gone, now - 600),
+                (recent, now - 599),
+            ],
+        );
+        let sockets = Sockets::new(&[], &[ignoring]);
+        let mut rng = rng(1);
+        // Two nodes are out long enough and none answers this process's
+        // probe: the round probes both, and one answers.
+        let change = run(census.maintain_with(&sockets, now, &mut rng)).unwrap();
+        assert_eq!(change.fresh_round, Some(outcome(2, 1)));
+        assert_eq!(census.take_changes().fresh_round, Some(outcome(2, 1)));
+        // None is made less than ten minutes after: none is reported.
+        let change = run(census.maintain_with(&sockets, now + 60, &mut rng)).unwrap();
+        assert_eq!(change.fresh_round, None);
+        assert_eq!(census.take_changes().fresh_round, None);
+        // The next is made when ten minutes have passed, with the node that
+        // was out less than ten minutes before too.
+        let change = run(census.maintain_with(&sockets, now + 600, &mut rng)).unwrap();
+        assert_eq!(change.fresh_round, Some(outcome(3, 1)));
+        // Two rounds in the changes taken together are counted together.
+        let change = run(census.maintain_with(&sockets, now + 1_200, &mut rng)).unwrap();
+        assert_eq!(change.fresh_round, Some(outcome(3, 1)));
+        assert_eq!(census.take_changes().fresh_round, Some(outcome(6, 2)));
+    }
+
+    /// The counts of fresh rounds are added where changes are, and a change
+    /// without a round adds none.
+    #[test]
+    fn the_counts_of_fresh_rounds_are_added_when_changes_are() {
+        let round = |probed, answered| CensusChange {
+            fresh_round: Some(outcome(probed, answered)),
+            ..CensusChange::default()
+        };
+        let mut change = CensusChange::default();
+        change.absorb(CensusChange::default());
+        assert_eq!(change.fresh_round, None);
+        change.absorb(round(2, 1));
+        assert_eq!(change.fresh_round, Some(outcome(2, 1)));
+        change.absorb(CensusChange::default());
+        assert_eq!(change.fresh_round, Some(outcome(2, 1)));
+        change.absorb(round(3, 0));
+        assert_eq!(change.fresh_round, Some(outcome(5, 1)));
     }
 
     /// The node a fresh round probes from keeps the client's transport

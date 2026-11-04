@@ -27,9 +27,12 @@ prints. Upstream's entries follow.
   one answers the fresh probe, then once the cycle ends the producer logs a warning naming the
   nodes, stops as on SIGTERM (ending its watches and saving its peer cache) and exits with an
   error, so that its service manager (systemd's `Restart=always`) starts it again, on a new
-  socket, from its state. In the library: `listings_census::probe_fresh`,
-  `listings_census::FRESH_PROBE_AFTER` and `CensusChange::ignored_socket`, and `Producer::run`
-  returns that error.
+  socket, from its state; `darwin listings serve --help` says so. Each round is logged at info
+  level (`Census: 3 nodes out 10 minutes or more probed from a fresh socket; 1 answered`), and
+  the round's node is made, started and stopped within 10 seconds each, so a stuck call can't hold
+  the producer without a restart. In the library: `listings_census::probe_fresh`,
+  `listings_census::FRESH_PROBE_AFTER`, `CensusChange::ignored_socket` and
+  `CensusChange::fresh_round`, and `Producer::run` returns that error.
 - `v0.3.11+ds.9`, the producer's lists: ant-cli's version is 0.3.11+ds.9 (ant-core stays
   0.13.0). `darwin listings serve` takes three new options, all off by default. `--hide-list
   FILE` names addresses the producer publishes nothing of: no entry, support, row in

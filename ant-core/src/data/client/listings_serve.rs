@@ -246,7 +246,9 @@ use super::listings::{
     ListingsIndex, ListingsRequests, PendingCopy, PushReceiver, PushSink, ReadContext,
     RejectedListing, CHECK_CONCURRENCY, REQUEST_TIMEOUT,
 };
-use super::listings_census::{user_agent_of, Census, Refusal};
+use super::listings_census::{
+    user_agent_of, Census, FreshRoundOutcome, Refusal, FRESH_PROBE_AFTER,
+};
 use super::listings_feeds::{FeedNode, Feeds, PollReport};
 use super::listings_lists::{resolved, write_held_file, ListFile, Looked, Rules};
 use super::listings_publish::{IndexChange, Publication, Publisher, RejectedChange};
@@ -1568,6 +1570,9 @@ impl Producer {
                 self.census.len(),
                 self.census.reprobing().count()
             );
+        }
+        if let Some(round) = &change.fresh_round {
+            info!("{}", fresh_round_line(round));
         }
 
         let asked = std::mem::take(&mut self.want_peers);
@@ -4566,16 +4571,42 @@ fn stop_for_new_socket(ignored: &[PeerId]) -> Result<()> {
     }
     let nodes: Vec<String> = ignored.iter().map(ToString::to_string).collect();
     let nodes = nodes.join(", ");
+    let count = node_count(ignored.len());
+    let answer = if ignored.len() == 1 {
+        "answers"
+    } else {
+        "answer"
+    };
     warn!(
-        "Census: {} nodes that left ({nodes}) answer a fresh socket but not this process's: \
-         restarting for a new socket",
-        ignored.len()
+        "Census: {count} that left ({nodes}) {answer} a fresh socket but not this process's: \
+         restarting for a new socket"
     );
     Err(Error::Network(format!(
-        "{} nodes that left the census ({nodes}) answer a fresh socket but not this process's: \
-         stopping, to be started again on a new socket",
-        ignored.len()
+        "{count} that left the census ({nodes}) {answer} a fresh socket but not this process's: \
+         stopping, to be started again on a new socket"
     )))
+}
+
+/// The line a cycle logs for the fresh round its census upkeep made
+/// ([`CensusChange::fresh_round`](super::listings_census::CensusChange::fresh_round)):
+/// how many nodes out [`FRESH_PROBE_AFTER`] or longer it probed from a fresh
+/// socket, and how many answered.
+fn fresh_round_line(round: &FreshRoundOutcome) -> String {
+    format!(
+        "Census: {} out {} minutes or more probed from a fresh socket; {} answered",
+        node_count(round.probed),
+        FRESH_PROBE_AFTER.as_secs() / 60,
+        round.answered
+    )
+}
+
+/// `count` nodes, as a log line says them: "1 node", "2 nodes".
+fn node_count(count: usize) -> String {
+    if count == 1 {
+        "1 node".to_owned()
+    } else {
+        format!("{count} nodes")
+    }
 }
 
 /// What `index`, the read of the cycle that began at `at`, changes in what
@@ -6657,6 +6688,27 @@ mod tests {
             assert!(text.contains(&peer.to_string()), "{text}");
         }
         assert!(text.contains("new socket"), "{text}");
+        assert!(text.contains(": 2 nodes that left the census ("), "{text}");
+        assert!(text.contains(") answer a fresh socket"), "{text}");
+        // The count and the verb agree for one node, too.
+        let text = stop_for_new_socket(&ignored[..1]).unwrap_err().to_string();
+        assert!(text.contains(": 1 node that left the census ("), "{text}");
+        assert!(text.contains(") answers a fresh socket"), "{text}");
+    }
+
+    /// A cycle whose census upkeep made a fresh round logs one line with its
+    /// counts, the count of nodes agreeing with its noun.
+    #[test]
+    fn a_fresh_round_is_logged_with_how_many_nodes_it_probed_and_how_many_answered() {
+        let round = |probed, answered| fresh_round_line(&FreshRoundOutcome { probed, answered });
+        assert_eq!(
+            round(3, 1),
+            "Census: 3 nodes out 10 minutes or more probed from a fresh socket; 1 answered"
+        );
+        assert_eq!(
+            round(1, 0),
+            "Census: 1 node out 10 minutes or more probed from a fresh socket; 0 answered"
+        );
     }
 
     /// While it lives, a request's file can't be removed, as one left where
