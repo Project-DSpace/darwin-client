@@ -11,7 +11,8 @@ Our changes on top of upstream 0.3.11 (ant-core 0.13.0). Releases are tagged `vX
 ant-cli's version set to match; other builds are told apart by the commit `darwin --version`
 prints. Upstream's entries follow.
 
-- Unreleased, after `v0.3.11+ds.10`: the client dials a peer's verified direct address before its
+- `v0.3.11+ds.11`, direct before relay: ant-cli's version is 0.3.11+ds.11 (ant-core stays 0.13.0).
+  The client dials a peer's verified direct address before its
   relay. `vendor/saorsa-core` is the network library saorsa-core 0.29.1 as darwin-node vendors it
   (since its ds.17; this copy is its `v0.23.0+ds.20`'s, byte for byte), changed only in the order
   a peer's addresses are dialled in (its `VENDORED.md`), and the workspace's `[patch.crates-io]`
