@@ -16,13 +16,15 @@
 //!    is closed again when a member misses polls or a node names peers the
 //!    census lacks. A member is probed afresh before it leaves, and one that
 //!    left is probed again each cycle, for a day, and is back on its first
-//!    answer. One out ten minutes or more that doesn't answer is probed from
-//!    a node of its own too, at most once every ten minutes
+//!    answer. One out ten minutes or more that doesn't answer (counted from
+//!    the producer's start, if it left before) is probed from a node of its
+//!    own too, at most once every ten minutes
 //!    ([`FRESH_PROBE_AFTER`](super::listings_census::FRESH_PROBE_AFTER)): if
 //!    it answers that but not the producer's own probe, it ignores the
 //!    producer's socket, and the producer stops once the cycle ends, to be
-//!    started again on a new one ([`Producer::run`]). A request to refresh
-//!    the census, left in the state directory
+//!    started again on a new one ([`Producer::run`]). Each start so watches
+//!    a node fail ten minutes itself before it stops for it. A request to
+//!    refresh the census, left in the state directory
 //!    ([`Producer::request_census_refresh`], `darwin listings
 //!    refresh-census`), has the cycle after it close every leaf, as the
 //!    daily refresh does.

@@ -19,12 +19,14 @@ prints. Upstream's entries follow.
   Each cycle's census upkeep now also probes the nodes that left 10 minutes ago or more and don't
   answer the producer's own probe from a node started for that round alone (client mode, port 0,
   a new identity, the client's transport settings, no bootstrap peers, shut down after the round),
-  at most once every 10 minutes. If one answers it, then once the cycle ends the producer logs a
-  warning naming the nodes, stops as on SIGTERM (ending its watches and saving its peer cache) and
-  exits with an error, so that its service manager (systemd's `Restart=always`) starts it again,
-  on a new socket, from its state. In the library: `listings_census::probe_fresh`,
-  `listings_census::FRESH_PROBE_AFTER` and `CensusChange::ignored_socket`, and `Producer::run`
-  returns that error.
+  at most once every 10 minutes. A node's time out counts from the producer's start if it left
+  before, so each start watches it fail 10 minutes itself first, and a node that answers new
+  sockets but never the producer's restarts it at most once every 10 minutes or so. If one
+  answers the fresh probe, then once the cycle ends the producer logs a warning naming the nodes,
+  stops as on SIGTERM (ending its watches and saving its peer cache) and exits with an error, so
+  that its service manager (systemd's `Restart=always`) starts it again, on a new socket, from its
+  state. In the library: `listings_census::probe_fresh`, `listings_census::FRESH_PROBE_AFTER` and
+  `CensusChange::ignored_socket`, and `Producer::run` returns that error.
 - `v0.3.11+ds.9`, the producer's lists: ant-cli's version is 0.3.11+ds.9 (ant-core stays
   0.13.0). `darwin listings serve` takes three new options, all off by default. `--hide-list
   FILE` names addresses the producer publishes nothing of: no entry, support, row in
