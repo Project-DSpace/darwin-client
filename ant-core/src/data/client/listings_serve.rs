@@ -16,7 +16,15 @@
 //!    is closed again when a member misses polls or a node names peers the
 //!    census lacks. A member is probed afresh before it leaves, and one that
 //!    left is probed again each cycle, for a day, and is back on its first
-//!    answer. A request to refresh the census, left in the state directory
+//!    answer. One out ten minutes or more that doesn't answer (counted from
+//!    the producer's start, if it left before) is probed from a node of its
+//!    own too, at most once every ten minutes
+//!    ([`FRESH_PROBE_AFTER`](super::listings_census::FRESH_PROBE_AFTER)): if
+//!    it answers that but not the producer's own probe, it ignores the
+//!    producer's socket, and the producer stops once the cycle ends, to be
+//!    started again on a new one ([`Producer::run`]). Each start so watches
+//!    a node fail ten minutes itself before it stops for it. A request to
+//!    refresh the census, left in the state directory
 //!    ([`Producer::request_census_refresh`], `darwin listings
 //!    refresh-census`), has the cycle after it close every leaf, as the
 //!    daily refresh does.
@@ -238,7 +246,9 @@ use super::listings::{
     ListingsIndex, ListingsRequests, PendingCopy, PushReceiver, PushSink, ReadContext,
     RejectedListing, CHECK_CONCURRENCY, REQUEST_TIMEOUT,
 };
-use super::listings_census::{user_agent_of, Census, Refusal};
+use super::listings_census::{
+    user_agent_of, Census, FreshRoundOutcome, Refusal, FRESH_PROBE_AFTER,
+};
 use super::listings_feeds::{FeedNode, Feeds, PollReport};
 use super::listings_lists::{resolved, write_held_file, ListFile, Looked, Rules};
 use super::listings_publish::{IndexChange, Publication, Publisher, RejectedChange};
@@ -884,6 +894,12 @@ pub struct Producer {
     cleared_list: Option<ListFile>,
     /// Where the entries held are written, if anywhere.
     held_file: Option<PathBuf>,
+    /// The nodes that left the census that the latest cycle's upkeep found
+    /// answering a fresh socket but not this process's
+    /// ([`CensusChange::ignored_socket`](super::listings_census::CensusChange::ignored_socket)):
+    /// once that cycle ends, [`Self::run`] stops for a new socket if there
+    /// are any.
+    ignored_socket: Vec<PeerId>,
 }
 
 impl Producer {
@@ -1001,6 +1017,7 @@ impl Producer {
                 .cleared_list
                 .map(|path| ListFile::new("cleared list", path)),
             held_file: options.held_file,
+            ignored_socket: Vec::new(),
         };
         producer.read_lists(None)?;
         Ok(producer)
@@ -1361,10 +1378,18 @@ impl Producer {
     /// start comes back as another reader, which would otherwise wait for
     /// these watches to lapse.
     ///
+    /// Once a cycle ends whose census upkeep found nodes that left
+    /// answering a fresh socket but not this process's
+    /// ([`CensusChange::ignored_socket`](super::listings_census::CensusChange::ignored_socket)),
+    /// it logs them and stops in the same way, with an error: the client
+    /// keeps one socket for its whole life, and such a node answers no new
+    /// connection from it, so only a new process, on a new socket, reaches
+    /// it again. Its service manager is to start it again.
+    ///
     /// # Errors
     ///
     /// Only if the producer can't go on at all: when its store can't be
-    /// read or written.
+    /// read or written; or, as above, to be started again on a new socket.
     pub async fn run(&mut self, cancel: CancellationToken) -> Result<()> {
         let result = self.run_cycles(&cancel).await;
         self.size_job = None;
@@ -1412,6 +1437,7 @@ impl Producer {
                     Err(e) => warn!("A listings cycle failed: {e}"),
                 },
             }
+            stop_for_new_socket(&std::mem::take(&mut self.ignored_socket))?;
             self.save_client_state().await;
             // Sizes read while the cycle ran are taken first, so the next
             // reads can start.
@@ -1527,6 +1553,8 @@ impl Producer {
             warn!("The census's upkeep failed in part: {e}");
         }
         let change = self.census.take_changes();
+        // `run` stops for a new socket once the cycle ends, if any.
+        self.ignored_socket.clone_from(&change.ignored_socket);
         if !change.unanswered.is_empty() {
             debug!(
                 "Census: {} ids named by other nodes answered no lookup",
@@ -1542,6 +1570,9 @@ impl Producer {
                 self.census.len(),
                 self.census.reprobing().count()
             );
+        }
+        if let Some(round) = &change.fresh_round {
+            info!("{}", fresh_round_line(round));
         }
 
         let asked = std::mem::take(&mut self.want_peers);
@@ -4524,6 +4555,60 @@ fn log_cycle(report: &CycleReport) {
     );
 }
 
+/// What [`Producer::run`] does once a cycle ends whose census upkeep found
+/// `ignored`, nodes that left the census answering a fresh socket but not
+/// this process's
+/// ([`CensusChange::ignored_socket`](super::listings_census::CensusChange::ignored_socket)):
+/// with none, it goes on; with any, it logs them and stops, so that its
+/// service manager starts it again on a new socket.
+///
+/// # Errors
+///
+/// When `ignored` names any node: the error that stops the producer.
+fn stop_for_new_socket(ignored: &[PeerId]) -> Result<()> {
+    if ignored.is_empty() {
+        return Ok(());
+    }
+    let nodes: Vec<String> = ignored.iter().map(ToString::to_string).collect();
+    let nodes = nodes.join(", ");
+    let count = node_count(ignored.len());
+    let answer = if ignored.len() == 1 {
+        "answers"
+    } else {
+        "answer"
+    };
+    warn!(
+        "Census: {count} that left ({nodes}) {answer} a fresh socket but not this process's: \
+         restarting for a new socket"
+    );
+    Err(Error::Network(format!(
+        "{count} that left the census ({nodes}) {answer} a fresh socket but not this process's: \
+         stopping, to be started again on a new socket"
+    )))
+}
+
+/// The line a cycle logs for the fresh round its census upkeep made
+/// ([`CensusChange::fresh_round`](super::listings_census::CensusChange::fresh_round)):
+/// how many nodes out [`FRESH_PROBE_AFTER`] or longer it probed from a fresh
+/// socket, and how many answered.
+fn fresh_round_line(round: &FreshRoundOutcome) -> String {
+    format!(
+        "Census: {} out {} minutes or more probed from a fresh socket; {} answered",
+        node_count(round.probed),
+        FRESH_PROBE_AFTER.as_secs() / 60,
+        round.answered
+    )
+}
+
+/// `count` nodes, as a log line says them: "1 node", "2 nodes".
+fn node_count(count: usize) -> String {
+    if count == 1 {
+        "1 node".to_owned()
+    } else {
+        format!("{count} nodes")
+    }
+}
+
 /// What `index`, the read of the cycle that began at `at`, changes in what
 /// `publisher` has published. `listed` is what the read listed, by address;
 /// `unlisted`, each entry published before that the read didn't list, with
@@ -6586,6 +6671,44 @@ mod tests {
         let elsewhere = tempfile::tempdir().unwrap();
         assert!(Producer::request_census_refresh(elsewhere.path()).is_err());
         assert!(!elsewhere.path().join(CENSUS_REFRESH_FILE).exists());
+    }
+
+    /// Once a cycle's census upkeep found nodes that left answering a fresh
+    /// socket but not this process's, `run` stops with an error naming
+    /// them, so that its service manager starts it again on a new socket;
+    /// with none, it goes on.
+    #[test]
+    fn nodes_ignoring_the_producers_socket_stop_it_for_a_new_one() {
+        assert!(stop_for_new_socket(&[]).is_ok());
+        let ignored = [PeerId::from_bytes([1; 32]), PeerId::from_bytes([2; 32])];
+        let error = stop_for_new_socket(&ignored).unwrap_err();
+        assert!(matches!(error, Error::Network(_)), "{error}");
+        let text = error.to_string();
+        for peer in &ignored {
+            assert!(text.contains(&peer.to_string()), "{text}");
+        }
+        assert!(text.contains("new socket"), "{text}");
+        assert!(text.contains(": 2 nodes that left the census ("), "{text}");
+        assert!(text.contains(") answer a fresh socket"), "{text}");
+        // The count and the verb agree for one node, too.
+        let text = stop_for_new_socket(&ignored[..1]).unwrap_err().to_string();
+        assert!(text.contains(": 1 node that left the census ("), "{text}");
+        assert!(text.contains(") answers a fresh socket"), "{text}");
+    }
+
+    /// A cycle whose census upkeep made a fresh round logs one line with its
+    /// counts, the count of nodes agreeing with its noun.
+    #[test]
+    fn a_fresh_round_is_logged_with_how_many_nodes_it_probed_and_how_many_answered() {
+        let round = |probed, answered| fresh_round_line(&FreshRoundOutcome { probed, answered });
+        assert_eq!(
+            round(3, 1),
+            "Census: 3 nodes out 10 minutes or more probed from a fresh socket; 1 answered"
+        );
+        assert_eq!(
+            round(1, 0),
+            "Census: 1 node out 10 minutes or more probed from a fresh socket; 0 answered"
+        );
     }
 
     /// While it lives, a request's file can't be removed, as one left where

@@ -11,6 +11,29 @@ Our changes on top of upstream 0.3.11 (ant-core 0.13.0). Releases are tagged `vX
 ant-cli's version set to match; other builds are told apart by the commit `darwin --version`
 prints. Upstream's entries follow.
 
+- `v0.3.11+ds.10`, the producer on a new socket: ant-cli's version is 0.3.11+ds.10 (ant-core stays
+  0.13.0). `darwin listings serve` starts again on a new socket when a
+  node that left its census ignores its own. A node can keep ignoring every new connection from
+  one socket (an address and port), as after a relay that socket reached it through closed, while
+  it answers any other; the producer keeps one socket for as long as it runs, so such a node
+  answered none of its probes until the producer was restarted, and `refresh-census` didn't help.
+  Each cycle's census upkeep now also probes the nodes that left 10 minutes ago or more and don't
+  answer the producer's own probe from a node started for that round alone (client mode, port 0,
+  a new identity, the client's transport settings, no bootstrap peers, shut down after the round),
+  at most once every 10 minutes. When a round is due, the upkeep probes those nodes before the
+  others, 64 at a time, the ones no round has probed first, then those one probed longest ago, so
+  the rounds reach every one of them in turn. A node's time out counts from the producer's start
+  if it left before, so each start watches it fail 10 minutes itself first, and a node that
+  answers new sockets but never the producer's restarts it at most once every 10 minutes or so. If
+  one answers the fresh probe, then once the cycle ends the producer logs a warning naming the
+  nodes, stops as on SIGTERM (ending its watches and saving its peer cache) and exits with an
+  error, so that its service manager (systemd's `Restart=always`) starts it again, on a new
+  socket, from its state; `darwin listings serve --help` says so. Each round is logged at info
+  level (`Census: 3 nodes out 10 minutes or more probed from a fresh socket; 1 answered`), and
+  the round's node is made, started and stopped within 10 seconds each, so a stuck call can't hold
+  the producer without a restart. In the library: `listings_census::probe_fresh`,
+  `listings_census::FRESH_PROBE_AFTER`, `CensusChange::ignored_socket` and
+  `CensusChange::fresh_round`, and `Producer::run` returns that error.
 - `v0.3.11+ds.9`, the producer's lists: ant-cli's version is 0.3.11+ds.9 (ant-core stays
   0.13.0). `darwin listings serve` takes three new options, all off by default. `--hide-list
   FILE` names addresses the producer publishes nothing of: no entry, support, row in

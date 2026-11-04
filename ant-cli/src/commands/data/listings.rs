@@ -48,7 +48,9 @@ pub struct ListingsArgs {
 #[derive(Subcommand)]
 pub enum ListingsCommand {
     /// Follow what the nodes serve and keep the index published as the
-    /// static files of listings/v1/ (docs/listings-v1.md), until stopped
+    /// static files of listings/v1/ (docs/listings-v1.md), until stopped; it
+    /// can also stop by itself, to start again on a new socket, so run it
+    /// under a service manager that restarts it (as systemd's Restart=always)
     Serve(ServeArgs),
     /// Ask the producer (`darwin listings serve`) to refresh its census of
     /// nodes at its next cycle, or its next start if it isn't running
@@ -100,7 +102,9 @@ pub struct ServeArgs {
 
 impl ServeArgs {
     /// Run the producer on `client` (which must have an EVM network) until
-    /// SIGINT, or SIGTERM where there is one.
+    /// SIGINT, or SIGTERM where there is one; or until it stops by itself,
+    /// with an error, to start again on a new socket, so it is run under a
+    /// service manager that restarts it (as systemd's `Restart=always`).
     pub async fn execute(&self, client: Client) -> anyhow::Result<()> {
         let options = ServeOptions {
             hide_list: self.hide_list.clone(),

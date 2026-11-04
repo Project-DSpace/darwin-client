@@ -49,8 +49,9 @@ E2E_PATH = re.compile(r'^\s*#\[path\s*=\s*"e2e/([^"/]+\.rs)"\s*\]', re.MULTILINE
 
 # Targets that start neither nodes nor a chain; build.yml runs them with the
 # unit tests. daemon_integration and node_add_integration test the node
-# manager the node image ships. census_probe starts two of the network
-# library's peers on loopback, no storage node, to probe one that restarted.
+# manager the node image ships. census_probe starts the network library's
+# peers on loopback, no storage node, to probe one that restarted and one
+# from a fresh socket.
 # offline runs client checks that fail before any network call, on a node
 # that is never started.
 NO_NODES = [
