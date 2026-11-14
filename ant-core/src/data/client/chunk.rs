@@ -621,6 +621,13 @@ fn retry_on_next_peer(error: &Error) -> bool {
     )
 }
 
+/// How long a re-read waits for the node that served the chunk last before it
+/// looks the chunk up too, natively and in the browser alike: the one second
+/// this client has always given the recent holder. Upstream has no holder
+/// cache; its browser early-read hedge (3 s) is for reads it races, not this.
+const RECENT_HOLDER_HEDGE_DELAY: Duration =
+    crate::client_engine::read::DEFAULT_EARLY_READ_HEDGE_DELAY;
+
 /// Peers a chunk read asks, each with its addresses in dial order.
 #[cfg(feature = "native")]
 type ReadPeers = Vec<(PeerId, Vec<MultiAddr>)>;
@@ -1446,7 +1453,7 @@ impl Client {
                     get(holder, true, RequestDispatched::unobserved()),
                     ordinary,
                     |error| bad_bytes.retry_on_next_peer(error),
-                    crate::runtime::sleep(self.network().read_hedge_delay()),
+                    crate::runtime::sleep(RECENT_HOLDER_HEDGE_DELAY),
                 )
                 .await;
                 if !read.served {
@@ -2096,6 +2103,24 @@ mod tests {
         ));
         let result = found.and_then(|found| bad_bytes.result(found));
         (result, asked.into_inner().unwrap())
+    }
+
+    /// A re-read waits one second for the node that served the chunk last
+    /// before it looks the chunk up, in the browser as natively: the value
+    /// main had, not the browser's 3 s early-read hedge from upstream.
+    #[test]
+    fn the_recent_holder_is_waited_for_one_second_in_every_build() {
+        assert_eq!(RECENT_HOLDER_HEDGE_DELAY, Duration::from_secs(1));
+        let source = include_str!("chunk.rs");
+        let start = source
+            .find("crate::client_engine::read::read_from_holder(")
+            .expect("the chunk read asks the recent holder");
+        let call = &source[start..];
+        let call = &call[..call.find(".await").expect("the holder read is awaited")];
+        assert!(
+            call.contains("crate::runtime::sleep(RECENT_HOLDER_HEDGE_DELAY)"),
+            "the holder read must wait RECENT_HOLDER_HEDGE_DELAY in every build: {call}"
+        );
     }
 
     #[test]
