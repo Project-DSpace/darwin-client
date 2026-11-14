@@ -791,11 +791,11 @@ const pointerAmount = medianPrice => {
   return (3n * medianPrice * numerator + denominator - 1n) / denominator;
 };
 
-test("a recovered pointer payment is checked against the size-priced band", async () => {
-  // The write's wallet is asked for the pointer's size-priced amount, which
-  // the browser checks against its quotes' band before paying; the state
-  // recovered from the checkpoint carries that same paid proof, and asks the
-  // wallet for nothing more.
+test("a pointer write pays its size-priced amount, and the state recovered from its checkpoint carries that payment", async () => {
+  // The write's wallet is asked for the pointer's size-priced amount; the
+  // state recovered from the checkpoint carries that same paid proof, and
+  // asks the wallet for nothing more. Recovery itself checks no amount: the
+  // payment is already made.
   const rtc = mockWebRtc(Array.from({ length: 7 }, () => ({})));
   const client = new BrowserNetworkClient(rtc.endpoints);
   const signer = wallet();
