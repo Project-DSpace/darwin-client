@@ -619,6 +619,64 @@ impl Client {
         Some(self.transaction_sender(a).await? == self.transaction_sender(b).await?)
     }
 
+    /// The transaction that recorded a payment whose bytes were taken as
+    /// never sent, searched for from `from_time` (Unix seconds): for a root
+    /// wave (`root`: its vault and key) the one whose `RootPaid` log names
+    /// the key ([`ListingChain::root_paid_transaction`]), else the one whose
+    /// `DataPaymentMade` log in the per-quote vault names `quote_hash`
+    /// ([`ListingChain::quote_paid_transaction`]). One search; `Ok(None)`
+    /// when it found none.
+    ///
+    /// # Errors
+    ///
+    /// If the search fails or stops before the latest block.
+    #[cfg(feature = "native")]
+    pub(crate) async fn recording_transaction_since(
+        &self,
+        root: Option<(&[u8; 20], &[u8; 32])>,
+        quote_hash: &[u8; 32],
+        from_time: u64,
+    ) -> std::result::Result<Option<[u8; 32]>, String> {
+        use super::listings::RootPaidSearch;
+        let network = self
+            .evm_network
+            .as_ref()
+            .ok_or("no EVM network to read the payment from")?;
+        let chain = read_back_chain(network, self.root_vault()).map_err(|e| e.to_string())?;
+        match root {
+            Some((vault, key)) => match chain
+                .root_paid_transaction(vault, key, from_time, None)
+                .await?
+            {
+                RootPaidSearch::Found(recording) => Ok(Some(recording)),
+                RootPaidSearch::NotFound => Ok(None),
+                RootPaidSearch::Incomplete { next, last } => Err(format!(
+                    "the search for the root wave's RootPaid log stopped at its limit of \
+                     eth_getLogs calls with blocks {next} to {last} unsearched"
+                )),
+            },
+            None => chain.quote_paid_transaction(quote_hash, from_time).await,
+        }
+    }
+
+    /// The gas transaction `tx` spent, in wei, read from its receipt
+    /// through the payment network's RPCs: `None` if it can't be read.
+    #[cfg(feature = "native")]
+    pub(crate) async fn transaction_gas(&self, tx: &[u8; 32]) -> Option<u128> {
+        let network = self.evm_network.as_ref()?;
+        let chain = read_back_chain(network, self.root_vault()).ok()?;
+        match chain.transaction_gas(tx).await {
+            Ok(gas) => gas,
+            Err(error) => {
+                tracing::debug!(
+                    "the gas of transaction {} couldn't be read: {error}",
+                    hex::encode(tx)
+                );
+                None
+            }
+        }
+    }
+
     /// The address transaction `tx` was sent from, read through the payment
     /// network's RPCs: `None` if it can't be read, as for a transaction the
     /// chain doesn't know.

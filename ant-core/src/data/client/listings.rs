@@ -3265,6 +3265,161 @@ impl ListingChain {
         Ok(None)
     }
 
+    /// The transaction that recorded the per-quote vault's payment of
+    /// `quote_hash`: the first whose `DataPaymentMade` log from the vault
+    /// names the quote (its third indexed topic) and whose receipt shows
+    /// that log. The vault records a quote's payment once, so there is at
+    /// most one. Searched for as [`Self::root_paid_transaction`] searches,
+    /// forwards from the block at `from_time` (Unix seconds) to the latest,
+    /// narrowed where the chain refuses a range, in at most
+    /// [`MAX_LOG_CALLS`] calls. `None` when every block was searched and
+    /// none holds it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a call fails other than for a range too wide, or
+    /// the search used all its calls before the latest block.
+    pub(crate) async fn quote_paid_transaction(
+        &self,
+        quote_hash: &[u8; 32],
+        from_time: u64,
+    ) -> std::result::Result<Option<[u8; 32]>, String> {
+        let vault = self.vault;
+        let last = self.latest_block().await?;
+        let first = self.block_at(from_time, last).await?;
+        let topics = json!([
+            format!("0x{}", hex::encode(DATA_PAYMENT_MADE_TOPIC)),
+            Value::Null,
+            Value::Null,
+            format!("0x{}", hex::encode(quote_hash)),
+        ]);
+        let mut from = first;
+        let mut range = last.saturating_sub(first).saturating_add(1);
+        for _ in 0..MAX_LOG_CALLS {
+            let to = from.saturating_add(range - 1).min(last);
+            let filter = json!({
+                "address": format!("0x{}", hex::encode(vault)),
+                "fromBlock": quantity(from),
+                "toBlock": quantity(to),
+                "topics": topics,
+            });
+            match self.rpc.call("eth_getLogs", json!([filter])).await {
+                Ok(answer) => {
+                    let logs = answer.value;
+                    let logs = logs.as_array().ok_or("logs are not a list")?;
+                    if let Some(paid) = self.quote_paid_among(logs, &vault, quote_hash).await? {
+                        return Ok(Some(paid));
+                    }
+                    if to >= last {
+                        return Ok(None);
+                    }
+                    from = to + 1;
+                }
+                Err(e) if range > MIN_LOG_RANGE => {
+                    debug!("Narrowing a search for a quote's payment after: {e}");
+                    range = (range / 2).max(MIN_LOG_RANGE);
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Err(format!(
+            "the search for the payment of quote {} stopped at its limit of eth_getLogs calls \
+             with blocks {from} to {last} unsearched",
+            hex::encode(quote_hash)
+        ))
+    }
+
+    /// The transaction of the first of `logs` (an `eth_getLogs` answer for
+    /// the per-quote vault `vault`'s `DataPaymentMade` naming `quote_hash`)
+    /// whose receipt holds that log, if any does.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a receipt can't be read.
+    async fn quote_paid_among(
+        &self,
+        logs: &[Value],
+        vault: &[u8; 20],
+        quote_hash: &[u8; 32],
+    ) -> std::result::Result<Option<[u8; 32]>, String> {
+        let names_quote = |address: Option<[u8; 20]>, topics: &[Option<[u8; 32]>]| {
+            address == Some(*vault)
+                && topics.first().copied().flatten() == Some(DATA_PAYMENT_MADE_TOPIC)
+                && topics.get(3).copied().flatten() == Some(*quote_hash)
+        };
+        let mut read = Vec::new();
+        for log in logs {
+            let address = log["address"].as_str().and_then(parse_bytes::<20>);
+            let topics: Vec<Option<[u8; 32]>> = log["topics"]
+                .as_array()
+                .map(|topics| {
+                    topics
+                        .iter()
+                        .map(|topic| topic.as_str().and_then(parse_bytes))
+                        .collect()
+                })
+                .unwrap_or_default();
+            if !names_quote(address, &topics) || log["removed"].as_bool() == Some(true) {
+                continue;
+            }
+            let Some(found) = parse_vault_log(log) else {
+                continue;
+            };
+            if read.contains(&found.tx_hash) {
+                continue;
+            }
+            read.push(found.tx_hash);
+            let shown = self
+                .transaction(&found.tx_hash)
+                .await?
+                .is_some_and(|(receipt, _)| {
+                    receipt.success
+                        && receipt.logs.iter().any(|log| {
+                            let topics: Vec<Option<[u8; 32]>> =
+                                log.topics.iter().copied().map(Some).collect();
+                            names_quote(Some(log.address), &topics)
+                        })
+                });
+            if shown {
+                return Ok(Some(found.tx_hash));
+            }
+        }
+        Ok(None)
+    }
+
+    /// The gas transaction `tx_hash` spent, in wei (its gas used times its
+    /// effective gas price), read from its receipt; `None` if the chain
+    /// doesn't serve the receipt (yet).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the call fails or the receipt names no gas.
+    pub(crate) async fn transaction_gas(
+        &self,
+        tx_hash: &[u8; 32],
+    ) -> std::result::Result<Option<u128>, String> {
+        let receipt = self
+            .rpc
+            .call(
+                "eth_getTransactionReceipt",
+                json!([format!("0x{}", hex::encode(tx_hash))]),
+            )
+            .await?
+            .value;
+        if receipt.is_null() {
+            return Ok(None);
+        }
+        let field = |name: &str| {
+            receipt[name]
+                .as_str()
+                .and_then(|hex| u128::from_str_radix(hex.trim_start_matches("0x"), 16).ok())
+                .ok_or_else(|| format!("the receipt names no {name}"))
+        };
+        Ok(Some(
+            field("gasUsed")?.saturating_mul(field("effectiveGasPrice")?),
+        ))
+    }
+
     /// The receipt of `tx_hash` (as little of it as a check reads: whether
     /// it succeeded, its block, and the vault's logs in it) and its block's
     /// timestamp, or `None` if the chain doesn't know the transaction (yet).
@@ -4524,11 +4679,19 @@ pub(crate) mod test_chain {
         /// advances `latest_nonce`, and a `RootPaid` log records its wave's
         /// key in `root_records`.
         pub(crate) mine: HashMap<usize, Vec<PaymentLog>>,
-        /// Whether a mined send's receipt is held back in `held`, as a
-        /// lagging replica doesn't serve it yet, rather than served.
-        pub(crate) hold_mined: bool,
-        /// Receipts the chain holds but doesn't serve yet.
-        pub(crate) held: HashMap<[u8; 32], PaymentReceipt>,
+        /// How many more `eth_getTransactionReceipt` reads of a mined
+        /// send's receipt answer null, as a lagging replica answers: each
+        /// such read counts one down. Logs and every other read show it.
+        pub(crate) hold_receipt_reads: usize,
+        /// The transactions mined from sends.
+        pub(crate) mined: HashSet<[u8; 32]>,
+        /// The sender `eth_getTransactionByHash` names for a mined send, if
+        /// any (null otherwise, as for a transaction the RPC doesn't know).
+        pub(crate) mined_sender: Option<[u8; 20]>,
+        /// How many more reads of a root vault's `records(bytes32)` answer
+        /// an empty record, whatever it holds, as a lagging replica answers:
+        /// each such read counts one down.
+        pub(crate) hold_record_reads: usize,
         /// The account nonce `eth_getTransactionCount` answers for the
         /// latest or pending block, once `nonce_reads` run out.
         pub(crate) latest_nonce: u64,
@@ -4586,16 +4749,18 @@ pub(crate) mod test_chain {
                                 }
                             }
                         }
-                        let receipt = PaymentReceipt {
-                            tx_hash: hash,
-                            success: true,
-                            block_number: 90,
-                            logs,
-                        };
-                        if self.hold_mined {
-                            self.held.insert(hash, receipt);
-                        } else {
-                            self.receipts.insert(hash, receipt);
+                        self.receipts.insert(
+                            hash,
+                            PaymentReceipt {
+                                tx_hash: hash,
+                                success: true,
+                                block_number: 90,
+                                logs,
+                            },
+                        );
+                        self.mined.insert(hash);
+                        if let Some(sender) = self.mined_sender {
+                            self.senders.insert(hash, sender);
                         }
                         self.latest_nonce += 1;
                     }
@@ -4603,6 +4768,29 @@ pub(crate) mod test_chain {
                         Some(error) => Err(error),
                         None => Ok(json!(format!("0x{}", hex::encode(hash)))),
                     })
+                }
+                "eth_call" => {
+                    let call = &params[0];
+                    let data = call["data"]
+                        .as_str()
+                        .or_else(|| call["input"].as_str())
+                        .and_then(|data| hex::decode(data.trim_start_matches("0x")).ok())?;
+                    if self.hold_record_reads == 0
+                        || data.len() != 36
+                        || data[..4] != ROOT_RECORDS_SELECTOR
+                    {
+                        return None;
+                    }
+                    self.hold_record_reads -= 1;
+                    Some(Ok(json!(format!("0x{}", "00".repeat(96)))))
+                }
+                "eth_getTransactionReceipt" => {
+                    let hash = params[0].as_str().and_then(parse_bytes::<32>)?;
+                    if self.hold_receipt_reads == 0 || !self.mined.contains(&hash) {
+                        return None;
+                    }
+                    self.hold_receipt_reads -= 1;
+                    Some(Ok(Value::Null))
                 }
                 "eth_getTransactionCount" => {
                     // A block named by its hash (an object), as the
