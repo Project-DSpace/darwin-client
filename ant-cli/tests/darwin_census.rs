@@ -157,6 +157,18 @@ const DECODES: Counting = &[
     (Some("serde_json"), "from_slice"),
 ];
 
+/// Quote requests that declare no settlement version: the unversioned message
+/// bodies and the request types they carry. A node asked without a version
+/// quotes as for version 1, and refuses the weighted or root payment made on
+/// that quote, so every quote request this client sends names its version.
+/// Upstream asks a storer that stays silent again in the unversioned shape;
+/// this client doesn't.
+const UNVERSIONED_QUOTES: Counting = &[
+    (None, "QuoteRequest"),
+    (None, "ChunkQuoteRequest"),
+    (None, "MerkleCandidateQuoteRequest"),
+];
+
 /// Erasures in the node manager's code (see [`NODE_MANAGER`]): every deletion
 /// of a file or folder, and every reset of all node state.
 const ERASES: Counting = &[
@@ -216,7 +228,10 @@ const BROWSER: &str = "raw, by the caller's choice: no envelope. The browser cor
     plain data map; the page's wallet pays each quote (pay_for_quotes is its callback), per chunk \
     by default; there is no read-back of paid quotes in the browser yet.";
 const BROWSER_POINTER: &str = "The browser core's pointer writes: the page's wallet pays the \
-    quote (pay_for_quotes is its callback); a pointer record has no envelope.";
+    quote (pay_for_quotes is its callback); a pointer record has no envelope. The browser has no \
+    price ceiling or occupied-quote read-back; a payment lost between broadcast and receipt is \
+    rebuilt from the write's checkpoint (recoverPointerPayment, which pays nothing) and stored \
+    through storePaidPointer.";
 const BROWSER_WIRE: &str = "The browser transport admits and sends a pointer PUT the browser \
     core built and paid; it stores nothing itself.";
 const IMPORT: &str = "An import or re-export of a listed path; the calls are listed where \
@@ -258,6 +273,9 @@ const ROOT_MAP: &str = "The root map of a listed file whose data map is shrunk o
     size the map declares for it, within MAX_ROOT_MAP_BYTES; only its size is kept.";
 const LOCAL_FILE: &str = "Decodes a local file this client wrote (a datamap file, upload \
     state, a snapshot, earlier listings output), not network bytes.";
+const PAGE_INPUT: &str = "Decodes what the page hands the browser core, not network bytes: a \
+    data map given to createManifest (held to canonical bytes and to what a writer embeds), or \
+    the plan in a pointer write's own recovery checkpoint (refused over 4 MiB).";
 const EMBED_LOCAL: &str = "Decodes a data map from a local manifest file the user gave, to \
     decide whether to embed it.";
 const RESET: &str = "node::reset deletes every node's data and log folders: reached only from \
@@ -410,14 +428,14 @@ const STORE_SITES: &[Site] = &[
     ),
     (
         "ant-core/src/browser/wasm_transport/pointer.rs",
-        "BrowserNetworkClient::store_pointer",
+        "BrowserNetworkClient::pay_and_store",
         "pay_for_quotes",
         1,
         BROWSER_POINTER,
     ),
     (
         "ant-core/src/browser/wasm_transport/pointer.rs",
-        "BrowserNetworkClient::store_pointer",
+        "BrowserNetworkClient::pay_and_store",
         "pointer_put_paid",
         1,
         BROWSER_POINTER,
@@ -444,13 +462,6 @@ const STORE_SITES: &[Site] = &[
         BROWSER_POINTER,
     ),
     (
-        "ant-core/src/browser/wasm_transport/pointer.rs",
-        "BrowserNetworkClient::write_pointer",
-        "store_pointer",
-        1,
-        BROWSER_POINTER,
-    ),
-    (
         "ant-core/src/browser/wasm_transport/shared.rs",
         "Admission::of",
         "PointerPutRequest",
@@ -459,7 +470,7 @@ const STORE_SITES: &[Site] = &[
     ),
     (
         "ant-core/src/browser/wasm_transport/shared.rs",
-        "SharedNetworkAdapter::request",
+        "SharedNetworkAdapter::request_notifying_dispatched",
         "PointerPutRequest",
         2,
         BROWSER_WIRE,
@@ -1972,7 +1983,42 @@ const BOUNDARY_SITES: &[Site] = &[
     ),
 ];
 
+const ADMISSION_ONLY: &str = "Names the unversioned quote requests only to sort a message the \
+     browser transport is handed into those that need a node taking paid uploads; nothing here \
+     builds or sends one.";
+
+const UNVERSIONED_QUOTE_SITES: &[Site] = &[
+    (
+        "ant-core/src/browser/wasm_transport/shared.rs",
+        "Admission::of",
+        "QuoteRequest",
+        1,
+        ADMISSION_ONLY,
+    ),
+    (
+        "ant-core/src/browser/wasm_transport/shared.rs",
+        "Admission::of",
+        "MerkleCandidateQuoteRequest",
+        1,
+        ADMISSION_ONLY,
+    ),
+];
+
 const DECODE_SITES: &[Site] = &[
+    (
+        "ant-core/src/browser/file_manifest.rs",
+        "embeddable_data_map",
+        "rmp_serde::from_slice",
+        1,
+        PAGE_INPUT,
+    ),
+    (
+        "ant-core/src/browser/wasm_transport/pointer.rs",
+        "PointerPaymentCheckpoint::decode",
+        "rmp_serde::from_slice",
+        1,
+        PAGE_INPUT,
+    ),
     (
         "ant-cli/src/commands/data/listings.rs",
         "ListingsArgs::load_earlier",
@@ -3513,6 +3559,18 @@ fn every_decode_is_reviewed() {
         "A data map read from the network is decoded only through decode_map_record, which \
          bounds it, or by the producer's root-map read, bounded by the chunks it decrypts; other \
          decodes read local files or other types.",
+    );
+}
+
+#[test]
+fn no_quote_request_is_sent_without_a_settlement_version() {
+    check(
+        UNVERSIONED_QUOTES,
+        UNVERSIONED_QUOTE_SITES,
+        "Every quote request this client sends declares its settlement version \
+         (QuoteRequestV2, MerkleCandidateQuoteRequestV2): upstream's retry of a silent storer in \
+         the unversioned shape is left out, since a node asked without a version quotes as for \
+         version 1 and refuses the weighted or root payment made on that quote.",
     );
 }
 
