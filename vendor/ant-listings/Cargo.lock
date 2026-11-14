@@ -420,9 +420,9 @@ dependencies = [
 
 [[package]]
 name = "ant-protocol"
-version = "5.0.0"
+version = "6.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e4ad739acc497fb0f9bb49691e5874ecd68584569e730cc32f8a26d70f4b6725"
+checksum = "28e38869b71a547db27d565d6256c371ec410700d646e0eb7b683684cdaa93de"
 dependencies = [
  "blake3",
  "bytes",
@@ -741,12 +741,6 @@ name = "base16ct"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4c7f02d4ea65f2c1853089ffd8d2787bdbc63de2f0d29dedbcf8ccdfa0ccd4cf"
-
-[[package]]
-name = "base64"
-version = "0.22.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6"
 
 [[package]]
 name = "base64"
@@ -2936,9 +2930,9 @@ dependencies = [
 
 [[package]]
 name = "saorsa-core"
-version = "0.29.1"
+version = "0.30.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "96eb0b46528062e949d16000877f27e37a535d2c431c49e102e73268f503a104"
+checksum = "25e3b19c7be5ab56d900ce4c0af1029f4009ef9142d4bb229e0370db0d31b131"
 dependencies = [
  "anyhow",
  "blake3",
@@ -2995,12 +2989,12 @@ dependencies = [
 
 [[package]]
 name = "saorsa-transport"
-version = "0.38.1"
+version = "0.39.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7debc3e4627e16065ae43ac24ce329de65f71a7ee1cc86943073de3d43f5d004"
+checksum = "beeb14b4a6d7a652dc0433eec1db536901c12c9532f0aaa922b1dd7e0fb58841"
 dependencies = [
  "anyhow",
- "base64 0.22.1",
+ "base64",
  "hex",
  "libc",
  "windows",
@@ -3196,7 +3190,7 @@ version = "3.24.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "df9adc193c780ef8f159aee8b61e2d5801aaa555e6eb0947fe45530ec506296f"
 dependencies = [
- "base64 0.23.1",
+ "base64",
  "bs58",
  "chrono",
  "hex",

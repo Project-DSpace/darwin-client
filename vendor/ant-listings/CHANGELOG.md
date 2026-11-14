@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+### Changed
+
+- Builds on ant-protocol 6.0.0 (was 5.0.0) and, for the tests, saorsa-core
+  0.30.0 (was 0.29.1), the versions upstream's node 0.24.0 uses, so that a
+  node or client vendoring this crate beside a 6.0.0 ant-protocol keeps one
+  copy of it. No source change: every ant-protocol item this crate uses is
+  the same in 6.0.0.
+
 ## 0.4.0
 
 Payments are read from a set of vaults, each by its own address, and a root
