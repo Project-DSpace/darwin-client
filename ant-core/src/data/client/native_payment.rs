@@ -390,14 +390,38 @@ async fn pay_root<A: UploadAdapter>(
             .await?,
     );
     let share = super::shared_wave::share_of(&receipt, &quotes, quotes.len())?;
+    let (mut amount, mut gas, mut recorded_by_payer) = (share.amount, share.gas, false);
+    if recording != own
+        && client.transaction_sender(&recording.0).await == Some(wallet.address().0 .0)
+    {
+        // This payer's own transaction recorded the wave, not `own`: one
+        // taken as never sent whose receipt a lagging replica held back,
+        // before `own` was sent again. The wave's total moved, in it, and
+        // its gas was spent besides `own`'s.
+        let recording_gas = client.transaction_gas(&recording.0).await.ok_or_else(|| {
+            Error::Payment(format!(
+                "the root wave was recorded by this payer's transaction {recording}, whose gas \
+                 couldn't be read, so the payment's cost isn't known yet; its journal is kept, \
+                 nothing is paid again, and a retry reads it again. Don't delete the upload's \
+                 checkpoint"
+            ))
+        })?;
+        amount = quotes
+            .iter()
+            .fold(ant_protocol::evm::Amount::ZERO, |sum, (_, _, paid)| {
+                sum.saturating_add(*paid)
+            });
+        gas = gas.saturating_add(recording_gas);
+        recorded_by_payer = true;
+    }
     Ok(root_wave_payment(
         &quotes,
         own,
         recording,
-        false,
+        recorded_by_payer,
         wave,
-        share.amount,
-        share.gas,
+        amount,
+        gas,
     ))
 }
 
@@ -3662,6 +3686,42 @@ mod tests {
         assert!(payment.transactions.values().all(|tx| *tx == sent[0]));
         assert_eq!(payment.amount, total_of(&paying.plans));
         assert_eq!(payment.gas, 21_000);
+    }
+
+    /// A root wave whose first send the chain took, its answer lost, where
+    /// both its receipt and the root vault's record of the wave lag past
+    /// every read, so it is signed and sent again: the second transaction
+    /// records nothing, and the wave is recorded by this payer's first.
+    /// The payment reports the wave's total, by the first transaction, and
+    /// the gas of both, not a cost of zero.
+    #[tokio::test]
+    async fn a_root_wave_sent_again_reports_the_payers_transaction_that_recorded_it() {
+        let mut paying = paying(PaymentVault::Root).await;
+        let wave = root_payment::wave_of(&paying.plans).unwrap();
+        let payer = payer(&paying);
+        {
+            let mut chain = paying.chain.lock().unwrap();
+            chain.send_answers = [lost_answer(), nonce_used()].into();
+            chain
+                .mine
+                .insert(0, vec![root_paid_log(wave.key(&PAYING_ROOT))]);
+            // The second transaction: the vault already holds the wave.
+            chain.mine.insert(2, Vec::new());
+            chain.hold_receipt_reads = REFUSED_FIRST_SEND_READS;
+            chain.hold_record_reads = ROOT_READS_BEFORE_PAYING_AGAIN;
+            chain.mined_sender = Some(payer);
+        }
+        let adapter = Counting::default();
+        let payment = pay_root(&paying.client, &adapter, &paying.plans, &mut paying.state)
+            .await
+            .unwrap();
+
+        let sent = sent_transactions(&paying.chain);
+        assert_eq!(sent.len(), 2, "the lag outlasted every read: sent again");
+        assert_eq!(payment.root.as_ref().unwrap().transaction, sent[0]);
+        assert!(payment.transactions.values().all(|tx| *tx == sent[0]));
+        assert_eq!(payment.amount, total_of(&paying.plans));
+        assert_eq!(payment.gas, 2 * 21_000);
     }
 
     /// The per-quote vault's `DataPaymentMade` log of `plan`'s paid quote.
