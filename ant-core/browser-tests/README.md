@@ -56,7 +56,7 @@ pins the node: darwin-node's repository, then the revision. It is the revision
 native suites run the same nodes, which dial a verified direct address before a
 relay in both (the native suite's are built with `vendor/saorsa-core`, darwin-node's
 copy); `scripts/darwin-node-pin.py`, which CI runs, checks that the pins agree. It is
-currently `8ab7d76`: darwin-node `0.24.0+ds.22` (branch `upstream-0.24`), upstream node v0.24.0 merged
+currently `6e792ac`: darwin-node `0.24.0+ds.22` on its `main`, upstream node v0.24.0 merged
 into node release `v0.23.0+ds.21`, which keeps the price curve (100 DARWIN per
 GB of full chunks on empty nodes, divisor 2,000, both curves accepted) and root
 payments. It prices records by size as node release 2 does, quotes a
