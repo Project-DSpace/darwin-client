@@ -13,9 +13,9 @@
 edition = "2024"
 rust-version = "1.95"
 name = "saorsa-core"
-version = "0.29.1"
+version = "0.30.0"
 authors = ["Saorsa Labs Limited <david@saorsalabs.com>"]
-build = "build.rs"
+build = false
 autolib = false
 autobins = false
 autoexamples = false
@@ -72,10 +72,6 @@ path = "tests/client_rebootstrap.rs"
 [[test]]
 name = "dht_self_advertisement"
 path = "tests/dht_self_advertisement.rs"
-
-[[test]]
-name = "masque_relay_e2e"
-path = "tests/masque_relay_e2e.rs"
 
 [[test]]
 name = "node_lifecycle"
@@ -147,7 +143,7 @@ version = "0.8"
 version = "0.5.2"
 
 [dependencies.saorsa-transport]
-version = "0.38.1"
+version = "0.39.0"
 default-features = false
 
 [dependencies.serde]

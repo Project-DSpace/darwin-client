@@ -1,4 +1,4 @@
-# Vendored from crates.io (ant-protocol 5.0.0, sha256 e4ad739a...).
+# Vendored from crates.io (ant-protocol 6.0.0, sha256 28e38869...; re-vendored from 5.0.0 with the merge of upstream node 0.24.0).
 # The changes from upstream, in src/payment/pricing.rs, src/payment/proof.rs, src/payment/mod.rs,
 # src/lib.rs and src/chunk.rs:
 # - The price curve: baseline 0.1396736 DARWIN, coefficient 9 × baseline, divisor 2,000 (Dan,

@@ -28,6 +28,14 @@ pub const MAX_WIRE_MESSAGE_SIZE: usize = 5 * 1024 * 1024;
 /// Data type identifier for chunks.
 pub const DATA_TYPE_CHUNK: u32 = 0;
 
+/// User-agent token a node announces when it answers
+/// [`ChunkMessageBody::GetOrCloserRequest`] (ant-node ADR-0020).
+///
+/// Native QUIC peers exchange no capabilities, and a node built before that
+/// request existed drops it without a reply. A client sends it only to a peer
+/// whose user agent carries this token; see [`advertises_get_or_closer`].
+pub const GET_OR_CLOSER_AGENT_TOKEN: &str = "get-or-closer/1";
+
 /// Settlement rules this build pays and verifies under.
 ///
 /// Separate from [`PROTOCOL_VERSION`] on purpose. That one tracks the *wire*:
@@ -199,6 +207,25 @@ pub enum ChunkMessageBody {
     PointerGetRequest(PointerGetRequest),
     /// Response to a pointer GET.
     PointerGetResponse(PointerGetResponse),
+    /// Request a chunk, or the responder's closest peers to it when it does
+    /// not hold the chunk: Kademlia's `FIND_VALUE` (ant-node ADR-0020).
+    ///
+    /// Appended after every existing variant for the reason given on
+    /// [`Self::QuoteRequestV2`]. A node built before this variant drops it
+    /// without a reply, so a client sends it only to a peer whose user agent
+    /// carries [`GET_OR_CLOSER_AGENT_TOKEN`].
+    GetOrCloserRequest(ChunkGetOrCloserRequest),
+    /// Response to a get-or-closer request.
+    GetOrCloserResponse(ChunkGetOrCloserResponse),
+}
+
+/// Whether a peer's user agent says it answers
+/// [`ChunkMessageBody::GetOrCloserRequest`].
+#[must_use]
+pub fn advertises_get_or_closer(user_agent: &str) -> bool {
+    user_agent
+        .split_whitespace()
+        .any(|token| token == GET_OR_CLOSER_AGENT_TOKEN)
 }
 
 // =============================================================================
@@ -460,6 +487,53 @@ pub enum ChunkGetResponse {
     NotFound {
         /// The requested address.
         address: XorName,
+    },
+    /// An error occurred.
+    Error(ProtocolError),
+}
+
+// =============================================================================
+// Get-or-closer Request/Response
+// =============================================================================
+
+/// Request a chunk, or the responder's closest peers to it when it does not
+/// hold the chunk.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChunkGetOrCloserRequest {
+    /// The content-addressed identifier to retrieve.
+    pub address: XorName,
+}
+
+impl ChunkGetOrCloserRequest {
+    /// Create a new get-or-closer request.
+    #[must_use]
+    pub const fn new(address: XorName) -> Self {
+        Self { address }
+    }
+}
+
+/// Response to a get-or-closer request.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
+pub enum ChunkGetOrCloserResponse {
+    /// The responder holds the chunk.
+    Found {
+        /// The chunk address.
+        address: XorName,
+        /// The chunk data.
+        content: Bytes,
+    },
+    /// The responder does not hold the chunk.
+    Closer {
+        /// The requested address.
+        address: XorName,
+        /// The responder's closest known peers to `address`, as its `FIND_NODE`
+        /// answer to the requester would hold them.
+        ///
+        /// Encoded by saorsa-core's `DhtNetworkManager::encode_closer_peers`
+        /// and checked by `decode_closer_peers`. Opaque here, so the peer
+        /// format is versioned in one place, as it is for `FIND_NODE`.
+        peers: Bytes,
     },
     /// An error occurred.
     Error(ProtocolError),
@@ -1396,5 +1470,112 @@ mod tests {
         assert!(rendered.contains("too old"), "{rendered}");
         // The whole point is that refusing to quote costs the user nothing.
         assert!(rendered.contains("nothing was charged"), "{rendered}");
+    }
+
+    #[test]
+    fn test_get_or_closer_request_encode_decode() {
+        let address = [0x61; 32];
+        let msg = ChunkMessage {
+            request_id: 600,
+            body: ChunkMessageBody::GetOrCloserRequest(ChunkGetOrCloserRequest::new(address)),
+        };
+
+        let encoded = msg.encode().expect("encode should succeed");
+        let decoded = ChunkMessage::decode(&encoded).expect("decode should succeed");
+
+        assert_eq!(decoded.request_id, 600);
+        let ChunkMessageBody::GetOrCloserRequest(request) = decoded.body else {
+            panic!("expected GetOrCloserRequest");
+        };
+        assert_eq!(request.address, address);
+    }
+
+    #[test]
+    fn test_get_or_closer_responses_encode_decode() {
+        let address = [0x62; 32];
+        let found = ChunkMessage {
+            request_id: 601,
+            body: ChunkMessageBody::GetOrCloserResponse(ChunkGetOrCloserResponse::Found {
+                address,
+                content: Bytes::from_static(b"chunk"),
+            }),
+        };
+        let decoded = ChunkMessage::decode(&found.encode().expect("encode")).expect("decode");
+        let ChunkMessageBody::GetOrCloserResponse(ChunkGetOrCloserResponse::Found {
+            address: found_address,
+            content,
+        }) = decoded.body
+        else {
+            panic!("expected Found");
+        };
+        assert_eq!(found_address, address);
+        assert_eq!(content.as_ref(), b"chunk");
+
+        let closer = ChunkMessage {
+            request_id: 602,
+            body: ChunkMessageBody::GetOrCloserResponse(ChunkGetOrCloserResponse::Closer {
+                address,
+                peers: Bytes::from_static(&[1, 2, 3]),
+            }),
+        };
+        let decoded = ChunkMessage::decode(&closer.encode().expect("encode")).expect("decode");
+        let ChunkMessageBody::GetOrCloserResponse(ChunkGetOrCloserResponse::Closer {
+            address: closer_address,
+            peers,
+        }) = decoded.body
+        else {
+            panic!("expected Closer");
+        };
+        assert_eq!(closer_address, address);
+        assert_eq!(peers.as_ref(), &[1, 2, 3]);
+    }
+
+    /// Variants are only ever appended, so a peer built before a variant
+    /// existed still reads every older one at its old wire value.
+    #[test]
+    fn test_message_discriminants_keep_their_wire_values() {
+        let address = [0x63; 32];
+        let discriminant = |body: ChunkMessageBody| {
+            let encoded = ChunkMessage {
+                request_id: 0,
+                body,
+            }
+            .encode()
+            .expect("encode should succeed");
+            // A zero request id is one varint byte; the variant index follows.
+            encoded[1]
+        };
+        assert_eq!(
+            discriminant(ChunkMessageBody::GetRequest(ChunkGetRequest::new(address))),
+            2
+        );
+        assert_eq!(
+            discriminant(ChunkMessageBody::PointerGetRequest(PointerGetRequest::new(
+                address
+            ))),
+            12
+        );
+        assert_eq!(
+            discriminant(ChunkMessageBody::GetOrCloserRequest(
+                ChunkGetOrCloserRequest::new(address)
+            )),
+            14
+        );
+        assert_eq!(
+            discriminant(ChunkMessageBody::GetOrCloserResponse(
+                ChunkGetOrCloserResponse::Error(ProtocolError::Internal("x".to_string()))
+            )),
+            15
+        );
+    }
+
+    #[test]
+    fn test_advertises_get_or_closer() {
+        assert!(advertises_get_or_closer(
+            "node/0.22.0 migration/files get-or-closer/1"
+        ));
+        assert!(!advertises_get_or_closer("node/0.21.0 migration/files"));
+        assert!(!advertises_get_or_closer("node/0.22.0 get-or-closer/10"));
+        assert!(!advertises_get_or_closer(""));
     }
 }

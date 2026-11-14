@@ -63,7 +63,7 @@ jobs:
             fi
           done
 
-      # vendor/saorsa-core is saorsa-core 0.29.1 from crates.io with only the
+      # vendor/saorsa-core is saorsa-core 0.30.0 from crates.io with only the
       # dial order changed, as darwin-node vendors it
       # (vendor/saorsa-core/VENDORED.md): the four patched files and the rest
       # of the copy are the git objects that file records.
