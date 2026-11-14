@@ -4508,6 +4508,35 @@ pub(crate) mod test_chain {
         pub(crate) ids: Vec<u64>,
         /// How many HTTP requests came: a batch is one.
         pub(crate) requests: usize,
+        /// Whether the chain answers the calls of a wallet that prepares and
+        /// sends a payment: the token's `balanceOf` and `allowance` with
+        /// plenty, fee history, gas estimates, nonce reads and sends. Off,
+        /// they get a null result.
+        pub(crate) paying: bool,
+        /// Each answer `eth_sendRawTransaction` gives in turn: an error's
+        /// code and message, or `None` to take the transaction. Once they
+        /// run out, every transaction is taken.
+        pub(crate) send_answers: std::collections::VecDeque<Option<(i64, String)>>,
+        /// The raw transactions `eth_sendRawTransaction` was given, in order.
+        pub(crate) sent: Vec<Vec<u8>>,
+        /// The sends (by their place in `sent`) the chain mines, in block 90,
+        /// whatever it answered them, each with these logs: a mined send
+        /// advances `latest_nonce`, and a `RootPaid` log records its wave's
+        /// key in `root_records`.
+        pub(crate) mine: HashMap<usize, Vec<PaymentLog>>,
+        /// Whether a mined send's receipt is held back in `held`, as a
+        /// lagging replica doesn't serve it yet, rather than served.
+        pub(crate) hold_mined: bool,
+        /// Receipts the chain holds but doesn't serve yet.
+        pub(crate) held: HashMap<[u8; 32], PaymentReceipt>,
+        /// The account nonce `eth_getTransactionCount` answers for the
+        /// latest or pending block, once `nonce_reads` run out.
+        pub(crate) latest_nonce: u64,
+        /// The nonces the next reads at the latest or pending block answer.
+        pub(crate) nonce_reads: std::collections::VecDeque<u64>,
+        /// The account nonce `eth_getTransactionCount` answers at any other
+        /// block, such as the finalized one.
+        pub(crate) finalized_nonce: u64,
     }
 
     impl MockChain {
@@ -4528,6 +4557,69 @@ pub(crate) mod test_chain {
         /// How many calls of `method` were made.
         pub(crate) fn calls_to(&self, method: &str) -> usize {
             self.calls.iter().filter(|call| *call == method).count()
+        }
+
+        /// The answer of a call that changes what the chain answers next, a
+        /// send or a nonce read; `None` for any other call.
+        fn answer_mut(
+            &mut self,
+            method: &str,
+            params: &Value,
+        ) -> Option<std::result::Result<Value, (i64, String)>> {
+            if !self.paying {
+                return None;
+            }
+            match method {
+                "eth_sendRawTransaction" => {
+                    let raw = params[0]
+                        .as_str()
+                        .and_then(|raw| hex::decode(raw.trim_start_matches("0x")).ok())
+                        .unwrap_or_default();
+                    let hash = alloy::primitives::keccak256(&raw).0;
+                    let place = self.sent.len();
+                    self.sent.push(raw);
+                    if let Some(logs) = self.mine.remove(&place) {
+                        for log in &logs {
+                            if log.topics.first() == Some(&ROOT_PAID_TOPIC) {
+                                if let Some(key) = log.topics.get(1) {
+                                    self.root_records.insert(*key);
+                                }
+                            }
+                        }
+                        let receipt = PaymentReceipt {
+                            tx_hash: hash,
+                            success: true,
+                            block_number: 90,
+                            logs,
+                        };
+                        if self.hold_mined {
+                            self.held.insert(hash, receipt);
+                        } else {
+                            self.receipts.insert(hash, receipt);
+                        }
+                        self.latest_nonce += 1;
+                    }
+                    Some(match self.send_answers.pop_front().flatten() {
+                        Some(error) => Err(error),
+                        None => Ok(json!(format!("0x{}", hex::encode(hash)))),
+                    })
+                }
+                "eth_getTransactionCount" => {
+                    // A block named by its hash (an object), as the
+                    // finalized one is read, answers the finalized nonce.
+                    let latest = match params.get(1) {
+                        None | Some(Value::Null) => true,
+                        Some(block) => matches!(block.as_str(), Some("latest" | "pending")),
+                    };
+                    let nonce = if latest {
+                        self.nonce_reads.pop_front().unwrap_or(self.latest_nonce)
+                    } else {
+                        self.finalized_nonce
+                    };
+                    Some(Ok(json!(quantity(nonce))))
+                }
+                _ => None,
+            }
         }
 
         /// The result of a call, or a JSON-RPC error message.
@@ -4637,6 +4729,14 @@ pub(crate) mod test_chain {
                     Value::Array(logs)
                 }
                 "eth_call" => self.vault_call(&params[0]),
+                "eth_estimateGas" if self.paying => json!("0x5208"),
+                "eth_maxPriorityFeePerGas" | "eth_gasPrice" if self.paying => json!("0x1"),
+                "eth_feeHistory" if self.paying => json!({
+                    "oldestBlock": "0x0",
+                    "baseFeePerGas": ["0x1", "0x1"],
+                    "gasUsedRatio": [0.5],
+                    "reward": [["0x1"]],
+                }),
                 "eth_getTransactionByHash" => {
                     let hash = params[0].as_str().and_then(parse_bytes::<32>);
                     match hash.and_then(|hash| Some((hash, self.senders.get(&hash)?))) {
@@ -4656,8 +4756,10 @@ pub(crate) mod test_chain {
         /// to an address with no such function, for anything else.
         fn vault_call(&self, call: &Value) -> Value {
             let to = call["to"].as_str().and_then(parse_bytes::<20>);
+            // alloy's contract calls name the calldata `input`.
             let data = call["data"]
                 .as_str()
+                .or_else(|| call["input"].as_str())
                 .and_then(|data| hex::decode(data.trim_start_matches("0x")).ok())
                 .unwrap_or_default();
             if data.len() == 36 && data[..4] == ROOT_RECORDS_SELECTOR {
@@ -4668,6 +4770,15 @@ pub(crate) mod test_chain {
                     words[76..96].copy_from_slice(&[0x9a; 20]);
                 }
                 return json!(format!("0x{}", hex::encode(words)));
+            }
+            let token_read = [
+                &alloy::primitives::keccak256(b"balanceOf(address)")[..4],
+                &alloy::primitives::keccak256(b"allowance(address,address)")[..4],
+            ];
+            if self.paying && data.len() >= 4 && token_read.contains(&&data[..4]) {
+                let mut word = [0u8; 32];
+                word[16..].copy_from_slice(&u128::MAX.to_be_bytes());
+                return json!(format!("0x{}", hex::encode(word)));
             }
             let selector = alloy::primitives::keccak256(b"completedPayments(bytes32)");
             if to != Some(VAULT) || data.len() != 36 || data[..4] != selector[..4] {
@@ -4788,9 +4899,12 @@ pub(crate) mod test_chain {
                             let answer =
                                 match chain.failing.iter().find(|(name, _)| *name == method) {
                                     Some((_, code)) => Err((*code, format!("{method} refused"))),
-                                    None => chain
-                                        .answer(&method, &call["params"])
-                                        .map_err(|message| (-32_000, message)),
+                                    None => match chain.answer_mut(&method, &call["params"]) {
+                                        Some(answer) => answer,
+                                        None => chain
+                                            .answer(&method, &call["params"])
+                                            .map_err(|message| (-32_000, message)),
+                                    },
                                 };
                             answers.push(match answer {
                                 Ok(result) => {
