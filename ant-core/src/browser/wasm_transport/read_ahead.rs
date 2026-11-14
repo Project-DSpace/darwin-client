@@ -10,11 +10,12 @@
 //! only within those bounds; the read fetches any record refused here itself.
 //!
 //! Read-ahead fetches through a client of its own. Its GETs are speculative
-//! unless a read waits for their record, and the read budget admits speculative
-//! GETs, cancelled ones included, only within a share of its cap. Only fetches a
-//! read waited for inform the reads' adaptive concurrency, and read-ahead keeps
-//! its records out of the shared chunk cache. Readers reading ahead the same
-//! record at the same time share one fetch.
+//! unless a read waits for their record. The read budget admits speculative
+//! GETs, cancelled ones included, only within a share of its cap, and each
+//! node's session only within a share of its slots, never ahead of a GET a read
+//! waits for. Only fetches a read waited for inform the reads' adaptive
+//! concurrency, and read-ahead keeps its records out of the shared chunk cache.
+//! Readers reading ahead the same record at the same time share one fetch.
 use super::{BrowserNetworkCore, SharedNetworkAdapter};
 use crate::client_engine::read_ahead::{read_ahead_window, releasable};
 use crate::client_engine::read_budget::ReadBudget;
@@ -287,7 +288,10 @@ impl ReadAhead {
     /// sequential read also moves the read-ahead window to its start, so the
     /// records ahead are fetched alongside it. A read is sequential when it
     /// continues a recent read or the reader streams. Another read fetches only
-    /// the record after it, in case it starts a new stream. A streaming read from
+    /// the record after it, in case it starts a new stream, and only once the
+    /// read has finished: that record's discovery and transfer would otherwise
+    /// compete with the record the read waits for, such as the head of a video
+    /// a player is about to start. A streaming read from
     /// the start of the file also fetches the last record, where containers such
     /// as MP4 and WebM often keep the index a player reads next. A read that
     /// needs no records, such as one of zero length, changes nothing.
@@ -301,6 +305,7 @@ impl ReadAhead {
                 read: None,
                 indices: HashMap::new(),
                 addresses: Vec::new(),
+                next: None,
             };
         }
         let read = self.next_id();
@@ -337,10 +342,11 @@ impl ReadAhead {
                 break;
             }
         }
+        let mut next = None;
         if sequential {
             self.fill();
         } else if needed.end < self.layout.infos().len() {
-            self.prefetch(needed.end);
+            next = Some(needed.end);
         }
         if self.streaming && start == 0 {
             if let Some(last) = self.layout.infos().len().checked_sub(1) {
@@ -359,6 +365,7 @@ impl ReadAhead {
             read: Some(read),
             indices,
             addresses,
+            next,
         }
     }
 
@@ -558,6 +565,8 @@ pub(super) struct ReadLease {
     /// Index of each record the read needs, by address.
     indices: HashMap<[u8; 32], usize>,
     addresses: Vec<[u8; 32]>,
+    /// The record after a read that continues no other, fetched once it ends.
+    next: Option<usize>,
 }
 
 impl ReadLease {
@@ -589,6 +598,9 @@ impl Drop for ReadLease {
             self.read_ahead.reads.borrow_mut().remove(&read);
             self.read_ahead.pool.awaited.remove(&self.addresses);
             self.read_ahead.last_read.set(Instant::now());
+        }
+        if let Some(next) = self.next {
+            self.read_ahead.prefetch(next);
         }
     }
 }

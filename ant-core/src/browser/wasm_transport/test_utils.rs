@@ -4,8 +4,12 @@
 
 use super::*;
 use crate::browser::{BrowserChunkInfo, BrowserRecord};
+use crate::data::client::adaptive::{AdaptiveConfig, AdaptiveController, ChannelStart};
+use crate::data::network::{BrowserNetwork, RequestDispatched};
 use ant_protocol::chunk::{PointerGetResponse, PointerPutResponse};
 use ant_protocol::pointer::Pointer;
+use ant_protocol::transport::signed_address::SignedAddressRecord;
+use ant_protocol::transport::{KnownReachability, NodeIdentity, TransportAddressRecord};
 use self_encryption::{ChunkInfo, DataMap, XorName};
 
 mod node_session;
@@ -17,6 +21,17 @@ use fips204::{
 use saorsa_transport::webrtc::{
     accept_pq_session, encode_response_frame, parse_request_frame, BrowserResponse,
 };
+
+/// Lets an exclusive request gather the slots it can before a GET queues.
+const EXCLUSIVE_GATHERS_FIRST: Duration = Duration::from_millis(10);
+/// When the exclusive request is abandoned, still waiting for its last slot.
+const EXCLUSIVE_ABANDONED_AFTER: Duration = Duration::from_millis(50);
+/// Well past the abandonment, and far short of an ordinary admission timeout.
+const SPECULATIVE_ADMISSION_WAIT: Duration = Duration::from_millis(500);
+/// Publication sequence of a mock node's owner proof; it never republishes.
+const SIGNED_PEER_SEQUENCE: u64 = 1;
+/// Reliability a lookup reply reports for a mock node.
+const SIGNED_PEER_RELIABILITY: f64 = 1.0;
 
 /// Exercise bootstrap readiness after actual LRU pool eviction.
 #[wasm_bindgen]
@@ -41,10 +56,14 @@ pub async fn test_bootstrap_eviction(endpoints: JsValue) -> Result<(), JsValue> 
     result.map_err(|error| JsValue::from_str(&error))
 }
 
-/// Run independent peer reads through the real adapter's physical GET gate.
+/// Run independent peer reads through the real adapter's physical GET gate,
+/// under an adaptive fetch cap of `fetch_cap` if one is given.
 #[wasm_bindgen]
-pub async fn test_budgeted_reads(endpoints: JsValue, close_early: bool) -> JsValue {
-    use crate::data::network::BrowserNetwork;
+pub async fn test_budgeted_reads(
+    endpoints: JsValue,
+    close_early: bool,
+    fetch_cap: Option<u32>,
+) -> JsValue {
     let endpoints: Vec<String> = serde_wasm_bindgen::from_value(endpoints).unwrap();
     let core = Rc::new(
         BrowserNetworkCore::new(
@@ -57,6 +76,14 @@ pub async fn test_budgeted_reads(endpoints: JsValue, close_early: bool) -> JsVal
         )
         .unwrap(),
     );
+    if let Some(fetch_cap) = fetch_cap {
+        let start = ChannelStart {
+            fetch: fetch_cap as usize,
+            ..ChannelStart::default()
+        };
+        *core.pool.fetch_limiter.borrow_mut() =
+            Some(AdaptiveController::new(start, AdaptiveConfig::default()).fetch);
+    }
     let adapter = SharedNetworkAdapter::new(Rc::clone(&core));
     let requests = endpoints.iter().map(|endpoint| {
         let adapter = &adapter;
@@ -88,6 +115,46 @@ pub async fn test_budgeted_reads(endpoints: JsValue, close_early: bool) -> JsVal
     let (results, ()) = futures::future::join(futures::future::join_all(requests), close).await;
     core.pool.close();
     serde_wasm_bindgen::to_value(&results).unwrap()
+}
+
+/// Send two GETs to a node whose session carries one request at a time; the
+/// second waits for the first one's slot. Returns what `replies()` reports when
+/// the second GET is dispatched: the node's GET replies delivered by then.
+#[wasm_bindgen]
+pub async fn test_get_dispatched_before_peer_slot(
+    endpoint: &str,
+    replies: js_sys::Function,
+) -> Result<JsValue, JsValue> {
+    let core = Rc::new(
+        BrowserNetworkCore::new(vec![BrowserEndpoint {
+            multiaddr: endpoint.into(),
+        }])
+        .unwrap(),
+    );
+    let adapter = SharedNetworkAdapter::new(Rc::clone(&core));
+    let peer = PeerId::from_hex(&parse_webrtc_direct_multiaddr(endpoint).unwrap().peer_id).unwrap();
+    let addrs = [endpoint.parse().unwrap()];
+    let get = |request_id| ant_protocol::ChunkMessage {
+        request_id,
+        body: ant_protocol::ChunkMessageBody::GetRequest(ant_protocol::ChunkGetRequest::new(
+            [1; 32],
+        )),
+    };
+    let timeout = Duration::from_secs(5);
+    let (dispatched, on_dispatched) = RequestDispatched::channel();
+    let first = adapter.request(&peer, &addrs, get(1), timeout);
+    let second = adapter.request_notifying_dispatched(&peer, &addrs, get(2), timeout, dispatched);
+    let at_dispatch = async {
+        on_dispatched
+            .await
+            .map_err(|_| JsValue::from_str("the second GET was never dispatched"))?;
+        replies.call0(&JsValue::NULL)
+    };
+    let (first, second, at_dispatch) = futures::join!(first, second, at_dispatch);
+    core.pool.close();
+    first.map_err(|error| JsValue::from_str(&error.to_string()))?;
+    second.map_err(|error| JsValue::from_str(&error.to_string()))?;
+    at_dispatch
 }
 
 /// Both cold lanes must observe the same failed association setup.
@@ -396,6 +463,32 @@ impl BrowserTestNode {
     }
     pub fn endpoint(&self) -> String {
         self.endpoint.clone()
+    }
+    /// This node as a lookup reply lists it, with an owner proof of its WebRTC
+    /// Direct endpoint signed with its own key.
+    pub fn signed_peer(&self) -> JsValue {
+        let identity = NodeIdentity::import(
+            &serde_json::from_value(serde_json::json!({
+                "secret_key": self.secret.clone().into_bytes().to_vec(),
+                "public_key": self.public,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let address = self.endpoint.parse().unwrap();
+        let record = TransportAddressRecord::from_multiaddr(&address, KnownReachability::Direct)
+            .unwrap()
+            .unwrap();
+        let signed =
+            SignedAddressRecord::sign(&identity, SIGNED_PEER_SEQUENCE, vec![record]).unwrap();
+        let node = shared::browser_record(
+            signed
+                .verify()
+                .unwrap()
+                .peer_record(SIGNED_PEER_RELIABILITY),
+        )
+        .unwrap();
+        serde_wasm_bindgen::to_value(&node).unwrap()
     }
     pub fn last_method(&self) -> String {
         self.last_method.clone()
@@ -1045,6 +1138,12 @@ pub async fn test_shared_identity_and_timers() {
     );
 }
 
+/// The close group size the read's rules use, for tests that build one.
+#[wasm_bindgen]
+pub fn test_close_group_size() -> usize {
+    ant_protocol::CLOSE_GROUP_SIZE
+}
+
 /// Build a real, non-expiring owner proof for browser forwarding regressions.
 #[wasm_bindgen]
 pub fn test_signed_address_node() -> JsValue {
@@ -1095,7 +1194,6 @@ pub async fn test_pool_waiters(endpoints: JsValue) -> Result<(), JsValue> {
 /// Send through the production adapter with the native operation's response timeout.
 #[wasm_bindgen]
 pub async fn test_operation_timeout(endpoint: &str, timeout_ms: u32) -> Result<(), JsValue> {
-    use crate::data::network::BrowserNetwork;
     use ant_protocol::{ChunkGetRequest, ChunkMessage, ChunkMessageBody};
     let parsed = parse_webrtc_direct_multiaddr(endpoint).unwrap();
     let endpoint = BrowserEndpoint {
@@ -1144,7 +1242,6 @@ pub async fn test_pooled_requests(
     payment: JsValue,
     before: js_sys::Function,
 ) -> Result<JsValue, JsValue> {
-    use crate::data::network::BrowserNetwork;
     use ant_protocol::{ChunkGetRequest, ChunkMessage, ChunkMessageBody};
     let parsed = parse_webrtc_direct_multiaddr(endpoint).unwrap();
     let endpoint = BrowserEndpoint {
@@ -1206,8 +1303,10 @@ pub async fn test_admission_deadlines(endpoints: JsValue) {
     let waiter = async {
         TimeoutFuture::new(1).await;
         let deadline = TransferDeadline::new(Duration::from_millis(20));
-        assert!(matches!(lease.client.authenticated_before(&deadline).await,
-            Err(RpcError::Timeout(message)) if message.contains("admission")));
+        assert!(
+            matches!(lease.client.authenticated_before(&deadline, None).await,
+            Err(RpcError::Timeout(message)) if message.contains("admission"))
+        );
     };
     let (result, ()) = futures::future::join(active, waiter).await;
     result.unwrap();
@@ -1436,6 +1535,40 @@ pub async fn test_draining_pool_capacity(endpoints: JsValue) {
         .await
         .unwrap();
     pool.close();
+}
+
+/// Abandon an exclusive request while it holds three of a multiplexed session's
+/// four slots and waits for the fourth, which an active request holds. A
+/// speculative GET queued meanwhile must be admitted to the slots it hands back,
+/// with no slot released and no change to the GET's read priority.
+#[wasm_bindgen]
+pub async fn test_speculative_read_after_abandoned_put(endpoint: &str) -> bool {
+    let client = BrowserNodeClientCore::new(parse_webrtc_direct_multiaddr(endpoint).unwrap());
+    client.hello().await.unwrap();
+    let rpc = client.current_rpc().unwrap();
+    let active = rpc.admit(RPC_ADMISSION_TIMEOUT).await.unwrap();
+    let put = rpc.request(0, Vec::new(), RPC_ADMISSION_TIMEOUT, None, None, true);
+    let speculative = || true;
+    // Never changes, so only the returned slots can admit the GET.
+    let (_priority, changed) = watch::channel(());
+    let read = multiplex::ReadPriority {
+        speculative: &speculative,
+        changed,
+    };
+    let queued_read = async {
+        crate::runtime::sleep(EXCLUSIVE_GATHERS_FIRST).await;
+        rpc.admit_read(SPECULATIVE_ADMISSION_WAIT, &read).await
+    };
+    let (put, admitted) = futures::future::join(
+        crate::runtime::timeout(EXCLUSIVE_ABANDONED_AFTER, put),
+        queued_read,
+    )
+    .await;
+    assert!(put.is_err(), "the exclusive request was admitted");
+    let admitted = admitted.is_ok();
+    drop(active);
+    client.close();
+    admitted
 }
 
 #[wasm_bindgen]
