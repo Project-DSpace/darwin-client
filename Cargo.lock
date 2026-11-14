@@ -837,7 +837,7 @@ dependencies = [
 
 [[package]]
 name = "ant-cli"
-version = "0.3.11+ds.11"
+version = "0.3.13+ds.12"
 dependencies = [
  "ant-core",
  "anyhow",

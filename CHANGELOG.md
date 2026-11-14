@@ -7,10 +7,55 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Darwin fork
 
-Our changes on top of upstream 0.3.11 (ant-core 0.13.0). Releases are tagged `vX.Y.Z+ds.N`, with
-ant-cli's version set to match; other builds are told apart by the commit `darwin --version`
-prints. Upstream's entries follow.
+Our changes on top of upstream 0.3.13 (ant-core 0.15.0) from `v0.3.13+ds.12`, and on top of
+upstream 0.3.11 (ant-core 0.13.0) before it. Releases are tagged `vX.Y.Z+ds.N`, with ant-cli's
+version set to match; other builds are told apart by the commit `darwin --version` prints.
+Upstream's entries follow.
 
+- `v0.3.13+ds.12`, upstream 0.3.13: ant-cli's version is 0.3.13+ds.12 and ant-core's 0.15.0,
+  upstream's ant-cli 0.3.13 / ant-core 0.15.0 merged in, with every change of ours kept. The ds
+  number goes on counting across the new base, as darwin-node's does. The tests and devnet run
+  darwin-node 0.24.0+ds.22 (upstream node v0.24.0 merged into node release ds.21), and
+  `vendor/ant-protocol` and `vendor/saorsa-core` are its copies, ant-protocol 6.0.0 and
+  saorsa-core 0.30.0 with our changes (ant-core requires exactly ant-protocol 6.0.0);
+  `vendor/ant-listings` is darwin-listings v0.4.0's code on ant-protocol 6.0.0. From upstream:
+  - Chunk reads through a client-driven Kademlia lookup (ADR-0020), which asks the peers it finds
+    likely to hold a chunk for it as it goes: a peer whose agent announces get-or-closer with the
+    new get-or-closer request, every other peer, as every node of the network today, with
+    FIND_NODE and a GET. Our reads stay around it: a chunk read asks the node that served it in the
+    last few minutes first, and the lookup only once that node has answered without it or not
+    within the hedge delay; a chunk the lookup finds notes the node that sent it for the next
+    read; a lookup that finds nothing hands its peers to the progressive read, which still asks
+    the bootstrap peers nearest the chunk in a lane of their own; a node that sends bytes that
+    don't match the address is passed over and named.
+  - First reads spread over the close group (ADR-0023), and an early read is raced only once it
+    has waited the hedge delay since it was sent, never while it waits on the client's own limits.
+    With the bootstrap peers' lane, a read still runs at most two GETs: the lane takes the second
+    once no early read is left in flight.
+  - Uploads report the file's SHA-256: `darwin file upload` prints it (`SHA-256:`) and puts it in
+    its JSON (`sha256`), always the plaintext's, whatever envelope stores the file. Manifest
+    entries record it (written only when known, so older manifests keep their bytes, and older
+    clients read new ones without it); `darwin manifest show` lists it, extraction checks each
+    downloaded file against it, and the upload history's entry, still naming the file by its
+    envelope's address, records it.
+  - The browser library builds manifests and file links (`createManifest`, `createFileLink`,
+    writing `.darwin` bytes and `darwin://` links), recovers a pointer write's payment from the
+    checkpoint `onPrepared` is given and the receipt or broadcast the wallet reported
+    (`recoverPointerPayment`, `onSubmission`; recovering pays nothing), types pointer write
+    errors, gives up on a dial whose ICE checks no node answers within 3 s, and paces its reads
+    for DataChannel transfers.
+  - zip 9 with only Deflate for the node manager's release archives, and tokio 1.53.3,
+    rustls-webpki 0.103.16 and webpki-root-certs 1.0.10 for RustSec advisories.
+  Left out: upstream's unversioned quote retry (every quote request names its settlement version;
+  a census test now fails if an unversioned one is sent), its installers, workflows, release
+  scripts and AGENTS.md, and its merkle finalize-resume test (our nodes refuse batch payments).
+  New pins: the read engine's bootstrap lane beside stalled early reads and after a lookup's miss,
+  the holder asked before the lookup, the lookup's reads of nodes that do and don't announce
+  get-or-closer (the e2e target starts a second network for a rolling upgrade), the lookup's
+  dials going through the direct-first dial plan, the SHA-256 of envelope uploads (private,
+  unlisted, resumed, already stored) and of manifests built and extracted, a finalize resumed
+  after a storage outage paying nothing again, manifests written before SHA-256, and
+  `darwin://` from the browser's manifest export.
 - `v0.3.11+ds.11`, direct before relay: ant-cli's version is 0.3.11+ds.11 (ant-core stays 0.13.0).
   The client dials a peer's verified direct address before its
   relay. `vendor/saorsa-core` is the network library saorsa-core 0.29.1 as darwin-node vendors it
