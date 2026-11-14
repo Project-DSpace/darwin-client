@@ -155,7 +155,8 @@ pub struct TorrentInput {
 #[derive(Debug, Deserialize)]
 #[serde(tag = "kind", rename_all = "camelCase", deny_unknown_fields)]
 pub enum EntryInput {
-    /// A public file, by its hex DataMap address or `ant://` file link.
+    /// A public file, by its hex DataMap address or file link (`darwin://`, or
+    /// upstream's `ant://`).
     Public {
         /// Relative path, subject to the portable path rules.
         path: Option<String>,
@@ -169,7 +170,7 @@ pub enum EntryInput {
     /// A file by its DataMap, in self_encryption's canonical MessagePack as
     /// the browser client hands it out. Grants access to a private file.
     ///
-    /// The `.ant` bytes carry the map as given; the link carries its shrunk
+    /// The `.darwin` bytes carry the map as given; the link carries its shrunk
     /// form, which a reader resolves through the wrapper records an upload
     /// stores. So a root map must be one an upload shrank, as every upload
     /// does, never one encrypted without being uploaded.
@@ -192,13 +193,13 @@ pub enum EntryInput {
 pub struct CreatedManifest {
     /// The manifest as encoded, entries in canonical order.
     pub manifest: BrowserManifestView,
-    /// Canonical `.ant` file bytes.
+    /// Canonical `.darwin` file bytes.
     #[serde(with = "serde_bytes")]
     pub bytes: Vec<u8>,
-    /// `ant://manifest/...` link carrying the manifest's link form.
+    /// `darwin://manifest/...` link carrying the manifest's link form.
     pub link: String,
     /// Whether the link is short enough to share in a chat message. A longer
-    /// link still works; share the `.ant` file instead.
+    /// link still works; share the `.darwin` file instead.
     pub link_recommended: bool,
 }
 

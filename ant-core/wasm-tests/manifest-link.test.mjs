@@ -96,6 +96,7 @@ test("createManifest takes JavaScript input and writes what the decoders read", 
 
   assert.deepEqual(decodeManifest(created.bytes), created.manifest);
   assert.deepEqual(parseManifestLink(created.link), { kind: "manifest", manifest: created.manifest });
+  assert.ok(created.link.startsWith("darwin://manifest/"), `this client writes darwin:// links: ${created.link}`);
 });
 
 test("createManifest refuses input it does not know", () => {
@@ -123,9 +124,11 @@ test("createManifest refuses input it does not know", () => {
   }
 });
 
-test("createFileLink formats a public address in the shared link grammar", () => {
-  assert.equal(createFileLink(ADDRESS), `ant://${ADDRESS}`);
-  assert.equal(createFileLink(`ant://${ADDRESS.toUpperCase()}`), `ant://${ADDRESS}`);
+test("createFileLink writes darwin:// links", () => {
+  // From a bare address, from upstream's ant:// link and from a darwin:// one.
+  assert.equal(createFileLink(ADDRESS), `darwin://${ADDRESS}`);
+  assert.equal(createFileLink(`ant://${ADDRESS.toUpperCase()}`), `darwin://${ADDRESS}`);
+  assert.equal(createFileLink(`darwin://${ADDRESS}`), `darwin://${ADDRESS}`);
   assert.throws(() => createFileLink(LINK), /expected a public file address/);
   assert.throws(() => createFileLink("not an address"));
 });

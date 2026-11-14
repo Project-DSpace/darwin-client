@@ -5,7 +5,7 @@ import { BrowserNetworkClient } from "./client-fixture.mjs";
 import assert from "node:assert/strict";
 import test from "node:test";
 import vm from "node:vm";
-import { parseWebRtcDirectMultiaddr, pointerAddress, recoverPointerPayment } from "./pkg/ant_core.js";
+import { parseWebRtcDirectMultiaddr, pointerAddress, recoverPointerPayment, test_storage_price } from "./pkg/ant_core.js";
 import { mockWebRtc, paymentNetwork } from "./mock-webrtc.mjs";
 
 const seed = new Uint8Array(32).fill(7);
@@ -736,6 +736,48 @@ test("recoverPointerPayment rebuilds the paid state from its checkpoint and rece
       async () => recoverPointerPayment(JSON.stringify({ ...saved, record: other.record }), receiptFor(quote)),
       /pointer record differs from its payment plan/,
     );
+  } finally {
+    client.close();
+  }
+});
+
+// A pointer pays by its size class, as pricing::record_weight has it: 3 × the
+// median price × (1/4 + 3/4 × 16 KiB / 4 MiB), rounded up, a pointer record
+// being under 16 KiB. Written out here, so a change to the classes fails on
+// purpose.
+const pointerAmount = medianPrice => {
+  const full = 4n * 1024n * 1024n;
+  const numerator = full + 3n * 16n * 1024n;
+  const denominator = 4n * full;
+  return (3n * medianPrice * numerator + denominator - 1n) / denominator;
+};
+
+test("a recovered pointer payment is checked against the size-priced band", async () => {
+  // The write's wallet is asked for the pointer's size-priced amount, which
+  // the browser checks against its quotes' band before paying; the state
+  // recovered from the checkpoint carries that same paid proof, and asks the
+  // wallet for nothing more.
+  const rtc = mockWebRtc(Array.from({ length: 7 }, () => ({})));
+  const client = new BrowserNetworkClient(rtc.endpoints);
+  const signer = wallet();
+  const checkpoints = [];
+  let paid;
+  const options = { onPrepared: value => { checkpoints.push(value); }, onPaid: value => { paid = value; } };
+  try {
+    const written = await client.createPointer(seed, target(3), "chunk", paymentNetwork, signer.pay, options);
+    assert.equal(signer.calls.length, 1);
+    const [quote] = signer.calls[0].quotes.filter(q => BigInt(q.amount) > 0n);
+    const expected = pointerAmount(BigInt(test_storage_price(0)));
+    assert.equal(BigInt(quote.amount), expected, "the pointer's size-priced amount");
+    assert.equal(BigInt(written.storageCostAtto), expected);
+
+    const recovered = recoverPointerPayment(checkpoints[0], receiptFor(quote));
+    assert.deepEqual(recovered.proof, paid.proof, "the proof of the size-priced payment");
+    assert.deepEqual(
+      await client.storePaidPointer(recovered.record, recovered.proof, paymentNetwork),
+      written.pointer,
+    );
+    assert.equal(signer.calls.length, 1, "recovering pays nothing");
   } finally {
     client.close();
   }

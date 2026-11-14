@@ -682,7 +682,8 @@ mod wasm {
         serde_wasm_bindgen::to_value(&view).map_err(|error| JsValue::from_str(&error.to_string()))
     }
 
-    /// Build canonical `.ant` bytes and a compact share link without network I/O.
+    /// Build canonical `.darwin` bytes and a compact `darwin://` share link
+    /// without network I/O.
     #[wasm_bindgen(js_name = createManifest)]
     pub fn create_manifest_wasm(input: JsValue) -> Result<JsValue, JsValue> {
         reject_unknown_keys(&input, struct_fields::<ManifestInput>())
@@ -700,7 +701,8 @@ mod wasm {
         serde_wasm_bindgen::to_value(&result).map_err(|error| JsValue::from_str(&error.to_string()))
     }
 
-    /// Format a public file link using the shared link grammar.
+    /// Format a public file link using the shared link grammar: `darwin://`
+    /// and the address, from a bare address or a `darwin://` or `ant://` link.
     #[wasm_bindgen(js_name = createFileLink)]
     pub fn create_file_link_wasm(address: &str) -> Result<String, JsValue> {
         match crate::data::manifest::parse_link(address)
