@@ -1285,6 +1285,11 @@ const PAYER_ROOT_RECORDING: &str = "A payer through the root vault looks for the
     recorded a wave it paid (Client::root_wave_transaction): eth_getLogs at the root vault it \
     paid alone, filtered by RootPaid and the wave's key, each log taken only once its receipt \
     shows that vault's RootPaid naming the key.";
+const PAYER_QUOTE_RECORDING: &str = "A payer through the per-quote vault looks for the \
+    transaction that recorded a quote it paid, when its own payment's receipt isn't served \
+    (Client::recording_transaction_since): eth_getLogs at the per-quote vault it paid alone, \
+    filtered by DataPaymentMade and the quote's hash, each log taken only once its receipt shows \
+    that vault's DataPaymentMade naming the quote.";
 const PAYER_ROOT_RECEIPT: &str = "A payer through the root vault reads a transaction's receipt \
     for that vault's RootPaid log naming the key of a wave it paid (ListingChain::root_paid_in): \
     its own payment's transaction, the one that replaced it, or one a RootPaid log search found, \
@@ -1444,6 +1449,13 @@ const VAULT_READ_SITES: &[Site] = &[
         "\"eth_getLogs\"",
         1,
         PAYER_ROOT_RECORDING,
+    ),
+    (
+        "ant-core/src/data/client/listings.rs",
+        "ListingChain::quote_paid_transaction",
+        "\"eth_getLogs\"",
+        1,
+        PAYER_QUOTE_RECORDING,
     ),
     (
         "ant-core/src/data/client/listings.rs",
