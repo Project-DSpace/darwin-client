@@ -1598,6 +1598,13 @@ const VAULT_READ_SITES: &[Site] = &[
         PAYER_READ_BACK,
     ),
     (
+        "ant-core/src/data/client/native_payment.rs",
+        "per_quote_records",
+        "completed_payment",
+        1,
+        PAYER_READ_BACK,
+    ),
+    (
         "ant-core/src/data/client/occupied.rs",
         "recording_transaction_via",
         "root_paid_in",

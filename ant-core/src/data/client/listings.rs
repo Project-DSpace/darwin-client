@@ -4688,10 +4688,21 @@ pub(crate) mod test_chain {
         /// The sender `eth_getTransactionByHash` names for a mined send, if
         /// any (null otherwise, as for a transaction the RPC doesn't know).
         pub(crate) mined_sender: Option<[u8; 20]>,
-        /// How many more reads of a root vault's `records(bytes32)` answer
-        /// an empty record, whatever it holds, as a lagging replica answers:
-        /// each such read counts one down.
+        /// How many more reads of a vault's record (a root vault's
+        /// `records(bytes32)`, the per-quote vault's `completedPayments`)
+        /// answer an empty record, whatever it holds, as a lagging replica
+        /// answers: each such read counts one down.
         pub(crate) hold_record_reads: usize,
+        /// How many more `eth_getLogs` calls answer without the logs of
+        /// mined sends, as a lagging replica answers: each counts one down.
+        pub(crate) hold_log_reads: usize,
+        /// Whether a mined send failed (its receipt's status 0).
+        pub(crate) mine_reverted: bool,
+        /// The sends (by their place in `sent`) whose receipts, once mined,
+        /// name no gas used, as a receipt that can't be read for its gas.
+        pub(crate) mine_without_gas: HashSet<usize>,
+        /// The transactions whose receipts name no gas used.
+        pub(crate) gasless: HashSet<[u8; 32]>,
         /// The account nonce `eth_getTransactionCount` answers for the
         /// latest or pending block, once `nonce_reads` run out.
         pub(crate) latest_nonce: u64,
@@ -4753,12 +4764,15 @@ pub(crate) mod test_chain {
                             hash,
                             PaymentReceipt {
                                 tx_hash: hash,
-                                success: true,
+                                success: !self.mine_reverted,
                                 block_number: 90,
                                 logs,
                             },
                         );
                         self.mined.insert(hash);
+                        if self.mine_without_gas.contains(&place) {
+                            self.gasless.insert(hash);
+                        }
                         if let Some(sender) = self.mined_sender {
                             self.senders.insert(hash, sender);
                         }
@@ -4775,14 +4789,35 @@ pub(crate) mod test_chain {
                         .as_str()
                         .or_else(|| call["input"].as_str())
                         .and_then(|data| hex::decode(data.trim_start_matches("0x")).ok())?;
-                    if self.hold_record_reads == 0
-                        || data.len() != 36
-                        || data[..4] != ROOT_RECORDS_SELECTOR
-                    {
-                        return None;
-                    }
+                    let completed = alloy::primitives::keccak256(b"completedPayments(bytes32)");
+                    let words = match data.get(..4) {
+                        _ if self.hold_record_reads == 0 || data.len() != 36 => return None,
+                        Some(selector) if selector == ROOT_RECORDS_SELECTOR => 3,
+                        Some(selector) if selector == &completed[..4] => 2,
+                        _ => return None,
+                    };
                     self.hold_record_reads -= 1;
-                    Some(Ok(json!(format!("0x{}", "00".repeat(96)))))
+                    Some(Ok(json!(format!("0x{}", "00".repeat(32 * words)))))
+                }
+                "eth_getLogs" if self.hold_log_reads > 0 => {
+                    self.hold_log_reads -= 1;
+                    Some(
+                        self.answer(method, params)
+                            .map(|logs| match logs {
+                                Value::Array(logs) => Value::Array(
+                                    logs.into_iter()
+                                        .filter(|log| {
+                                            log["transactionHash"]
+                                                .as_str()
+                                                .and_then(parse_bytes::<32>)
+                                                .is_none_or(|hash| !self.mined.contains(&hash))
+                                        })
+                                        .collect(),
+                                ),
+                                other => other,
+                            })
+                            .map_err(|message| (-32_000, message)),
+                    )
                 }
                 "eth_getTransactionReceipt" => {
                     let hash = params[0].as_str().and_then(parse_bytes::<32>)?;
@@ -4842,7 +4877,15 @@ pub(crate) mod test_chain {
                 "eth_getTransactionReceipt" => {
                     let hash = params[0].as_str().and_then(parse_bytes::<32>);
                     match hash.and_then(|hash| self.receipts.get(&hash)) {
-                        Some(receipt) => receipt_json(receipt),
+                        Some(receipt) => {
+                            let mut json = receipt_json(receipt);
+                            if self.gasless.contains(&receipt.tx_hash) {
+                                if let Some(fields) = json.as_object_mut() {
+                                    fields.remove("gasUsed");
+                                }
+                            }
+                            json
+                        }
                         None => Value::Null,
                     }
                 }

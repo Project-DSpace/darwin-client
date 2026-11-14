@@ -260,21 +260,36 @@ async fn pay_with<A: UploadAdapter>(
         }
         Journal::Preparing | Journal::Signed(_) => None,
     };
-    let (receipt, wave_quotes) = match paid {
-        Some(paid) => paid,
+    // A wave reconciled from a journal may have paid nothing, as may a
+    // payment executed on such a path (`Executed::unproven`).
+    let ((receipt, wave_quotes), unproven) = match paid {
+        Some(paid) => (paid, true),
         None => match journal_of(state)? {
-            Journal::Preparing if share => {
-                pay_in_wave(client, adapter, &quotes, state, &fresh).await?
-            }
+            Journal::Preparing if share => (
+                pay_in_wave(client, adapter, &quotes, state, &fresh).await?,
+                false,
+            ),
             _ => {
                 let request = PaymentRequest::Quotes(quotes.clone());
                 let wallet = client.require_wallet()?;
                 let executed =
                     execute(client, wallet, adapter, &request, state, fresh, None).await?;
-                (executed.receipt, quotes.len())
+                ((executed.receipt, quotes.len()), executed.unproven)
             }
         },
     };
+    if unproven {
+        let from_time = earliest_quote(plans).saturating_sub(ant_listings::CLOCK_MARGIN);
+        return per_quote_records(
+            client,
+            client.require_wallet()?,
+            &quotes,
+            &receipt,
+            wave_quotes,
+            from_time,
+        )
+        .await;
+    }
     let share = super::shared_wave::share_of(&receipt, &quotes, wave_quotes)?;
     Ok(UploadPayment {
         transactions: quotes
@@ -348,9 +363,12 @@ async fn pay_root<A: UploadAdapter>(
         })
     };
     let request = PaymentRequest::Quotes(quotes.clone());
+    // A root wave's records name the transaction its RootPaid log shows
+    // ([`Client::root_wave_transaction`]), whichever path confirmed it.
     let Executed {
         receipt,
         replaced_by,
+        unproven: _,
     } = execute(
         client,
         wallet,
@@ -391,28 +409,30 @@ async fn pay_root<A: UploadAdapter>(
     );
     let share = super::shared_wave::share_of(&receipt, &quotes, quotes.len())?;
     let (mut amount, mut gas, mut recorded_by_payer) = (share.amount, share.gas, false);
-    if recording != own
-        && client.transaction_sender(&recording.0).await == Some(wallet.address().0 .0)
-    {
-        // This payer's own transaction recorded the wave, not `own`: one
-        // taken as never sent whose receipt a lagging replica held back,
-        // before `own` was sent again. The wave's total moved, in it, and
-        // its gas was spent besides `own`'s.
-        let recording_gas = client.transaction_gas(&recording.0).await.ok_or_else(|| {
-            Error::Payment(format!(
-                "the root wave was recorded by this payer's transaction {recording}, whose gas \
-                 couldn't be read, so the payment's cost isn't known yet; its journal is kept, \
-                 nothing is paid again, and a retry reads it again. Don't delete the upload's \
-                 checkpoint"
-            ))
-        })?;
-        amount = quotes
-            .iter()
-            .fold(ant_protocol::evm::Amount::ZERO, |sum, (_, _, paid)| {
-                sum.saturating_add(*paid)
-            });
-        gas = gas.saturating_add(recording_gas);
-        recorded_by_payer = true;
+    if recording != own {
+        // Another transaction recorded the wave, not `own`. Sent by this
+        // payer (one taken as never sent whose receipt a lagging replica
+        // held back, before `own` was sent again, or its wallet's
+        // replacement of `own`), the wave's total moved in it, and its gas
+        // was spent besides `own`'s; sent by another payer, this payment
+        // moved no tokens. Who sent it is read, never assumed: where its
+        // sender or gas can't be read, the payment stops with its journal
+        // kept rather than report a cost it doesn't know.
+        const WHAT: &str = "the root wave was recorded by a transaction other than this                             payment's own";
+        let reader = client.payment_reader()?;
+        let (by_payer, recording_gas) =
+            sender_and_gas(&reader, &recording.0, &wallet.address().0 .0)
+                .await
+                .map_err(|problem| cost_not_known(WHAT, &problem))?;
+        if by_payer {
+            amount = quotes
+                .iter()
+                .fold(ant_protocol::evm::Amount::ZERO, |sum, (_, _, paid)| {
+                    sum.saturating_add(*paid)
+                });
+            gas = gas.saturating_add(recording_gas);
+            recorded_by_payer = true;
+        }
     }
     Ok(root_wave_payment(
         &quotes,
@@ -864,6 +884,7 @@ async fn lead(client: &Client, wallet: &Wallet, member: &Member) {
         return;
     }
     let request = PaymentRequest::Quotes(quotes.clone());
+    let first_signed_at = unix_now();
     for round in 0..2 {
         if let Some(refusal) = client.corroborated_settlement_refusal() {
             member.end(WaveEnd::NotSent(Error::ClientUpdateRequired(refusal)));
@@ -898,10 +919,32 @@ async fn lead(client: &Client, wallet: &Wallet, member: &Member) {
             Settled::StaleUnsent => {
                 match recorded_after_all(client, wallet, &request, None, signed_at).await {
                     Ok(RecordedAfterAll::Paid(receipt)) => Settled::Confirmed(receipt),
-                    // `ByAnother` is a root wave's answer, never a shared wave's.
-                    Ok(RecordedAfterAll::NotRecorded | RecordedAfterAll::ByAnother) => {
-                        Settled::StaleUnsent
+                    Ok(RecordedAfterAll::NotRecorded) => Settled::StaleUnsent,
+                    Err(error) => Settled::Kept(error),
+                }
+            }
+            // The wave prepared again may have paid nothing, if the first
+            // round's transaction was mined after all: its members take it
+            // only once its own logs show every quote paid, else they
+            // reconcile it on the next attempt, where each record names the
+            // transaction that recorded its quote ([`per_quote_records`]).
+            Settled::Confirmed(receipt) if round > 0 => {
+                let from_time = first_signed_at.saturating_sub(ant_listings::CLOCK_MARGIN);
+                match per_quote_records(client, wallet, &quotes, &receipt, quotes.len(), from_time)
+                    .await
+                {
+                    Ok(paid)
+                        if paid
+                            .transactions
+                            .values()
+                            .all(|tx| *tx == receipt.transaction_hash) =>
+                    {
+                        Settled::Confirmed(receipt)
                     }
+                    Ok(_) => Settled::Kept(cost_not_known(
+                        "the shared wave's payment, prepared again, is confirmed, but a quote of                          it was recorded by another transaction",
+                        "its members' records are made on the next attempt",
+                    )),
                     Err(error) => Settled::Kept(error),
                 }
             }
@@ -1081,6 +1124,10 @@ struct Executed {
     /// vault records by another ([`recorded_elsewhere`]): the transaction
     /// that took its nonce, the first [`pay_root`] reads for the recording.
     replaced_by: Option<ant_protocol::evm::TxHash>,
+    /// Whether the payment was confirmed on a path where its transaction
+    /// may have paid nothing: prepared again after a first send refused for
+    /// its nonce, or reconciled from a journal ([`per_quote_records`]).
+    unproven: bool,
 }
 
 impl From<PaymentReceipt> for Executed {
@@ -1088,6 +1135,7 @@ impl From<PaymentReceipt> for Executed {
         Self {
             receipt,
             replaced_by: None,
+            unproven: false,
         }
     }
 }
@@ -1114,7 +1162,12 @@ async fn execute<A: UploadAdapter, F: Fn(&UploadState) -> bool + Send + Sync>(
     // wave no record of it.
     match execute_once(client, wallet, adapter, request, state, &fresh, root).await {
         Err(Error::Payment(message)) if message == STALE_UNSENT_NONCE => {
-            execute_once(client, wallet, adapter, request, state, &fresh, root).await
+            execute_once(client, wallet, adapter, request, state, &fresh, root)
+                .await
+                .map(|executed| Executed {
+                    unproven: true,
+                    ..executed
+                })
         }
         outcome => outcome,
     }
@@ -1188,15 +1241,6 @@ async fn execute_once<A: UploadAdapter, F: Fn(&UploadState) -> bool + Send + Syn
                     .await
                     .map(Executed::from)
             }
-            RecordedAfterAll::ByAnother => {
-                let receipt = finish(
-                    adapter,
-                    state,
-                    Settled::Confirmed(recorded_elsewhere(journaled_hash(&signed)?)),
-                )
-                .await?;
-                return Ok(Executed::from(receipt));
-            }
         }
     }
     if let (Some((vault, key)), Settled::Reverted | Settled::Replaced(_)) = (root, &settled) {
@@ -1213,19 +1257,35 @@ async fn execute_once<A: UploadAdapter, F: Fn(&UploadState) -> bool + Send + Syn
                 Settled::Replaced(replacement) => Some(*replacement),
                 _ => None,
             };
-            let receipt = finish(
-                adapter,
-                state,
-                Settled::Confirmed(recorded_elsewhere(transaction)),
-            )
-            .await?;
+            let mut elsewhere = recorded_elsewhere(transaction);
+            if let Settled::Reverted = settled {
+                // A reverted transaction was mined: its gas was spent.
+                elsewhere.gas_cost_wei =
+                    client
+                        .transaction_gas(&transaction.0)
+                        .await
+                        .ok_or_else(|| {
+                            cost_not_known(
+                                "the root wave's own transaction reverted, and the root vault                                  records the wave as paid by another",
+                                &format!("the gas of transaction {transaction} couldn't be read"),
+                            )
+                        })?;
+            }
+            let receipt = finish(adapter, state, Settled::Confirmed(elsewhere)).await?;
             return Ok(Executed {
                 receipt,
                 replaced_by,
+                unproven: !unsent,
             });
         }
     }
-    finish(adapter, state, settled).await.map(Executed::from)
+    finish(adapter, state, settled)
+        .await
+        .map(|receipt| Executed {
+            receipt,
+            replaced_by: None,
+            unproven: !unsent,
+        })
 }
 
 /// The receipt a root wave's payment ends with when its own transaction
@@ -1459,9 +1519,78 @@ enum RecordedAfterAll {
     /// A transaction this payer sent recorded it, with this receipt: the
     /// payment is made, and nothing is signed again.
     Paid(PaymentReceipt),
-    /// A root wave another payer's transaction recorded: it is paid, and
-    /// this payment moved no tokens ([`recorded_elsewhere`]).
-    ByAnother,
+}
+
+/// The error a payment stops with when the chain shows it recorded but not
+/// what it cost (`problem` says what wasn't found or read): nothing is sent
+/// or signed again, and the journal keeps the signed transaction, which the
+/// next attempt reconciles from the chain.
+fn cost_not_known(what: &str, problem: &str) -> Error {
+    Error::Payment(format!(
+        "{what}; its cost isn't known yet ({problem}). \
+         Its journal is kept and nothing is sent again: run the same upload again, and nothing \
+         is paid twice. Don't delete the upload's checkpoint"
+    ))
+}
+
+/// The transaction that recorded a payment in the vault, by its log: for a
+/// root wave (`root`: its vault and key) the one whose `RootPaid` log names
+/// the key, else the one whose `DataPaymentMade` log in the per-quote vault
+/// names `quote_hash`, searched for forwards from `from_time` (Unix
+/// seconds) through `reader`, within the root-wave search's caps
+/// ([`ListingChain::root_paid_transaction`],
+/// [`ListingChain::quote_paid_transaction`]). One search; `Ok(None)` when
+/// it found none.
+///
+/// # Errors
+///
+/// If the search fails or stops at its caps before the latest block.
+async fn recording_of(
+    reader: &super::listings::ListingChain,
+    root: Option<&RootKey>,
+    quote_hash: &[u8; 32],
+    from_time: u64,
+) -> std::result::Result<Option<[u8; 32]>, String> {
+    use super::listings::RootPaidSearch;
+    match root {
+        Some((vault, key)) => match reader
+            .root_paid_transaction(vault, key, from_time, None)
+            .await?
+        {
+            RootPaidSearch::Found(recording) => Ok(Some(recording)),
+            RootPaidSearch::NotFound => Ok(None),
+            RootPaidSearch::Incomplete { next, last } => Err(format!(
+                "the search for the root wave's RootPaid log stopped at its limit of eth_getLogs \
+                 calls with blocks {next} to {last} unsearched"
+            )),
+        },
+        None => reader.quote_paid_transaction(quote_hash, from_time).await,
+    }
+}
+
+/// Who sent `tx`, read through `reader`, and its gas when this payer
+/// (`payer`) did. `Err` names what couldn't be read.
+async fn sender_and_gas(
+    reader: &super::listings::ListingChain,
+    tx: &[u8; 32],
+    payer: &[u8; 20],
+) -> std::result::Result<(bool, u128), String> {
+    let unread = |what: &str, why: String| {
+        format!(
+            "the {what} of transaction {} couldn't be read: {why}",
+            hex::encode(tx)
+        )
+    };
+    match reader.transaction_sender(tx).await {
+        Ok(Some(sender)) if sender == *payer => match reader.transaction_gas(tx).await {
+            Ok(Some(gas)) => Ok((true, gas)),
+            Ok(None) => Err(unread("gas", "no receipt".into())),
+            Err(error) => Err(unread("gas", error)),
+        },
+        Ok(Some(_)) => Ok((false, 0)),
+        Ok(None) => Err(unread("sender", "the chain doesn't know it".into())),
+        Err(error) => Err(unread("sender", error)),
+    }
 }
 
 /// Whether the vault records a payment after all whose bytes, signed at
@@ -1474,20 +1603,22 @@ enum RecordedAfterAll {
 /// prepared again, as before.
 ///
 /// When the vault records it, the transaction that recorded it is looked
-/// for by its log ([`Client::recording_transaction_since`]), up to
-/// [`REFUSED_FIRST_SEND_READS`] times a second apart, with its sender and
-/// gas: sent by this payer, it is the payment, the request's total and that
-/// transaction's gas; sent by another, a root wave moved no tokens of this
-/// payment's, and per-quote payments are prepared again, the quotes the
-/// other recorded skipped by the vault and quoted again by the
-/// occupied-quote read-back.
+/// for by its log ([`recording_of`]: for a root wave by its key, else by
+/// the request's first quote, which one `payForQuotes` of this payer's
+/// records with all the others), up to [`REFUSED_FIRST_SEND_READS`] times
+/// a second apart, through one reader, with its sender and gas. Sent by
+/// this payer, it is the payment: the request's total and that
+/// transaction's gas.
 ///
 /// # Errors
 ///
-/// If the vault's records can't be read, or they show the payment but the
-/// transaction that recorded it, and so its cost, isn't known within the
-/// reads: the journal is kept, nothing is signed, and a retry reconciles
-/// the journaled transaction.
+/// Every other outcome stops the payment, with the journal kept, nothing
+/// signed, and a retry reconciling the journaled transaction from the
+/// chain: the vault's records can't be read; or they show the payment
+/// recorded by another payer's transaction (which these bytes, if mined,
+/// were skipped beside, so their own outcome decides what they cost); or
+/// the transaction that recorded it, its sender or its gas isn't found or
+/// read within the reads ([`cost_not_known`]).
 async fn recorded_after_all(
     client: &Client,
     wallet: &Wallet,
@@ -1512,13 +1643,15 @@ async fn recorded_after_all(
                 return Err(Error::Payment(
                     "the payment's first send was refused for its nonce and isn't found on \
                      chain, and the vault's records of its quotes couldn't be read; its journal \
-                     is kept, and a retry reads them again rather than pay twice. Don't delete \
-                     the upload's checkpoint"
+                     is kept and nothing is sent again: run the same upload again, and nothing \
+                     is paid twice. Don't delete the upload's checkpoint"
                         .into(),
                 ))
             }
         },
     }
+    const WHAT: &str = "the payment's first send was refused for its nonce and isn't found on \
+                        chain, but the vault records it as paid";
     let payer = wallet.address().0 .0;
     let total = quotes
         .iter()
@@ -1526,85 +1659,181 @@ async fn recorded_after_all(
         .fold(ant_protocol::evm::Amount::ZERO, |sum, (_, _, amount)| {
             sum.saturating_add(*amount)
         });
-    let from_time = signed_at.saturating_sub(ant_listings::CLOCK_MARGIN);
-    // A root wave is recorded whole, by one transaction: one search finds it.
-    let searched: Vec<[u8; 32]> = match root {
-        Some(_) => quotes.iter().take(1).map(|(hash, _, _)| hash.0).collect(),
-        None => quotes.iter().map(|(hash, _, _)| hash.0).collect(),
+    let Some((first, _, _)) = quotes.iter().find(|(_, _, amount)| !amount.is_zero()) else {
+        return Ok(RecordedAfterAll::NotRecorded);
     };
+    let reader = client.payment_reader()?;
+    let from_time = signed_at.saturating_sub(ant_listings::CLOCK_MARGIN);
     let mut problem = String::new();
     for read in 0..REFUSED_FIRST_SEND_READS {
         if read > 0 {
             crate::runtime::sleep(std::time::Duration::from_secs(1)).await;
         }
-        problem.clear();
-        let mut by_another = 0;
-        for hash in &searched {
-            let recording = match client
-                .recording_transaction_since(
-                    root.as_ref().map(|(vault, key)| (vault, key)),
-                    hash,
-                    from_time,
-                )
-                .await
-            {
-                Ok(Some(recording)) => recording,
-                Ok(None) => {
-                    problem = "no log of the vault's names it yet".into();
-                    continue;
-                }
-                Err(error) => {
-                    problem = error;
-                    continue;
-                }
-            };
-            match client.transaction_sender(&recording).await {
-                Some(sender) if sender == payer => match client.transaction_gas(&recording).await {
-                    Some(gas) => {
-                        let recording = ant_protocol::evm::TxHash::from(recording);
-                        tracing::warn!(
-                            "the payment's first send was refused for its nonce and its receipt \
-                             wasn't served, but the vault records it paid by this payer's \
-                             transaction {recording}: that is the payment, and nothing is sent \
-                             again"
-                        );
-                        return Ok(RecordedAfterAll::Paid(PaymentReceipt {
-                            transaction_hash: recording,
-                            amount: total,
-                            winner_pool: None,
-                            gas_cost_wei: gas,
-                        }));
-                    }
-                    None => {
-                        problem = format!(
-                            "the gas of transaction {} couldn't be read",
-                            hex::encode(recording)
-                        )
-                    }
-                },
-                Some(_) => by_another += 1,
-                None => {
-                    problem = format!(
-                        "the sender of transaction {} couldn't be read",
-                        hex::encode(recording)
-                    )
-                }
+        let recording = match recording_of(&reader, root.as_ref(), &first.0, from_time).await {
+            Ok(Some(recording)) => recording,
+            Ok(None) => {
+                problem = "no log of the vault's names it yet".into();
+                continue;
             }
-        }
-        if problem.is_empty() && by_another == searched.len() {
-            // Another payer recorded it: these bytes paid none of it.
-            return Ok(match root {
-                Some(_) => RecordedAfterAll::ByAnother,
-                None => RecordedAfterAll::NotRecorded,
-            });
+            Err(error) => {
+                problem = error;
+                continue;
+            }
+        };
+        match sender_and_gas(&reader, &recording, &payer).await {
+            Ok((true, gas)) => {
+                let recording = ant_protocol::evm::TxHash::from(recording);
+                tracing::warn!(
+                    "the payment's first send was refused for its nonce and its receipt wasn't \
+                     served, but the vault records it paid by this payer's transaction \
+                     {recording}: that is the payment, and nothing is sent again"
+                );
+                return Ok(RecordedAfterAll::Paid(PaymentReceipt {
+                    transaction_hash: recording,
+                    amount: total,
+                    winner_pool: None,
+                    gas_cost_wei: gas,
+                }));
+            }
+            Ok((false, _)) => {
+                return Err(Error::Payment(format!(
+                    "{WHAT}, by another payer's transaction {}, so this payment's own transaction \
+                     decides what it cost; its journal is kept and nothing is sent again: run \
+                     the same upload again, and nothing is paid twice. Don't delete the upload's \
+                     checkpoint",
+                    hex::encode(recording)
+                )))
+            }
+            Err(error) => problem = error,
         }
     }
-    Err(Error::Payment(format!(
-        "the payment's first send was refused for its nonce and isn't found on chain, but the \
-         vault records it as paid; the transaction that recorded it, and so its cost, isn't \
-         known yet ({problem}). Its journal is kept, nothing is sent again, and a retry \
-         reconciles it. Don't delete the upload's checkpoint"
-    )))
+    Err(cost_not_known(WHAT, &problem))
+}
+
+/// The records of a per-quote payment confirmed by `receipt`, on a path
+/// where its transaction may have paid none of its quotes: prepared again
+/// after a first send refused for its nonce, or reconciled from a journal.
+/// There, a mined first transaction whose receipt and vault record lagged
+/// every read may have recorded the quotes, and the confirmed one, sent
+/// after it, skipped them. So every record is to name the transaction that
+/// recorded its quote, by its `DataPaymentMade` log.
+///
+/// `receipt`'s own logs are read first ([`ListingChain::transaction`]):
+/// a quote they show is its. Each other quote whose vault record is a
+/// payment to its rewards address is looked for by its log
+/// ([`recording_of`]), up to [`REFUSED_FIRST_SEND_READS`] times a second
+/// apart: recorded by this payer's earlier transaction, the record names
+/// that one and its gas (this member's share of it, in a shared wave) is
+/// added to the payment's; recorded by another payer, the record names
+/// that payer's transaction, which holds the quote's payment. A quote
+/// whose record isn't a payment to its rewards address is left to the
+/// occupied-quote read-back, as on every path. The amount stays the
+/// quotes' total, as every per-quote payment reports it.
+///
+/// # Errors
+///
+/// When `receipt`'s logs, a vault record, or a recording transaction, its
+/// sender or its gas can't be found or read within the reads: the payment
+/// stops with its journal kept ([`cost_not_known`]), and the next attempt
+/// reads again.
+async fn per_quote_records(
+    client: &Client,
+    wallet: &Wallet,
+    quotes: &[QuoteTuple],
+    receipt: &PaymentReceipt,
+    wave_quotes: usize,
+    from_time: u64,
+) -> Result<UploadPayment> {
+    const WHAT: &str = "the payment's transaction is confirmed, but doesn't show the payment of \
+                        every quote it carries";
+    let share = super::shared_wave::share_of(receipt, quotes, wave_quotes)?;
+    let own = receipt.transaction_hash;
+    let mut payment = UploadPayment {
+        transactions: quotes.iter().map(|q| (q.0, own)).collect(),
+        amount: share.amount,
+        gas: share.gas,
+        root: None,
+    };
+    let reader = client.payment_reader()?;
+    let vault = *reader.vault();
+    let payer = wallet.address().0 .0;
+    let mut problem = String::new();
+    let mut logged = None;
+    for read in 0..REFUSED_FIRST_SEND_READS {
+        if read > 0 {
+            crate::runtime::sleep(std::time::Duration::from_secs(1)).await;
+        }
+        match reader.transaction(&own.0).await {
+            Ok(Some((own_receipt, _))) => {
+                logged = Some(own_receipt);
+                break;
+            }
+            Ok(None) => problem = format!("the receipt of transaction {own} isn't served"),
+            Err(error) => problem = format!("the receipt of transaction {own}: {error}"),
+        }
+    }
+    let Some(own_receipt) = logged else {
+        return Err(cost_not_known(WHAT, &problem));
+    };
+    let logs_quote = |logs: &[ant_listings::PaymentLog], hash: &[u8; 32]| {
+        logs.iter().any(|log| {
+            log.address == vault
+                && log.topics.first() == Some(&ant_listings::DATA_PAYMENT_MADE_TOPIC)
+                && log.topics.get(3) == Some(hash)
+        })
+    };
+    let mut counted = std::collections::HashSet::new();
+    for (hash, rewards, amount) in quotes {
+        if amount.is_zero() || logs_quote(&own_receipt.logs, &hash.0) {
+            continue;
+        }
+        let record = reader
+            .completed_payment(hash)
+            .await
+            .map_err(|error| cost_not_known(WHAT, &format!("the vault's record: {error}")))?;
+        if record.amount.is_zero() || record.rewards_prefix[..] != rewards.as_slice()[..16] {
+            // Not a payment to its rewards address: the occupied-quote
+            // read-back quotes it again.
+            continue;
+        }
+        let mut found = None;
+        for read in 0..REFUSED_FIRST_SEND_READS {
+            if read > 0 {
+                crate::runtime::sleep(std::time::Duration::from_secs(1)).await;
+            }
+            match recording_of(&reader, None, &hash.0, from_time).await {
+                Ok(Some(recording)) => {
+                    found = Some(recording);
+                    break;
+                }
+                Ok(None) => problem = "no log of the vault's names its quote yet".into(),
+                Err(error) => problem = error,
+            }
+        }
+        let Some(recording) = found else {
+            return Err(cost_not_known(WHAT, &problem));
+        };
+        let (by_payer, gas) = sender_and_gas(&reader, &recording, &payer)
+            .await
+            .map_err(|error| cost_not_known(WHAT, &error))?;
+        let recording_hash = ant_protocol::evm::TxHash::from(recording);
+        payment.transactions.insert(*hash, recording_hash);
+        if by_payer && counted.insert(recording) {
+            let paid = wave_quotes.max(1) as u128;
+            let mine = (quotes.len() as u128).min(paid);
+            payment.gas = payment.gas.saturating_add(gas.saturating_mul(mine) / paid);
+        }
+        tracing::warn!(
+            "quote {hash} of the payment confirmed by {own} was recorded by transaction \
+             {recording_hash}{}: its record names that one",
+            if by_payer {
+                ", this payer's"
+            } else {
+                ", another payer's"
+            }
+        );
+    }
+    Ok(payment)
 }
 
 /// Take how a payment `settled` into `state`'s journal, saved through
@@ -2349,6 +2578,9 @@ mod tests {
                 log_index: 0,
             }],
         });
+        // Sent by another wallet: the payment moved no tokens. (Its sender
+        // is read; one that can't be read stops the payment instead.)
+        chain.senders.insert(recording.0, [0x9a; 20]);
         chain.failing = vec![("eth_getLogs", -32_603)];
         let chain = Arc::new(Mutex::new(chain));
         let url = serve(Arc::clone(&chain)).await;
@@ -3629,7 +3861,7 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("journal is kept"), "{error}");
-        assert!(error.contains("its cost, isn't known yet"), "{error}");
+        assert!(error.contains("its cost isn't known yet"), "{error}");
         let sent = sent_transactions(&paying.chain);
         assert_eq!(sent.len(), 1, "nothing prepared and sent again");
         assert_eq!(paying.chain.lock().unwrap().calls_to("eth_estimateGas"), 1);
@@ -3931,5 +4163,358 @@ mod tests {
         assert!(payment.transactions.values().all(|tx| *tx == sent[0]));
         assert_eq!(payment.amount, total_of(&paying.plans));
         assert_eq!(payment.gas, 21_000);
+    }
+
+    /// The root wave sent again, as in
+    /// [`a_root_wave_sent_again_reports_the_payers_transaction_that_recorded_it`],
+    /// but the sender of the transaction that recorded the wave can't be
+    /// read: the payment stops saying its cost isn't known, rather than
+    /// report it as zero, with the journal keeping the second transaction.
+    /// Once the sender is served, the next attempt reconciles it, sending
+    /// nothing, and reports the wave's total by the first and both gases.
+    #[tokio::test]
+    async fn a_root_wave_sent_again_whose_recording_sender_cant_be_read_stops_with_its_journal() {
+        let mut paying = paying(PaymentVault::Root).await;
+        let wave = root_payment::wave_of(&paying.plans).unwrap();
+        let payer = payer(&paying);
+        {
+            let mut chain = paying.chain.lock().unwrap();
+            chain.send_answers = [lost_answer(), nonce_used()].into();
+            chain
+                .mine
+                .insert(0, vec![root_paid_log(wave.key(&PAYING_ROOT))]);
+            chain.mine.insert(2, Vec::new());
+            chain.hold_receipt_reads = REFUSED_FIRST_SEND_READS;
+            chain.hold_record_reads = ROOT_READS_BEFORE_PAYING_AGAIN;
+        }
+        let adapter = Counting::default();
+        let error = pay_root(&paying.client, &adapter, &paying.plans, &mut paying.state)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("its cost isn't known yet"), "{error}");
+        assert!(error.contains("run the same upload again"), "{error}");
+        let sent = sent_transactions(&paying.chain);
+        assert_eq!(sent.len(), 2);
+        let Journal::Signed(kept) = journal_of(&paying.state).unwrap() else {
+            panic!("the journal keeps the second transaction")
+        };
+        assert_eq!(journaled_hash(&kept).unwrap(), sent[1]);
+
+        let sends = {
+            let mut chain = paying.chain.lock().unwrap();
+            chain.senders.insert(sent[0].0, payer);
+            chain.senders.insert(sent[1].0, payer);
+            chain.sent.len()
+        };
+        let payment = pay_root(&paying.client, &adapter, &paying.plans, &mut paying.state)
+            .await
+            .unwrap();
+        assert_eq!(
+            paying.chain.lock().unwrap().sent.len(),
+            sends,
+            "nothing sent again"
+        );
+        assert_eq!(payment.root.as_ref().unwrap().transaction, sent[0]);
+        assert!(payment.transactions.values().all(|tx| *tx == sent[0]));
+        assert_eq!(payment.amount, total_of(&paying.plans));
+        assert_eq!(payment.gas, 2 * 21_000);
+    }
+
+    /// As [`a_root_wave_sent_again_whose_recording_sender_cant_be_read_stops_with_its_journal`],
+    /// but the recording's sender is this payer and its gas can't be read
+    /// (its receipt names none): the payment stops saying its cost isn't
+    /// known, with the journal kept, and nothing is sent again.
+    #[tokio::test]
+    async fn a_root_wave_sent_again_whose_recording_gas_cant_be_read_stops_with_its_journal() {
+        let mut paying = paying(PaymentVault::Root).await;
+        let wave = root_payment::wave_of(&paying.plans).unwrap();
+        let payer = payer(&paying);
+        {
+            let mut chain = paying.chain.lock().unwrap();
+            chain.send_answers = [lost_answer(), nonce_used()].into();
+            chain
+                .mine
+                .insert(0, vec![root_paid_log(wave.key(&PAYING_ROOT))]);
+            chain.mine.insert(2, Vec::new());
+            chain.mine_without_gas.insert(0);
+            chain.hold_receipt_reads = REFUSED_FIRST_SEND_READS;
+            chain.hold_record_reads = ROOT_READS_BEFORE_PAYING_AGAIN;
+            chain.mined_sender = Some(payer);
+        }
+        let adapter = Counting::default();
+        let error = pay_root(&paying.client, &adapter, &paying.plans, &mut paying.state)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("its cost isn't known yet"), "{error}");
+        assert!(error.contains("gas"), "{error}");
+        assert_eq!(sent_transactions(&paying.chain).len(), 2);
+        assert!(matches!(
+            journal_of(&paying.state).unwrap(),
+            Journal::Signed(_)
+        ));
+    }
+
+    /// The `RootPaid` log of a wave under `key` that another payer's
+    /// transaction `tx` wrote in block 80, with its sender.
+    fn recorded_by_another(
+        chain: &mut crate::data::client::listings::test_chain::MockChain,
+        tx: [u8; 32],
+        logs: Vec<ant_listings::PaymentLog>,
+    ) {
+        chain.add_receipt(ant_listings::PaymentReceipt {
+            tx_hash: tx,
+            success: true,
+            block_number: 80,
+            logs,
+        });
+        chain.senders.insert(tx, [0x9a; 20]);
+    }
+
+    /// A root wave signed with a stale nonce read and refused for it, never
+    /// mined, while the root vault records the wave by another payer's
+    /// transaction: nothing is signed again, and the payment stops with its
+    /// journal kept, rather than end as paid by the other (its own
+    /// transaction's outcome decides what it cost, and the next attempt
+    /// reads it).
+    #[tokio::test]
+    async fn a_root_wave_recorded_by_another_payer_after_a_refused_send_stops_with_its_journal() {
+        let mut paying = paying(PaymentVault::Root).await;
+        let wave = root_payment::wave_of(&paying.plans).unwrap();
+        let key = wave.key(&PAYING_ROOT);
+        {
+            let mut chain = paying.chain.lock().unwrap();
+            chain.nonce_reads = [6, 6].into();
+            chain.finalized_nonce = 6;
+            chain.send_answers = [nonce_used()].into();
+            chain.root_records.insert(key);
+            recorded_by_another(&mut chain, [0x0b; 32], vec![root_paid_log(key)]);
+        }
+        let adapter = Counting::default();
+        let error = pay_root(&paying.client, &adapter, &paying.plans, &mut paying.state)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("another payer's transaction"), "{error}");
+        assert!(error.contains("journal is kept"), "{error}");
+        assert_eq!(
+            sent_transactions(&paying.chain).len(),
+            1,
+            "nothing signed again"
+        );
+        assert_eq!(paying.chain.lock().unwrap().calls_to("eth_estimateGas"), 1);
+        assert!(matches!(
+            journal_of(&paying.state).unwrap(),
+            Journal::Signed(_)
+        ));
+    }
+
+    /// As [`a_root_wave_recorded_by_another_payer_after_a_refused_send_stops_with_its_journal`],
+    /// for a per-quote payment whose quote another payer recorded, to its
+    /// rewards address: nothing is signed again, and the payment stops
+    /// with its journal kept.
+    #[tokio::test]
+    async fn a_per_quote_payment_recorded_by_another_payer_after_a_refused_send_stops_with_its_journal(
+    ) {
+        let mut paying = paying(PaymentVault::V2).await;
+        {
+            let mut chain = paying.chain.lock().unwrap();
+            chain.nonce_reads = [6, 6].into();
+            chain.finalized_nonce = 6;
+            chain.send_answers = [nonce_used()].into();
+            record_quote_paid(&mut chain, &paying.plans[0]);
+            let log = quote_paid_log(&paying.plans[0]);
+            recorded_by_another(&mut chain, [0x0c; 32], vec![log]);
+        }
+        let adapter = Counting::default();
+        let error = pay(&paying.client, &adapter, &paying.plans, &mut paying.state)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("another payer's transaction"), "{error}");
+        assert_eq!(
+            sent_transactions(&paying.chain).len(),
+            1,
+            "nothing signed again"
+        );
+        assert_eq!(paying.chain.lock().unwrap().calls_to("eth_getLogs"), 1);
+        assert!(matches!(
+            journal_of(&paying.state).unwrap(),
+            Journal::Signed(_)
+        ));
+    }
+
+    /// A per-quote payment's first send taken by the chain, its answer lost,
+    /// its receipt held back past the reads and the vault showing its
+    /// quote paid, while the replica also holds back the logs: the search
+    /// for the transaction that recorded it runs once per read, up to
+    /// [`REFUSED_FIRST_SEND_READS`] times (one `eth_getLogs` each over these
+    /// few blocks), then the payment stops saying its cost isn't known,
+    /// with the journal kept and nothing sent again.
+    #[tokio::test]
+    async fn a_payment_whose_logs_lag_with_its_receipt_stops_after_bounded_searches() {
+        let mut paying = paying(PaymentVault::V2).await;
+        let payer = payer(&paying);
+        {
+            let mut chain = paying.chain.lock().unwrap();
+            chain.send_answers = [lost_answer(), nonce_used()].into();
+            chain.mine.insert(0, vec![quote_paid_log(&paying.plans[0])]);
+            chain.hold_receipt_reads = REFUSED_FIRST_SEND_READS;
+            chain.hold_log_reads = usize::MAX;
+            chain.mined_sender = Some(payer);
+            record_quote_paid(&mut chain, &paying.plans[0]);
+        }
+        let adapter = Counting::default();
+        let error = pay(&paying.client, &adapter, &paying.plans, &mut paying.state)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("its cost isn't known yet"), "{error}");
+        let chain = paying.chain.lock().unwrap();
+        assert_eq!(chain.calls_to("eth_getLogs"), REFUSED_FIRST_SEND_READS);
+        assert_eq!(chain.calls_to("eth_estimateGas"), 1, "nothing signed again");
+        drop(chain);
+        assert_eq!(sent_transactions(&paying.chain).len(), 1);
+        assert!(matches!(
+            journal_of(&paying.state).unwrap(),
+            Journal::Signed(_)
+        ));
+    }
+
+    /// A per-quote payment whose first send the chain took, its answer
+    /// lost, where its receipt and the vault's record of its quote both lag
+    /// past every read, so it is signed and sent again: the second
+    /// transaction pays nothing (the vault skips the quote the first
+    /// recorded). The record names the first transaction, found by its
+    /// `DataPaymentMade` log, never the second, and the gas of both is
+    /// reported.
+    #[tokio::test]
+    async fn a_per_quote_payment_sent_again_names_the_transaction_that_recorded_it() {
+        let mut paying = paying(PaymentVault::V2).await;
+        let payer = payer(&paying);
+        {
+            let mut chain = paying.chain.lock().unwrap();
+            chain.send_answers = [lost_answer(), nonce_used()].into();
+            chain.mine.insert(0, vec![quote_paid_log(&paying.plans[0])]);
+            chain.mine.insert(2, Vec::new());
+            chain.hold_receipt_reads = REFUSED_FIRST_SEND_READS;
+            chain.hold_record_reads = 1;
+            chain.mined_sender = Some(payer);
+            record_quote_paid(&mut chain, &paying.plans[0]);
+        }
+        let adapter = Counting::default();
+        let payment = pay(&paying.client, &adapter, &paying.plans, &mut paying.state)
+            .await
+            .unwrap();
+
+        let sent = sent_transactions(&paying.chain);
+        assert_eq!(sent.len(), 2, "the lag outlasted every read: sent again");
+        assert!(!payment.transactions.is_empty());
+        assert!(payment.transactions.values().all(|tx| *tx == sent[0]));
+        assert_eq!(payment.amount, total_of(&paying.plans));
+        assert_eq!(payment.gas, 2 * 21_000);
+    }
+
+    /// As [`a_per_quote_payment_sent_again_names_the_transaction_that_recorded_it`],
+    /// for a shared wave's payment: the lead doesn't take the second
+    /// transaction as the payment, since its logs don't show the quote paid;
+    /// the payment stops with every member's journal kept. The next attempt
+    /// reconciles it, sending nothing, and the record names the first
+    /// transaction, with the gas of both.
+    #[tokio::test]
+    async fn a_shared_waves_payment_sent_again_names_the_transaction_that_recorded_it() {
+        let mut paying = paying(PaymentVault::V2).await;
+        let payer = payer(&paying);
+        {
+            let mut chain = paying.chain.lock().unwrap();
+            chain.send_answers = [lost_answer(), nonce_used()].into();
+            chain.mine.insert(0, vec![quote_paid_log(&paying.plans[0])]);
+            chain.mine.insert(2, Vec::new());
+            chain.hold_receipt_reads = REFUSED_FIRST_SEND_READS;
+            chain.hold_record_reads = 1;
+            chain.mined_sender = Some(payer);
+            record_quote_paid(&mut chain, &paying.plans[0]);
+        }
+        let adapter = Counting::default();
+        let error = pay_shared(&paying.client, &adapter, &paying.plans, &mut paying.state)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("its cost isn't known yet"), "{error}");
+        let sent = sent_transactions(&paying.chain);
+        assert_eq!(sent.len(), 2);
+
+        let sends = paying.chain.lock().unwrap().sent.len();
+        let payment = pay_shared(&paying.client, &adapter, &paying.plans, &mut paying.state)
+            .await
+            .unwrap();
+        assert_eq!(
+            paying.chain.lock().unwrap().sent.len(),
+            sends,
+            "nothing sent again"
+        );
+        assert!(!payment.transactions.is_empty());
+        assert!(payment.transactions.values().all(|tx| *tx == sent[0]));
+        assert_eq!(payment.amount, total_of(&paying.plans));
+        assert_eq!(payment.gas, 2 * 21_000);
+    }
+
+    /// A first send taken by the chain, its answer lost, whose transaction
+    /// reverted in a finalized block: the chain read finds it reverted, so
+    /// nothing is signed again in this attempt, and it ends as a reverted
+    /// payment does ("retry is safe": it moved nothing).
+    #[tokio::test]
+    async fn a_refused_first_send_that_reverted_is_not_sent_again() {
+        let mut paying = paying(PaymentVault::Root).await;
+        {
+            let mut chain = paying.chain.lock().unwrap();
+            chain.send_answers = [lost_answer(), nonce_used()].into();
+            chain.mine.insert(0, Vec::new());
+            chain.mine_reverted = true;
+        }
+        let adapter = Counting::default();
+        let error = pay_root(&paying.client, &adapter, &paying.plans, &mut paying.state)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("reverted"), "{error}");
+        assert_eq!(
+            sent_transactions(&paying.chain).len(),
+            1,
+            "nothing signed again"
+        );
+        assert_eq!(paying.chain.lock().unwrap().calls_to("eth_estimateGas"), 1);
+        assert!(paying.state.pending_payment.is_none());
+    }
+
+    /// As [`a_refused_first_send_that_reverted_is_not_sent_again`], but the
+    /// block it reverted in isn't final yet: its journal is kept, and
+    /// nothing is signed again.
+    #[tokio::test]
+    async fn a_refused_first_send_reverted_before_finality_keeps_its_journal() {
+        let mut paying = paying(PaymentVault::Root).await;
+        {
+            let mut chain = paying.chain.lock().unwrap();
+            chain.send_answers = [lost_answer(), nonce_used()].into();
+            chain.mine.insert(0, Vec::new());
+            chain.mine_reverted = true;
+            chain.finalized = Some(50);
+        }
+        let adapter = Counting::default();
+        let error = pay_root(&paying.client, &adapter, &paying.plans, &mut paying.state)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("finality"), "{error}");
+        assert_eq!(
+            sent_transactions(&paying.chain).len(),
+            1,
+            "nothing signed again"
+        );
+        assert!(matches!(
+            journal_of(&paying.state).unwrap(),
+            Journal::Signed(_)
+        ));
     }
 }
