@@ -12,6 +12,23 @@ upstream 0.3.11 (ant-core 0.13.0) before it. Releases are tagged `vX.Y.Z+ds.N`, 
 version set to match; other builds are told apart by the commit `darwin --version` prints.
 Upstream's entries follow.
 
+- `v0.3.13+ds.13`, one send per payment: ant-cli's version is 0.3.13+ds.13 (ant-core stays
+  0.15.0). A payment's first send that the RPC refused with "nonce too low" was taken as never
+  sent and signed again, but the wallet library re-sends the same bytes after an answer it lost
+  and returns the last answer, so a first send the chain had taken came back refused, and a
+  second transaction was sent for the same payment (seen once, 2026-11-14, on the root vault: it
+  moved no tokens, cost gas, and the upload reported it as the payment with a cost of zero). Now
+  the chain is read for the refused transaction up to three times, one second apart, and the
+  vault (the root vault's wave record, or the per-quote vault's quote records, for single
+  payments and shared waves) before anything is signed again; a payment the vault shows is
+  reported by the transaction that recorded it, found by its log in the same bounded reads, with
+  that transaction's cost, and where it can't be found or a read fails, the upload stops saying
+  the cost isn't known, with the signed transaction kept in its checkpoint. A root wave recorded
+  by an earlier transaction of the same payer is counted as paid. New pins: a lost answer on
+  either vault, a receipt held back past the reads with the vault showing the payment (root,
+  per-quote, shared wave), its recording transaction unreadable, a failed chain read, a real stale
+  nonce, and a second send's report. Left as they are, at the cost of gas only: token approvals
+  and the library payment functions the CLI never calls, which use the library's older send.
 - `v0.3.13+ds.12`, upstream 0.3.13: ant-cli's version is 0.3.13+ds.12 and ant-core's 0.15.0,
   upstream's ant-cli 0.3.13 / ant-core 0.15.0 merged in, with every change of ours kept. The ds
   number goes on counting across the new base, as darwin-node's does. The tests and devnet run
