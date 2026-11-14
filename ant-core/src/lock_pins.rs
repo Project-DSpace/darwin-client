@@ -222,6 +222,68 @@ fn the_direct_first_tests_stay_and_run() {
     );
 }
 
+/// The body of `fn <name>` in `source`, from its signature to the next item
+/// at the same indent.
+fn function_body<'a>(source: &'a str, signature: &str) -> &'a str {
+    let start = source
+        .find(signature)
+        .unwrap_or_else(|| panic!("no `{signature}` in vendor/saorsa-core"));
+    let rest = &source[start..];
+    let end = rest.find("\n    }\n").map_or(rest.len(), |end| end + 6);
+    &rest[..end]
+}
+
+/// The kad read (ant-node ADR-0020) connects to each peer it asks through
+/// `DhtNetworkManager::connect_lookup_peer` and asks FIND_NODE through
+/// `find_node_on_peer`, both in the vendored copy. Each reaches the dial plan
+/// that dials a verified direct address before a relay: connect_lookup_peer
+/// and the FIND_NODE request go through `ensure_peer_channel`, whose dial
+/// (`run_owned_dial`) goes through `dial_addresses`, which takes
+/// `contextual_dial_plan`, which is
+/// `select_dial_candidates_with_context`, the function the direct_first_*
+/// tests pin. A re-vendoring that routes either around it fails here.
+#[test]
+fn the_kad_lookup_dials_through_the_direct_first_plan() {
+    let source = include_str!("../../vendor/saorsa-core/src/dht_network_manager.rs");
+    for (signature, calls) in [
+        (
+            "pub async fn connect_lookup_peer(",
+            "self.ensure_peer_channel(",
+        ),
+        (
+            "pub async fn find_node_on_peer(",
+            ".send_find_node_lookup_request(",
+        ),
+        (
+            "async fn send_find_node_lookup_request(",
+            "self.ensure_peer_channel(",
+        ),
+        (
+            "pub(crate) async fn ensure_peer_channel(",
+            ".run_owned_dial(",
+        ),
+        ("async fn run_owned_dial(", "self.dial_addresses("),
+        ("async fn dial_addresses(", "self.contextual_dial_plan("),
+        (
+            "async fn contextual_dial_plan(",
+            "Self::select_dial_candidates_with_context(",
+        ),
+    ] {
+        assert!(
+            function_body(source, signature).contains(calls),
+            "vendor/saorsa-core: `{signature}` no longer calls `{calls}`"
+        );
+    }
+    assert!(
+        include_str!("data/client/kad_get.rs").contains(".connect_lookup_peer(peer)"),
+        "the kad read no longer connects through connect_lookup_peer"
+    );
+    assert!(
+        include_str!("data/client/kad_get.rs").contains(".find_node_on_peer(peer, &self.address)"),
+        "the kad read no longer asks FIND_NODE through find_node_on_peer"
+    );
+}
+
 #[test]
 fn versions_compare_by_number() {
     assert!(numbers("0.38.10") > numbers("0.38.2"));

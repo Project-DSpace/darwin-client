@@ -2279,4 +2279,103 @@ mod tests {
         // Adopted with the 15 s refusal hold-off: three waits add at most 45 s.
         assert_eq!(MAX_REFUSAL_WAITS, 3);
     }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_bootstrap_lane_never_makes_a_third_get_with_stalled_early_reads() {
+        // Two early GETs, to peers 1 and 2, stall and are still in flight when
+        // discovery answers: the second raced the first a hedge delay after it
+        // was dispatched. The ordinary path joins them only once one of them
+        // has retired, asking peer 3, which is silent too, and the bootstrap
+        // lane, which holds the second GET, only once both have: never a
+        // third GET on the wire.
+        let latency = Duration::from_millis(50);
+        let net = Simulated::default();
+        let start = tokio::time::Instant::now();
+        let result = retrieve_progressive(
+            peer(0),
+            early_reads(7),
+            nearest,
+            vec![peer(4)],
+            |updates| async move {
+                updates.send_replace(vec![peer(1), peer(2)]);
+                tokio::time::sleep(HEDGE_DELAY * 3).await;
+                ReadCandidates {
+                    closest: vec![peer(1), peer(2), peer(3)],
+                    known: vec![],
+                }
+            },
+            |p| *p,
+            |p, early, dispatched| {
+                let silent = [1, 2, 3].map(peer).contains(&p);
+                net.get(dispatched, p, early, latency, silent, p == peer(4))
+            },
+            |error| *error == ReadError::Transport,
+            Vec::new,
+            || unreachable!("no peer is refused"),
+            tokio::time::sleep,
+        )
+        .await;
+        assert_eq!(result, Ok(Some(42)));
+        assert_eq!(net.most.get(), 2, "at most two GETs in flight");
+        assert_eq!(
+            *net.gets.borrow(),
+            vec![
+                (peer(1), true),
+                (peer(2), true),
+                (peer(3), false),
+                (peer(4), false)
+            ]
+        );
+        // Peer 1 times out ten seconds after it was asked, freeing the
+        // ordinary path's turn; peer 2 a hedge delay later, freeing the lane's,
+        // while peer 3 still holds the ordinary path's.
+        assert_eq!(
+            start.elapsed(),
+            Duration::from_secs(10) + HEDGE_DELAY + latency
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn bootstrap_peers_are_asked_after_a_kad_miss() {
+        // The chunk read's kad lookup ended without the chunk, so the first
+        // round's discovery answers at once with the peers the lookup ended
+        // on, which all answer "not found". The bootstrap peer the lookup
+        // leaves among the nearest still holds the record, and the read asks
+        // it in its own lane.
+        let latency = Duration::from_millis(100);
+        let net = Simulated::default();
+        let start = tokio::time::Instant::now();
+        let rounds = Cell::new(0);
+        let result = retrieve_progressive(
+            peer(0),
+            early_reads(MAX_GET_FALLBACK_PEERS),
+            nearest,
+            vec![peer(60)],
+            |_| {
+                rounds.set(rounds.get() + 1);
+                async {
+                    ReadCandidates {
+                        closest: (1..=7).map(peer).collect(),
+                        known: vec![],
+                    }
+                }
+            },
+            |p| *p,
+            |p, early, dispatched| net.get(dispatched, p, early, latency, false, p == peer(60)),
+            |_| true,
+            Vec::new,
+            || unreachable!("no peer is refused"),
+            tokio::time::sleep,
+        )
+        .await;
+        assert_eq!(result, Ok(Some(42)));
+        assert_eq!(
+            rounds.get(),
+            1,
+            "found in the round the lookup's peers began"
+        );
+        assert_eq!(start.elapsed(), latency);
+        assert!(net.gets.borrow().contains(&(peer(60), false)));
+        assert_eq!(net.most.get(), 2);
+    }
 }

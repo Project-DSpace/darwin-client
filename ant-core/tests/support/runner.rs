@@ -17,7 +17,7 @@
 //! every node handles pointer requests again, whatever the case left
 //! silenced.
 
-use super::{MiniTestnet, DEFAULT_NODE_COUNT};
+use super::{GetOrCloser, MiniTestnet, DEFAULT_NODE_COUNT};
 use futures::FutureExt;
 use std::future::Future;
 use std::pin::Pin;
@@ -51,6 +51,11 @@ pub enum Needs {
     /// The same, but every node carries a live storage commitment over
     /// [`COMMITTED_KEYS`] keys (ADR-0004).
     Committed,
+    /// The same as the shared network, part way through a rolling upgrade:
+    /// every other node announces get-or-closer (ant-node ADR-0020), as nodes
+    /// of a later release will, and the rest don't, as the network's nodes
+    /// today don't ([`GetOrCloser::Mixed`]).
+    Upgrading,
 }
 
 enum Run {
@@ -83,6 +88,16 @@ impl Case {
         Fut: Future<Output = ()> + 'static,
     {
         Self::on(name, Needs::Committed, case)
+    }
+
+    /// A case on the network part way through an upgrade
+    /// ([`Needs::Upgrading`]).
+    pub fn on_upgrading<F, Fut>(name: &str, case: F) -> Self
+    where
+        F: Fn(Arc<MiniTestnet>) -> Fut + 'static,
+        Fut: Future<Output = ()> + 'static,
+    {
+        Self::on(name, Needs::Upgrading, case)
     }
 
     /// A case that needs no network of the runner's.
@@ -241,7 +256,12 @@ async fn run_selected(cases: Vec<Case>) -> bool {
 
     let mut failures = Vec::new();
     let mut passed = 0usize;
-    for needs in [Needs::Nothing, Needs::Network, Needs::Committed] {
+    for needs in [
+        Needs::Nothing,
+        Needs::Network,
+        Needs::Committed,
+        Needs::Upgrading,
+    ] {
         let mut these: Vec<&Case> = cases.iter().filter(|case| case.needs == needs).collect();
         if these.is_empty() {
             continue;
@@ -251,12 +271,17 @@ async fn run_selected(cases: Vec<Case>) -> bool {
 
         let network = match needs {
             Needs::Nothing => None,
-            Needs::Network | Needs::Committed => {
+            Needs::Network | Needs::Committed | Needs::Upgrading => {
                 let start = Instant::now();
-                let network = if needs == Needs::Committed {
-                    MiniTestnet::start_with_commitments(DEFAULT_NODE_COUNT, COMMITTED_KEYS).await
-                } else {
-                    MiniTestnet::start(DEFAULT_NODE_COUNT).await
+                let network = match needs {
+                    Needs::Committed => {
+                        MiniTestnet::start_with_commitments(DEFAULT_NODE_COUNT, COMMITTED_KEYS)
+                            .await
+                    }
+                    Needs::Upgrading => {
+                        MiniTestnet::start_announcing(DEFAULT_NODE_COUNT, GetOrCloser::Mixed).await
+                    }
+                    _ => MiniTestnet::start(DEFAULT_NODE_COUNT).await,
                 };
                 println!(
                     "network ({needs:?}, {} nodes) started in {:.1} s",

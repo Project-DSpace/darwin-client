@@ -42,7 +42,7 @@ use ant_protocol::pqc::ops::{MlDsaOperations, MlDsaSecretKey};
 use ant_protocol::transport::{
     CoreNodeConfig, IPDiversityConfig, MlDsa65, MultiAddr, NodeIdentity, P2PEvent, P2PNode,
 };
-use ant_protocol::{CLOSE_GROUP_SIZE, GET_OR_CLOSER_AGENT_TOKEN, MAX_WIRE_MESSAGE_SIZE};
+use ant_protocol::{CLOSE_GROUP_SIZE, MAX_WIRE_MESSAGE_SIZE};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -374,6 +374,17 @@ pub enum GetOrCloser {
 }
 
 impl GetOrCloser {
+    /// What a node of the pinned darwin-node release announces by default:
+    /// [`Self::Unannounced`] while `ANNOUNCES_GET_OR_CLOSER` is false, as it is
+    /// in 0.24.0+ds.22, so the shared network reads as the network does.
+    pub fn as_released() -> Self {
+        if ant_node::node::ANNOUNCES_GET_OR_CLOSER {
+            Self::Announced
+        } else {
+            Self::Unannounced
+        }
+    }
+
     /// Whether the node at `index` announces get-or-closer.
     fn announces(self, index: usize) -> bool {
         match self {
@@ -427,7 +438,7 @@ impl MiniTestnet {
             node_count,
             NodeOptions {
                 commitment_key_count: None,
-                get_or_closer: GetOrCloser::Unannounced,
+                get_or_closer: GetOrCloser::as_released(),
             },
         )
         .await
@@ -443,7 +454,7 @@ impl MiniTestnet {
             node_count,
             NodeOptions {
                 commitment_key_count: Some(key_count),
-                get_or_closer: GetOrCloser::Unannounced,
+                get_or_closer: GetOrCloser::as_released(),
             },
         )
         .await
@@ -743,13 +754,14 @@ impl MiniTestnet {
         core_config.connection_timeout = DHT_REQUEST_TIMEOUT;
         core_config.node_identity = Some(Arc::clone(&identity));
         // Every test node answers get-or-closer (ant-node ADR-0020); a client
-        // only sends one to a node whose user agent announces it, as
-        // ant-node's does. The `node/` prefix keeps it in routing tables.
-        core_config.custom_user_agent = Some(if options.get_or_closer.announces(node_index) {
-            format!("node/ant-core-test {GET_OR_CLOSER_AGENT_TOKEN}")
-        } else {
-            "node/ant-core-test".to_string()
-        });
+        // only sends one to a node whose user agent announces it. The agent is
+        // darwin-node's own (`node/<release>`, with the token when this node
+        // announces it), made by its test-only seam, so the client reads it as
+        // it reads a node of the network.
+        core_config.custom_user_agent = Some(ant_node::node::agent_for_tests(
+            None,
+            options.get_or_closer.announces(node_index),
+        ));
         core_config.diversity_config = Some(IPDiversityConfig::permissive());
 
         let node = Arc::new(P2PNode::new(core_config).await.expect("create P2P node"));
