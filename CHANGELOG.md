@@ -20,15 +20,27 @@ Upstream's entries follow.
   moved no tokens, cost gas, and the upload reported it as the payment with a cost of zero). Now
   the chain is read for the refused transaction up to three times, one second apart, and the
   vault (the root vault's wave record, or the per-quote vault's quote records, for single
-  payments and shared waves) before anything is signed again; a payment the vault shows is
-  reported by the transaction that recorded it, found by its log in the same bounded reads, with
-  that transaction's cost, and where it can't be found or a read fails, the upload stops saying
-  the cost isn't known, with the signed transaction kept in its checkpoint. A root wave recorded
-  by an earlier transaction of the same payer is counted as paid. New pins: a lost answer on
-  either vault, a receipt held back past the reads with the vault showing the payment (root,
-  per-quote, shared wave), its recording transaction unreadable, a failed chain read, a real stale
-  nonce, and a second send's report. Left as they are, at the cost of gas only: token approvals
-  and the library payment functions the CLI never calls, which use the library's older send.
+  payments and shared waves) before anything is signed again. A payment the vault shows is
+  taken as this wallet's only once the transaction that recorded it is found by its log, in the
+  same three reads with each log search held to the root-wave search's caps, and its sender read
+  as this wallet; it is then reported with that transaction's cost. A per-quote payment confirmed
+  after it was sent again, or from an earlier run's checkpoint, has each record name the
+  transaction whose log shows its quote paid; a root wave sent again is reported once, by the
+  transaction that recorded it, with both gases; a reverted transaction's gas is reported.
+  Anything else (an unreadable vault, a payment another wallet recorded, a recording, sender or
+  gas not found or read) stops the upload saying the cost isn't known yet, with the signed
+  transaction kept in the checkpoint: running the same upload again reconciles it and pays
+  nothing twice. New pins: a lost answer on either vault; a receipt held back past the reads with
+  the vault showing the payment (root, per-quote, shared wave); a recording whose sender or gas
+  can't be read; a payment another wallet recorded (root, per-quote); logs lagging with the
+  receipt (three searches, then the stop); a per-quote payment and a shared wave sent again,
+  their records naming the first transaction; a failed chain read; a refused send that reverted,
+  final or not yet; a real stale nonce; a root wave sent again. Left as they are, in the release
+  notes' known limits: a payment confirmed on a later run is in neither run's reported cost; a
+  stale nonce meeting an unreadable vault or a quote another wallet recorded now waits for the
+  chain's finality; token approvals and the library payment functions the CLI never calls still
+  use the library's older send, which can sign again after a send timeout (gas only, except a
+  batch payment sent again, which the vault can charge twice and the CLI refuses).
 - `v0.3.13+ds.12`, upstream 0.3.13: ant-cli's version is 0.3.13+ds.12 and ant-core's 0.15.0,
   upstream's ant-cli 0.3.13 / ant-core 0.15.0 merged in, with every change of ours kept. The ds
   number goes on counting across the new base, as darwin-node's does. The tests and devnet run
