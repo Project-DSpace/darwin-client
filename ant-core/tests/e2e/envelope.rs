@@ -54,6 +54,10 @@ pub fn cases() -> Vec<Case> {
             "envelope::the_file_shortcuts_store_envelopes_by_default",
             the_file_shortcuts_store_envelopes_by_default,
         ),
+        Case::on_network(
+            "envelope::an_envelope_upload_reports_the_plaintext_sha256",
+            an_envelope_upload_reports_the_plaintext_sha256,
+        ),
     ]
 }
 
@@ -807,4 +811,99 @@ async fn the_file_shortcuts_store_envelopes_by_default(testnet: Arc<MiniTestnet>
         .expect("file_download should succeed");
     assert_eq!(bytes_written, original.len() as u64);
     assert_eq!(std::fs::read(path).unwrap(), original);
+}
+
+/// The SHA-256 an upload reports is the file's plaintext's, whatever it
+/// stores: the default private envelope, the unlisted envelope of
+/// `darwin file upload --public`, an upload resumed from its checkpoint after
+/// its first attempt failed, and a second upload of the same file, whose
+/// chunks are all stored already. Never the envelope chunk's hash: a manifest
+/// entry naming the envelope's address records this hash, and extracting it
+/// checks the downloaded file against it.
+async fn an_envelope_upload_reports_the_plaintext_sha256(testnet: Arc<MiniTestnet>) {
+    use sha2::{Digest, Sha256};
+    let client = testnet.client();
+    let file = |data: &[u8]| {
+        let mut file = NamedTempFile::new().expect("create temp file");
+        file.write_all(data).expect("write temp file");
+        file.flush().expect("flush temp file");
+        file
+    };
+
+    // The default: a private envelope.
+    let private = vec![0x51u8; 4096];
+    let input = file(&private);
+    let expected: [u8; 32] = Sha256::digest(&private).into();
+    let result = client
+        .file_upload(input.path())
+        .await
+        .expect("the default upload should succeed");
+    let envelope = result.envelope.as_ref().expect("an envelope by default");
+    assert_eq!(result.sha256, expected, "the private envelope's file");
+    assert_ne!(
+        result.sha256,
+        envelope.address(),
+        "not the envelope's address"
+    );
+
+    // Uploaded again: every chunk is stored already, and the hash is the same.
+    let again = client
+        .file_upload(input.path())
+        .await
+        .expect("a second upload of the same file should succeed");
+    assert_eq!(again.sha256, expected, "the same file, uploaded again");
+
+    // `darwin file upload --public`: the unlisted envelope.
+    let unlisted = vec![0x52u8; 4096];
+    let input = file(&unlisted);
+    let result = client
+        .file_upload_with_visibility_and_progress(
+            input.path(),
+            PaymentMode::Single,
+            Visibility::Envelope(EnvelopeOptions::unlisted()),
+            None,
+        )
+        .await
+        .expect("the unlisted upload should succeed");
+    assert!(result.envelope.is_some(), "an unlisted envelope");
+    assert_eq!(
+        result.sha256,
+        <[u8; 32]>::from(Sha256::digest(&unlisted)),
+        "the unlisted envelope's file"
+    );
+
+    // Resumed: the first attempt fails for want of funds, the second, once
+    // funded, carries on from the file's checkpoint.
+    let node = testnet
+        .node(crate::support::CLIENT_NODE)
+        .expect("client node");
+    let wallet = Wallet::new_with_random_wallet(testnet.evm_network().clone());
+    let payer = wallet.address();
+    let unfunded = Client::from_node(node, test_client_config()).with_wallet(wallet);
+    let resumed = vec![0x53u8; 4096];
+    let input = file(&resumed);
+    unfunded
+        .file_upload(input.path())
+        .await
+        .expect_err("an unfunded upload fails");
+    testnet
+        .wallet()
+        .transfer_tokens(payer, Amount::from(100_000_000_000_000_000_000u128))
+        .await
+        .expect("fund the payer's tokens");
+    testnet
+        .wallet()
+        .transfer_gas_tokens(payer, Amount::from(1_000_000_000_000_000_000u64))
+        .await
+        .expect("fund the payer's gas");
+    let result = unfunded
+        .file_upload(input.path())
+        .await
+        .expect("the funded retry should succeed");
+    assert!(result.envelope.is_some(), "the resumed upload's envelope");
+    assert_eq!(
+        result.sha256,
+        <[u8; 32]>::from(Sha256::digest(&resumed)),
+        "the resumed upload's file"
+    );
 }

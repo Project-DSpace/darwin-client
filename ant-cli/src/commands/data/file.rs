@@ -2445,6 +2445,37 @@ mod tests {
         );
     }
 
+    /// The history entry of a readable upload carries the file's plaintext
+    /// SHA-256 beside the envelope's address, so extracting it checks the
+    /// downloaded file; the hash is the one given, for every readable
+    /// choice, and a private upload records nothing.
+    #[test]
+    fn the_history_records_the_files_sha256() {
+        let address = [0x42; 32];
+        let sha256 = [0x17; 32];
+        for readable in [
+            EnvelopeOptions::unlisted(),
+            EnvelopeOptions::listed(),
+            upload(&["--public", "--hide", "all"]).unwrap(),
+        ] {
+            let entry = history_entry_for(&readable, Some(address), "notes.txt", 10, sha256)
+                .expect("a readable upload is recorded");
+            assert_eq!(entry.entries.len(), 1);
+            assert_eq!(entry.entries[0].sha256, Some(sha256));
+            assert_eq!(entry.entries[0].source, ContentRef::Public { address });
+        }
+        assert_eq!(
+            history_entry_for(
+                &EnvelopeOptions::private(),
+                Some(address),
+                "notes.txt",
+                10,
+                sha256
+            ),
+            None
+        );
+    }
+
     #[test]
     fn upload_modes_keep_their_json_names() {
         assert_eq!(upload_mode(&EnvelopeOptions::private()), "private");

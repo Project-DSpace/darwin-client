@@ -680,6 +680,20 @@ mod tests {
         assert!(with.windows(b"sha256".len()).any(|w| w == b"sha256"));
     }
 
+    /// A manifest a client before SHA-256 wrote (darwin v0.3.11+ds.11 writes
+    /// `GOLDEN_V1_HEX`, which its own golden test pins) decodes with no hash
+    /// on any entry and encodes back to the same bytes, so `.darwin` files
+    /// and `darwin://manifest/` links written before keep their bytes and
+    /// their addresses.
+    #[test]
+    fn a_manifest_written_before_sha256_decodes_and_encodes_unchanged() {
+        let written = hex::decode(GOLDEN_V1_HEX).unwrap();
+        let manifest = Manifest::decode(&written).unwrap();
+        assert!(!manifest.entries.is_empty());
+        assert!(manifest.entries.iter().all(|entry| entry.sha256.is_none()));
+        assert_eq!(manifest.encode().unwrap(), written);
+    }
+
     #[test]
     fn decode_rejects_a_sha256_of_the_wrong_length() {
         let golden = hex::decode(GOLDEN_V1_SHA256_HEX).unwrap();

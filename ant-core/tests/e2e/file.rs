@@ -36,6 +36,10 @@ pub fn cases() -> Vec<Case> {
             "file::retry_after_funding_uses_existing_checkpoint",
             test_file_retry_after_funding_uses_existing_checkpoint,
         ),
+        Case::on_network(
+            "file::a_finalize_after_a_storage_outage_resumes_without_paying_again",
+            a_finalize_after_a_storage_outage_resumes_without_paying_again,
+        ),
     ]
 }
 
@@ -357,4 +361,115 @@ async fn test_file_retry_after_funding_uses_existing_checkpoint(testnet: Arc<Min
     let path = output.path().join("recovered.bin");
     client.file_download(&result.data_map, &path).await.unwrap();
     assert_eq!(std::fs::read(path).unwrap(), data);
+}
+
+/// An external signer's finalize survives a storage outage after payment
+/// (upstream #144), with this client's default envelope: during the outage
+/// the finalize comes back partial and stores nothing, the envelope least of
+/// all, since it is stored only after every other chunk; resumed against the
+/// same payment once the nodes take PUTs again, it stores every chunk, the
+/// envelope last, and the wallet that paid pays nothing more.
+async fn a_finalize_after_a_storage_outage_resumes_without_paying_again(testnet: Arc<MiniTestnet>) {
+    use ant_core::data::FinalizeOutcome;
+    let client = testnet.client();
+    let original: Vec<u8> = (0u8..=255).cycle().skip(11).take(4096).collect();
+    let mut input_file = NamedTempFile::new().expect("create temp file");
+    input_file.write_all(&original).expect("write temp file");
+    input_file.flush().expect("flush temp file");
+
+    let prepared = client
+        .file_prepare_upload(input_file.path())
+        .await
+        .expect("prepare should succeed");
+    let envelope_address = prepared
+        .envelope
+        .as_ref()
+        .expect("a file upload stores an envelope by default")
+        .address();
+    let expected_sha256: [u8; 32] = Sha256::digest(&original).into();
+    assert_eq!(prepared.sha256, expected_sha256);
+    let payments = match &prepared.payment_info {
+        ExternalPaymentInfo::WaveBatch { payment_intent, .. } => payment_intent.payments.clone(),
+        other => panic!("expected per-chunk payments for a 4 KB file, got {other:?}"),
+    };
+    let (tx_hash_map, _gas) = testnet
+        .wallet()
+        .pay_for_quotes(payments)
+        .await
+        .expect("the signer's wallet pays the quotes");
+    let tx_hash_map: HashMap<QuoteHash, TxHash> = tx_hash_map.into_iter().collect();
+    let balance_after_payment = testnet.wallet().balance_of_tokens().await.unwrap();
+
+    // Outage: every node is up but drops chunk PUTs. Nothing answers a
+    // silenced PUT, so each attempt waits out the store-response timeout.
+    testnet.silence_chunk_puts(true);
+    let outcome = client
+        .finalize_upload_resumable(prepared, &tx_hash_map)
+        .await
+        .expect("a store-side failure comes back as Partial, not Err");
+    let mut resume = match outcome {
+        FinalizeOutcome::Partial { result, resume } => {
+            assert_eq!(result.chunks_stored, 0, "no node accepted a PUT");
+            assert_eq!(result.chunks_failed, result.total_chunks);
+            resume
+        }
+        FinalizeOutcome::Complete(_) => panic!("finalize cannot complete while PUTs are dropped"),
+    };
+    testnet.silence_chunk_puts(false);
+    assert!(
+        client
+            .chunk_get(&envelope_address)
+            .await
+            .expect("fetch")
+            .is_none(),
+        "the envelope is not stored before the content"
+    );
+    assert_eq!(
+        testnet.wallet().balance_of_tokens().await.unwrap(),
+        balance_after_payment,
+        "the failed finalize pays nothing"
+    );
+
+    // Recovery: resume against the same payment, a bounded number of times.
+    let mut completed = None;
+    for _ in 0..3 {
+        match client
+            .finalize_resume(resume)
+            .await
+            .expect("resume must not error")
+        {
+            FinalizeOutcome::Complete(result) => {
+                completed = Some(result);
+                break;
+            }
+            FinalizeOutcome::Partial { resume: rest, .. } => resume = rest,
+        }
+    }
+    let result = completed.expect("resume completes once the nodes accept PUTs");
+    assert_eq!(result.chunks_failed, 0);
+    assert_eq!(result.chunks_stored, result.total_chunks);
+    assert_eq!(result.sha256, expected_sha256);
+    let envelope = result.envelope.as_ref().expect("the envelope");
+    assert_eq!(envelope.address(), envelope_address);
+    assert!(
+        client
+            .chunk_get(&envelope_address)
+            .await
+            .expect("fetch")
+            .is_some(),
+        "the envelope is stored once the content is"
+    );
+    assert_eq!(
+        testnet.wallet().balance_of_tokens().await.unwrap(),
+        balance_after_payment,
+        "resuming reuses the original payment, and pays nothing again"
+    );
+
+    let output_dir = TempDir::new().expect("create output temp dir");
+    let output_path = output_dir.path().join("resumed.bin");
+    client
+        .file_download(&result.data_map, &output_path)
+        .await
+        .expect("file_download should succeed");
+    assert_eq!(std::fs::read(&output_path).unwrap(), original);
 }

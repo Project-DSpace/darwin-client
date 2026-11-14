@@ -58,6 +58,10 @@ pub fn cases() -> Vec<Case> {
             "manifest::embedded_root_identity_is_the_published_address",
             embedded_root_identity_is_the_published_address,
         ),
+        Case::on_network(
+            "manifest::uploads_record_sha256_and_extraction_checks_it",
+            uploads_record_sha256_and_extraction_checks_it,
+        ),
     ]
 }
 
@@ -922,4 +926,107 @@ async fn embedded_root_identity_is_the_published_address(testnet: Arc<MiniTestne
         panic!("link form keeps the entry embedded");
     };
     assert_eq!(data_map, &result.data_map);
+}
+
+/// Upstream's SHA-256 manifest test, on this client's defaults: a build
+/// stores each file in a private envelope and records the file's SHA-256 on
+/// its entry; an entry naming a readable envelope by its address, as the
+/// upload history records one, carries the file's hash too. The hashes
+/// survive the `.darwin` encoding, a matching download extracts, and a wrong
+/// hash fails only its entry, with nothing left at its target.
+async fn uploads_record_sha256_and_extraction_checks_it(testnet: Arc<MiniTestnet>) {
+    use sha2::{Digest, Sha256};
+    let client = testnet.client();
+    let source = TempDir::new().unwrap();
+    write_tree(source.path(), [0x71, 0x72, 0x73]);
+    let mut builder = ManifestBuilder::new(&client, BuildOptions::default());
+    builder.add_directory(source.path(), None).unwrap();
+    let built = builder.finish(None).await.expect("build manifest");
+    assert_eq!(built.manifest.entries.len(), 3);
+    assert_eq!(built.envelopes.len(), 3, "each file in an envelope");
+
+    // Every uploaded entry records the SHA-256 of the file it came from.
+    for entry in &built.manifest.entries {
+        let path = entry.path.as_deref().expect("uploaded entries have paths");
+        let bytes = fs::read(source.path().join(path)).unwrap();
+        let expected: [u8; 32] = Sha256::digest(&bytes).into();
+        assert_eq!(entry.sha256, Some(expected), "{path}");
+    }
+
+    // A file in an unlisted envelope, by the envelope's address, with the
+    // hash its upload reported.
+    let public = source.path().join("..").join("hashed-public.bin");
+    fs::write(&public, vec![0x74u8; FILE_BYTES]).unwrap();
+    let upload = client
+        .file_upload_with_visibility_and_progress(
+            &public,
+            PaymentMode::Single,
+            Visibility::Envelope(EnvelopeOptions::unlisted()),
+            None,
+        )
+        .await
+        .expect("unlisted upload");
+    let address = upload.envelope.as_ref().expect("an envelope").address();
+    assert_eq!(
+        upload.sha256,
+        <[u8; 32]>::from(Sha256::digest(vec![0x74u8; FILE_BYTES]))
+    );
+    let mut manifest = built.manifest.clone();
+    manifest.entries.push(ManifestEntry {
+        path: Some("public.bin".into()),
+        size: Some(FILE_BYTES as u64),
+        sha256: Some(upload.sha256),
+        source: ContentRef::Public { address },
+    });
+
+    // It survives the `.darwin` encoding, and matching downloads extract.
+    let reread = Manifest::decode(&manifest.encode().unwrap()).unwrap();
+    let mut canonical = manifest.clone();
+    canonical.canonicalize().unwrap();
+    assert_eq!(reread, canonical);
+    let out = TempDir::new().unwrap();
+    let report = extract_manifest(&client, &reread, &extract_options(out.path(), vec![]), None)
+        .await
+        .unwrap();
+    assert_eq!(report.written(), 4, "{:?}", report.entries);
+    assert_eq!(
+        fs::read(out.path().join("public.bin")).unwrap(),
+        vec![0x74u8; FILE_BYTES]
+    );
+
+    // A wrong hash fails only that entry, for an embedded file and for one
+    // read through its envelope, and leaves nothing at its target.
+    let mut tampered = reread.clone();
+    for entry in &mut tampered.entries {
+        if matches!(entry.path.as_deref(), Some("docs/b.bin" | "public.bin")) {
+            entry.sha256 = Some([0u8; 32]);
+        }
+    }
+    let out = TempDir::new().unwrap();
+    let report = extract_manifest(
+        &client,
+        &tampered,
+        &extract_options(out.path(), vec![]),
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(report.written(), 2, "{:?}", report.entries);
+    assert_eq!(report.failed(), 2, "{:?}", report.entries);
+    for name in ["docs/b.bin", "public.bin"] {
+        assert!(
+            report.entries.iter().any(|e| e.name == name
+                && matches!(&e.status, EntryStatus::Failed { error } if error.contains("SHA-256 mismatch"))),
+            "{name}: {:?}",
+            report.entries
+        );
+        assert!(!out.path().join(name).exists(), "{name}");
+    }
+    // No temporary file is left beside them either.
+    let leftovers: Vec<_> = fs::read_dir(out.path().join("docs"))
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|n| n != "c.bin")
+        .collect();
+    assert!(leftovers.is_empty(), "{leftovers:?}");
 }
