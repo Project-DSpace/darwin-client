@@ -113,7 +113,7 @@ test("a pointer only the seeds hold is read when its close group holds none", as
   let record;
   try {
     await writer.createPointer(seed, target(1), "chunk", paymentNetwork, wallet().pay,
-      value => { record = value.record; });
+      { onPaid: value => { record = value.record; } });
   } finally {
     writer.close();
   }
@@ -148,7 +148,7 @@ test("a seed the seed policy rejected is not counted among the bootstrap peers",
   let record;
   try {
     await writer.createPointer(seed, target(1), "chunk", paymentNetwork, wallet().pay,
-      value => { record = value.record; });
+      { onPaid: value => { record = value.record; } });
   } finally {
     writer.close();
   }
@@ -191,7 +191,7 @@ async function readWithTwelveSeeds(holding) {
   let record;
   try {
     await writer.createPointer(seed, target(1), "chunk", paymentNetwork, wallet().pay,
-      value => { record = value.record; });
+      { onPaid: value => { record = value.record; } });
   } finally {
     writer.close();
   }

@@ -213,8 +213,15 @@ test("a read stops asking hints once a lookup lists a close group nearer the rec
     assert.equal(reader.size, content.length);
     const gets = rtc.requests.filter(r => r.method === "get_chunk");
     assert.ok(gets.some(r => r.node === holder));
-    const farGets = gets.filter(r => far.includes(r.node)).length;
-    assert.ok(farGets <= 1, `the read asked ${farGets} far hints`);
+    // Early, the read asks at most one far hint. Once discovery answers,
+    // this client also asks, in a lane of their own, the seeds its lookup
+    // leaves among the nine nearest of what it knows (seeds_for_read): here
+    // the two far nodes nearest the record, after the close group of seven.
+    const lane = far.slice(0, 2);
+    const farGets = gets.filter(r => far.includes(r.node) && !lane.includes(r.node)).length;
+    assert.ok(farGets <= 1, `the read asked ${farGets} far hints outside the seeds' lane`);
+    const laneGets = gets.filter(r => lane.includes(r.node)).length;
+    assert.ok(laneGets <= lane.length, `the seeds' lane asked ${laneGets} times`);
   } finally { reader?.close(); client.close(); }
 });
 
