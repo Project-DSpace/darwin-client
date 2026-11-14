@@ -1557,12 +1557,12 @@ mod tests {
         // nearest to the addresses they make up.
         let mut net = Net::new(24, 4);
         let prefix = vec![0x5a; 12];
-        for node in 0..3 {
-            net.ids[node][..12].copy_from_slice(&prefix);
+        for id in net.ids.iter_mut().take(3) {
+            id[..12].copy_from_slice(&prefix);
         }
         let addresses = net.store(0, 3_000);
-        for node in 0..3 {
-            net.nodes[node].behaviour = Behaviour::Flood {
+        for node in net.nodes.iter_mut().take(3) {
+            node.behaviour = Behaviour::Flood {
                 prefix: prefix.clone(),
                 per_page: PAGE,
             };

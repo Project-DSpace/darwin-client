@@ -114,7 +114,7 @@ note = "a modified copy of the crates.io release, kept in vendor/ant-protocol of
 
 [remark.ant-listings]
 version = "0.4.0"
-note = "a copy of Project-DSpace/darwin-listings v0.4.0 on ant-protocol 6.0.0 (commit 2b1cb84923f2dbd8b9092bc9b85eb6c6a0d0be86), which is not published on crates.io, kept in vendor/ant-listings of the repository this build is made from; its Source above is that copy. Its files are those of that commit, without the .github folder, plus a VENDORED.md saying where they come from."
+note = "a copy of Project-DSpace/darwin-listings v0.4.0 on ant-protocol 6.0.0 (commit a4d5e10bcdc23d6c0693c7d1422f25e1628a8305), which is not published on crates.io, kept in vendor/ant-listings of the repository this build is made from; its Source above is that copy. Its files are those of that commit, without the .github folder, plus a VENDORED.md saying where they come from."
 
 [remark.saorsa-core]
 version = "0.30.0"

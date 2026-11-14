@@ -844,8 +844,8 @@ mod tests {
         // the nearest to the addresses they make up.
         let mut net = Net::new(24, 4);
         let prefix = vec![0x5a; 12];
-        for node in 0..3 {
-            net.ids[node][..12].copy_from_slice(&prefix);
+        for id in net.ids.iter_mut().take(3) {
+            id[..12].copy_from_slice(&prefix);
         }
         let addresses = net.store(3_000);
         for node in 0..3 {
@@ -1020,8 +1020,8 @@ mod tests {
     fn a_smaller_quorum_is_only_for_small_test_networks() {
         let mut net = Net::new(3, 11);
         let address = id(5);
-        for node in 0..3 {
-            net.held[node].push(real(address, 1));
+        for held in net.held.iter_mut().take(3) {
+            held.push(real(address, 1));
         }
         let mut walk = IndexWalk::new(
             net.ids
