@@ -275,11 +275,13 @@ async fn stored_chunk(testnet: &MiniTestnet, content: &'static str) -> (Bytes, [
 /// and a GET, and finds the chunk with no get-or-closer request sent. A
 /// whole read, as users have it, does the same.
 async fn a_kad_read_reads_older_nodes_with_find_node_and_get(testnet: Arc<MiniTestnet>) {
-    assert!(
-        !ant_node::node::ANNOUNCES_GET_OR_CLOSER,
-        "the pinned darwin-node announces get-or-closer: this case needs a network of nodes \
-         that don't, as the network's were before it"
-    );
+    const {
+        assert!(
+            !ant_node::node::ANNOUNCES_GET_OR_CLOSER,
+            "the pinned darwin-node announces get-or-closer: this case needs a network of nodes \
+             that don't, as the network's were before it"
+        );
+    }
     let (content, address) =
         stored_chunk(&testnet, "ant-core kad read of nodes without get-or-closer").await;
     let reader = testnet.client();
