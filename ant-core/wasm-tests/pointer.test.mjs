@@ -113,7 +113,7 @@ test("a pointer only the seeds hold is read when its close group holds none", as
   let record;
   try {
     await writer.createPointer(seed, target(1), "chunk", paymentNetwork, wallet().pay,
-      { onPaid: value => { record = value.record; } });
+      value => { record = value.record; });
   } finally {
     writer.close();
   }
@@ -148,7 +148,7 @@ test("a seed the seed policy rejected is not counted among the bootstrap peers",
   let record;
   try {
     await writer.createPointer(seed, target(1), "chunk", paymentNetwork, wallet().pay,
-      { onPaid: value => { record = value.record; } });
+      value => { record = value.record; });
   } finally {
     writer.close();
   }
@@ -191,7 +191,7 @@ async function readWithTwelveSeeds(holding) {
   let record;
   try {
     await writer.createPointer(seed, target(1), "chunk", paymentNetwork, wallet().pay,
-      { onPaid: value => { record = value.record; } });
+      value => { record = value.record; });
   } finally {
     writer.close();
   }
@@ -648,6 +648,47 @@ test("onPrepared is awaited before the wallet, and one that fails pays nothing",
   }
 });
 
+// Every pointer write takes onPaid in its options, as upstream's API has it,
+// or as a bare function, as pages written for earlier releases pass it.
+const pointerWrites = {
+  createPointer: (client, pay, options) =>
+    client.createPointer(seed, target(1), "chunk", paymentNetwork, pay, options),
+  updatePointer: async (client, pay, options) => {
+    await client.createPointer(seed, target(1), "chunk", paymentNetwork, pay);
+    return client.updatePointer(seed, target(2), "chunk", paymentNetwork, pay, options);
+  },
+  transferPointer: async (client, pay, options) => {
+    const recipient = await client.createPointer(new Uint8Array(32).fill(0x57), target(3),
+      "chunk", paymentNetwork, pay);
+    await client.createPointer(seed, target(1), "chunk", paymentNetwork, pay);
+    return client.transferPointer(seed, recipient.pointer.address, paymentNetwork, pay, options);
+  },
+};
+for (const [name, write] of Object.entries(pointerWrites)) {
+  for (const form of ["options", "function"]) {
+    test(`${name} hands onPaid the paid state, given ${form === "options" ? "{ onPaid }" : "a bare function"}`, async () => {
+      const rtc = mockWebRtc(Array.from({ length: 7 }, () => ({})));
+      const client = new BrowserNetworkClient(rtc.endpoints);
+      const signer = wallet();
+      const handed = [];
+      const onPaid = value => { handed.push(value); };
+      try {
+        const written = await write(client, signer.pay, form === "options" ? { onPaid } : onPaid);
+        assert.equal(handed.length, 1, "onPaid is called once, for this write");
+        assert.ok(handed[0].record instanceof Uint8Array && handed[0].proof instanceof Uint8Array);
+        assert.deepEqual(
+          await client.storePaidPointer(handed[0].record, handed[0].proof, paymentNetwork),
+          written.pointer,
+        );
+        assert.equal(signer.calls.length, name === "createPointer" ? 1 : name === "updatePointer" ? 2 : 3,
+          "one payment for each state written, and none for the state handed back");
+      } finally {
+        client.close();
+      }
+    });
+  }
+}
+
 test("pointer write options are checked before anything is paid", async () => {
   const rtc = mockWebRtc(Array.from({ length: 7 }, () => ({})));
   const client = new BrowserNetworkClient(rtc.endpoints);
@@ -661,8 +702,6 @@ test("pointer write options are checked before anything is paid", async () => {
       [{ onPaid: 5 }, /onPaid must be a function/],
       [{ onSubmission: "x" }, /onSubmission must be a function/],
       [7, /must be an object/],
-      // Earlier releases took a bare `onPaid` function here.
-      [() => {}, /must be an object/],
     ]) {
       await assert.rejects(
         client.createPointer(seed, target(1), "chunk", paymentNetwork, signer.pay, options),

@@ -317,8 +317,9 @@ impl BrowserNetworkClient {
     /// `kind` is `"chunk"` or `"pointer"`. Refused before anything is paid if
     /// the pointer already exists.
     ///
-    /// `options` is `{ onPrepared, onSubmission, onPaid }`, each optional.
-    /// An unknown option is refused before anything is paid.
+    /// `options` is `{ onPrepared, onSubmission, onPaid }`, each optional, or
+    /// a bare function, taken as `onPaid` as earlier releases took it. An
+    /// unknown option is refused before anything is paid.
     ///
     /// - `onPrepared` is awaited with an opaque checkpoint string, the signed
     ///   record and its payment plan (never the owner seed), before the
@@ -480,15 +481,22 @@ struct PointerWriteOptions {
 }
 
 impl PointerWriteOptions {
-    /// Read `{ onPrepared, onSubmission, onPaid }`. An unknown option is
-    /// refused rather than ignored: a misspelt `onPrepared` would otherwise
-    /// pay with no checkpoint kept.
+    /// Read `{ onPrepared, onSubmission, onPaid }`, or a bare function as
+    /// `onPaid`, the form pages written for earlier releases pass. An unknown
+    /// option is refused rather than ignored: a misspelt `onPrepared` would
+    /// otherwise pay with no checkpoint kept.
     fn parse(value: Option<JsValue>) -> Result<Self, String> {
         let Some(value) = value.filter(|value| !value.is_undefined() && !value.is_null()) else {
             return Ok(Self::default());
         };
-        // A function is not an object here: earlier releases took a bare
-        // `onPaid`, which must not now be read as an empty options object.
+        // Earlier releases took a bare `onPaid` here, never an empty options
+        // object: it keeps meaning `onPaid`.
+        if value.is_function() {
+            return Ok(Self {
+                on_paid: Some(value.unchecked_into()),
+                ..Self::default()
+            });
+        }
         if !value.is_object() {
             return Err("pointer write options must be an object".into());
         }
