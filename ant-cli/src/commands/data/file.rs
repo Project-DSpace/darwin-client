@@ -645,9 +645,14 @@ async fn handle_file_upload(
     // history (ADR-0006), naming the file by the address the upload stored,
     // so it can be listed and downloaded again. A private upload is not: its
     // data map stays only in its .datamap and .record.
-    let manifest_id =
-        history_entry_for(&options, result.data_map_address, &original_name, file_size)
-            .and_then(|entry| record_upload_manifest(&entry, Some(&original_name)));
+    let manifest_id = history_entry_for(
+        &options,
+        result.data_map_address,
+        &original_name,
+        file_size,
+        result.sha256,
+    )
+    .and_then(|entry| record_upload_manifest(&entry, Some(&original_name)));
 
     let address = result.data_map_address.map(hex::encode);
     if options.readable && address.is_none() {
@@ -670,6 +675,7 @@ async fn handle_file_upload(
             chunks_stored: result.chunks_stored,
             chunks_failed: result.chunks_failed,
             size: file_size,
+            sha256: hex::encode(result.sha256),
             storage_cost_atto: result.storage_cost_atto.clone(),
             gas_cost_wei: result.gas_cost_wei.to_string(),
             elapsed_secs: elapsed.as_secs_f64(),
@@ -730,6 +736,7 @@ async fn handle_file_upload(
         )
     );
     println!("  Size:     {}", format_size(file_size));
+    println!("  SHA-256:  {}", hex::encode(result.sha256));
     println!("  Cost:     {cost_display}");
     println!("  Time:     {:.1}s", elapsed.as_secs_f64());
     println!();
@@ -775,12 +782,15 @@ const NOT_RECORDED_PRIVATE_UPLOAD: &str = "Not recorded in the upload history: a
 /// private upload: its data map is kept only in its `.datamap` and
 /// `.record`, never under the client's data directory. A file name that
 /// breaks the portable path rules is repaired, or dropped so the entry
-/// extracts under its address.
+/// extracts under its address. `sha256` is the file's plaintext SHA-256
+/// (`FileUploadResult::sha256`), which extraction checks the download
+/// against.
 fn history_entry_for(
     options: &EnvelopeOptions,
     address: Option<[u8; 32]>,
     original_name: &str,
     size: u64,
+    sha256: [u8; 32],
 ) -> Option<Manifest> {
     if !options.readable {
         return None;
@@ -791,6 +801,7 @@ fn history_entry_for(
         entries: vec![ManifestEntry {
             path: portable_component(original_name),
             size: Some(size),
+            sha256: Some(sha256),
             source: ContentRef::Public { address: address? },
         }],
     })
@@ -1603,6 +1614,8 @@ struct UploadJsonResult {
     chunks_stored: usize,
     chunks_failed: usize,
     size: u64,
+    /// SHA-256 of the uploaded file, hex.
+    sha256: String,
     storage_cost_atto: String,
     gas_cost_wei: String,
     elapsed_secs: f64,
@@ -2107,6 +2120,7 @@ mod tests {
             entries: vec![ManifestEntry {
                 path: Some("a.bin".into()),
                 size: None,
+                sha256: None,
                 source: ContentRef::Public { address: [1; 32] },
             }],
         };
@@ -2366,6 +2380,9 @@ mod tests {
     /// manifest naming the file by the address the upload stored, never by
     /// an embedded data map. A private upload's data map stays only in its
     /// .datamap and .record.
+    /// A file's SHA-256, as an upload reports it.
+    const SHA: [u8; 32] = [0x5a; 32];
+
     #[test]
     fn only_readable_uploads_are_recorded_and_by_their_address() {
         let address = [0x42; 32];
@@ -2380,9 +2397,12 @@ mod tests {
             upload(&["--name", "notes.txt"]).unwrap(),
         ] {
             assert!(!private.readable);
-            assert_eq!(history_entry_for(&private, None, "notes.txt", 10), None);
             assert_eq!(
-                history_entry_for(&private, Some(address), "notes.txt", 10),
+                history_entry_for(&private, None, "notes.txt", 10, SHA),
+                None
+            );
+            assert_eq!(
+                history_entry_for(&private, Some(address), "notes.txt", 10, SHA),
                 None
             );
         }
@@ -2392,7 +2412,7 @@ mod tests {
             upload(&["--public", "--hide", "all"]).unwrap(),
             upload(&["--public", "--name", "notes.txt", "--hide", "quote"]).unwrap(),
         ] {
-            let entry = history_entry_for(&readable, Some(address), "notes.txt", 10)
+            let entry = history_entry_for(&readable, Some(address), "notes.txt", 10, SHA)
                 .expect("a readable upload is recorded");
             assert_eq!(
                 entry,
@@ -2402,17 +2422,21 @@ mod tests {
                     entries: vec![ManifestEntry {
                         path: Some("notes.txt".into()),
                         size: Some(10),
+                        sha256: Some(SHA),
                         source: ContentRef::Public { address },
                     }],
                 }
             );
             // A readable upload always has an address; without one there is
             // nothing to record.
-            assert_eq!(history_entry_for(&readable, None, "notes.txt", 10), None);
+            assert_eq!(
+                history_entry_for(&readable, None, "notes.txt", 10, SHA),
+                None
+            );
         }
         // A name the portable path rules refuse is dropped: the entry is
         // then named by its address.
-        let entry = history_entry_for(&EnvelopeOptions::unlisted(), Some(address), "..", 10)
+        let entry = history_entry_for(&EnvelopeOptions::unlisted(), Some(address), "..", 10, SHA)
             .expect("recorded");
         assert_eq!(entry.entries[0].path, None);
         assert_eq!(

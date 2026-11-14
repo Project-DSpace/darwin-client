@@ -3,10 +3,12 @@
 //! Provides peer discovery, message sending, and DHT operations
 //! for the client library.
 
+pub use crate::client_engine::read::RequestDispatched;
 #[cfg(feature = "native")]
 use crate::data::error::Error;
 use crate::data::error::Result;
-use ant_protocol::transport::{DHTNode, MultiAddr, PeerId, WitnessedCloseGroup};
+use ant_protocol::transport::{xor_distance, DHTNode, MultiAddr, PeerId, WitnessedCloseGroup};
+use ant_protocol::CLOSE_GROUP_SIZE;
 #[cfg(feature = "native")]
 use ant_protocol::{
     transport::{CoreNodeConfig, IPDiversityConfig, NodeMode, P2PNode},
@@ -15,8 +17,7 @@ use ant_protocol::{
 use serde::{Deserialize, Serialize};
 #[cfg(feature = "native")]
 use std::net::SocketAddr;
-#[cfg(feature = "native")]
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 /// Mirror of saorsa-core's private `AUTO_REBOOTSTRAP_THRESHOLD`
 /// (dht_network_manager.rs): the routing-table size below which the DHT
@@ -234,11 +235,23 @@ pub(crate) const MIN_POINTER_READ_SEEDS: usize = 2;
 /// Bounded, latest-value hints for an immutable read in progress. Hints only
 /// start authenticated GETs; they never establish closeness, absence or payment
 /// authority. The receiver may cancel discovery after verifying content.
+///
+/// Discovery also reports the peers its lookup replies list. A record is stored
+/// by its close group, the `CLOSE_GROUP_SIZE` peers nearest it, so a peer with
+/// that many listed peers nearer the record cannot hold it, and is dropped
+/// from the hints: a browser's first hints are its bootstrap peers, which share
+/// few or no leading bits with the record, and each GET to one costs a new
+/// connection lane and a round trip before the read can ask a holder.
+/// Transports list only peers whose identity they have verified, so a peer
+/// cannot rule out holders with identities it invents. Listing only removes
+/// hints: discovery, and the read after it, are unchanged.
 #[derive(Clone)]
 pub struct ReadProgress {
     target: [u8; 32],
     local: PeerId,
     sender: tokio::sync::watch::Sender<PeerAddresses>,
+    /// The nearest listed peers, at most `CLOSE_GROUP_SIZE`, nearest first.
+    listed: Arc<Mutex<Vec<PeerId>>>,
 }
 
 impl ReadProgress {
@@ -251,11 +264,13 @@ impl ReadProgress {
             target,
             local,
             sender,
+            listed: Arc::default(),
         }
     }
 
     /// Offer authenticated discovery hints, retaining only the nearest bounded
-    /// set. Sending never waits for a slow read consumer.
+    /// set of those that may hold the record. Sending never waits for a slow
+    /// read consumer.
     pub fn offer(&self, peers: PeerAddresses) {
         if self.sender.is_closed() {
             return;
@@ -271,11 +286,52 @@ impl ReadProgress {
                     current.push(peer);
                 }
             }
-            current.sort_by_key(|peer| {
-                ant_protocol::transport::xor_distance(peer.0.as_bytes(), &self.target)
-            });
+            current.sort_by_key(|peer| xor_distance(peer.0.as_bytes(), &self.target));
             current.truncate(crate::client_engine::read::MAX_GET_FALLBACK_PEERS);
+            self.retain_possible_holders(current);
         });
+    }
+
+    /// Record peers a lookup reply listed, including its responder, and drop
+    /// the hints they show cannot hold the record.
+    pub fn listed(&self, peers: impl IntoIterator<Item = PeerId>) {
+        {
+            let mut listed = self.listed.lock().unwrap_or_else(|e| e.into_inner());
+            for peer in peers {
+                if peer != self.local && !listed.contains(&peer) {
+                    listed.push(peer);
+                }
+            }
+            listed.sort_by_key(|peer| xor_distance(peer.as_bytes(), &self.target));
+            listed.truncate(CLOSE_GROUP_SIZE);
+        }
+        if !self.sender.is_closed() {
+            self.sender
+                .send_if_modified(|current| self.retain_possible_holders(current));
+        }
+    }
+
+    /// Whether `peer` may hold the record: fewer than `CLOSE_GROUP_SIZE` peers
+    /// listed so far are nearer to it.
+    pub fn may_hold(&self, peer: &PeerId) -> bool {
+        let listed = self.listed.lock().unwrap_or_else(|e| e.into_inner());
+        self.may_hold_given(&listed, peer)
+    }
+
+    fn may_hold_given(&self, listed: &[PeerId], peer: &PeerId) -> bool {
+        crate::client_engine::read::may_hold(
+            listed.iter().map(PeerId::as_bytes),
+            peer.as_bytes(),
+            &self.target,
+        )
+    }
+
+    /// Drop the hints that cannot hold the record, and report whether any was.
+    fn retain_possible_holders(&self, hints: &mut PeerAddresses) -> bool {
+        let listed = self.listed.lock().unwrap_or_else(|e| e.into_inner());
+        let before = hints.len();
+        hints.retain(|peer| self.may_hold_given(&listed, &peer.0));
+        hints.len() != before
     }
 }
 
@@ -348,6 +404,27 @@ pub trait BrowserNetwork {
         request: ant_protocol::ChunkMessage,
         timeout: std::time::Duration,
     ) -> futures::future::LocalBoxFuture<'a, Result<ant_protocol::ChunkMessage>>;
+    /// Execute one authenticated request as [`BrowserNetwork::request`] does, and
+    /// notify `dispatched` once it has passed this adapter's own limits, which
+    /// another request would wait for too, and waits only on its peer. Adapters
+    /// without limits of their own keep this default, which notifies at once.
+    fn request_notifying_dispatched<'a>(
+        &'a self,
+        peer: &'a PeerId,
+        addrs: &'a [MultiAddr],
+        request: ant_protocol::ChunkMessage,
+        timeout: std::time::Duration,
+        dispatched: RequestDispatched,
+    ) -> futures::future::LocalBoxFuture<'a, Result<ant_protocol::ChunkMessage>> {
+        dispatched.notify();
+        self.request(peer, addrs, request, timeout)
+    }
+    /// How long a read's first GET waits for its response, once dispatched,
+    /// before the read also asks another holder: a healthy peer's transfer of a
+    /// full record.
+    fn read_hedge_delay(&self) -> std::time::Duration {
+        crate::client_engine::read::DEFAULT_EARLY_READ_HEDGE_DELAY
+    }
 }
 
 impl Network {
@@ -756,6 +833,19 @@ impl Network {
         );
     }
 
+    /// How long a read's first GET waits for its response, once dispatched,
+    /// before the read also asks another holder.
+    pub(crate) fn read_hedge_delay(&self) -> std::time::Duration {
+        #[cfg(feature = "native")]
+        {
+            crate::client_engine::read::DEFAULT_EARLY_READ_HEDGE_DELAY
+        }
+        #[cfg(not(feature = "native"))]
+        {
+            self.backend.read_hedge_delay()
+        }
+    }
+
     /// Peers skipped for now because they declined a session while busy,
     /// each with the time until they are tried again. Only browser sessions
     /// are refused this way, so native reports none.
@@ -803,21 +893,40 @@ impl Network {
     }
 }
 
+/// One request to a peer, as [`send_and_await_chunk_response`] sends it.
+pub(crate) struct ChunkRequest<'a> {
+    pub(crate) target_peer: &'a PeerId,
+    pub(crate) peer_addrs: &'a [MultiAddr],
+    /// The encoded `ChunkMessage`.
+    pub(crate) message_bytes: Vec<u8>,
+    pub(crate) request_id: u64,
+    pub(crate) timeout: std::time::Duration,
+    /// Notified once the request has passed this client's own limits and waits
+    /// only on its peer.
+    pub(crate) dispatched: RequestDispatched,
+}
+
 /// Execute a request through the platform adapter and apply the shared response handler.
-#[allow(clippy::too_many_arguments)]
 pub(crate) async fn send_and_await_chunk_response<T, E: From<crate::data::error::Error>>(
     network: &Network,
-    target_peer: &PeerId,
-    message_bytes: Vec<u8>,
-    request_id: u64,
-    timeout: std::time::Duration,
-    peer_addrs: &[MultiAddr],
+    request: ChunkRequest<'_>,
     response_handler: impl Fn(ant_protocol::ChunkMessageBody) -> Option<std::result::Result<T, E>>,
     send_error: impl FnOnce(String) -> E,
     timeout_error: impl FnOnce() -> E,
 ) -> std::result::Result<T, E> {
+    let ChunkRequest {
+        target_peer,
+        peer_addrs,
+        message_bytes,
+        request_id,
+        timeout,
+        dispatched,
+    } = request;
     #[cfg(feature = "native")]
     {
+        // A native client has no limits of its own on requests: each is
+        // dispatched at once.
+        dispatched.notify();
         ant_protocol::send_and_await_chunk_response(
             network.node(),
             target_peer,
@@ -837,7 +946,13 @@ pub(crate) async fn send_and_await_chunk_response<T, E: From<crate::data::error:
             Ok(request) => {
                 network
                     .backend
-                    .request(target_peer, peer_addrs, request, timeout)
+                    .request_notifying_dispatched(
+                        target_peer,
+                        peer_addrs,
+                        request,
+                        timeout,
+                        dispatched,
+                    )
                     .await
             }
             Err(error) => Err(crate::data::error::Error::Protocol(error.to_string())),
@@ -859,6 +974,117 @@ pub(crate) async fn send_and_await_chunk_response<T, E: From<crate::data::error:
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The record the read-progress tests read: a peer's distance to it is the
+    /// peer's own identity.
+    const TARGET: [u8; 32] = [0; 32];
+    /// The reading client.
+    const LOCAL: u8 = 0x01;
+    /// First byte of the nearest listed peer; a close group follows it.
+    const NEAREST_LISTED: u8 = 0x10;
+    /// First byte of a peer inside the listed close group: with a nonzero tie
+    /// it has three listed peers nearer the record.
+    const WITHIN_CLOSE_GROUP: u8 = NEAREST_LISTED + 2;
+    /// First byte of a peer with a whole close group listed nearer the record.
+    const BEYOND_CLOSE_GROUP: u8 = 0xf0;
+    /// Port of the hints' addresses, which the hints only need to have.
+    const HINT_PORT: u16 = 4433;
+
+    /// A peer whose identity starts with `first`; `tie` tells apart peers
+    /// sharing it, as their last byte.
+    fn peer(first: u8, tie: u8) -> PeerId {
+        let mut bytes = [0; 32];
+        bytes[0] = first;
+        bytes[31] = tie;
+        PeerId::from_bytes(bytes)
+    }
+
+    fn hint(peer: PeerId) -> (PeerId, Vec<MultiAddr>) {
+        let address = std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, HINT_PORT));
+        (peer, vec![MultiAddr::quic(address)])
+    }
+
+    /// A close group of listed peers, nearest first.
+    fn close_group() -> Vec<PeerId> {
+        (0..CLOSE_GROUP_SIZE as u8)
+            .map(|offset| peer(NEAREST_LISTED + offset, 0))
+            .collect()
+    }
+
+    fn read_progress() -> (ReadProgress, tokio::sync::watch::Receiver<PeerAddresses>) {
+        let (sender, receiver) = tokio::sync::watch::channel(Vec::new());
+        (ReadProgress::new(TARGET, peer(LOCAL, 0), sender), receiver)
+    }
+
+    fn hinted(receiver: &tokio::sync::watch::Receiver<PeerAddresses>) -> Vec<PeerId> {
+        receiver.borrow().iter().map(|(peer, _)| *peer).collect()
+    }
+
+    #[test]
+    fn listed_peers_drop_hints_that_cannot_hold_the_record() {
+        let (progress, receiver) = read_progress();
+        let within = peer(WITHIN_CLOSE_GROUP, 1);
+        let beyond = peer(BEYOND_CLOSE_GROUP, 0);
+        progress.offer(vec![hint(beyond), hint(within)]);
+        assert_eq!(hinted(&receiver), vec![within, beyond]);
+
+        progress.listed(close_group());
+        assert_eq!(hinted(&receiver), vec![within]);
+
+        // Later offers are held to the same rule.
+        progress.offer(vec![hint(beyond)]);
+        assert_eq!(hinted(&receiver), vec![within]);
+    }
+
+    #[test]
+    fn a_peer_may_hold_the_record_until_a_close_group_is_listed_nearer() {
+        let (progress, _receiver) = read_progress();
+        let group = close_group();
+        let beyond = peer(BEYOND_CLOSE_GROUP, 0);
+        assert!(progress.may_hold(&beyond));
+
+        progress.listed(group[..CLOSE_GROUP_SIZE - 1].iter().copied());
+        assert!(progress.may_hold(&beyond));
+
+        progress.listed(group.iter().copied());
+        assert!(!progress.may_hold(&beyond));
+        assert!(progress.may_hold(&peer(WITHIN_CLOSE_GROUP, 1)));
+        // The farthest of the close group has only the rest of it nearer.
+        assert!(group.iter().all(|member| progress.may_hold(member)));
+    }
+
+    #[test]
+    fn listing_ignores_the_local_peer_and_repeats() {
+        let (progress, _receiver) = read_progress();
+        let farthest = close_group()[CLOSE_GROUP_SIZE - 1];
+        let local = peer(LOCAL, 0);
+        progress.listed(std::iter::repeat_n(close_group()[0], CLOSE_GROUP_SIZE).chain([local]));
+        assert!(progress.may_hold(&farthest));
+    }
+
+    #[test]
+    fn listing_keeps_only_the_nearest_close_group() {
+        let (progress, _receiver) = read_progress();
+        // The first peer past the close group has all of it listed nearer.
+        let past_group = peer(NEAREST_LISTED + CLOSE_GROUP_SIZE as u8, 0);
+        progress.listed(close_group());
+        progress.listed((0..CLOSE_GROUP_SIZE as u8).map(|tie| peer(BEYOND_CLOSE_GROUP, tie)));
+        assert_eq!(
+            *progress.listed.lock().unwrap_or_else(|e| e.into_inner()),
+            close_group()
+        );
+        assert!(!progress.may_hold(&past_group));
+    }
+
+    #[test]
+    fn a_listing_that_rules_out_no_hint_does_not_wake_the_read() {
+        let (progress, mut receiver) = read_progress();
+        progress.offer(vec![hint(peer(WITHIN_CLOSE_GROUP, 1))]);
+        receiver.borrow_and_update();
+
+        progress.listed(close_group());
+        assert!(!receiver.has_changed().unwrap());
+    }
 
     #[test]
     fn write_ready_false_with_no_peers() {

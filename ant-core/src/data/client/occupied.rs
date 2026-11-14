@@ -1292,6 +1292,7 @@ mod outside_payer_tests {
             already_stored_addresses: Vec::new(),
             total_chunks,
             envelope: None,
+            sha256: [0x5a; 32],
         }
     }
 

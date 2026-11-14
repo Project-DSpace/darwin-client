@@ -11,6 +11,7 @@ use ant_core::data::{
     ListingChain, PaymentMode, Visibility,
 };
 use ant_protocol::evm::{QuoteHash, TxHash};
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::io::Write;
 use std::sync::Arc;
@@ -54,6 +55,11 @@ async fn test_file_upload_download_round_trip(testnet: Arc<MiniTestnet>) {
     assert!(
         result.chunks_stored >= 3,
         "self-encryption produces at least 3 chunks"
+    );
+    let expected_sha256: [u8; 32] = Sha256::digest(&data).into();
+    assert_eq!(
+        result.sha256, expected_sha256,
+        "upload reports the file's SHA-256"
     );
 
     // As `darwin file upload` stores a file by default: in a private
@@ -252,6 +258,11 @@ async fn test_public_upload_round_trip_wave_batch(testnet: Arc<MiniTestnet>) {
     let data_map_address = prepared
         .data_map_address
         .expect("public prepare must record the DataMap address");
+    let expected_sha256: [u8; 32] = Sha256::digest(&original).into();
+    assert_eq!(
+        prepared.sha256, expected_sha256,
+        "prepare hashes the plaintext"
+    );
 
     // Phase 2: simulate an external signer by paying for the quotes with the
     // testnet wallet and collecting the resulting (quote_hash, tx_hash) map.
@@ -276,6 +287,10 @@ async fn test_public_upload_round_trip_wave_batch(testnet: Arc<MiniTestnet>) {
         result.data_map_address,
         Some(data_map_address),
         "FileUploadResult must carry the DataMap address forward from PreparedUpload"
+    );
+    assert_eq!(
+        result.sha256, expected_sha256,
+        "FileUploadResult must carry the SHA-256 forward from PreparedUpload"
     );
 
     // Phase 4: a fresh retriever can fetch the data map using only the

@@ -904,6 +904,7 @@ async fn embedded_root_identity_is_the_published_address(testnet: Arc<MiniTestne
         entries: vec![ManifestEntry {
             path: Some("big.bin".into()),
             size: None,
+            sha256: None,
             source: ContentRef::Embedded { data_map: root },
         }],
     };

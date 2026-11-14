@@ -128,6 +128,10 @@ closure during asynchronous prepayment checkpoints for both payment modes.
 buffer drain with early responses, one HELLO for concurrent cold operations,
 reauthentication and capability checks after timeout, bounded admission without
 closing active work, pool closure during setup, and strict queued session handles.
+It also checks that a dial fails if its endpoint has not answered ICE checks
+3 s after the offer, while one whose ICE succeeded may take longer to open its
+channel. The mock leaves a node with `iceUnreachable` checking forever, and
+`openDelay` delays a channel's opening without holding up its offer.
 
 `failed-peer-connection.test.mjs` emulates WebKit, which reports a lost peer
 connection as `failed` but leaves its DataChannels "open" without a close event
@@ -135,11 +139,21 @@ and opens channels created on it later. A request in flight must fail when the
 connection fails rather than at its response deadline, and the pool must redial
 rather than open a lane on the failed association.
 
+`capacity-refusal.test.mjs` and `refused-holder.test.mjs` cover full nodes
+(ant-node ADR-0023). A node that declines a dial, at its transport or its
+application, fails the dial at once and is dialled again after the 15 s refusal
+cooldown, while a DTLS failure keeps the 30-minute cooldown. A read whose only
+holder declines waits out the cooldown instead of reporting the record not
+found, and a read whose holder keeps declining reports it busy after three waits.
+
 `ice-gathering.test.mjs` checks that concurrent dials gather ICE candidates one
 connection at a time, and that a gathering which never completes hands the turn
 on after its timeout. WebKit opens many more UDP sockets for connections whose
 gathering overlaps and closes the oldest past its per-page cap, cutting
-established connections. The mock completes gathering after `gatheringMs`.
+established connections. Chromium, which the test recognizes by
+`navigator.userAgentData`, gathers for concurrent dials at once, unless the
+page reports WebKit's vendor, as Safari with a Client Hints polyfill would. The
+mock completes gathering after `gatheringMs`.
 
 `lookup-reuse.test.mjs` covers draining admitted lookups after grace cancellation,
 retaining actual dial failures, cancelling queued work, closing background work,

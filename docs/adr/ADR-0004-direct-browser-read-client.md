@@ -2,7 +2,7 @@
 
 - **Status:** Proposed
 - **Date:** 2026-08-03
-- **Last amended:** 2026-10-13
+- **Last amended:** 2026-10-28
 - **Decision owners:** <pending>
 - **Reviewers:** <pending>
 - **Supersedes:** none
@@ -709,7 +709,9 @@ adaptive fetch cap and its `concurrency` argument, with missing records retried
 together in deferred rounds, so retry waits do not add up across records. Each
 chunk is decrypted as it arrives and copied straight into its place in one
 JavaScript `Uint8Array` allocated up front, so WASM memory holds only the records
-in flight, and `Downloaded chunk n/total` counts chunks as they land. The file is
+in flight, and `Downloaded chunk n/total from <peer hex> after <n> attempts`
+counts chunks as they land, naming the node that served each one and the GETs it
+cost so a read investigation can attribute a slow download to a peer. The file is
 hashed afterwards, copied back in 4 MiB pieces. The optional `maxMemoryBytes`
 limits the allocation; allocation failure rejects before file-content transfer
 and directs the caller to streaming. Automatic free-memory detection and
@@ -769,3 +771,184 @@ budgets; manifest validation; and native index, range and retry tests. The
 generated WASM tests use mocked WebRTC hosts with real Rust protocol and crypto
 processing. They do not establish real-browser or live-network compatibility by
 themselves.
+
+## Dial failure and ICE gathering (2026-10-26)
+
+Related: [V2-1483](https://linear.app/autonominetwork/issue/V2-1483).
+
+Browser downloads from mainnet spent most of their time dialling. In traced
+downloads of a 64 MiB public file, 42-50% of fresh dials went to WebRTC Direct
+endpoints that never answered ICE. Each held a pool slot, and kept its lookup
+round waiting, until the 10-second channel-opening timeout: 18-30 of the 64
+slots at a time. A file whose DataMap had child records could not start reading
+data until the slowest of them arrived, and one such 418-byte record took 10 s.
+Dials to live nodes also queued for the page's ICE gathering turn. In Chromium,
+a dial waited 0.6 s at the median at a fetch concurrency of 4, and 1.7 s at 8,
+before sending its offer. ICE, DTLS, SCTP and the PQ handshake together took
+about 0.4 s.
+
+- **A dial fails when ICE has not connected 3 s after its offer.** Live nodes
+  answered ICE checks in 110 ms at the median and 1.2-1.4 s at p99; the slowest
+  of 788 took 2.7 s. Every failed dial in the traces was one whose ICE never
+  connected. A fresh connection still `new` or `checking` at 3 s fails, and
+  enters the dial-failure cache like any other failed dial. One whose ICE
+  connected keeps the opening timeout for DTLS, SCTP and the channel. Endpoints
+  that failed in one download and connected in another were 4% of failures with
+  the deadline and 5% without it.
+- **Chromium dials gather ICE candidates at once.** The gathering turn exists
+  for WebKit, which opens many more sockets for overlapping gatherings.
+  Chromium is recognized by `navigator.userAgentData`, which only it exposes,
+  unless the page reports WebKit's vendor: a Client Hints polyfill in Safari
+  must not lift the turn. WebKit and Firefox keep it; Firefox was not measured.
+- **Only Chromium starts fetching at the read budget's 8 GETs.** Where dials
+  take turns to gather, more concurrent reads queue more dials for the turn,
+  so other engines keep the native cold start of 4. No engine's fetch
+  controller climbs past the read budget. A fetch beyond it adds only a
+  lookup, which costs dials more than it overlaps transfers: given the default
+  ceiling of 256, the controller probed 10 and came back, a successful dial's
+  p90 rose from 2.7 s to 4.8 s, and downloads were slower in 6 of 8 pairs
+  (612 MB in Chromium and Safari, 64 MiB in Chromium).
+
+In Chromium, the first two let the fetch start of 8, which on its own made
+mainnet downloads 15-26% slower by overflowing the pool, pay off. Measured with
+headless Chromium on macOS against mainnet, each arm downloading the same
+64 MiB public file with a fresh client, in rotating order. The first run
+separates the changes on the branch before it merged main; the second compares
+the merged branch with main at `ccd4106`:
+
+| run | build | rounds | p50 | against main, paired | faster |
+| --: | --- | --: | --: | --: | --: |
+| 1 | main | 4 | 39.1 s | | |
+| 1 | fetch start 8 alone | 4 | 45.0 s | +15% | 1/4 |
+| 1 | fetch start 4, ICE deadline | 4 | 32.3 s | -15% | 3/4 |
+| 1 | fetch start 4, both changes | 4 | 25.3 s | -34% | 4/4 |
+| 1 | fetch start 8, both changes | 4 | 19.7 s | -49% | 4/4 |
+| 2 | main | 5 | 37.6 s | | |
+| 2 | fetch start 4, both changes | 5 | 28.9 s | -23% | 4/5 |
+| 2 | fetch start 8, both changes | 5 | 21.6 s | -40% | 5/5 |
+
+In the second run the fetch start of 8 was faster than 4 in every round. A
+612 MB public video took 195 and 270 s with both changes, against main's 398
+and 323 s. The faster branch opens more connections per download: 243 instead
+of 187 for the 64 MiB file, and 2,977 instead of 2,019 for the video.
+
+In WebKit, which keeps the gathering turn, the fetch start of 8 still made
+downloads slower. A dial waited 1.9 s at the median before its ICE checks,
+against 0.7 s at a start of 4, and a lookup round took 3.6 s against 1.3 s.
+Against main, the same 64 MiB file took, at the median:
+
+| engine | rounds | main | fetch start 8 | engine's start | against main, paired | faster |
+| --- | --: | --: | --: | --: | --: | --: |
+| Safari 26.5.2 | 4 | 31.5 s | 38.8 s | 25.5 s (4) | -19% | 4/4 |
+| WebKit (Playwright) | 5 | 32.3 s | | 25.9 s (4) | -18% | 5/5 |
+| Chromium (Playwright) | 3 | 35.3 s | | 18.6 s (8) | -46% | 3/3 |
+
+In Safari the fetch start of 8 was slower than main in all 4 rounds.
+
+In traces of the branch before the merge, a successful dial took 0.4 s at the
+median instead of 1.9-2.7 s, a failed one 3.0 s instead of 10.4-11.0 s, and a
+lookup round 1.2 s instead of 1.6-3.8 s. Failing dials held 14 pool slots on average, and the
+first data read started at 7-8 s instead of 13.5-14.3 s. The lookup width, its
+grace period, the pool size and the dial-failure cooldown are unchanged.
+
+## First record of a read (2026-10-28)
+
+Related: [V2-1769](https://linear.app/autonominetwork/issue/V2-1769); the
+node-side DTLS delay is
+[saorsa-transport#229](https://github.com/WithAutonomi/saorsa-transport/issues/229).
+
+A stream's first frame waits for its first record. This was traced on mainnet
+with a test-utils build of `7a432e7`, over 15 rounds in Chromium. A warm client
+read the first 1 MiB of a 54.9 MB video 3 s after connecting. The GET to the
+record's holder started a median 4.1 s after the read began:
+
+- A lookup reply first named the holder at 1.1 s.
+- The read's early GETs went first to hints that could not hold the record.
+  Its first hints are its bootstrap peers, which share 0-2 leading bits with
+  the record. A median 6 GETs ran one at a time before the holder's, and each
+  waited 0.46 s for a new connection lane before its NotFound.
+- In 15 of 15 rounds, the preconnect slots were full when the holder was named.
+  The peers in them shared a median 1 bit with the record, and half were dead
+  endpoints. A third had come from the lookup for the record after this one,
+  which a header read started at the same time. A skipped node is not queued,
+  so the holder waited for the lookup's next round or another reply.
+
+The decisions:
+
+- **Peers that cannot hold the record are not read early.**
+  `ReadProgress::listed` records the peers each lookup reply lists, with its
+  responder. A record is stored by its close group, so a peer with
+  `CLOSE_GROUP_SIZE` listed peers nearer the record cannot hold it, and
+  `ReadProgress::may_hold` is false for it. Such a peer leaves the read's hints.
+  A holder is in the close group by definition, so the rule never excludes one,
+  whether or not the peers nearer it are reachable.
+  - Only proven identities are listed: the responder, which its session
+    authenticated, and the peers whose owner-signed address records `find_node`
+    verified. A peer a reply lists without a record proves nothing, so it does
+    not count.
+  - Listing only removes hints from early reads. Discovery, its preconnects,
+    the read after it, and that read's absence and closeness decisions are
+    unchanged. A responder with signed records for invented identities near the
+    record can therefore at most suppress early reads, leaving the read to
+    finish after discovery.
+  - Native reads never list peers, so their hints are unchanged.
+- **A read that continues no other fetches the record after it only once it
+  has finished.** It used to start that fetch at once, in case the read starts
+  a stream, so its lookup and transfer competed with the record the read waits
+  for. Reads that continue a stream are unchanged.
+
+This was measured against main on mainnet, from one macOS machine, on
+2026-10-28, with the arms in rotating order and a fresh browser context per
+sample. The traced read of the first 1 MiB, at the median:
+
+| engine | rounds | holder's GET, main → this | 1 MiB read, main → this | sooner |
+| --- | --: | --: | --: | --: |
+| Chromium | 10 | 4.3 → 1.9 s | 5.0 → 3.4 s | 10/10 |
+| WebKit (Playwright) | 6 | 4.4 → 2.2 s | 5.1 → 3.0 s | 5/6 |
+
+GETs before the holder's fell from 6 to 1 in Chromium, and from 7 to 1 in
+WebKit. Once the read knew the holder, it asked it at once.
+
+The same video was then streamed on try.autonomi.com's own page. Two copies of
+the page differed only in the core, main's and this change's:
+- each sample clicked Stream 3 s after the page's client connected;
+- it was timed to the first decoded frame;
+- the video played for ten seconds, then was sought to 85%, beyond the
+  read-ahead window.
+
+| engine | rounds | first frame, median | sooner | seek to 85%, median | sooner |
+| --- | --: | --: | --: | --: | --: |
+| Chromium | 20 | 5.8 → 3.1 s | 16/20 | 5.1 → 4.1 s | 14/20 |
+| WebKit (Playwright) | 6 | 4.0 → 3.1 s | 5/6 | 2.9 → 2.8 s | 3/6 |
+
+- In Chromium, the median paired saving was 1.6 s for the first frame and
+  1.0 s for the seek.
+- First frames over 6 s fell from 9 of 20 to 3.
+- The WebKit seek was level, at a median paired difference of 0.4 s later.
+- All 52 samples played, and no page reported an error.
+
+**Cost: first reads concentrate on the first holder found.** In the Chromium
+traces, three holders served main's first reads (5, 4 and 1 of 10); with this
+change one served 9 of 10. In WebKit it served all 6, against 5 of 6. Early
+GETs still choose uniformly among the hints that may hold the record, but the
+first such hint is now asked at once. A holder that is full declines new
+sessions and is skipped for 15 s (ant-node ADR-0023).
+
+Unchanged: the lookup's width and grace period, its preconnects, the hedge
+delay, and the read after discovery.
+
+Left for later:
+
+- **DTLS:** it took 1.39 s at the median after ICE connected (p90 3.5 s), in
+  both engines, and its times cluster at the browsers' DTLS resend timers. The
+  node's ICE-lite agent starts DTLS only once the browser nominates the
+  connection, which the browser does late; that is V2-1770
+  (saorsa-transport#229).
+- **Preconnect slots:** they are still first come, first served, and a node
+  that finds them full is skipped, not queued. Ordering pending preconnects by
+  distance to the target would help every lookup, not only reads.
+- **Lookup answers:** each took about five of its node's round trips. It
+  carries 20 owner-signed records, whose ML-DSA-65 keys and signatures alone
+  come to over 100 KB.
+- **Lookup rounds:** each round waits for its slowest answer, up to its grace
+  period.

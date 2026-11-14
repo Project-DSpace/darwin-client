@@ -56,10 +56,10 @@ pins the node: darwin-node's repository, then the revision. It is the revision
 native suites run the same nodes, which dial a verified direct address before a
 relay in both (the native suite's are built with `vendor/saorsa-core`, darwin-node's
 copy); `scripts/darwin-node-pin.py`, which CI runs, checks that the pins agree. It is
-currently `363640e`: darwin-node's `main` released as `v0.23.0+ds.20`, which
-brings the price curve (100 DARWIN per GB of full chunks on empty nodes,
-divisor 2,000, quoted from its switch time, both curves accepted) and root
-payments together. It prices records by size as node release 2 does, quotes a
+currently `8ab7d76`: darwin-node `0.24.0+ds.22` (branch `upstream-0.24`), upstream node v0.24.0 merged
+into node release `v0.23.0+ds.21`, which keeps the price curve (100 DARWIN per
+GB of full chunks on empty nodes, divisor 2,000, both curves accepted) and root
+payments. It prices records by size as node release 2 does, quotes a
 client settling at version 2 at its weight total, and accepts root payment
 proofs (tag `0x03`) beside single-node ones, quoting a client that asks
 settlement version 3 only where it knows a root vault (`CURRENT_SETTLEMENT_VERSION`
@@ -91,6 +91,14 @@ or node RPC mocks are installed. It also checks that a closed network client
 rejects reconnection. Temporary node data is removed on shutdown.
 The suite uses local funds only and verifies that the RPC belongs to the local
 Anvil devnet before invoking the wallet.
+
+The pointer recovery test pays once on the local chain, then loses the page
+after the payment confirms and before the write stores the state. It rebuilds
+the paid state from the `onPrepared` checkpoint and the transaction
+`onSubmission` kept, stores it without paying again, and checks that a write
+refused before the wallet says "payment was not submitted". It also builds a
+manifest in the page and writes the `.ant` file and link to its test output
+directory, for decoding with `ant manifest show`.
 
 ## Large-file disk streaming
 

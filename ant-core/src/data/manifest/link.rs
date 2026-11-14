@@ -177,6 +177,7 @@ mod tests {
             entries: vec![ManifestEntry {
                 path: Some("a.bin".into()),
                 size: Some(1),
+                sha256: None,
                 source: ContentRef::Public { address: [5; 32] },
             }],
         }
@@ -275,6 +276,7 @@ mod tests {
         manifest.entries.push(ManifestEntry {
             path: Some("big".into()),
             size: None,
+            sha256: None,
             source: ContentRef::Embedded { data_map: root },
         });
         let link = manifest_link(&manifest).unwrap();

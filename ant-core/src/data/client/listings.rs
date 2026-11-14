@@ -1253,7 +1253,14 @@ impl Client {
         let fetch = |peer: PeerId| {
             let addresses = context.addresses.get(&peer).cloned().unwrap_or_default();
             async move {
-                let fetched = self.chunk_get_from_peer(address, &peer, &addresses).await;
+                let fetched = self
+                    .chunk_get_from_peer(
+                        address,
+                        &peer,
+                        &addresses,
+                        crate::data::network::RequestDispatched::unobserved(),
+                    )
+                    .await;
                 (peer, fetched)
             }
         };

@@ -109,15 +109,15 @@ note = "its THIRD_PARTY file covers documentation adapted from Apple's Security 
 # once a copy moves to another version; update them when a copy changes.
 
 [remark.ant-protocol]
-version = "5.0.0"
+version = "6.0.0"
 note = "a modified copy of the crates.io release, kept in vendor/ant-protocol of the repository this build is made from; its Source above is that copy. The changes are the price curve in src/payment/pricing.rs (100 DARWIN per GB at divisor 2,000, with the earlier ×32 curve still accepted), payment by record size, root payment proofs (proof tag 0x03) and settlement version 3, under which they are accepted (see vendor/ant-protocol/VENDORED.md)."
 
 [remark.ant-listings]
 version = "0.4.0"
-note = "a copy of Project-DSpace/darwin-listings v0.4.0 (commit a58de649e66584c0ed7d6e3868d79f37f3aeac40), which is not published on crates.io, kept in vendor/ant-listings of the repository this build is made from; its Source above is that copy. Its files are those of that commit, without the .github folder, plus a VENDORED.md saying where they come from."
+note = "a copy of Project-DSpace/darwin-listings v0.4.0 on ant-protocol 6.0.0 (commit 2b1cb84923f2dbd8b9092bc9b85eb6c6a0d0be86), which is not published on crates.io, kept in vendor/ant-listings of the repository this build is made from; its Source above is that copy. Its files are those of that commit, without the .github folder, plus a VENDORED.md saying where they come from."
 
 [remark.saorsa-core]
-version = "0.29.1"
+version = "0.30.0"
 note = "a modified copy of the crates.io release, kept in vendor/saorsa-core of the repository this build is made from; its Source above is that copy. The one change is the order a peer's addresses are dialled in, a verified direct address before a relay: AddressType::priority in src/peer_record.rs, the dial plan in src/dht_network_manager.rs and the stored order in src/dht/core_engine.rs, with upstream's order kept as AddressType::tag_rank for re-tagging and the lookup tie-break in src/client_routing.rs (see vendor/saorsa-core/VENDORED.md)."
 
 # Crates whose published files and repository contain no text of any licence
@@ -139,7 +139,7 @@ text_sha256 = "b05785f9f18e6716bab63424b11454513b9943a222595b70411009202fc592b5"
 note = "its COPYING, reproduced with its copyright lines, refers to LICENSE-MIT and LICENSE-APACHE files that neither the crate nor its repository contain; the MIT text is reproduced from the SPDX licence list."
 
 [missing.granit-parser]
-version = "1.3.0"
+version = "2.1.0"
 text_url = "https://raw.githubusercontent.com/spdx/license-list-data/v3.29.0/text/MIT.txt"
 text_sha256 = "b05785f9f18e6716bab63424b11454513b9943a222595b70411009202fc592b5"
 note = "its root LICENSE, reproduced with its notices for Chen Yuheng, Ethiraric and Bourumir Wyngs, refers to licence texts the crate ships under a hidden .licenses directory, which is not searched for licence files; the MIT text is reproduced from the SPDX licence list."

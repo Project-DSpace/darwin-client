@@ -42,9 +42,9 @@ use ant_protocol::pqc::ops::{MlDsaOperations, MlDsaSecretKey};
 use ant_protocol::transport::{
     CoreNodeConfig, IPDiversityConfig, MlDsa65, MultiAddr, NodeIdentity, P2PEvent, P2PNode,
 };
-use ant_protocol::{CLOSE_GROUP_SIZE, MAX_WIRE_MESSAGE_SIZE};
+use ant_protocol::{CLOSE_GROUP_SIZE, GET_OR_CLOSER_AGENT_TOKEN, MAX_WIRE_MESSAGE_SIZE};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::time::sleep;
@@ -59,6 +59,9 @@ const BOOTSTRAP_COUNT: usize = 2;
 /// unoptimised signature checks).
 const SPAWN_DELAY: Duration = Duration::from_millis(50);
 const STABILIZATION_TIMEOUT_SECS: u64 = 180;
+/// A chunk read request is a few dozen bytes, so anything larger, such as a
+/// PUT carrying a chunk, is not decoded.
+const MAX_READ_REQUEST_BYTES: usize = 1024;
 
 /// The DHT request timeout (saorsa-core's `connection_timeout`) of every
 /// testnet node, as this harness has always set it for its testnets.
@@ -154,8 +157,8 @@ pub fn test_client_config() -> ClientConfig {
 pub struct TestNode {
     pub p2p_node: Arc<P2PNode>,
     pub protocol: Arc<AntProtocol>,
-    /// Which pointer requests the node takes off the wire and ignores.
-    pub pointer_silence: Arc<PointerSilence>,
+    /// Which requests the node takes off the wire and ignores.
+    pub silence: Arc<Silence>,
     /// Chunk GET requests the node has received.
     pub chunk_gets: Arc<ChunkGetCounts>,
     /// The settlement versions the quote requests the node has received
@@ -173,76 +176,135 @@ impl TestNode {
     }
 }
 
-/// Switches that make a node ignore pointer requests while staying in the
+/// Switches that make a node ignore some requests while staying in the
 /// network, as a peer that is up but unreachable for them would.
 ///
 /// A silenced request is read off the wire and dropped: nothing is stored and
 /// nothing is answered, so the sender waits out its own timeout. Everything
 /// else the node handles as usual. Lets a test choose how many of a close group
-/// a read or a write actually reaches, over the real transport.
+/// a read or a write actually reaches, over the real transport, and then lift
+/// the silence with every node keeping its identity and address, which a node
+/// shut down and restarted would not.
 ///
 /// The decision is taken as each message arrives, before any work is spawned
 /// for it, so a request that arrived while its kind was silenced is dropped
 /// even if the switch is lifted a moment later.
 #[derive(Default)]
-pub struct PointerSilence {
+pub struct Silence {
     /// Ignore pointer GETs.
-    pub gets: AtomicBool,
+    pub pointer_gets: AtomicBool,
     /// Ignore pointer PUTs.
-    pub puts: AtomicBool,
+    pub pointer_puts: AtomicBool,
+    /// Ignore chunk PUTs, paid by either payment path.
+    pub chunk_puts: AtomicBool,
 }
 
-impl PointerSilence {
-    /// Whether `data` is a pointer request this node is ignoring.
+impl Silence {
+    /// Whether `data` is a request this node is ignoring.
     fn drops(&self, data: &[u8]) -> bool {
-        let gets = self.gets.load(Ordering::Relaxed);
-        let puts = self.puts.load(Ordering::Relaxed);
-        if !gets && !puts {
+        let pointer_gets = self.pointer_gets.load(Ordering::Relaxed);
+        let pointer_puts = self.pointer_puts.load(Ordering::Relaxed);
+        let chunk_puts = self.chunk_puts.load(Ordering::Relaxed);
+        if !pointer_gets && !pointer_puts && !chunk_puts {
             return false;
         }
         match ChunkMessage::decode(data) {
             Ok(ChunkMessage {
                 body: ChunkMessageBody::PointerGetRequest(_),
                 ..
-            }) => gets,
+            }) => pointer_gets,
             Ok(ChunkMessage {
                 body: ChunkMessageBody::PointerPutRequest(_),
                 ..
-            }) => puts,
+            }) => pointer_puts,
+            Ok(ChunkMessage {
+                body: ChunkMessageBody::PutRequest(_),
+                ..
+            }) => chunk_puts,
             _ => false,
         }
     }
 }
 
-/// Chunk GET requests a node has received, by chunk address, counted as each
-/// message arrives and before the node handles it.
+/// A chunk read request, as a node receives it.
+enum ReadRequest {
+    Get([u8; 32]),
+    /// A get-or-closer request (ant-node ADR-0020).
+    GetOrCloser([u8; 32]),
+}
+
+impl ReadRequest {
+    fn of(data: &[u8]) -> Option<Self> {
+        if data.len() > MAX_READ_REQUEST_BYTES {
+            return None;
+        }
+        match ChunkMessage::decode(data).ok()?.body {
+            ChunkMessageBody::GetRequest(request) => Some(Self::Get(request.address)),
+            ChunkMessageBody::GetOrCloserRequest(request) => {
+                Some(Self::GetOrCloser(request.address))
+            }
+            _ => None,
+        }
+    }
+
+    fn address(&self) -> [u8; 32] {
+        match self {
+            Self::Get(address) | Self::GetOrCloser(address) => *address,
+        }
+    }
+}
+
+/// Chunk reads the test nodes received, counted across the whole network.
+///
+/// Lets a test tell which kind of read a client sent, over the real
+/// transport.
+#[derive(Default)]
+pub struct ReadRequestCounts {
+    gets: AtomicUsize,
+    get_or_closers: AtomicUsize,
+}
+
+impl ReadRequestCounts {
+    fn record(&self, data: &[u8]) {
+        let counter = match ReadRequest::of(data) {
+            Some(ReadRequest::Get(_)) => &self.gets,
+            Some(ReadRequest::GetOrCloser(_)) => &self.get_or_closers,
+            None => return,
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Plain GETs received so far.
+    pub fn gets(&self) -> usize {
+        self.gets.load(Ordering::Relaxed)
+    }
+
+    /// Get-or-closer requests received so far.
+    pub fn get_or_closers(&self) -> usize {
+        self.get_or_closers.load(Ordering::Relaxed)
+    }
+}
+
+/// Chunk read requests a node has received, by chunk address, counted as each
+/// message arrives and before the node handles it. A GET and a get-or-closer
+/// request (ADR-0020) are both reads.
 #[derive(Default)]
 pub struct ChunkGetCounts(Mutex<HashMap<[u8; 32], usize>>);
 
 impl ChunkGetCounts {
-    /// A GET request is a few dozen bytes, so anything larger, such as a PUT
-    /// carrying a chunk, is not decoded.
-    const MAX_GET_REQUEST_BYTES: usize = 1024;
-
     fn note(&self, data: &[u8]) {
-        if data.len() > Self::MAX_GET_REQUEST_BYTES {
+        let Some(request) = ReadRequest::of(data) else {
             return;
-        }
-        if let Ok(ChunkMessage {
-            body: ChunkMessageBody::GetRequest(request),
-            ..
-        }) = ChunkMessage::decode(data)
-        {
-            *self
-                .0
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .entry(request.address)
-                .or_default() += 1;
-        }
+        };
+        *self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entry(request.address())
+            .or_default() += 1;
     }
 
-    /// GET requests received for `address`.
+    /// Read requests received for `address`.
     pub fn get(&self, address: &[u8; 32]) -> usize {
         self.0
             .lock()
@@ -294,8 +356,48 @@ impl QuoteVersions {
     }
 }
 
+/// Which nodes of a test network announce get-or-closer (ant-node ADR-0020)
+/// in their user agent. Every test node answers the request; a client sends
+/// it only to a node whose agent announces it, and reads every other node
+/// with FIND_NODE and GET.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GetOrCloser {
+    /// No node, as on the network today: darwin-node 0.24.0+ds.22 leaves the
+    /// token out of its agent while nodes of earlier releases, which can't
+    /// read an agent carrying it, remain.
+    Unannounced,
+    /// Every node, as once every node of the network announces it.
+    Announced,
+    /// Every other node (the odd indexes), as a network part way through a
+    /// rolling upgrade to nodes that announce it.
+    Mixed,
+}
+
+impl GetOrCloser {
+    /// Whether the node at `index` announces get-or-closer.
+    fn announces(self, index: usize) -> bool {
+        match self {
+            Self::Unannounced => false,
+            Self::Announced => true,
+            Self::Mixed => index % 2 == 1,
+        }
+    }
+}
+
+/// How every node of a test network is set up.
+#[derive(Clone, Copy)]
+struct NodeOptions {
+    /// ADR-0004: give each node a live storage commitment over this many
+    /// synthetic keys.
+    commitment_key_count: Option<u32>,
+    /// Which nodes announce get-or-closer.
+    get_or_closer: GetOrCloser,
+}
+
 pub struct MiniTestnet {
     pub nodes: Vec<TestNode>,
+    /// Chunk reads received by every node.
+    pub reads: Arc<ReadRequestCounts>,
     _temp_dirs: Vec<tempfile::TempDir>,
     /// Keeps the Anvil process alive for the lifetime of the testnet.
     _testnet: Testnet,
@@ -311,7 +413,7 @@ pub struct MiniTestnet {
 struct Spawned {
     node: Arc<P2PNode>,
     protocol: Arc<AntProtocol>,
-    pointer_silence: Arc<PointerSilence>,
+    silence: Arc<Silence>,
     chunk_gets: Arc<ChunkGetCounts>,
     quote_versions: Arc<QuoteVersions>,
     handler: tokio::task::JoinHandle<()>,
@@ -321,7 +423,14 @@ impl MiniTestnet {
     /// Start a testnet with the given number of nodes. Nodes emit baseline
     /// `(0, None)` quotes (no commitment source wired).
     pub async fn start(node_count: usize) -> Self {
-        Self::start_inner(node_count, None).await
+        Self::start_inner(
+            node_count,
+            NodeOptions {
+                commitment_key_count: None,
+                get_or_closer: GetOrCloser::Unannounced,
+            },
+        )
+        .await
     }
 
     /// ADR-0004: start a testnet where every node carries a live storage
@@ -330,7 +439,30 @@ impl MiniTestnet {
     /// in the quote response). Exercises the full node→client→storer binding
     /// handshake against real QUIC + Anvil.
     pub async fn start_with_commitments(node_count: usize, key_count: u32) -> Self {
-        Self::start_inner(node_count, Some(key_count)).await
+        Self::start_inner(
+            node_count,
+            NodeOptions {
+                commitment_key_count: Some(key_count),
+                get_or_closer: GetOrCloser::Unannounced,
+            },
+        )
+        .await
+    }
+
+    /// ADR-0020: start a testnet where the nodes `get_or_closer` says
+    /// announce get-or-closer in their agent, so a client sends them
+    /// get-or-closer requests, and reads every other node with FIND_NODE and
+    /// GET. [`Self::start`] starts nodes that announce it nowhere, as on the
+    /// network today.
+    pub async fn start_announcing(node_count: usize, get_or_closer: GetOrCloser) -> Self {
+        Self::start_inner(
+            node_count,
+            NodeOptions {
+                commitment_key_count: None,
+                get_or_closer,
+            },
+        )
+        .await
     }
 
     /// Anvil, with the DARWIN vault's code as the payment vault, so payment
@@ -338,7 +470,7 @@ impl MiniTestnet {
     /// and later ones are skipped (evmlib's test vault lets a later payment
     /// overwrite the record instead). Then `node_count` nodes, each on a port
     /// the system picks, so no two testnets on one machine collide.
-    async fn start_inner(node_count: usize, commitment_key_count: Option<u32>) -> Self {
+    async fn start_inner(node_count: usize, options: NodeOptions) -> Self {
         // Start Anvil EVM testnet FIRST
         let testnet = Testnet::new().await.expect("start Anvil testnet");
 
@@ -378,6 +510,7 @@ impl MiniTestnet {
             .map(|_| tempfile::TempDir::new().expect("create temp dir"))
             .collect();
         let mut spawned = Vec::with_capacity(node_count);
+        let reads = Arc::new(ReadRequestCounts::default());
 
         // Phase 1: the bootstrap nodes, one after another, each joining the
         // ones before it.
@@ -389,7 +522,8 @@ impl MiniTestnet {
                 &evm_network,
                 root_of(i),
                 i,
-                commitment_key_count,
+                options,
+                Arc::clone(&reads),
             )
             .await;
             bootstrap_addrs.extend(node.node.listen_addrs().await);
@@ -405,7 +539,8 @@ impl MiniTestnet {
                 &evm_network,
                 root_of(i),
                 i,
-                commitment_key_count,
+                options,
+                Arc::clone(&reads),
             )
             .await;
             spawned.push(node);
@@ -417,7 +552,7 @@ impl MiniTestnet {
             .map(|node| TestNode {
                 p2p_node: node.node,
                 protocol: node.protocol,
-                pointer_silence: node.pointer_silence,
+                silence: node.silence,
                 chunk_gets: node.chunk_gets,
                 quote_versions: node.quote_versions,
                 up: AtomicBool::new(true),
@@ -487,6 +622,7 @@ impl MiniTestnet {
 
         Self {
             nodes,
+            reads,
             _temp_dirs: temp_dirs,
             _testnet: testnet,
             wallet,
@@ -558,11 +694,12 @@ impl MiniTestnet {
             .collect()
     }
 
-    /// Let every node handle every pointer request again.
+    /// Let every node handle every request again.
     pub fn reset_switches(&self) {
         for node in &self.nodes {
-            node.pointer_silence.gets.store(false, Ordering::Relaxed);
-            node.pointer_silence.puts.store(false, Ordering::Relaxed);
+            node.silence.pointer_gets.store(false, Ordering::Relaxed);
+            node.silence.pointer_puts.store(false, Ordering::Relaxed);
+            node.silence.chunk_puts.store(false, Ordering::Relaxed);
         }
     }
 
@@ -583,7 +720,8 @@ impl MiniTestnet {
         evm_network: &EvmNetwork,
         root_vault: ant_node::config::RootVaultSetting,
         node_index: usize,
-        commitment_key_count: Option<u32>,
+        options: NodeOptions,
+        reads: Arc<ReadRequestCounts>,
     ) -> Spawned {
         // Generate ML-DSA-65 identity for this node
         let identity = Arc::new(NodeIdentity::generate().expect("generate node identity"));
@@ -604,6 +742,14 @@ impl MiniTestnet {
         core_config.bootstrap_peers = bootstrap_peers.to_vec();
         core_config.connection_timeout = DHT_REQUEST_TIMEOUT;
         core_config.node_identity = Some(Arc::clone(&identity));
+        // Every test node answers get-or-closer (ant-node ADR-0020); a client
+        // only sends one to a node whose user agent announces it, as
+        // ant-node's does. The `node/` prefix keeps it in routing tables.
+        core_config.custom_user_agent = Some(if options.get_or_closer.announces(node_index) {
+            format!("node/ant-core-test {GET_OR_CLOSER_AGENT_TOKEN}")
+        } else {
+            "node/ant-core-test".to_string()
+        });
         core_config.diversity_config = Some(IPDiversityConfig::permissive());
 
         let node = Arc::new(P2PNode::new(core_config).await.expect("create P2P node"));
@@ -687,14 +833,14 @@ impl MiniTestnet {
         // pinned, with the signed commitment shipped in the quote response).
         // Without this the node has no commitment source and emits baseline
         // `(0, None)` quotes — the path the rest of the suite exercises.
-        if let Some(key_count) = commitment_key_count {
+        if let Some(key_count) = options.commitment_key_count {
             let source = build_commitment_source(key_count, &identity);
             protocol.attach_commitment_source(source);
         }
 
         // Start message handler loop
-        let pointer_silence = Arc::new(PointerSilence::default());
-        let handler_silence = Arc::clone(&pointer_silence);
+        let silence = Arc::new(Silence::default());
+        let handler_silence = Arc::clone(&silence);
         let chunk_gets = Arc::new(ChunkGetCounts::default());
         let handler_gets = Arc::clone(&chunk_gets);
         let quote_versions = Arc::new(QuoteVersions::default());
@@ -717,6 +863,7 @@ impl MiniTestnet {
                             if handler_silence.drops(&data) {
                                 continue;
                             }
+                            reads.record(&data);
                         }
                         let protocol = Arc::clone(&handler_protocol);
                         let node = Arc::clone(&handler_node);
@@ -765,7 +912,7 @@ impl MiniTestnet {
         Spawned {
             node,
             protocol,
-            pointer_silence,
+            silence,
             chunk_gets,
             quote_versions,
             handler,
@@ -781,6 +928,13 @@ impl MiniTestnet {
                 task.abort();
             }
             let _ = node.p2p_node.shutdown().await;
+        }
+    }
+
+    /// Make every node drop (`true`) or handle (`false`) chunk PUTs. See [`Silence`].
+    pub fn silence_chunk_puts(&self, silenced: bool) {
+        for node in &self.nodes {
+            node.silence.chunk_puts.store(silenced, Ordering::Relaxed);
         }
     }
 

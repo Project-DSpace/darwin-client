@@ -243,6 +243,7 @@ impl<'a> ManifestBuilder<'a> {
         self.entries.push(ManifestEntry {
             path,
             size,
+            sha256: None,
             source: ContentRef::Embedded { data_map },
         });
         Ok(())
@@ -264,6 +265,7 @@ impl<'a> ManifestBuilder<'a> {
         self.entries.push(ManifestEntry {
             path,
             size,
+            sha256: None,
             source: ContentRef::Public { address },
         });
         Ok(())
@@ -399,6 +401,7 @@ impl<'a> ManifestBuilder<'a> {
             self.entries.push(ManifestEntry {
                 path: Some(file.path.clone()),
                 size: Some(size),
+                sha256: Some(result.sha256),
                 source: ContentRef::Embedded {
                     data_map: result.data_map.clone(),
                 },

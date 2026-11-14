@@ -83,12 +83,12 @@ fn the_lock_has_one_ant_protocol_the_vendored_copy() {
 }
 
 /// The saorsa-core release vendor/saorsa-core is, and upstream's commit for it.
-const SAORSA_CORE_VERSION: &str = "0.29.1";
-const SAORSA_CORE_COMMIT: &str = "29bb069691880de59f5157c315a6233b1c57b20f";
+const SAORSA_CORE_VERSION: &str = "0.30.0";
+const SAORSA_CORE_COMMIT: &str = "5fdeea2faa6858574597716499ec806dd297befe";
 
 /// One saorsa-core, the vendored copy: `[patch.crates-io]` puts
 /// vendor/saorsa-core in place of crates.io's, so the lock holds it as a path
-/// package, without a `source`. The copy is saorsa-core 0.29.1's crates.io
+/// package, without a `source`. The copy is saorsa-core 0.30.0's crates.io
 /// release with only the dial order changed (its VENDORED.md), built against
 /// the lock's one saorsa-transport (see the saorsa-transport pin above).
 #[test]

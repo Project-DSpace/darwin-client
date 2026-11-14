@@ -800,11 +800,11 @@ saorsa-core = { git = "https://github.com/Project-DSpace/darwin-client", tag = "
 curve, the earlier curve it still accepts, and payment by record size), in place
 of the crates.io release. Cargo applies a `[patch]` only in the top-level workspace, so taking
 `ant-core` alone isn't enough, and `ant-core` doesn't compile without it. `ant-core` requires
-exactly `ant-protocol` 5.0.0, the vendored copy's version, so a later crates.io release can't
+exactly `ant-protocol` 6.0.0, the vendored copy's version, so a later crates.io release can't
 take the patch's place, for `ant-core` or for any other crate in your build that uses
 `ant-protocol`.
 
-The second puts `vendor/saorsa-core`, the network library saorsa-core 0.29.1 as darwin-node
+The second puts `vendor/saorsa-core`, the network library saorsa-core 0.30.0 as darwin-node
 vendors it, in place of the crates.io release, so that the client dials a peer's verified direct
 address before its relay (see [Bootstrap multiaddresses and browser
 defaults](#bootstrap-multiaddresses-and-browser-defaults)). Without it, `ant-core` still
@@ -1288,7 +1288,7 @@ peer's addresses the same way (`DHTNode::addresses_by_priority`). Upstream's
 client dials a relay first, so it reached even a node it could reach directly
 through another node's relay, and depended on that relay staying up. A node
 behind NAT has no verified direct address, so its relay is still dialled first.
-The order is the network library's: `vendor/saorsa-core` is saorsa-core 0.29.1
+The order is the network library's: `vendor/saorsa-core` is saorsa-core 0.30.0
 as darwin-node vendors it, changed only in this (its `VENDORED.md` says how),
 and the workspace's `[patch.crates-io]` puts it in place of the crates.io
 release, for the client and for the in-process nodes of the tests and devnet.

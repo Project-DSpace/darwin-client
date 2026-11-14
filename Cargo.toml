@@ -28,7 +28,7 @@ opt-level = 2
 # A project that takes ant-core by git repeats this entry, from the same tag
 # (README, "Rust Library API"): a [patch] applies only in the top-level workspace.
 ant-protocol = { path = "vendor/ant-protocol" }
-# saorsa-core 0.29.1, the network library, as darwin-node vendors it; see
+# saorsa-core 0.30.0, the network library, as darwin-node vendors it; see
 # vendor/saorsa-core/VENDORED.md. A peer's verified direct address is dialled
 # before its relay address, so the client reaches a node that is reachable
 # directly without passing through another node's relay. The in-process nodes

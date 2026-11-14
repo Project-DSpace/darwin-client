@@ -9,7 +9,7 @@ use crate::data::client::Client;
 use crate::data::client::SettlementRefusals;
 use crate::data::client::PUT_TARGET_WIDTH;
 use crate::data::error::{Error, Result};
-use crate::data::network::send_and_await_chunk_response;
+use crate::data::network::{send_and_await_chunk_response, ChunkRequest, RequestDispatched};
 #[cfg(test)]
 use ant_protocol::compute_address;
 use ant_protocol::evm::{Amount, PaymentQuote};
@@ -292,11 +292,14 @@ async fn request_store_quote_from_peer(
 
     let result = send_and_await_chunk_response(
         &node,
-        &peer_id,
-        message_bytes,
-        request_id,
-        per_peer_timeout,
-        &peer_addrs,
+        ChunkRequest {
+            target_peer: &peer_id,
+            peer_addrs: &peer_addrs,
+            message_bytes,
+            request_id,
+            timeout: per_peer_timeout,
+            dispatched: RequestDispatched::unobserved(),
+        },
         |body| map_quote_response(&peer_id, &address, settlement_version, body),
         |e| Error::Network(format!("Failed to send quote request to {peer_id}: {e}")),
         || Error::Timeout(format!("Timeout waiting for quote from {peer_id}")),
@@ -1664,7 +1667,10 @@ impl Client {
             return false;
         }
         crate::quote_policy::proven_by_majority(claimants, |(peer, addrs)| async move {
-            match self.chunk_get_from_peer(address, &peer, &addrs).await {
+            match self
+                .chunk_get_from_peer(address, &peer, &addrs, RequestDispatched::unobserved())
+                .await
+            {
                 Ok(Some(_)) => true,
                 Ok(None) => {
                     warn!(

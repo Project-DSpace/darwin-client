@@ -40,6 +40,7 @@ use futures::stream::StreamExt;
 use self_encryption::{
     stream_decrypt_batch_size, stream_encrypt, streaming_decrypt_with_batch_size, DataMap,
 };
+use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::num::NonZeroUsize;
@@ -785,6 +786,7 @@ fn fold_external_merkle_payments(
 fn assemble_merkle_finalize_outcome(
     store_result: Result<(usize, String, u128, WaveAggregateStats)>,
     data_map: DataMap,
+    sha256: [u8; 32],
     data_map_address: Option<[u8; 32]>,
     total_chunks: usize,
     chunk_store: ExternalChunkStore,
@@ -795,6 +797,7 @@ fn assemble_merkle_finalize_outcome(
             info!("External-signer merkle upload finalized: {chunks_stored} chunks stored");
             Ok(FinalizeOutcome::Complete(FileUploadResult {
                 data_map,
+                sha256,
                 chunks_stored,
                 chunks_failed: 0,
                 total_chunks,
@@ -823,6 +826,7 @@ fn assemble_merkle_finalize_outcome(
             let unstored_addresses: Vec<[u8; 32]> = failed.iter().map(|(addr, _)| *addr).collect();
             let result = FileUploadResult {
                 data_map: data_map.clone(),
+                sha256,
                 chunks_stored: stored_count,
                 chunks_failed: failed_count,
                 total_chunks,
@@ -838,6 +842,7 @@ fn assemble_merkle_finalize_outcome(
             };
             let resume = MerkleFinalizeResume {
                 data_map,
+                sha256,
                 data_map_address,
                 total_chunks,
                 chunk_store,
@@ -889,6 +894,7 @@ fn assemble_wave_finalize_outcome(
     mut retained: HashMap<[u8; 32], PaidChunk>,
     occupied: Vec<([u8; 32], String)>,
     data_map: DataMap,
+    sha256: [u8; 32],
     data_map_address: Option<[u8; 32]>,
     total_chunks: usize,
     already_stored_count: usize,
@@ -901,6 +907,7 @@ fn assemble_wave_finalize_outcome(
         stats.absorb(&wave_result);
         return FinalizeOutcome::Complete(FileUploadResult {
             data_map,
+            sha256,
             chunks_stored: stored_count,
             chunks_failed: 0,
             total_chunks,
@@ -927,6 +934,7 @@ fn assemble_wave_finalize_outcome(
         .collect();
     let result = FileUploadResult {
         data_map: data_map.clone(),
+        sha256,
         chunks_stored: stored_count,
         chunks_failed: failed_count,
         total_chunks,
@@ -942,6 +950,7 @@ fn assemble_wave_finalize_outcome(
     };
     let resume = WaveFinalizeResume {
         data_map,
+        sha256,
         data_map_address,
         total_chunks,
         stored_count,
@@ -1191,6 +1200,7 @@ pub async fn file_data_map(path: &Path) -> Result<DataMap> {
         .map_err(|e| Error::Encryption(format!("encryption failed: {e}")))?;
     data_map
         .await
+        .map(|(data_map, _sha256)| data_map)
         .map_err(|_| Error::Encryption("no DataMap from encryption thread".to_string()))
 }
 
@@ -1715,6 +1725,9 @@ fn build_upload_envelope(
 pub struct PreparedUpload {
     /// The data map for later retrieval.
     pub data_map: DataMap,
+    /// SHA-256 of the plaintext, computed at prepare time and carried
+    /// through to [`FileUploadResult::sha256`].
+    pub sha256: [u8; 32],
     /// Payment information for chunks that still need payment after the
     /// already-stored preflight. This may be wave-batch even when the original
     /// chunk count was merkle-eligible if the remaining count is below the
@@ -1799,6 +1812,7 @@ pub enum FinalizeResume {
 #[non_exhaustive]
 pub struct WaveFinalizeResume {
     data_map: DataMap,
+    sha256: [u8; 32],
     data_map_address: Option<[u8; 32]>,
     total_chunks: usize,
     stored_count: usize,
@@ -1847,6 +1861,7 @@ impl std::fmt::Debug for WaveFinalizeResume {
 #[non_exhaustive]
 pub struct MerkleFinalizeResume {
     data_map: DataMap,
+    sha256: [u8; 32],
     data_map_address: Option<[u8; 32]>,
     total_chunks: usize,
     chunk_store: ExternalChunkStore,
@@ -1866,14 +1881,18 @@ impl std::fmt::Debug for MerkleFinalizeResume {
     }
 }
 
-/// Return type for [`spawn_file_encryption`]: chunk receiver, `DataMap` oneshot, join handle.
+/// Return type for [`spawn_file_encryption`]: chunk receiver, a oneshot with
+/// the `DataMap` and the plaintext's SHA-256, join handle.
 type EncryptionChannels = (
     tokio::sync::mpsc::Receiver<Bytes>,
-    tokio::sync::oneshot::Receiver<DataMap>,
+    tokio::sync::oneshot::Receiver<(DataMap, [u8; 32])>,
     tokio::task::JoinHandle<Result<()>>,
 );
 
 /// Spawn a blocking task that streams file encryption through a channel.
+///
+/// The plaintext's SHA-256 is computed in the same read loop that feeds the
+/// encryptor, so the file is read once.
 fn spawn_file_encryption(path: PathBuf) -> Result<EncryptionChannels> {
     let metadata = std::fs::metadata(&path)?;
     let data_size = usize::try_from(metadata.len())
@@ -1888,6 +1907,8 @@ fn spawn_file_encryption(path: PathBuf) -> Result<EncryptionChannels> {
 
         let read_error: Arc<Mutex<Option<std::io::Error>>> = Arc::new(Mutex::new(None));
         let read_error_clone = Arc::clone(&read_error);
+        let hasher = Arc::new(Mutex::new(Sha256::new()));
+        let hasher_clone = Arc::clone(&hasher);
 
         let data_iter = std::iter::from_fn(move || {
             let mut buffer = vec![0u8; 8192];
@@ -1895,6 +1916,10 @@ fn spawn_file_encryption(path: PathBuf) -> Result<EncryptionChannels> {
                 Ok(0) => None,
                 Ok(n) => {
                     buffer.truncate(n);
+                    hasher_clone
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .update(&buffer);
                     Some(Bytes::from(buffer))
                 }
                 Err(e) => {
@@ -1944,7 +1969,13 @@ fn spawn_file_encryption(path: PathBuf) -> Result<EncryptionChannels> {
         let datamap = stream
             .into_datamap()
             .ok_or_else(|| Error::Encryption("no DataMap after encryption".to_string()))?;
-        if datamap_tx.send(datamap).is_err() {
+        let sha256: [u8; 32] = hasher
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+            .finalize()
+            .into();
+        if datamap_tx.send((datamap, sha256)).is_err() {
             warn!("DataMap receiver dropped — upload may have been cancelled");
         }
         Ok(())
@@ -2421,7 +2452,8 @@ impl Client {
             path.display()
         );
 
-        let (spill, data_map) = self.encrypt_file_to_spill(path, progress.as_ref()).await?;
+        let (spill, data_map, _sha256) =
+            self.encrypt_file_to_spill(path, progress.as_ref()).await?;
         let content_chunks = spill.len();
         // The chunk the upload adds to its content, and how it is paid: an
         // envelope is kept out of merkle batches, a public data map is not.
@@ -2776,7 +2808,8 @@ impl Client {
         let file_size = std::fs::metadata(path)?.len();
         check_disk_space_for_spill(file_size)?;
 
-        let (mut spill, data_map) = self.encrypt_file_to_spill(path, progress.as_ref()).await?;
+        let (mut spill, data_map, sha256) =
+            self.encrypt_file_to_spill(path, progress.as_ref()).await?;
 
         info!(
             "Encrypted {} into {} chunks for external signing (spilled to disk)",
@@ -2952,6 +2985,7 @@ impl Client {
 
         Ok(PreparedUpload {
             data_map,
+            sha256,
             payment_info,
             data_map_address,
             already_stored_addresses,
@@ -3147,6 +3181,7 @@ impl Client {
 
                 Ok(FileUploadResult {
                     data_map: prepared.data_map,
+                    sha256: prepared.sha256,
                     chunks_stored,
                     chunks_failed: 0,
                     total_chunks,
@@ -3315,6 +3350,7 @@ impl Client {
 
                 Ok(FileUploadResult {
                     data_map: prepared.data_map,
+                    sha256: prepared.sha256,
                     chunks_stored,
                     chunks_failed: 0,
                     total_chunks,
@@ -3395,6 +3431,7 @@ impl Client {
         let already_stored_addresses = prepared.already_stored_addresses;
         let total_chunks = prepared.total_chunks;
         let data_map = prepared.data_map;
+        let sha256 = prepared.sha256;
         match prepared.payment_info {
             ExternalPaymentInfo::Merkle {
                 prepared_batches,
@@ -3406,6 +3443,7 @@ impl Client {
                     fold_external_merkle_payments(prepared_batches, winner_pool_hashes)?;
                 self.drive_merkle_finalize(
                     data_map,
+                    sha256,
                     data_map_address,
                     total_chunks,
                     chunk_store,
@@ -3474,6 +3512,7 @@ impl Client {
         let total_chunks = prepared.total_chunks;
         let data_map = prepared.data_map;
         let envelope = prepared.envelope;
+        let sha256 = prepared.sha256;
         match prepared.payment_info {
             ExternalPaymentInfo::WaveBatch {
                 prepared_chunks,
@@ -3487,6 +3526,7 @@ impl Client {
                 Ok(self
                     .drive_wave_finalize(
                         data_map,
+                        sha256,
                         data_map_address,
                         total_chunks,
                         already_stored_count,
@@ -3555,6 +3595,7 @@ impl Client {
             FinalizeResume::Wave(w) => {
                 let WaveFinalizeResume {
                     data_map,
+                    sha256,
                     data_map_address,
                     total_chunks,
                     stored_count,
@@ -3566,6 +3607,7 @@ impl Client {
                 Ok(self
                     .drive_wave_finalize(
                         data_map,
+                        sha256,
                         data_map_address,
                         total_chunks,
                         stored_count,
@@ -3580,6 +3622,7 @@ impl Client {
             FinalizeResume::Merkle(m) => {
                 let MerkleFinalizeResume {
                     data_map,
+                    sha256,
                     data_map_address,
                     total_chunks,
                     chunk_store,
@@ -3589,6 +3632,7 @@ impl Client {
                 } = *m;
                 self.drive_merkle_finalize(
                     data_map,
+                    sha256,
                     data_map_address,
                     total_chunks,
                     chunk_store,
@@ -3617,6 +3661,7 @@ impl Client {
     async fn drive_merkle_finalize(
         &self,
         data_map: DataMap,
+        sha256: [u8; 32],
         data_map_address: Option<[u8; 32]>,
         total_chunks: usize,
         chunk_store: ExternalChunkStore,
@@ -3639,6 +3684,7 @@ impl Client {
         assemble_merkle_finalize_outcome(
             store_result,
             data_map,
+            sha256,
             data_map_address,
             total_chunks,
             chunk_store,
@@ -3664,6 +3710,7 @@ impl Client {
     async fn drive_wave_finalize(
         &self,
         data_map: DataMap,
+        sha256: [u8; 32],
         data_map_address: Option<[u8; 32]>,
         total_chunks: usize,
         already_stored_count: usize,
@@ -3693,6 +3740,7 @@ impl Client {
             retained,
             occupied,
             data_map,
+            sha256,
             data_map_address,
             total_chunks,
             already_stored_count,
@@ -3982,7 +4030,8 @@ impl Client {
 
         // Phase 1: Encrypt file and spill chunks to temp directory.
         // Only 32-byte addresses stay in memory — chunk data lives on disk.
-        let (mut spill, data_map) = self.encrypt_file_to_spill(path, progress.as_ref()).await?;
+        let (mut spill, data_map, sha256) =
+            self.encrypt_file_to_spill(path, progress.as_ref()).await?;
 
         let mut data_map_address = match visibility {
             Visibility::Public => {
@@ -4169,6 +4218,7 @@ impl Client {
         crate::data::client::cached_merkle::try_delete_for_file(&file_path_key);
         Ok(FileUploadResult {
             data_map,
+            sha256,
             chunks_stored: result.addresses.len(),
             chunks_failed: 0,
             total_chunks: chunk_count,
@@ -4193,7 +4243,7 @@ impl Client {
         &self,
         path: &Path,
         progress: Option<&mpsc::Sender<UploadEvent>>,
-    ) -> Result<(ChunkSpill, DataMap)> {
+    ) -> Result<(ChunkSpill, DataMap, [u8; 32])> {
         let (mut chunk_rx, datamap_rx, handle) = spawn_file_encryption(path.to_path_buf())?;
 
         let mut spill = ChunkSpill::new()?;
@@ -4220,11 +4270,11 @@ impl Client {
             .map_err(|e| Error::Encryption(format!("encryption task panicked: {e}")))?
             .map_err(|e| Error::Encryption(format!("encryption failed: {e}")))?;
 
-        let data_map = datamap_rx
+        let (data_map, sha256) = datamap_rx
             .await
             .map_err(|_| Error::Encryption("no DataMap from encryption thread".to_string()))?;
 
-        Ok((spill, data_map))
+        Ok((spill, data_map, sha256))
     }
 
     /// Download and decrypt a file, returning the number of bytes written.
@@ -4819,11 +4869,15 @@ mod tests {
         }
     }
 
+    /// A recognisable plaintext hash, to check it is carried to the result.
+    const TEST_SHA256: [u8; 32] = [0x5a; 32];
+
     #[test]
     fn assemble_complete_on_full_store() {
         let outcome = assemble_merkle_finalize_outcome(
             Ok((3, "0".into(), 0, WaveAggregateStats::default())),
             DataMap::new(vec![]),
+            TEST_SHA256,
             Some([9u8; 32]),
             3,
             empty_chunk_store(),
@@ -4836,6 +4890,7 @@ mod tests {
                 assert_eq!(result.chunks_failed, 0);
                 assert_eq!(result.total_chunks, 3);
                 assert_eq!(result.data_map_address, Some([9u8; 32]));
+                assert_eq!(result.sha256, TEST_SHA256);
                 assert!(matches!(result.payment_mode_used, PaymentMode::Merkle));
             }
             FinalizeOutcome::Partial { .. } => panic!("expected Complete"),
@@ -4863,6 +4918,7 @@ mod tests {
         let outcome = assemble_merkle_finalize_outcome(
             store_result,
             DataMap::new(vec![]),
+            TEST_SHA256,
             Some([9u8; 32]),
             3,
             empty_chunk_store(),
@@ -4885,6 +4941,7 @@ mod tests {
                 assert_eq!(m.stored_addresses, vec![a]);
                 assert_eq!(m.total_chunks, 3);
                 assert_eq!(m.data_map_address, Some([9u8; 32]));
+                assert_eq!(m.sha256, TEST_SHA256);
             }
             FinalizeOutcome::Complete(_) => panic!("expected Partial"),
         }
@@ -4945,6 +5002,7 @@ mod tests {
         let outcome = assemble_merkle_finalize_outcome(
             first_pass,
             DataMap::new(vec![]),
+            TEST_SHA256,
             Some([9u8; 32]),
             3,
             empty_chunk_store(),
@@ -4965,6 +5023,7 @@ mod tests {
         let outcome = assemble_merkle_finalize_outcome(
             second_pass,
             m.data_map,
+            m.sha256,
             m.data_map_address,
             m.total_chunks,
             m.chunk_store,
@@ -4977,6 +5036,7 @@ mod tests {
                 assert_eq!(result.chunks_failed, 0);
                 assert_eq!(result.total_chunks, 3);
                 assert_eq!(result.data_map_address, Some([9u8; 32]));
+                assert_eq!(result.sha256, TEST_SHA256);
             }
             FinalizeOutcome::Partial { .. } => panic!("expected Complete after the drain pass"),
         }
@@ -4988,6 +5048,7 @@ mod tests {
         let outcome = assemble_merkle_finalize_outcome(
             Err(Error::Payment("on-chain call reverted".into())),
             DataMap::new(vec![]),
+            TEST_SHA256,
             None,
             3,
             empty_chunk_store(),
@@ -5014,6 +5075,7 @@ mod tests {
             retained,
             Vec::new(),
             DataMap::new(vec![]),
+            TEST_SHA256,
             Some([9u8; 32]),
             1,
             0,
@@ -5053,6 +5115,7 @@ mod tests {
             retained,
             Vec::new(),
             DataMap::new(vec![]),
+            TEST_SHA256,
             Some([9u8; 32]),
             3,
             0,
@@ -5110,6 +5173,7 @@ mod tests {
             retained,
             occupied.clone(),
             DataMap::new(vec![]),
+            TEST_SHA256,
             None,
             3,
             0,
@@ -5780,6 +5844,26 @@ mod tests {
         assert!(missing.is_empty());
     }
 
+    #[tokio::test]
+    async fn file_encryption_reports_the_plaintext_sha256() {
+        // More than one 8 KiB read and more than three chunks, so the hash
+        // spans many reads and the DataMap is shrunk.
+        let data: Vec<u8> = (0..(3 * self_encryption::MAX_CHUNK_SIZE + 12_345))
+            .map(|i| (i % 253) as u8)
+            .collect();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("plain.bin");
+        std::fs::write(&path, &data).unwrap();
+
+        let (mut chunk_rx, datamap_rx, handle) = spawn_file_encryption(path).unwrap();
+        while chunk_rx.recv().await.is_some() {}
+        handle.await.unwrap().unwrap();
+        let (_data_map, sha256) = datamap_rx.await.unwrap();
+
+        let expected: [u8; 32] = Sha256::digest(&data).into();
+        assert_eq!(sha256, expected);
+    }
+
     #[test]
     fn chunk_spill_round_trip() {
         let mut spill = ChunkSpill::new().unwrap();
@@ -6035,7 +6119,7 @@ mod tests {
             spill.push(&content).unwrap();
         }
         handle.await.unwrap().unwrap();
-        let uploaded = map.await.unwrap();
+        let (uploaded, _sha256) = map.await.unwrap();
         let local = file_data_map(&path).await.unwrap();
         assert!(local == uploaded);
         // The same as encrypting the bytes in memory.

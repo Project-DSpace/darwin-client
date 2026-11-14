@@ -373,6 +373,7 @@ mod tests {
         ManifestEntry {
             path: Some(path.into()),
             size: None,
+            sha256: None,
             source: ContentRef::Embedded { data_map },
         }
     }
@@ -453,6 +454,7 @@ mod tests {
                 ManifestEntry {
                     path: Some("public".into()),
                     size: None,
+                    sha256: None,
                     source: ContentRef::Public { address: [9; 32] },
                 },
             ],
