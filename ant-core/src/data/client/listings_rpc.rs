@@ -6,12 +6,14 @@
 //!   ([`Kind`]), on to the next whenever one fails it, and the next call
 //!   starts at the first again. Log queries have an order of their own. On
 //!   the bundled network, receipts and blocks go to the network's own RPC
-//!   (PublicNode's) first, then Robinhood's RPC, then ordofi's; log queries
-//!   go to Robinhood's RPC first, then PublicNode's, then ordofi's. ordofi's
-//!   is last for both, since it answered payment reads "busy" or too late in
-//!   October 2026. A provider that refuses a kind of call outright (HTTP
-//!   403, as PublicNode refuses ranged `eth_getLogs`) is asked last for that
-//!   kind for the next [`BUSY_MAX`], then in its place again.
+//!   (PublicNode's) first, then Robinhood's RPC, then Tenderly's public
+//!   gateway; log queries go to Robinhood's RPC first, then PublicNode's,
+//!   then Tenderly's. The last place, for both, was ordofi's until
+//!   2026-11-24, when it had refused every connection for 7 days and
+//!   Tenderly's gateway took its place. A provider that refuses a kind of
+//!   call outright (HTTP 403, as PublicNode refuses ranged `eth_getLogs`) is
+//!   asked last for that kind for the next [`BUSY_MAX`], then in its place
+//!   again.
 //! - **Batches.** Calls known together go to a provider in one request, a
 //!   JSON-RPC batch of up to [`RPC_BATCH`], and every call carries an id of
 //!   its own, unique for the reader's life.
@@ -23,11 +25,12 @@
 //!   twice as long each time in a row, up to [`BUSY_MAX`]; an answer ends it.
 //!   Calls go to the next provider meanwhile, the rest of a set sent in
 //!   batches too, and wait for one held off only when every other has failed
-//!   them. [`BUSY_CODE`] in answer to a log query from a provider that gives
-//!   it as a span answer (ordofi, wherever it is listed) fails that query
-//!   alone and holds nothing off: ordofi gives it to a query over a wider
-//!   span than it serves, and the query goes on to the next provider, if
-//!   any. From any other provider it holds that provider off.
+//!   them. [`BUSY_CODE`] in answer to a log query holds the provider off
+//!   like any other call's, and the query goes on to the next provider. Until
+//!   2026-11-24 ordofi's was an exception: ordofi gave it to a log query over
+//!   a wider span than it served, so from ordofi it failed that query alone
+//!   and held nothing off. ordofi is no longer listed, and no listed
+//!   provider was seen to answer that way.
 //! - **Redaction.** An error names a provider by its host alone, never its
 //!   URL, which can carry a key.
 //! - **Chain.** Where the chain is known (a list of RPCs given in place of
@@ -57,7 +60,7 @@ pub(crate) const RPC_CALLS_PER_SECOND: u32 = 10;
 pub(crate) const RPC_BATCH: usize = 100;
 
 /// The JSON-RPC error code of a provider over its limit: "limit exceeded",
-/// or ordofi's "the network is busy".
+/// or "the network is busy" (as ordofi, listed until 2026-11-24, gave it).
 pub(crate) const BUSY_CODE: i64 = -32_005;
 
 /// How long a busy provider is first held off.
@@ -213,9 +216,6 @@ struct Provider {
     host: String,
     calls: AtomicU64,
     errors: AtomicU64,
-    /// Whether its [`BUSY_CODE`] to a log query answers a span wider than it
-    /// serves, not a limit (ordofi's).
-    span_answers: bool,
     state: Mutex<ProviderState>,
 }
 
@@ -253,10 +253,8 @@ pub(crate) struct Rpc {
 impl Rpc {
     /// Providers at `urls`, asked in that order for everything but log
     /// queries, which are asked in `logs_order` (indexes into `urls`; the
-    /// same order when `None`). The providers at `span_answers` (indexes
-    /// into `urls`) give [`BUSY_CODE`] to a log query over a span wider than
-    /// they serve, which fails that query alone. With `chain_id`, each must
-    /// say it is on that chain before it is used.
+    /// same order when `None`). With `chain_id`, each must say it is on
+    /// that chain before it is used.
     ///
     /// # Errors
     ///
@@ -265,7 +263,6 @@ impl Rpc {
     pub(crate) fn new(
         urls: Vec<String>,
         logs_order: Option<Vec<usize>>,
-        span_answers: &[usize],
         chain_id: Option<u64>,
     ) -> std::result::Result<Self, String> {
         if urls.is_empty() {
@@ -285,13 +282,11 @@ impl Rpc {
         let now = Instant::now();
         let providers = urls
             .into_iter()
-            .enumerate()
-            .map(|(index, url)| Provider {
+            .map(|url| Provider {
                 host: rpc_host(&url),
                 url,
                 calls: AtomicU64::new(0),
                 errors: AtomicU64::new(0),
-                span_answers: span_answers.contains(&index),
                 state: Mutex::new(ProviderState {
                     bucket: Bucket::full(now),
                     hold: Hold::default(),
@@ -626,9 +621,9 @@ impl Rpc {
         provider
             .calls
             .fetch_add(calls.len() as u64, Ordering::Relaxed);
-        let (outcome, over_rpc) = match self.post(&provider.url, &body).await {
-            Ok(answer) => (answers_by_id(&answer, &ids), true),
-            Err(failure) => (ids.iter().map(|_| Err(failure.clone())).collect(), false),
+        let outcome = match self.post(&provider.url, &body).await {
+            Ok(answer) => answers_by_id(&answer, &ids),
+            Err(failure) => ids.iter().map(|_| Err(failure.clone())).collect(),
         };
         let (mut busy, mut refused, mut answered) = (false, false, false);
         let results = calls
@@ -640,23 +635,6 @@ impl Rpc {
                     Ok(value)
                 }
                 Err(failure) => {
-                    // ordofi answers a log query over a wider span than it
-                    // serves with BUSY_CODE too. From ordofi (a provider
-                    // marked as giving span answers, wherever it is in the
-                    // order), the query fails there and goes on to the next
-                    // provider, if any, but holds nothing off, so its other
-                    // calls go on. From any other provider it is over its
-                    // limit, and is held off like any busy provider.
-                    let failure = match failure {
-                        Failure::Busy(message)
-                            if over_rpc
-                                && Kind::of(call.method) == Kind::Logs
-                                && provider.span_answers =>
-                        {
-                            Failure::Failed(message)
-                        }
-                        failure => failure,
-                    };
                     busy |= matches!(failure, Failure::Busy(_));
                     refused |= matches!(failure, Failure::Refused(_));
                     provider.errors.fetch_add(1, Ordering::Relaxed);
@@ -868,11 +846,11 @@ mod tests {
     #[test]
     fn the_log_queries_order_must_order_every_rpc_once() {
         let urls = || vec!["http://a.test".to_string(), "http://b.test".to_string()];
-        assert!(Rpc::new(urls(), Some(vec![1, 0]), &[], None).is_ok());
-        assert!(Rpc::new(urls(), Some(vec![1, 1]), &[], None).is_err());
-        assert!(Rpc::new(urls(), Some(vec![0]), &[], None).is_err());
-        assert!(Rpc::new(Vec::new(), None, &[], None).is_err());
-        let rpc = Rpc::new(urls(), Some(vec![1, 0]), &[], None).unwrap();
+        assert!(Rpc::new(urls(), Some(vec![1, 0]), None).is_ok());
+        assert!(Rpc::new(urls(), Some(vec![1, 1]), None).is_err());
+        assert!(Rpc::new(urls(), Some(vec![0]), None).is_err());
+        assert!(Rpc::new(Vec::new(), None, None).is_err());
+        let rpc = Rpc::new(urls(), Some(vec![1, 0]), None).unwrap();
         assert_eq!(rpc.order(Kind::Chain), vec![0, 1]);
         assert_eq!(rpc.order(Kind::Logs), vec![1, 0]);
     }
@@ -882,7 +860,7 @@ mod tests {
         let urls = ["http://a.test", "http://b.test", "http://c.test"]
             .map(String::from)
             .to_vec();
-        let rpc = Rpc::new(urls, Some(vec![1, 0, 2]), &[], None).unwrap();
+        let rpc = Rpc::new(urls, Some(vec![1, 0, 2]), None).unwrap();
         let now = Instant::now();
         rpc.refused(1, Kind::Logs, now);
         assert_eq!(rpc.order_at(Kind::Logs, now), vec![0, 2, 1]);
@@ -906,7 +884,7 @@ mod tests {
             serve(Arc::clone(&first)).await,
             serve(Arc::clone(&second)).await,
         ];
-        let mut rpc = Rpc::new(urls, None, &[], None).unwrap();
+        let mut rpc = Rpc::new(urls, None, None).unwrap();
         rpc.unpaced();
         (first, second, rpc)
     }
@@ -916,12 +894,8 @@ mod tests {
     }
 
     /// Three mock chains served locally, and paced-off providers for them
-    /// with log queries in `logs_order` and span answers from the one at
-    /// `ordofi`.
-    async fn three_mocks(
-        logs_order: Option<Vec<usize>>,
-        ordofi: usize,
-    ) -> (Vec<Arc<Mutex<MockChain>>>, Rpc) {
+    /// with log queries in `logs_order`.
+    async fn three_mocks(logs_order: Option<Vec<usize>>) -> (Vec<Arc<Mutex<MockChain>>>, Rpc) {
         let mut mocks = Vec::new();
         let mut urls = Vec::new();
         for _ in 0..3 {
@@ -929,61 +903,48 @@ mod tests {
             urls.push(serve(Arc::clone(&mock)).await);
             mocks.push(mock);
         }
-        let mut rpc = Rpc::new(urls, logs_order, &[ordofi], None).unwrap();
+        let mut rpc = Rpc::new(urls, logs_order, None).unwrap();
         rpc.unpaced();
         (mocks, rpc)
     }
 
     #[tokio::test]
-    async fn a_busy_answer_to_a_log_query_holds_off_every_provider_but_ordofi() {
+    async fn a_busy_answer_to_a_log_query_holds_off_every_provider() {
         let filter = json!({ "fromBlock": "0x0", "toBlock": "0x9" });
         let logs_call = || Call::new("eth_getLogs", json!([filter]));
         // The bundled network: log queries to Robinhood's RPC (1), then
-        // PublicNode's (0), then ordofi's (2) last. Listed in RPC_URLS as
-        // the gateway's README gives them: ordofi's (0), Robinhood's (1),
-        // PublicNode's (2), in that order for everything, so PublicNode's,
-        // not ordofi's, is asked last for log queries.
-        for (logs_order, ordofi, others) in [(Some(vec![1, 0, 2]), 2, [1, 0]), (None, 0, [1, 2])] {
-            // Any other provider, over its limit, is held off, wherever it is
-            // in the order...
-            for other in others {
-                let (mocks, rpc) = three_mocks(logs_order.clone(), ordofi).await;
-                mocks[other].lock().unwrap().failing = vec![("eth_getLogs", BUSY_CODE)];
-                let logs = rpc.batch_to(other, Kind::Logs, &[logs_call()]).await;
+        // PublicNode's (0), then Tenderly's (2) last; and RPCs listed in
+        // RPC_URLS, in that order for everything. Until 2026-11-24 ordofi's
+        // busy answer to a log query held nothing off; no listed provider
+        // is treated so now.
+        for logs_order in [Some(vec![1, 0, 2]), None] {
+            // Any provider over its limit is held off, wherever it is in the
+            // order, the last included...
+            for index in 0..3 {
+                let (mocks, rpc) = three_mocks(logs_order.clone()).await;
+                mocks[index].lock().unwrap().failing = vec![("eth_getLogs", BUSY_CODE)];
+                let logs = rpc.batch_to(index, Kind::Logs, &[logs_call()]).await;
                 assert!(logs[0].is_err());
-                assert!(rpc.is_held(other), "{other} of {logs_order:?}");
+                assert!(rpc.is_held(index), "{index} of {logs_order:?}");
             }
             // ...and a query goes on past it to the next.
-            let (mocks, rpc) = three_mocks(logs_order.clone(), ordofi).await;
+            let (mocks, rpc) = three_mocks(logs_order.clone()).await;
             let order = rpc.order(Kind::Logs);
-            let at = order.iter().position(|index| *index != ordofi).unwrap();
-            for before in &order[..at] {
+            mocks[order[0]].lock().unwrap().failing = vec![("eth_getLogs", BUSY_CODE)];
+            let logs = rpc.call("eth_getLogs", json!([filter])).await.unwrap();
+            assert_eq!(logs.provider, order[1]);
+            assert!(rpc.is_held(order[0]));
+            // The last in the order, over its limit after the others failed
+            // the query: the query fails, and it is held off too.
+            let (mocks, rpc) = three_mocks(logs_order.clone()).await;
+            let order = rpc.order(Kind::Logs);
+            for before in &order[..2] {
                 mocks[*before].lock().unwrap().failing = vec![("eth_getLogs", -32_000)];
             }
-            mocks[order[at]].lock().unwrap().failing = vec![("eth_getLogs", BUSY_CODE)];
-            let logs = rpc.call("eth_getLogs", json!([filter])).await.unwrap();
-            assert_eq!(logs.provider, order[at + 1]);
-            assert!(rpc.is_held(order[at]));
-
-            // ordofi, answering a span wider than it serves: the query fails
-            // there alone and holds nothing off, wherever it is in the
-            // order...
-            let (mocks, rpc) = three_mocks(logs_order.clone(), ordofi).await;
-            for other in others {
-                mocks[other].lock().unwrap().failing = vec![("eth_getLogs", -32_000)];
-            }
-            mocks[ordofi].lock().unwrap().failing = vec![("eth_getLogs", BUSY_CODE)];
+            mocks[order[2]].lock().unwrap().failing = vec![("eth_getLogs", BUSY_CODE)];
             assert!(rpc.call("eth_getLogs", json!([filter])).await.is_err());
-            assert_eq!(mocks[ordofi].lock().unwrap().calls_to("eth_getLogs"), 1);
-            assert!(!rpc.is_held(ordofi), "{logs_order:?}");
-            // ...so it still answers everything else in its place.
-            let receipt = rpc.batch_to(ordofi, Kind::Chain, &[receipt_call(1)]).await;
-            assert!(receipt[0].is_ok());
-            // The same answer to any other call holds it off.
-            mocks[ordofi].lock().unwrap().failing = vec![("eth_getTransactionReceipt", BUSY_CODE)];
-            let receipt = rpc.batch_to(ordofi, Kind::Chain, &[receipt_call(2)]).await;
-            assert!(receipt[0].is_err());
-            assert!(rpc.is_held(ordofi));
+            assert!(rpc.is_held(order[2]), "{logs_order:?}");
+            assert!(!rpc.is_held(order[0]) && !rpc.is_held(order[1]));
         }
     }
 

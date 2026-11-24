@@ -12,6 +12,19 @@ upstream 0.3.11 (ant-core 0.13.0) before it. Releases are tagged `vX.Y.Z+ds.N`, 
 version set to match; other builds are told apart by the commit `darwin --version` prints.
 Upstream's entries follow.
 
+- Unreleased, after `v0.3.13+ds.13`: the bundled network's last payment-read fallback is Tenderly's
+  public gateway (`https://robinhood-chain.gateway.tenderly.co`) in place of ordofi's
+  (`https://rpc.ordofi.network`), which had refused every connection for 7 days up to 2026-11-24
+  (Dan, 2026-11-24: "yes please replace ordofi in every single instance in the entire project where
+  it is used"). The order is unchanged: payment reads go to PublicNode, then Robinhood's RPC, then
+  Tenderly's; log queries to Robinhood's RPC, then PublicNode, then Tenderly's. Asked with no key on
+  2026-11-24, Tenderly's gateway answered calls at old blocks, JSON-RPC batches, and `eth_getLogs`
+  on the payment vault over every span tried, up to the whole chain. ordofi's exception is gone: a
+  "busy" answer (-32005) to a log query from ordofi, which it gave to a query over a wider span than
+  it served, held nothing off; from any provider now, it holds that provider off as any busy answer
+  does, and the query goes on to the next. That exception was keyed on the RPC the bundled network
+  asks last for log queries, so it would otherwise have moved to Tenderly's, which was not seen to
+  answer that way.
 - `v0.3.13+ds.13`, one send per payment: ant-cli's version is 0.3.13+ds.13 (ant-core stays
   0.15.0). A payment's first send that the RPC refused with "nonce too low" was taken as never
   sent and signed again, but the wallet library re-sends the same bytes after an answer it lost

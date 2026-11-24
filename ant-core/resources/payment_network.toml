@@ -18,14 +18,18 @@ chain_id = 4663
 # each quote an upload paid, read back after paying) go when `rpc_url` refuses
 # or fails a call, in this order: ordinary reads (receipts, blocks, vault
 # records) go to PublicNode (`rpc_url`), then Robinhood's own RPC, then
-# ordofi; log queries go to Robinhood's RPC first, since PublicNode refuses
-# the ranged `eth_getLogs` that finding a payment whose transaction hash is
-# hidden needs, then PublicNode, then ordofi. ordofi stays, as the last
-# fallback, rather than being dropped (Dan, 2026-10-28: "just keep it as last
-# fallback"), and goes last for ordinary reads too (Dan, 2026-10-28: "Make it
-# last"): it answered payment reads "busy" or too late in October 2026, and
-# still answered -32005 "busy" on 28 October.
-fallback_rpc_urls = ["https://rpc.mainnet.chain.robinhood.com", "https://rpc.ordofi.network"]
+# Tenderly's public gateway; log queries go to Robinhood's RPC first, since
+# PublicNode refuses the ranged `eth_getLogs` that finding a payment whose
+# transaction hash is hidden needs, then PublicNode, then Tenderly's.
+# The last place was ordofi's (https://rpc.ordofi.network) until 2026-11-24,
+# kept as the last fallback (Dan, 2026-10-28: "just keep it as last fallback"
+# and "Make it last") after it answered payment reads "busy" or too late in
+# October 2026. It then refused every connection for 7 days, and Tenderly's
+# gateway took its place (Dan, 2026-11-24: "yes please replace ordofi in every
+# single instance in the entire project where it is used"). Tenderly's
+# gateway, asked with no key on 2026-11-24, answered calls at old blocks,
+# batches, and `eth_getLogs` over every span tried, up to the whole chain.
+fallback_rpc_urls = ["https://rpc.mainnet.chain.robinhood.com", "https://robinhood-chain.gateway.tenderly.co"]
 payment_token_address = "0x511f76a3de41f000ec11ea4fd212fb3587c6cef3"
 payment_vault_address = "0xE0f627986c0438De0E314B644f3C8aA21D3f4f6B"
 # The block the payment vault was deployed in, and that block's timestamp in
