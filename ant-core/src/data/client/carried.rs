@@ -99,6 +99,12 @@ pub(crate) const BOTH_PENDING: &str =
     "this upload's saved checkpoint holds a payment not yet confirmed; run it without the \
      carried state to settle it first";
 
+/// Why a carried payment not yet confirmed is refused when this upload
+/// already holds some of its records and not the others.
+pub(crate) const PENDING_PARTLY_HELD: &str =
+    "its payment not yet confirmed names records this upload already holds and records it does \
+     not, and a payment is settled whole; carry the state saved after that payment was confirmed";
+
 /// Why a payer's payment not yet confirmed that pays more than this client's
 /// price ceiling is refused.
 pub(crate) const PENDING_ABOVE_CEILING: &str =
@@ -357,9 +363,10 @@ fn read(bytes: &[u8], records: &HashSet<XorName>, caller: CarriedCaller) -> Resu
 /// it was. A carried payment not yet confirmed is left out when the base
 /// already holds it (an earlier run of this upload took it from the same
 /// state, and it is counted as settled this run), or when the base proves,
-/// has paid again or holds pending any of its records; beside another
-/// payment the base holds, it is refused; otherwise it is taken only if its
-/// paid quotes are within the payer's client's price ceiling. Then the base
+/// has paid again or holds pending every one of its records; beside another
+/// payment the base holds, or when the base holds some of its records and
+/// not the others, it is refused; otherwise it is taken only if its paid
+/// quotes are within the payer's client's price ceiling. Then the base
 /// takes from it only what it lacks ([`UploadState::take_carried`]).
 pub(crate) fn starting_state(
     saved: Option<UploadState>,
@@ -385,14 +392,20 @@ pub(crate) fn starting_state(
             // settles it, as on any resume.
             state.pending_payment = None;
             pending_here = Some(attempt.addresses.iter().copied().collect());
-        } else if attempt.addresses.iter().any(|address| held(&base, address)) {
-            // This upload already took, settled or is paying some of its
-            // records itself, and a payment is settled whole: the rest are
-            // quoted afresh, and the payer is never asked to pay a record
-            // this upload proves.
+        } else if attempt.addresses.iter().all(|address| held(&base, address)) {
+            // This upload already took, settled or is paying every one of
+            // its records itself: the payer is never asked to pay a record
+            // this upload proves, and no record of it is quoted afresh.
             state.pending_payment = None;
         } else if base.pending_payment.is_some() || base.pending_merkle.is_some() {
             return Err(refused(BOTH_PENDING));
+        } else if attempt.addresses.iter().any(|address| held(&base, address)) {
+            // A payment is settled whole. Left out, the records this upload
+            // does not hold would be quoted afresh and paid under new
+            // quotes, while the carried payment of them may be on chain;
+            // taken, the payer would be asked to pay records this upload
+            // proves.
+            return Err(refused(PENDING_PARTLY_HELD));
         } else if let CarriedCaller::Payer { ceiling, .. } = caller {
             within_ceiling(&state, ceiling)?;
         }
@@ -1064,8 +1077,8 @@ mod tests {
     /// A carried payment this upload took and settled is not taken again
     /// when the upload runs again with the same carried state, so its payer
     /// is not asked to pay records the upload proves. Nor is it taken when
-    /// this upload's own state already proves or has paid again any of its
-    /// records.
+    /// this upload's own state already proves or has paid again every one
+    /// of its records.
     #[test]
     fn a_carried_attempt_this_upload_settled_is_not_taken_again() {
         let (carried, addresses) = carried_attempt(&[b"settled c", b"settled d"]);
@@ -1107,16 +1120,73 @@ mod tests {
             starting_state(Some(dropped), nothing_local, Some(&bytes), &upload, PAYER).unwrap();
         assert!(again.pending_payment.is_none());
         assert!(report.unwrap().reconciled.is_empty());
+    }
+
+    /// A carried payment not yet confirmed of records some of which this
+    /// upload already holds is refused whole. Left out, its other records
+    /// would be quoted afresh and paid by this upload's payer under new
+    /// quotes, while the carried payment of them may already be on chain.
+    /// When this upload holds every one of its records, it is left out.
+    #[test]
+    fn a_carried_attempt_this_upload_holds_only_in_part_is_refused() {
+        let (carried, addresses) = carried_attempt(&[b"part c", b"part d"]);
+        let bytes = carried.checkpoint().unwrap();
+        let upload = records(&[b"attempt proven", b"part c", b"part d"]);
+        let (c, d) = (address(b"part c"), address(b"part d"));
+        assert_eq!(addresses, vec![c, d]);
         // This machine's receipts prove one of its records.
-        let (c, local) = paid(b"settled c");
+        let (_, local) = paid(b"part c");
         let receipts = || {
             Ok(UploadState::from_proofs(HashMap::from([(
                 c,
                 local.clone(),
             )])))
         };
-        let (state, report) = starting_state(None, receipts, Some(&bytes), &upload, PAYER).unwrap();
+        assert_refused(
+            starting_state(None, receipts, Some(&bytes), &upload, PAYER),
+            PENDING_PARTLY_HELD,
+        );
+        // The saved checkpoint proves one and has paid the other again.
+        let mut saved = UploadState::from_proofs(HashMap::from([(c, local.clone())]));
+        assert_refused(
+            starting_state(
+                Some(saved.clone()),
+                nothing_local,
+                Some(&bytes),
+                &upload,
+                PAYER,
+            ),
+            PENDING_PARTLY_HELD,
+        );
+        saved.mark_paid_again(d);
+        let (state, report) =
+            starting_state(Some(saved), nothing_local, Some(&bytes), &upload, PAYER).unwrap();
         assert!(state.pending_payment.is_none());
+        assert_eq!(state.proof(&c), Some(&local));
+        assert!(report.unwrap().reconciled.is_empty());
+        // The saved checkpoint's own payment not yet confirmed holds one of
+        // its records: refused, as beside any other saved payment.
+        let own = pending(&[b"part c"], PaymentVault::V2);
+        let before = own.checkpoint().unwrap();
+        assert_refused(
+            starting_state(
+                Some(own.clone()),
+                nothing_local,
+                Some(&bytes),
+                &upload,
+                PAYER,
+            ),
+            BOTH_PENDING,
+        );
+        assert_eq!(own.checkpoint().unwrap(), before);
+        // It proves one and its own payment not yet confirmed holds the
+        // other: every record is held, and its own payment is kept.
+        let mut own = UploadState::from_proofs(HashMap::from([(c, local.clone())]));
+        own.prepare(plan(b"part d", now()));
+        own.start_payment(false, vec![d]).unwrap();
+        let (state, report) =
+            starting_state(Some(own), nothing_local, Some(&bytes), &upload, PAYER).unwrap();
+        assert_eq!(state.pending_payment.as_ref().unwrap().addresses, vec![d]);
         assert_eq!(state.proof(&c), Some(&local));
         assert!(report.unwrap().reconciled.is_empty());
     }

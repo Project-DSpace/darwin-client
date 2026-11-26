@@ -76,7 +76,9 @@ again through the per-chunk path. A payer's attempt not yet confirmed is settled
 payer, which is asked for exactly its plans, as on any resume; a wallet's is refused, since only
 the wallet that made it can settle it. A payer's attempt is left out when the upload's own state
 already holds it (an earlier run took it from the same state) or proves, has paid again or holds
-pending any of its records, so a payer is never asked again for a payment the upload settled. A
+pending every one of its records, so a payer is never asked again for a payment the upload settled.
+When the upload's own state holds some of its records and not the others, the state is refused:
+a payment is settled whole, and left out, its other records would be paid again under new quotes. A
 proof is not taken for a record the upload marked as paid again and dropped. A state that fails
 `UploadState::restore`'s checks, that is a checkpoint's main file without its proofs, that names
 none of the upload's records, that holds a Merkle proof or a pending Merkle batch, whose pending
