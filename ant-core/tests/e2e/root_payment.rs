@@ -157,7 +157,7 @@ fn nearest(testnet: &MiniTestnet, address: &[u8; 32]) -> Vec<[u8; 32]> {
 
 /// Whether every one of `address`'s [`ROOT_MARGIN`] nearest nodes knows the
 /// root vault.
-fn pays_root(testnet: &MiniTestnet, address: &[u8; 32]) -> bool {
+pub(crate) fn pays_root(testnet: &MiniTestnet, address: &[u8; 32]) -> bool {
     let unaware = testnet.root_unaware_peers();
     nearest(testnet, address)
         .iter()

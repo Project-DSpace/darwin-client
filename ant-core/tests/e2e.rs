@@ -6,7 +6,7 @@
 //! network, runs every case on it one after another, and tears it down once;
 //! the ADR-0004 cases get a committed network of their own after it. Select
 //! cases as with libtest, by name: `storage`, `envelopes`, `refusals`,
-//! `pointers`, `root_payments` and `committed` are the groups, so
+//! `pointers`, `root_payments`, `carried` and `committed` are the groups, so
 //!
 //! ```text
 //! cargo test -p ant-core --features test-utils --test e2e -- refusals
@@ -37,6 +37,12 @@
 //!   client that asks for root waves: a mixed wave paid through both vaults,
 //!   an interrupted payment reconciled without paying again, and a root
 //!   request paid at the per-quote vault stored with single-node proofs.
+//! - `carried`: an upload given the paid state another client saved stores
+//!   the paid records without paying for them again; a payment not yet
+//!   confirmed in it is settled through the payer; proofs that paid nothing
+//!   are paid again once, unpaid quotes quoted afresh, through the
+//!   occupied-quote path and under the price ceiling; a state with a bad
+//!   signature is refused before anything is paid.
 
 #![allow(
     clippy::unwrap_used,
@@ -48,6 +54,8 @@ mod support;
 
 #[path = "e2e/adr0004.rs"]
 mod adr0004;
+#[path = "e2e/carried.rs"]
+mod carried;
 #[path = "e2e/chunk.rs"]
 mod chunk;
 #[path = "e2e/cost_estimate.rs"]
@@ -109,6 +117,7 @@ fn main() -> std::process::ExitCode {
     ));
     cases.extend(group("pointers", [pointer::cases()]));
     cases.extend(group("root_payments", [root_payment::cases()]));
+    cases.extend(group("carried", [carried::cases()]));
     cases.extend(group("committed", [adr0004::cases()]));
     run(cases)
 }
