@@ -4867,8 +4867,7 @@ mod tests {
                     &records,
                     caller,
                 )
-                .err()
-                .expect("refused");
+                .expect_err("refused");
                 assert_eq!(
                     error.to_string(),
                     format!(

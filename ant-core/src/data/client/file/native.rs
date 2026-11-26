@@ -7174,8 +7174,7 @@ mod payer_tests {
             &HashSet::from([x, y]),
             PAYER,
         )
-        .err()
-        .expect("refused");
+        .expect_err("refused");
         assert!(error.to_string().ends_with(BOTH_PENDING), "{error}");
         assert_eq!(saved.checkpoint().unwrap(), before);
     }

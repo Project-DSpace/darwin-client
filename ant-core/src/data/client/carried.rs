@@ -460,7 +460,7 @@ mod tests {
     }
 
     fn assert_refused(result: Result<(UploadState, Option<TakeReport>)>, words: &str) {
-        let error = result.err().expect("refused");
+        let error = result.expect_err("refused");
         let text = reason(&error);
         assert!(
             text.starts_with(&format!("invalid data: {CARRIED_STATE_REFUSED}: ")),
