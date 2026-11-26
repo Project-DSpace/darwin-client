@@ -2248,6 +2248,39 @@ pub(crate) mod test_support {
         }
     }
 
+    /// [`make_prepared_merkle_batch`], each candidate signed by a node of
+    /// its own at the price of a node holding no keys, so the batch and
+    /// its proofs pass a checkpoint's checks.
+    pub(crate) fn make_signed_prepared_merkle_batch(count: usize) -> PreparedMerkleBatch {
+        let mut batch = make_prepared_merkle_batch(count);
+        let price = ant_protocol::payment::calculate_price(0);
+        for pool in &mut batch.candidate_pools {
+            for candidate in &mut pool.candidate_nodes {
+                let identity = ant_protocol::transport::NodeIdentity::generate().unwrap();
+                candidate.price = price;
+                candidate.pub_key = identity.public_key().as_bytes().to_vec();
+                candidate.signature = identity
+                    .sign(&MerklePaymentCandidateNode::bytes_to_sign(
+                        &candidate.price,
+                        &candidate.reward_address,
+                        candidate.merkle_payment_timestamp,
+                        candidate.committed_key_count,
+                        &candidate.commitment_pin,
+                    ))
+                    .unwrap()
+                    .as_bytes()
+                    .to_vec();
+            }
+        }
+        batch.pool_commitments = batch
+            .candidate_pools
+            .iter()
+            .map(pool_commitment_with_payment_multiplier)
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
+        batch
+    }
+
     /// A winner pool hash `finalize_merkle_batch` will accept for `batch`
     /// (the first candidate pool's) — the same selection the existing
     /// finalize tests use. Lives here because `candidate_pools` is private

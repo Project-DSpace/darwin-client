@@ -12,6 +12,8 @@ pub mod cache;
 pub(crate) mod cached_merkle;
 #[cfg(feature = "native")]
 pub(crate) mod cached_single;
+#[cfg(feature = "native")]
+pub(crate) mod carried;
 pub mod chunk;
 pub mod data;
 #[cfg(feature = "native")]

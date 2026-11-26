@@ -71,6 +71,8 @@ const STORES: Counting = &[
     (None, "batch_upload_chunks*"),
     (None, "upload_records"),
     (None, "upload_records_then"),
+    (None, "carried_state"),
+    (None, "state_saved"),
     (None, "chunk_put*"),
     (None, "data_map_store"),
     (None, "pointer_put*"),
@@ -187,6 +189,18 @@ const ENVELOPE_LIB: &str = "The library's file shortcuts: an envelope from Envel
     private by default with all five payment fields shown, paid per chunk.";
 const FINALIZE: &str = "Finishes a prepared file upload with the envelope chosen when it was \
     prepared; paid per chunk through the upload coordinator, which reads paid quotes back.";
+const CARRIED: &str = "Adds a carried state's proofs for this upload's records only where its \
+    checkpoint holds none; each payment path is covered or refused in data/client/carried.rs, \
+    and every new payment goes through the per-chunk path.";
+const CARRIED_OUT: &str = "Hands the payer the state the engine saved, the only source of \
+    carried bytes; nothing is paid or stored here.";
+const CARRIED_ROOT: &str = "Whether an outside payer pays root waves decides whether a carried \
+    root payment not yet confirmed is settled through it or refused (data/client/carried.rs); \
+    nothing is quoted or paid here.";
+const CARRIED_DECODE: &str = "Decodes an upload checkpoint this client wrote, or a carried \
+    state given to an upload; every quote and proof is checked (validated) before use, a carried \
+    main file without its proofs is refused, and a carried state is refused whole on any \
+    failure.";
 const PER_CHUNK: &str = "Per-chunk payment in the network's token through the client's \
     chain-bound wallet; paid quotes are read back from the vault and occupied ones quoted again.";
 const JOURNALED: &str = "Per-chunk payment in the network's token through the client's \
@@ -695,9 +709,30 @@ const STORE_SITES: &[Site] = &[
     (
         "ant-core/src/data/client/file/native.rs",
         "Client::upload_file",
+        "carried_state",
+        1,
+        CARRIED,
+    ),
+    (
+        "ant-core/src/data/client/file/native.rs",
+        "Client::upload_file",
+        "state_saved",
+        1,
+        CARRIED_OUT,
+    ),
+    (
+        "ant-core/src/data/client/file/native.rs",
+        "Client::upload_file",
         "upload_records",
         1,
         PER_CHUNK,
+    ),
+    (
+        "ant-core/src/data/client/file/native.rs",
+        "SpillUploadAdapter::checkpoint",
+        "state_saved",
+        1,
+        CARRIED_OUT,
     ),
     (
         "ant-core/src/data/client/file/native.rs",
@@ -1149,6 +1184,20 @@ const CHOICE_SITES: &[Site] = &[
         "pays_root_waves",
         1,
         PAYER_ROOT_ASKED,
+    ),
+    (
+        "ant-core/src/data/client/file/native.rs",
+        "Client::upload_file",
+        "pays_root_waves",
+        1,
+        CARRIED_ROOT,
+    ),
+    (
+        "ant-core/src/data/client/file.rs",
+        "CarriedUploadOptions::new",
+        "Visibility::default",
+        1,
+        ENVELOPE_LIB,
     ),
     (
         "ant-core/src/data/client/upload.rs",
@@ -2197,7 +2246,7 @@ const DECODE_SITES: &[Site] = &[
         "UploadState::parse",
         "rmp_serde::from_slice",
         2,
-        LOCAL_FILE,
+        CARRIED_DECODE,
     ),
     (
         "ant-core/src/datamap_file.rs",

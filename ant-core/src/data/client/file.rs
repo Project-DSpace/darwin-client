@@ -282,4 +282,71 @@ pub struct FileUploadResult {
     pub retries_histogram: [usize; 4],
     /// The envelope stored with an envelope upload, with its proof record.
     pub envelope: Option<UploadEnvelope>,
+    /// What the upload did with a carried state; None when none was given.
+    pub carried: Option<CarriedOutcome>,
+}
+
+/// The start of the error an upload gives when it refuses a carried state
+/// (`CarriedUploadOptions::state`, `UploadPayer::carried_state`): the
+/// error is `Error::InvalidData` with this, a colon and the reason. A
+/// carried state is refused whole, before anything is quoted, paid or
+/// stored.
+pub const CARRIED_STATE_REFUSED: &str = "carried upload state refused";
+
+/// What an upload did with the carried state it was given.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[non_exhaustive]
+pub struct CarriedOutcome {
+    /// The paid proofs in the carried state.
+    pub proofs: usize,
+    /// Of those, the proofs added to this upload's checkpoint by this run:
+    /// proofs of this upload's records that its checkpoint did not hold. A
+    /// resumed run that took them already adds none.
+    pub taken: usize,
+    /// The records of a carried payment not yet confirmed, settled through
+    /// this upload's payer.
+    pub reconciled: usize,
+    /// Taken records that hold a different proof at the end: no storer
+    /// accepted the carried proof, or its paid node had left the storers,
+    /// and a new payment was made.
+    pub paid_again: usize,
+    /// Records the carried state held only an unpaid quote for, that hold
+    /// a proof at the end: quoted and paid afresh.
+    pub quoted_again: usize,
+}
+
+/// What a wallet upload that starts from a carried state is given
+/// (`Client::file_upload_carried`).
+#[cfg(feature = "native")]
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct CarriedUploadOptions {
+    /// How the upload is shown: by default the private envelope a file
+    /// upload stores ([`Visibility::default`]).
+    pub visibility: Visibility,
+    /// How the upload is paid: by default per chunk
+    /// ([`PaymentMode::default`]).
+    pub mode: PaymentMode,
+    /// Where progress events are sent, if anywhere.
+    pub progress: Option<tokio::sync::mpsc::Sender<UploadEvent>>,
+    /// The carried state: the bytes `UploadState::checkpoint` writes, as
+    /// another client's `UploadPayer::state_saved` gave them. Give one
+    /// state to one client at a time.
+    pub state: Vec<u8>,
+}
+
+#[cfg(feature = "native")]
+impl CarriedUploadOptions {
+    /// Options for an upload that starts from the carried `state`, every
+    /// other field at its default. A caller outside this crate sets the
+    /// other fields on the value this returns.
+    #[must_use]
+    pub fn new(state: Vec<u8>) -> Self {
+        Self {
+            visibility: Visibility::default(),
+            mode: PaymentMode::default(),
+            progress: None,
+            state,
+        }
+    }
 }

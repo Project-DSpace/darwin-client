@@ -66,13 +66,15 @@ pub use client::envelope::{
 };
 #[cfg(feature = "native")]
 pub use client::file::{
-    file_data_map, forget_upload_record, ExternalChunkStore, ExternalPaymentInfo, FinalizeOutcome,
-    FinalizeResume, MerkleFinalizeResume, PreparedUpload, UploadPayer, WaveFinalizeResume,
+    file_data_map, forget_upload_record, CarriedUploadOptions, ExternalChunkStore,
+    ExternalPaymentInfo, FinalizeOutcome, FinalizeResume, MerkleFinalizeResume, PreparedUpload,
+    UploadPayer, WaveFinalizeResume,
 };
 pub use client::file::{
-    CostEstimateConfidence, DownloadEvent, FileChunkPeerReport, FileChunkPeerReportPeer,
-    FileChunkPeerStatus, FileChunkPeerSweepReport, FileDownloadWithPeerReport, FileUploadResult,
-    UploadCostEstimate, UploadEvent, Visibility,
+    CarriedOutcome, CostEstimateConfidence, DownloadEvent, FileChunkPeerReport,
+    FileChunkPeerReportPeer, FileChunkPeerStatus, FileChunkPeerSweepReport,
+    FileDownloadWithPeerReport, FileUploadResult, UploadCostEstimate, UploadEvent, Visibility,
+    CARRIED_STATE_REFUSED,
 };
 pub use client::merkle::{
     finalize_merkle_batch, MerkleBatchPaymentResult, PaymentMode, PreparedMerkleBatch,

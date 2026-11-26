@@ -168,6 +168,28 @@ fn journal_of(state: &UploadState) -> Result<Journal> {
     }
 }
 
+/// The path of a carried payment not yet confirmed that a wallet made
+/// ([`super::carried`]): a wallet's own transaction, or a share of a shared
+/// wave. `None` for an attempt with no submissions and no receipt, as a
+/// payer's is. A journal this client can't read is a wallet's, never a
+/// payer's.
+pub(super) fn carried_journal_path(
+    attempt: &PaymentAttempt,
+) -> Option<super::carried::CarriedPath> {
+    use super::carried::CarriedPath;
+    if attempt.submissions.is_empty() && attempt.receipt.is_none() {
+        return None;
+    }
+    let journal = match attempt.submissions.as_slice() {
+        [value] => serde_json::from_value::<Journal>(value.clone()).ok(),
+        _ => None,
+    };
+    Some(match journal {
+        Some(Journal::Preparing | Journal::Signed(_)) | None => CarriedPath::WalletPendingPayment,
+        Some(Journal::Wave(_) | Journal::WaveSigned(_)) => CarriedPath::SharedWave,
+    })
+}
+
 /// Make `journal` the journal of `state`'s pending attempt.
 fn set_journal(state: &mut UploadState, journal: &Journal) -> Result<()> {
     let value = serde_json::to_value(journal).map_err(|e| Error::Serialization(e.to_string()))?;
@@ -4799,5 +4821,63 @@ mod tests {
             journal_of(&paying.state).unwrap(),
             Journal::Signed(_)
         ));
+    }
+
+    /// A carried payment not yet confirmed whose journal is a wallet's, its
+    /// own or a shared wave's, is refused whole for every caller, in the
+    /// census words: only that wallet, on the machine that made it, settles
+    /// it.
+    #[test]
+    fn a_carried_wallet_journal_is_refused_for_every_caller() {
+        use super::super::carried::{
+            starting_state, CarriedCaller, SHARED_WAVE_PENDING, WALLET_PENDING,
+        };
+        let now = std::time::SystemTime::now();
+        let plan = signed_plan([0x51; 32], 1024, now);
+        let records = std::collections::HashSet::from([plan.address]);
+        let signed = journaled_paying(ant_protocol::evm::Address::from([0x22; 20]));
+        let journals = [
+            (Journal::Preparing, WALLET_PENDING),
+            (Journal::Signed(signed.clone()), WALLET_PENDING),
+            (Journal::Wave("ab".repeat(32)), SHARED_WAVE_PENDING),
+            (
+                Journal::WaveSigned(WaveSigned {
+                    wave: "ab".repeat(32),
+                    transaction: signed,
+                    quotes: quotes_of(std::slice::from_ref(&plan)),
+                }),
+                SHARED_WAVE_PENDING,
+            ),
+        ];
+        for (journal, words) in journals {
+            let mut state = UploadState::default();
+            state.prepare(plan.clone());
+            state.start_payment(false, vec![plan.address]).unwrap();
+            set_journal(&mut state, &journal).unwrap();
+            let bytes = state.checkpoint().unwrap();
+            for caller in [
+                CarriedCaller::Wallet,
+                CarriedCaller::Payer { root_waves: false },
+                CarriedCaller::Payer { root_waves: true },
+            ] {
+                let error = starting_state(
+                    None,
+                    || Ok(UploadState::default()),
+                    Some(&bytes),
+                    &records,
+                    caller,
+                )
+                .err()
+                .expect("refused");
+                assert_eq!(
+                    error.to_string(),
+                    format!(
+                        "invalid data: {}: {words}",
+                        crate::data::CARRIED_STATE_REFUSED
+                    )
+                );
+            }
+        }
+        assert!(SHARED_WAVE_PENDING.contains("shared wave's file"));
     }
 }

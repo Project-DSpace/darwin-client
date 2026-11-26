@@ -811,6 +811,7 @@ fn assemble_merkle_finalize_outcome(
                 store_durations_ms: stats.store_durations_ms,
                 retries_histogram: stats.retries_histogram,
                 envelope: None,
+                carried: None,
             }))
         }
         Err(Error::PartialUpload {
@@ -839,6 +840,7 @@ fn assemble_merkle_finalize_outcome(
                 store_durations_ms: Vec::new(),
                 retries_histogram: [0; 4],
                 envelope: None,
+                carried: None,
             };
             let resume = MerkleFinalizeResume {
                 data_map,
@@ -921,6 +923,7 @@ fn assemble_wave_finalize_outcome(
             store_durations_ms: stats.store_durations_ms,
             retries_histogram: stats.retries_histogram,
             envelope: None,
+            carried: None,
         });
     }
 
@@ -947,6 +950,7 @@ fn assemble_wave_finalize_outcome(
         store_durations_ms: Vec::new(),
         retries_histogram: [0; 4],
         envelope: None,
+        carried: None,
     };
     let resume = WaveFinalizeResume {
         data_map,
@@ -1377,6 +1381,68 @@ async fn open_upload_checkpoint(
     super::super::upload_checkpoint::remove_unresumed(&cache_dir);
     let (files, saved) = super::super::upload_checkpoint::UploadCheckpointFiles::open(cache_path)?;
     Ok((files, lock, saved))
+}
+
+/// The lock file that uploads of `records` on `network` given a carried
+/// state share, in `directory`: named by the network and every record's
+/// address and size, with no payer, envelope choices or carried bytes in
+/// the name.
+fn carried_lock_path(
+    directory: &Path,
+    network: &ant_protocol::evm::Network,
+    records: &[super::super::upload::UploadRecord],
+) -> Result<PathBuf> {
+    let records = records
+        .iter()
+        .map(|r| (r.address, r.size))
+        .collect::<Vec<_>>();
+    let name = rmp_serde::to_vec(&("carried", network, records))
+        .map_err(|e| Error::Serialization(e.to_string()))?;
+    Ok(directory.join(format!(
+        "{}.lock",
+        hex::encode(blake3::hash(&name).as_bytes())
+    )))
+}
+
+/// Wait for the exclusive lock of the file at `path`, and hold it while the
+/// returned file is open.
+async fn lock_exclusive(path: PathBuf) -> Result<std::fs::File> {
+    tokio::task::spawn_blocking(move || -> std::io::Result<std::fs::File> {
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(path)?;
+        fs2::FileExt::lock_exclusive(&file)?;
+        Ok(file)
+    })
+    .await
+    .map_err(|e| Error::Io(std::io::Error::other(e.to_string())))?
+    .map_err(Error::Io)
+}
+
+/// Take the lock that uploads of `records` on `network` given a carried
+/// state hold for their life ([`carried_lock_path`]), after their own
+/// checkpoint's lock. Two such uploads on this machine, under any payers or
+/// upload ids, run one after the other, so the second finds the first's
+/// records stored and pays nothing for them. Whoever holds this lock holds
+/// its own checkpoint's lock already, so the two locks are always taken in
+/// the same order.
+async fn lock_carried(
+    network: &ant_protocol::evm::Network,
+    records: &[super::super::upload::UploadRecord],
+) -> Result<std::fs::File> {
+    let directory = crate::config::data_dir()
+        .map_err(|e| Error::Config(e.to_string()))?
+        .join("payments/upload");
+    std::fs::create_dir_all(&directory)?;
+    lock_exclusive(carried_lock_path(
+        &long_path_safe(directory),
+        network,
+        records,
+    )?)
+    .await
 }
 
 /// `directory` in the form Windows takes past MAX_PATH (260 characters):
@@ -2125,6 +2191,45 @@ pub trait UploadPayer: Send + Sync {
     fn payer_address(&self) -> Option<ant_protocol::evm::Address> {
         None
     }
+
+    /// The paid state of this upload that another client prepared: bytes as
+    /// `UploadState::checkpoint` writes them, taken from that client's
+    /// [`Self::state_saved`]. Give one state to one upload at a time.
+    ///
+    /// The engine asks once per upload, after it opens the upload's own
+    /// checkpoint. It checks the state whole (every quote signed by its node
+    /// and for its record, every proof well formed, no Merkle payment, no
+    /// payment not yet confirmed that a wallet made) and refuses it on any
+    /// failure with an `Error::InvalidData` that starts with
+    /// [`CARRIED_STATE_REFUSED`](crate::data::CARRIED_STATE_REFUSED), before
+    /// anything is quoted, paid or saved. Otherwise it adds to the upload's
+    /// checkpoint the proofs of this upload's records that the checkpoint
+    /// lacks, and stores those records as a resumed upload does: without a
+    /// new payment, unless every storer refuses a proof and the vault shows
+    /// its payment, when the record is paid again once. A payment not yet
+    /// confirmed in it is settled through this payer, which is asked for
+    /// exactly its plans, as on any resume. A saved checkpoint of the upload
+    /// is never replaced. Uploads of the same file on one machine that are
+    /// given a carried state run one after the other; uploads on different
+    /// machines cannot see each other, so give a state to one client at a
+    /// time, and give the newest state [`Self::state_saved`] gave.
+    /// `None` by default.
+    fn carried_state(&self) -> Option<Vec<u8>> {
+        None
+    }
+
+    /// The state of this upload each time the engine saves its checkpoint:
+    /// before a payment is sent (with the attempt pending), after it is
+    /// confirmed, after a journaled payment is reconciled, and once when a
+    /// carried state is taken. Call `UploadState::checkpoint` on it to get
+    /// the bytes another client takes through [`Self::carried_state`]. This
+    /// is the only supported source of carried bytes: a state a payer builds
+    /// itself with `prepare` and `confirm` cannot hold root proofs (the
+    /// engine finds the root wave) and does not know which occupied quotes
+    /// the engine released. Must not block. Does nothing by default.
+    fn state_saved(&self, state: &crate::data::client::upload_state::UploadState) {
+        let _ = state;
+    }
 }
 
 /// Where an upload's record bytes come from.
@@ -2325,7 +2430,11 @@ impl super::super::upload::UploadAdapter for SpillUploadAdapter<'_> {
         state: &super::super::upload_state::UploadState,
         _: Option<&super::super::upload::UploadPayment>,
     ) -> Result<()> {
-        self.checkpoint.save(state)
+        self.checkpoint.save(state)?;
+        if let Some(payer) = self.payer {
+            payer.state_saved(state);
+        }
+        Ok(())
     }
     fn stored(&self, stored: usize, total: usize) {
         if let Some(progress) = self.progress {
@@ -3195,6 +3304,7 @@ impl Client {
                     store_durations_ms: stats.store_durations_ms,
                     retries_histogram: stats.retries_histogram,
                     envelope,
+                    carried: None,
                 })
             }
             ExternalPaymentInfo::Merkle { .. } => Err(Error::Payment(
@@ -3365,6 +3475,7 @@ impl Client {
                     retries_histogram: stats.retries_histogram,
                     // Envelope uploads are prepared as wave batches.
                     envelope: None,
+                    carried: None,
                 })
             }
             ExternalPaymentInfo::WaveBatch { .. } => Err(Error::Payment(
@@ -3948,7 +4059,7 @@ impl Client {
         visibility: Visibility,
         progress: Option<mpsc::Sender<UploadEvent>>,
     ) -> Result<FileUploadResult> {
-        self.upload_file(path, mode, visibility, progress, None)
+        self.upload_file(path, mode, visibility, progress, None, None)
             .await
     }
 
@@ -3981,7 +4092,41 @@ impl Client {
         payer: &dyn UploadPayer,
         progress: Option<mpsc::Sender<UploadEvent>>,
     ) -> Result<FileUploadResult> {
-        self.upload_file(path, mode, visibility, progress, Some(payer))
+        self.upload_file(path, mode, visibility, progress, Some(payer), None)
+            .await
+    }
+
+    /// Upload a file paid by the client's wallet, adding the paid proofs of
+    /// a carried state for this upload's records.
+    ///
+    /// `options.state` is the bytes `UploadState::checkpoint` writes, as
+    /// another client's [`UploadPayer::state_saved`] gave them. The upload
+    /// runs as [`Client::file_upload_with_visibility_and_progress`] does,
+    /// with the carried state taken as [`UploadPayer::carried_state`]
+    /// describes: the records it holds proofs for are stored without a new
+    /// payment, and the result says what was taken
+    /// ([`FileUploadResult::carried`]). A payment not yet confirmed in the
+    /// state is refused here, since only a payer settles a payer's payment
+    /// and only the wallet that made it settles a wallet's.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the carried state is refused (`Error::InvalidData`
+    /// starting with [`CARRIED_STATE_REFUSED`](crate::data::CARRIED_STATE_REFUSED)),
+    /// the file cannot be read or encrypted, a payment fails, or any chunk
+    /// cannot be stored.
+    pub async fn file_upload_carried(
+        &self,
+        path: &Path,
+        options: CarriedUploadOptions,
+    ) -> Result<FileUploadResult> {
+        let CarriedUploadOptions {
+            visibility,
+            mode,
+            progress,
+            state,
+        } = options;
+        self.upload_file(path, mode, visibility, progress, None, Some(state))
             .await
     }
 
@@ -4007,7 +4152,9 @@ impl Client {
     }
 
     /// Upload a file through the upload engine, paid by `payer` or else by
-    /// the client's wallet.
+    /// the client's wallet, starting from the `carried` state of the
+    /// wallet's [`Client::file_upload_carried`] or the payer's
+    /// [`UploadPayer::carried_state`] if there is one.
     #[allow(clippy::too_many_lines)]
     async fn upload_file(
         &self,
@@ -4016,6 +4163,7 @@ impl Client {
         visibility: Visibility,
         progress: Option<mpsc::Sender<UploadEvent>>,
         payer: Option<&dyn UploadPayer>,
+        carried: Option<Vec<u8>>,
     ) -> Result<FileUploadResult> {
         let visibility = visibility.normalized();
         check_envelope_options(&visibility)?;
@@ -4082,6 +4230,14 @@ impl Client {
             payer.map(|_| payer_scope.as_slice()),
         )
         .await?;
+        // Asked once, whether or not a checkpoint is saved.
+        let from_payer = payer.and_then(|payer| payer.carried_state());
+        let carried = carried.or(from_payer);
+        // Held for the upload's life, after its own lock.
+        let _carried_lock = match carried {
+            Some(_) => Some(lock_carried(network, &records).await?),
+            None => None,
+        };
         let mut envelope = match &visibility {
             Visibility::Envelope(options) => {
                 let salt = if options.readable {
@@ -4117,28 +4273,52 @@ impl Client {
                 .await;
         }
 
-        let mut state = match saved {
-            Some(state) => state,
-            None => {
-                // The marks of chunks paid again once already stop the
-                // upload if they can't be read: never a third payment.
-                let paid_again =
-                    crate::data::client::cached_single::load_marks_for_file(&file_path_key)
-                        .map_err(crate::data::client::batch::paid_again_marks_unreadable)?;
-                let mut proofs =
-                    crate::data::client::cached_single::try_load_for_file(&file_path_key)
-                        .map(|(_, receipt)| receipt.proofs)
-                        .unwrap_or_default();
-                if let Some((_, receipt)) =
-                    crate::data::client::cached_merkle::try_load_for_file(&file_path_key)
-                {
-                    proofs.extend(receipt.proofs);
-                }
-                let mut state = super::super::upload_state::UploadState::from_proofs(proofs);
-                state.add_paid_again(paid_again);
-                state
+        let receipts = || {
+            // The marks of chunks paid again once already stop the upload
+            // if they can't be read: never a third payment.
+            let paid_again =
+                crate::data::client::cached_single::load_marks_for_file(&file_path_key)
+                    .map_err(crate::data::client::batch::paid_again_marks_unreadable)?;
+            let mut proofs = crate::data::client::cached_single::try_load_for_file(&file_path_key)
+                .map(|(_, receipt)| receipt.proofs)
+                .unwrap_or_default();
+            if let Some((_, receipt)) =
+                crate::data::client::cached_merkle::try_load_for_file(&file_path_key)
+            {
+                proofs.extend(receipt.proofs);
             }
+            let mut state = super::super::upload_state::UploadState::from_proofs(proofs);
+            state.add_paid_again(paid_again);
+            Ok(state)
         };
+        // Every record of the upload: the content records, a public upload's
+        // data map record among them, and the envelope's record.
+        let record_set = records
+            .iter()
+            .map(|record| record.address)
+            .chain(envelope.as_ref().map(|(_, record)| record.address))
+            .collect::<HashSet<_>>();
+        let caller = match payer {
+            Some(payer) => crate::data::client::carried::CarriedCaller::Payer {
+                root_waves: payer.pays_root_waves(),
+            },
+            None => crate::data::client::carried::CarriedCaller::Wallet,
+        };
+        let (mut state, taken) = crate::data::client::carried::starting_state(
+            saved,
+            receipts,
+            carried.as_deref(),
+            &record_set,
+            caller,
+        )?;
+        if taken.is_some() {
+            // The taken proofs are this upload's own before anything is
+            // paid: a later run finds them in its checkpoint.
+            checkpoint_files.save(&state)?;
+            if let Some(payer) = payer {
+                payer.state_saved(&state);
+            }
+        }
         let adapter = SpillUploadAdapter {
             client: self,
             source: ChunkSource::Spill(&spill),
@@ -4184,6 +4364,9 @@ impl Client {
         if result.amount == Amount::ZERO {
             result.amount = recovered;
         }
+        let carried_outcome = taken
+            .as_ref()
+            .map(|taken| crate::data::client::carried::outcome(taken, &state));
         // The record is built before the checkpoint is removed, and kept
         // until the caller has saved it.
         if let Some((envelope, _)) = envelope.as_mut() {
@@ -4230,6 +4413,7 @@ impl Client {
             store_durations_ms: result.stats.store_durations_ms,
             retries_histogram: result.stats.retries_histogram,
             envelope: envelope.map(|(envelope, _)| envelope),
+            carried: carried_outcome,
         })
     }
 
@@ -6886,5 +7070,248 @@ mod payer_tests {
             .to_string();
         assert!(message.contains("nothing was paid"), "{message}");
         assert_eq!(not_asking.0.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    /// A payer that records each state the engine saved.
+    struct RecordingPayer(std::sync::Mutex<Vec<usize>>);
+
+    #[async_trait::async_trait]
+    impl UploadPayer for RecordingPayer {
+        async fn pay_quotes(&self, _plans: &[ChunkPaymentPlan]) -> Result<UploadPayment> {
+            Err(Error::Payment("refused".into()))
+        }
+
+        async fn pay_merkle(&self, _batch: &PreparedMerkleBatch) -> Result<MerkleUploadPayment> {
+            Err(Error::Payment("refused".into()))
+        }
+
+        fn state_saved(&self, state: &crate::data::client::upload_state::UploadState) {
+            self.0.lock().unwrap().push(state.proofs().len());
+        }
+    }
+
+    /// The paid state of records at `addresses`, and their proofs.
+    fn carried_paid(addresses: &[[u8; 32]]) -> crate::data::client::upload_state::UploadState {
+        use crate::data::client::native_payment::test_plans::{signed_plan, transactions};
+        let now = std::time::SystemTime::now();
+        let mut state = crate::data::client::upload_state::UploadState::default();
+        for address in addresses {
+            let plan = signed_plan(*address, 1024, now);
+            state.prepare(plan.clone());
+            state
+                .confirm(&[plan.address], &transactions(&plan), now)
+                .unwrap();
+        }
+        state
+    }
+
+    const PAYER: crate::data::client::carried::CarriedCaller =
+        crate::data::client::carried::CarriedCaller::Payer { root_waves: false };
+
+    fn no_receipts() -> Result<crate::data::client::upload_state::UploadState> {
+        Ok(crate::data::client::upload_state::UploadState::default())
+    }
+
+    /// A saved checkpoint is used as it was saved: a carried state fills in
+    /// only the proofs of records it neither proves nor holds in a payment
+    /// not yet confirmed, and drops the unpaid plan of a record it fills.
+    #[test]
+    fn a_saved_checkpoint_is_kept_whole_and_carried_proofs_fill_only_what_it_lacks() {
+        use crate::data::client::carried::starting_state;
+        use crate::data::client::native_payment::test_plans::signed_plan;
+        let (a, b, c) = ([0xa1; 32], [0xb1; 32], [0xc1; 32]);
+        let now = std::time::SystemTime::now();
+        let mut saved = carried_paid(&[a]);
+        saved.prepare(signed_plan(b, 1024, now));
+        let pending = signed_plan(c, 1024, now);
+        saved.prepare(pending.clone());
+        saved.start_payment(false, vec![c]).unwrap();
+        let local_a = saved.proof(&a).unwrap().clone();
+        let carried = carried_paid(&[a, b, c]);
+        let records = HashSet::from([a, b, c]);
+        let (state, taken) = starting_state(
+            Some(saved),
+            || panic!("the receipts are read only without a saved checkpoint"),
+            Some(&carried.checkpoint().unwrap()),
+            &records,
+            PAYER,
+        )
+        .unwrap();
+        let taken = taken.unwrap();
+        assert_eq!(state.proof(&a), Some(&local_a));
+        assert_eq!(state.proof(&b), carried.proof(&b));
+        assert!(state.retained_plan(&b, 1024, now).is_none());
+        assert!(!state.plan_addresses().contains(&b));
+        assert!(state.proof(&c).is_none());
+        assert_eq!(state.pending_payment.as_ref().unwrap().addresses, vec![c]);
+        assert_eq!(
+            state.pending_plans().unwrap()[0].payment.quotes[0].quote_hash,
+            pending.payment.quotes[0].quote_hash,
+            "the pending attempt's own plan"
+        );
+        assert_eq!(taken.taken.keys().copied().collect::<Vec<_>>(), vec![b]);
+    }
+
+    /// A carried payment not yet confirmed beside one the saved checkpoint
+    /// holds is refused, and the saved state is left as it was.
+    #[test]
+    fn a_saved_pending_attempt_and_a_carried_one_are_refused_together() {
+        use crate::data::client::carried::{starting_state, BOTH_PENDING};
+        use crate::data::client::native_payment::test_plans::signed_plan;
+        let now = std::time::SystemTime::now();
+        let (x, y) = ([0xd1; 32], [0xe1; 32]);
+        let mut saved = crate::data::client::upload_state::UploadState::default();
+        saved.prepare(signed_plan(x, 1024, now));
+        saved.start_payment(false, vec![x]).unwrap();
+        let before = saved.checkpoint().unwrap();
+        let mut carried = crate::data::client::upload_state::UploadState::default();
+        carried.prepare(signed_plan(y, 1024, now));
+        carried.start_payment(false, vec![y]).unwrap();
+        let error = starting_state(
+            Some(saved.clone()),
+            no_receipts,
+            Some(&carried.checkpoint().unwrap()),
+            &HashSet::from([x, y]),
+            PAYER,
+        )
+        .err()
+        .expect("refused");
+        assert!(error.to_string().ends_with(BOTH_PENDING), "{error}");
+        assert_eq!(saved.checkpoint().unwrap(), before);
+    }
+
+    /// The taken proofs are saved in the upload's own checkpoint before
+    /// anything is paid: reopened, it holds them, and the same carried
+    /// state given again takes none.
+    #[test]
+    fn carried_proofs_are_saved_in_the_uploads_own_checkpoint_before_any_payment() {
+        use crate::data::client::carried::starting_state;
+        use crate::data::client::upload_checkpoint::UploadCheckpointFiles;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(format!("{}.msgpack", "ef".repeat(32)));
+        let (files, saved) = UploadCheckpointFiles::open(path.clone()).unwrap();
+        assert!(saved.is_none());
+        let (a, b) = ([0x1a; 32], [0x1b; 32]);
+        let carried = carried_paid(&[a, b]).checkpoint().unwrap();
+        let records = HashSet::from([a, b, [0x1c; 32]]);
+        let (state, taken) =
+            starting_state(saved, no_receipts, Some(&carried), &records, PAYER).unwrap();
+        assert_eq!(taken.unwrap().taken.len(), 2);
+        files.save(&state).unwrap();
+        drop(files);
+        let (_, reopened) = UploadCheckpointFiles::open(path).unwrap();
+        let reopened = reopened.unwrap();
+        assert_eq!(reopened.proof(&a), state.proof(&a));
+        assert_eq!(reopened.proof(&b), state.proof(&b));
+        let (again, taken) =
+            starting_state(Some(reopened), no_receipts, Some(&carried), &records, PAYER).unwrap();
+        assert_eq!(taken.unwrap().taken.len(), 0);
+        assert_eq!(again.proofs().len(), 2);
+    }
+
+    /// Two uploads of the same file given a carried state, under different
+    /// payers, share one lock: the second waits until the first lets go.
+    #[tokio::test]
+    async fn the_carried_lock_serialises_two_uploads_of_one_file() {
+        use crate::data::client::native_payment::test_plans::network;
+        use crate::data::client::upload::UploadRecord;
+        let dir = tempfile::tempdir().unwrap();
+        let net = network(1);
+        let records = [
+            UploadRecord {
+                address: [0x2a; 32],
+                size: 1024,
+                index: 0,
+            },
+            UploadRecord {
+                address: [0x2b; 32],
+                size: 2048,
+                index: 1,
+            },
+        ];
+        // Each payer's own checkpoint is its own; the carried lock is shared.
+        let sizes = records
+            .iter()
+            .map(|r| (r.address, r.size))
+            .collect::<Vec<_>>();
+        assert_ne!(
+            upload_checkpoint_scope(&net, &sizes, None, Some(b"first")).unwrap(),
+            upload_checkpoint_scope(&net, &sizes, None, Some(b"second")).unwrap()
+        );
+        let path = carried_lock_path(dir.path(), &net, &records).unwrap();
+        let first = lock_exclusive(path.clone()).await.unwrap();
+        let second = tokio::spawn(lock_exclusive(path));
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert!(!second.is_finished(), "the second upload waits");
+        drop(first);
+        let second = tokio::time::timeout(std::time::Duration::from_secs(10), second)
+            .await
+            .expect("the second upload goes on once the first lets go")
+            .unwrap();
+        assert!(second.is_ok());
+    }
+
+    /// A payer gives no carried state unless it says so, and an upload
+    /// given none takes nothing and reports nothing.
+    #[test]
+    fn a_payer_gives_no_carried_state_by_default() {
+        let payer = CountingPayer(std::sync::atomic::AtomicUsize::new(0));
+        assert!(payer.carried_state().is_none());
+        let (state, taken) = crate::data::client::carried::starting_state(
+            None,
+            no_receipts,
+            payer.carried_state().as_deref(),
+            &HashSet::from([[0x3a; 32]]),
+            PAYER,
+        )
+        .unwrap();
+        assert!(taken.is_none());
+        assert!(state.proofs().is_empty());
+    }
+
+    /// The engine hands a payer the state it saved, once for each save.
+    #[tokio::test]
+    async fn state_saved_is_called_after_each_checkpoint_save() {
+        use crate::data::client::upload::UploadAdapter as _;
+        const KEY: &str = "0x4c0883a69102937d6231471b5dbb6204fe5129617082792ae468d01a3f362318";
+        let net = crate::data::client::native_payment::test_plans::network(1);
+        let node = crate::data::Network::unstarted(&[], true, false)
+            .await
+            .unwrap();
+        let client = Client::from_node(std::sync::Arc::clone(node.node()), Default::default())
+            .with_wallet(ant_protocol::evm::Wallet::new_from_private_key(net, KEY).unwrap());
+        let dir = tempfile::tempdir().unwrap();
+        let (checkpoint, _) = crate::data::client::upload_checkpoint::UploadCheckpointFiles::open(
+            dir.path().join(format!("{}.msgpack", "9a".repeat(32))),
+        )
+        .unwrap();
+        let spill = ChunkSpill::new().unwrap();
+        let payer = RecordingPayer(std::sync::Mutex::new(Vec::new()));
+        let adapter = SpillUploadAdapter {
+            client: &client,
+            source: ChunkSource::Spill(&spill),
+            progress: None,
+            checkpoint: &checkpoint,
+            payer: Some(&payer),
+        };
+        adapter
+            .checkpoint(&carried_paid(&[[0x4a; 32]]), None)
+            .await
+            .unwrap();
+        adapter
+            .checkpoint(&carried_paid(&[[0x4a; 32], [0x4b; 32]]), None)
+            .await
+            .unwrap();
+        assert_eq!(*payer.0.lock().unwrap(), vec![1, 2]);
+        // The wallet's own uploads have no payer to hand it to.
+        let wallet = SpillUploadAdapter {
+            payer: None,
+            ..adapter
+        };
+        wallet
+            .checkpoint(&carried_paid(&[[0x4c; 32]]), None)
+            .await
+            .unwrap();
+        assert_eq!(payer.0.lock().unwrap().len(), 2);
     }
 }

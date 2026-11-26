@@ -225,6 +225,23 @@ struct BodyIn {
     proofs_len: Option<u64>,
 }
 
+/// What [`UploadState::take_carried`] took from a carried state.
+#[cfg(feature = "native")]
+#[derive(Debug, Default)]
+pub(crate) struct TakeReport {
+    /// The carried state's proofs, of any record.
+    pub(crate) proofs: usize,
+    /// The records whose carried proof was taken, each with the BLAKE3 hash
+    /// of that proof's bytes.
+    pub(crate) taken: HashMap<XorName, [u8; 32]>,
+    /// The records of the carried payment not yet confirmed, taken whole.
+    pub(crate) reconciled: HashSet<XorName>,
+    /// This upload's records the carried state held only an unpaid plan
+    /// for, and that this state neither proves nor holds in a payment not
+    /// yet confirmed.
+    pub(crate) unpaid: HashSet<XorName>,
+}
+
 /// A checkpoint as read, before it is checked ([`UploadState::validated`]).
 pub(crate) struct Parsed {
     /// What it holds.
@@ -977,6 +994,100 @@ impl UploadState {
         for (address, bytes) in proofs {
             self.insert_proof(address, bytes);
         }
+    }
+
+    /// The records this state holds a plan for.
+    #[cfg(feature = "native")]
+    pub(crate) fn plan_addresses(&self) -> HashSet<XorName> {
+        self.plans.keys().copied().collect()
+    }
+
+    /// Add to this upload's state, from a `carried` state another client
+    /// prepared (checked: [`Self::validated`], and `carried`'s census), only
+    /// what it lacks for its `records`:
+    ///
+    /// - the proof of each of its records that it neither proves nor names
+    ///   in its own payment not yet confirmed: the local proof wins. A taken
+    ///   record's unpaid plan, an offer, is dropped. Proofs of other records
+    ///   are counted and left out;
+    /// - the paid-again mark of each of its records whose carried proof was
+    ///   taken, or that has no proof in either state and is in no local
+    ///   payment not yet confirmed, so a record is never paid a third time,
+    ///   and a mark never lands on a local proof that was not paid again;
+    /// - the carried payment not yet confirmed, whole, with the plans it
+    ///   names, so this upload's payer settles it as on any resume. The
+    ///   caller refuses one beside a payment this state holds.
+    ///
+    /// Unpaid carried plans and failed payments are left out: those records
+    /// are quoted afresh. `planned` are the records the carried state held
+    /// plans for before its check dropped any.
+    #[cfg(feature = "native")]
+    pub(crate) fn take_carried(
+        &mut self,
+        carried: UploadState,
+        records: &HashSet<XorName>,
+        planned: &HashSet<XorName>,
+    ) -> TakeReport {
+        let local_pending = self
+            .pending_payment
+            .iter()
+            .flat_map(|attempt| attempt.addresses.iter().copied())
+            .collect::<HashSet<_>>();
+        let proven = self.proofs.keys().copied().collect::<HashSet<_>>();
+        let UploadState {
+            mut plans,
+            proofs,
+            pending_payment,
+            paid_again,
+            ..
+        } = carried;
+        let carried_proven = proofs.keys().copied().collect::<HashSet<_>>();
+        let mut report = TakeReport {
+            proofs: proofs.len(),
+            ..TakeReport::default()
+        };
+        for (address, bytes) in proofs {
+            if !records.contains(&address)
+                || proven.contains(&address)
+                || local_pending.contains(&address)
+            {
+                continue;
+            }
+            report
+                .taken
+                .insert(address, *blake3::hash(&bytes).as_bytes());
+            self.plans.remove(&address);
+            self.insert_proof(address, bytes);
+        }
+        for address in paid_again {
+            let unproven = !proven.contains(&address)
+                && !carried_proven.contains(&address)
+                && !local_pending.contains(&address);
+            if records.contains(&address) && (report.taken.contains_key(&address) || unproven) {
+                self.paid_again.insert(address);
+            }
+        }
+        if let Some(attempt) = pending_payment.filter(|attempt| !attempt.merkle) {
+            for address in &attempt.addresses {
+                if let Some(plan) = plans.remove(address) {
+                    self.plans.insert(*address, plan);
+                }
+            }
+            report.reconciled = attempt.addresses.iter().copied().collect();
+            self.pending_payment = Some(attempt);
+        }
+        report.unpaid = planned
+            .iter()
+            .filter(|address| {
+                records.contains(*address)
+                    && !report.taken.contains_key(*address)
+                    && !report.reconciled.contains(*address)
+                    && !proven.contains(*address)
+                    && !local_pending.contains(*address)
+            })
+            .copied()
+            .collect();
+        report
     }
 
     /// Restore a local checkpoint, in either format, validating payment
