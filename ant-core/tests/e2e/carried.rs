@@ -669,6 +669,10 @@ async fn the_occupied_quote_path_and_the_price_ceiling_hold_for_a_record_paid_ag
         .file_upload_with_payer(file.path(), readable(), PaymentMode::Single, &refused, None)
         .await
         .expect_err("every quote is above the ceiling");
+    // The ceiling's own words, and not a refusal of the carried state.
+    let text = format!("{error:?}");
+    assert!(text.contains("above the price ceiling 1"), "{text}");
+    assert!(!text.contains(CARRIED_STATE_REFUSED), "{text}");
     assert!(refused.asked.lock().unwrap().is_empty(), "{error}");
 
     let second = CarryPayer::new(&testnet, "carried: occupied again").carrying(bytes);

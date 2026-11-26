@@ -1006,8 +1006,9 @@ impl UploadState {
     /// prepared (checked: [`Self::validated`], and `carried`'s census), only
     /// what it lacks for its `records`:
     ///
-    /// - the proof of each of its records that it neither proves nor names
-    ///   in its own payment not yet confirmed: the local proof wins. A taken
+    /// - the proof of each of its records that it neither proves, nor names
+    ///   in its own payment not yet confirmed, nor has marked as paid again
+    ///   (its proof dropped to be paid again): the local state wins. A taken
     ///   record's unpaid plan, an offer, is dropped. Proofs of other records
     ///   are counted and left out;
     /// - the paid-again mark of each of its records whose carried proof was
@@ -1016,7 +1017,9 @@ impl UploadState {
     ///   and a mark never lands on a local proof that was not paid again;
     /// - the carried payment not yet confirmed, whole, with the plans it
     ///   names, so this upload's payer settles it as on any resume. The
-    ///   caller refuses one beside a payment this state holds.
+    ///   caller leaves it out when this state already holds it or holds,
+    ///   proves or has paid again any of its records, and refuses one beside
+    ///   another payment this state holds.
     ///
     /// Unpaid carried plans and failed payments are left out: those records
     /// are quoted afresh. `planned` are the records the carried state held
@@ -1047,9 +1050,14 @@ impl UploadState {
             ..TakeReport::default()
         };
         for (address, bytes) in proofs {
+            // A record this state marked as paid again and holds no proof
+            // for had its proof dropped to be paid again: the carried proof
+            // is the one its storers refused, or older, and the record is
+            // quoted afresh.
             if !records.contains(&address)
                 || proven.contains(&address)
                 || local_pending.contains(&address)
+                || self.paid_again.contains(&address)
             {
                 continue;
             }

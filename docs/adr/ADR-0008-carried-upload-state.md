@@ -74,10 +74,15 @@ added only for a record of this upload whose own state holds none, and only proo
 pending payment attempt are taken. Unpaid quotes are not taken; those records are quoted and paid
 again through the per-chunk path. A payer's attempt not yet confirmed is settled through the new
 payer, which is asked for exactly its plans, as on any resume; a wallet's is refused, since only
-the wallet that made it can settle it. A state that fails `UploadState::restore`'s checks, that is
-a checkpoint's main file without its proofs, that names none of the upload's records, that holds a
-Merkle proof or a pending Merkle batch, whose pending attempt names records outside the upload, or
-whose pending attempt meets one already saved, is
+the wallet that made it can settle it. A payer's attempt is left out when the upload's own state
+already holds it (an earlier run took it from the same state) or proves, has paid again or holds
+pending any of its records, so a payer is never asked again for a payment the upload settled. A
+proof is not taken for a record the upload marked as paid again and dropped. A state that fails
+`UploadState::restore`'s checks, that is a checkpoint's main file without its proofs, that names
+none of the upload's records, that holds a Merkle proof or a pending Merkle batch, whose pending
+attempt names records outside the upload, meets another attempt already saved, or pays a quote
+above the client's price ceiling (`ClientConfig::max_chunk_price`, which a reconciled plan is not
+quoted again to meet), is
 refused whole with `Error::InvalidData` starting with `CARRIED_STATE_REFUSED`, before anything is
 quoted, paid or saved.
 

@@ -22,10 +22,11 @@ Upstream's entries follow.
   <file>`. Proofs for this upload's records are added only where its own checkpoint holds none, so
   a saved checkpoint is never replaced and payment recovery is unchanged, and those records are
   stored with no new payment, after every check a resumed record passes. A payer's payment not yet
-  confirmed in the state is settled through the new payer, as on any resume. A state that fails its
-  checks, that is a checkpoint's main file without its proofs, that names none of the upload's
-  records, or that holds a wallet's unconfirmed payment, a Merkle proof or a pending Merkle batch,
-  is refused whole with an error that starts with `CARRIED_STATE_REFUSED`, and nothing is paid.
+  confirmed in the state is settled through the new payer, as on any resume, unless the upload
+  already took, settled or proves part of it. A state that fails its checks, that is a
+  checkpoint's main file without its proofs, that names none of the upload's records, or that
+  holds a wallet's unconfirmed payment, a payer's unconfirmed payment above the client's price
+  ceiling, a Merkle proof or a pending Merkle batch, is refused whole with an error that starts with `CARRIED_STATE_REFUSED`, and nothing is paid.
   Unpaid quotes in it are quoted again, a proof no storer accepts is paid again once, under the
   price ceiling and through the occupied-quote checks, and `FileUploadResult::carried` counts both
   (`darwin file upload` prints the counts, and `--json` gives them as `carried`). A private

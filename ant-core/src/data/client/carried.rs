@@ -37,12 +37,13 @@
 //! normal quoting, the price ceiling and the occupied-quote read-back.
 
 use super::root_payment::PaymentVault;
-use super::upload_state::{TakeReport, UploadState};
+use super::upload_state::{PaymentAttempt, TakeReport, UploadState};
 use crate::data::client::file::{CarriedOutcome, CARRIED_STATE_REFUSED};
 use crate::data::error::{Error, Result};
+use ant_protocol::evm::Amount;
 use ant_protocol::payment::{detect_proof_type, ProofType};
 use ant_protocol::XorName;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 /// Why a wallet's payment not yet confirmed, in a shared wave, is refused.
 pub(crate) const SHARED_WAVE_PENDING: &str =
@@ -97,6 +98,11 @@ pub(crate) const NO_PAYMENT_FOR_UPLOAD: &str =
 pub(crate) const BOTH_PENDING: &str =
     "this upload's saved checkpoint holds a payment not yet confirmed; run it without the \
      carried state to settle it first";
+
+/// Why a payer's payment not yet confirmed that pays more than this client's
+/// price ceiling is refused.
+pub(crate) const PENDING_ABOVE_CEILING: &str =
+    "its payment not yet confirmed pays a quote above this client's price ceiling";
 
 /// Each way an upload pays for a record, as a carried state meets it.
 ///
@@ -165,11 +171,15 @@ impl CarriedPath {
 pub(crate) enum CarriedCaller {
     /// The client's own wallet.
     Wallet,
-    /// A payer outside the client (`UploadPayer`), and whether it pays
-    /// root waves (as `UploadPayer::pays_root_waves` says).
+    /// A payer outside the client (`UploadPayer`), whether it pays root
+    /// waves (as `UploadPayer::pays_root_waves` says), and the client's
+    /// price ceiling.
     Payer {
         /// Whether the payer pays plans for the root vault.
         root_waves: bool,
+        /// The client's `ClientConfig::max_chunk_price`, which a carried
+        /// payment not yet confirmed is checked against before it is taken.
+        ceiling: Option<Amount>,
     },
 }
 
@@ -201,7 +211,10 @@ pub(crate) enum Coverage {
 /// paid again. A payment not yet confirmed with no wallet journal is taken
 /// as a payer's: a wallet attempt saved before wallet journals existed
 /// looks the same, and the payer, asked for exactly those plans, looks for
-/// that earlier payment first.
+/// that earlier payment first. It is taken only if its paid quotes are
+/// within this client's price ceiling ([`PENDING_ABOVE_CEILING`]), and not
+/// when this upload already holds, proves or has paid again any of its
+/// records.
 pub(crate) fn coverage(path: CarriedPath, caller: CarriedCaller) -> Coverage {
     match path {
         CarriedPath::PerQuoteVault | CarriedPath::RootWave | CarriedPath::PaidAgainMarks => {
@@ -215,10 +228,12 @@ pub(crate) fn coverage(path: CarriedPath, caller: CarriedCaller) -> Coverage {
         },
         CarriedPath::PayerPendingRootPayment => match caller {
             CarriedCaller::Wallet => Coverage::Refused(PAYER_PENDING_FOR_WALLET),
-            CarriedCaller::Payer { root_waves: true } => Coverage::Reconciled,
-            CarriedCaller::Payer { root_waves: false } => {
-                Coverage::Refused(ROOT_PENDING_FOR_PER_QUOTE_PAYER)
-            }
+            CarriedCaller::Payer {
+                root_waves: true, ..
+            } => Coverage::Reconciled,
+            CarriedCaller::Payer {
+                root_waves: false, ..
+            } => Coverage::Refused(ROOT_PENDING_FOR_PER_QUOTE_PAYER),
         },
         CarriedPath::MerkleBatch | CarriedPath::PendingMerkle => Coverage::Refused(MERKLE_BATCH),
         CarriedPath::UnpaidQuote => Coverage::QuotedAgain,
@@ -339,9 +354,13 @@ fn read(bytes: &[u8], records: &HashSet<XorName>, caller: CarriedCaller) -> Resu
 /// (`receipts`). With no carried state that is all, as before. With one
 /// (`carried`), the carried state is read and checked first ([`read`]); a
 /// refusal comes before anything is saved, so a saved checkpoint is left as
-/// it was. A carried payment not yet confirmed beside one the base holds is
-/// refused. Then the base takes from it only what it lacks
-/// ([`UploadState::take_carried`]).
+/// it was. A carried payment not yet confirmed is left out when the base
+/// already holds it (an earlier run of this upload took it from the same
+/// state, and it is counted as settled this run), or when the base proves,
+/// has paid again or holds pending any of its records; beside another
+/// payment the base holds, it is refused; otherwise it is taken only if its
+/// paid quotes are within the payer's client's price ceiling. Then the base
+/// takes from it only what it lacks ([`UploadState::take_carried`]).
 pub(crate) fn starting_state(
     saved: Option<UploadState>,
     receipts: impl FnOnce() -> Result<UploadState>,
@@ -356,16 +375,93 @@ pub(crate) fn starting_state(
         Some(state) => state,
         None => receipts()?,
     };
-    let Some(Read { state, planned }) = read else {
+    let Some(Read { mut state, planned }) = read else {
         return Ok((base, None));
     };
-    if (base.pending_payment.is_some() || base.pending_merkle.is_some())
-        && state.pending_payment.is_some()
-    {
-        return Err(refused(BOTH_PENDING));
+    let mut pending_here = None;
+    if let Some(attempt) = state.pending_payment.clone() {
+        if same_attempt(&base, &state) {
+            // An earlier run of this upload took it and saved it: the base
+            // settles it, as on any resume.
+            state.pending_payment = None;
+            pending_here = Some(attempt.addresses.iter().copied().collect());
+        } else if attempt.addresses.iter().any(|address| held(&base, address)) {
+            // This upload already took, settled or is paying some of its
+            // records itself, and a payment is settled whole: the rest are
+            // quoted afresh, and the payer is never asked to pay a record
+            // this upload proves.
+            state.pending_payment = None;
+        } else if base.pending_payment.is_some() || base.pending_merkle.is_some() {
+            return Err(refused(BOTH_PENDING));
+        } else if let CarriedCaller::Payer { ceiling, .. } = caller {
+            within_ceiling(&state, ceiling)?;
+        }
     }
-    let report = base.take_carried(state, records, &planned);
+    let mut report = base.take_carried(state, records, &planned);
+    if let Some(addresses) = pending_here {
+        report.reconciled = addresses;
+    }
     Ok((base, Some(report)))
+}
+
+/// Whether `base`, this upload's own state, proves `address`, has paid it
+/// again once already, or names it in its own payment not yet confirmed.
+fn held(base: &UploadState, address: &XorName) -> bool {
+    base.proof(address).is_some()
+        || base.was_paid_again(address)
+        || base
+            .pending_payment
+            .as_ref()
+            .is_some_and(|attempt| attempt.addresses.contains(address))
+}
+
+/// Whether `base`'s payment not yet confirmed is the one `carried` holds:
+/// a payer's (no wallet journal), for the same records, with the same
+/// quotes. An earlier run of this upload took it from the same carried
+/// state.
+fn same_attempt(base: &UploadState, carried: &UploadState) -> bool {
+    let (Some(ours), Some(theirs)) = (&base.pending_payment, &carried.pending_payment) else {
+        return false;
+    };
+    let quotes = |state: &UploadState| {
+        state.pending_plans().ok().map(|plans| {
+            plans
+                .into_iter()
+                .map(|plan| {
+                    let hashes = plan
+                        .payment
+                        .quotes
+                        .iter()
+                        .map(|quote| quote.quote_hash)
+                        .collect::<Vec<_>>();
+                    (plan.address, hashes)
+                })
+                .collect::<HashMap<_, _>>()
+        })
+    };
+    let payer_journal = |attempt: &PaymentAttempt| {
+        !attempt.merkle && attempt.submissions.is_empty() && attempt.receipt.is_none()
+    };
+    base.pending_merkle.is_none()
+        && payer_journal(ours)
+        && payer_journal(theirs)
+        && ours.addresses.iter().collect::<HashSet<_>>()
+            == theirs.addresses.iter().collect::<HashSet<_>>()
+        && quotes(base).is_some_and(|ours| Some(ours) == quotes(carried))
+}
+
+/// Refuse a carried payment not yet confirmed whose plans pay a quote above
+/// `ceiling` (`ClientConfig::max_chunk_price`): the payer is asked to pay
+/// those plans as they are, without quoting them again, so the ceiling a
+/// plan meets when it is made ([`crate::payment_policy`]) is checked here.
+fn within_ceiling(state: &UploadState, ceiling: Option<Amount>) -> Result<()> {
+    for plan in state.pending_plans().map_err(refused)? {
+        for quote in plan.payment.quotes.iter().filter(|q| !q.amount.is_zero()) {
+            crate::quote_validation::validate_price_ceiling(quote.price, ceiling)
+                .map_err(|reason| refused(format!("{PENDING_ABOVE_CEILING}: {reason}")))?;
+        }
+    }
+    Ok(())
 }
 
 /// What an upload did with a carried state ([`TakeReport`]), read from its
@@ -406,8 +502,14 @@ mod tests {
     use std::collections::HashMap;
     use std::time::SystemTime;
 
-    const PAYER: CarriedCaller = CarriedCaller::Payer { root_waves: false };
-    const ROOT_PAYER: CarriedCaller = CarriedCaller::Payer { root_waves: true };
+    const PAYER: CarriedCaller = CarriedCaller::Payer {
+        root_waves: false,
+        ceiling: None,
+    };
+    const ROOT_PAYER: CarriedCaller = CarriedCaller::Payer {
+        root_waves: true,
+        ceiling: None,
+    };
 
     fn now() -> SystemTime {
         crate::runtime::system_time()
@@ -482,12 +584,18 @@ mod tests {
                 CarriedCaller::Wallet,
             ) => Refused(PAYER_PENDING_FOR_WALLET),
             (CarriedPath::PayerPendingPayment, CarriedCaller::Payer { .. }) => Reconciled,
-            (CarriedPath::PayerPendingRootPayment, CarriedCaller::Payer { root_waves: true }) => {
-                Reconciled
-            }
-            (CarriedPath::PayerPendingRootPayment, CarriedCaller::Payer { root_waves: false }) => {
-                Refused(ROOT_PENDING_FOR_PER_QUOTE_PAYER)
-            }
+            (
+                CarriedPath::PayerPendingRootPayment,
+                CarriedCaller::Payer {
+                    root_waves: true, ..
+                },
+            ) => Reconciled,
+            (
+                CarriedPath::PayerPendingRootPayment,
+                CarriedCaller::Payer {
+                    root_waves: false, ..
+                },
+            ) => Refused(ROOT_PENDING_FOR_PER_QUOTE_PAYER),
             (CarriedPath::MerkleBatch | CarriedPath::PendingMerkle, _) => Refused(MERKLE_BATCH),
             (CarriedPath::UnpaidQuote, _) => QuotedAgain,
             (CarriedPath::LocalReceipts | CarriedPath::RecordCheckpoint, _) => {
@@ -911,6 +1019,181 @@ mod tests {
             .is_none());
         assert!(state.plan_addresses().is_empty());
         assert_eq!(report.unpaid, records(&[b"quoted b", b"quoted c"]));
+    }
+
+    /// A record this upload marked as paid again and whose proof it dropped
+    /// (every storer refused it) does not get the refused carried proof
+    /// back when the upload runs again with the same carried state: it is
+    /// quoted afresh, as without the carried state.
+    #[test]
+    fn a_proof_this_upload_dropped_to_pay_again_is_not_taken_again() {
+        let carried = proving(&[b"dropped a", b"kept b"]).checkpoint().unwrap();
+        let upload = records(&[b"dropped a", b"kept b"]);
+        let (mut saved, report) =
+            starting_state(None, nothing_local, Some(&carried), &upload, PAYER).unwrap();
+        assert_eq!(report.unwrap().taken.len(), 2);
+        // Every storer refused A: marked, its proof dropped and saved, then
+        // the new quote failed before any payment.
+        let a = address(b"dropped a");
+        saved.mark_paid_again(a);
+        saved.drop_proof(&a);
+        let (state, report) =
+            starting_state(Some(saved), nothing_local, Some(&carried), &upload, PAYER).unwrap();
+        assert!(
+            state.proof(&a).is_none(),
+            "the refused proof is not put back"
+        );
+        assert!(state.was_paid_again(&a));
+        assert!(state.proof(&address(b"kept b")).is_some());
+        assert!(report.unwrap().taken.is_empty());
+    }
+
+    /// A carried payment not yet confirmed, with one confirmed proof beside
+    /// it, as an upload's payer gives it.
+    fn carried_attempt(contents: &[&[u8]]) -> (UploadState, Vec<XorName>) {
+        let mut carried = proving(&[b"attempt proven"]);
+        let attempt = pending(contents, PaymentVault::V2);
+        for plan in attempt.pending_plans().unwrap() {
+            carried.prepare(plan);
+        }
+        carried.pending_payment = attempt.pending_payment.clone();
+        let addresses = attempt.pending_payment.unwrap().addresses;
+        (carried, addresses)
+    }
+
+    /// A carried payment this upload took and settled is not taken again
+    /// when the upload runs again with the same carried state, so its payer
+    /// is not asked to pay records the upload proves. Nor is it taken when
+    /// this upload's own state already proves or has paid again any of its
+    /// records.
+    #[test]
+    fn a_carried_attempt_this_upload_settled_is_not_taken_again() {
+        let (carried, addresses) = carried_attempt(&[b"settled c", b"settled d"]);
+        let bytes = carried.checkpoint().unwrap();
+        let upload = records(&[b"attempt proven", b"settled c", b"settled d", b"later e"]);
+        let (mut run, report) =
+            starting_state(None, nothing_local, Some(&bytes), &upload, PAYER).unwrap();
+        assert_eq!(report.unwrap().reconciled.len(), 2);
+        // Settled through the payer, then a later record failed to store.
+        let mut paid_with = HashMap::new();
+        for plan in run.pending_plans().unwrap() {
+            paid_with.extend(transactions(&plan));
+        }
+        run.confirm(&addresses, &paid_with, now()).unwrap();
+        assert!(run.pending_payment.is_none());
+        let (again, report) = starting_state(
+            Some(run.clone()),
+            nothing_local,
+            Some(&bytes),
+            &upload,
+            PAYER,
+        )
+        .unwrap();
+        assert!(
+            again.pending_payment.is_none(),
+            "the payer is not asked again"
+        );
+        let report = report.unwrap();
+        assert!(report.reconciled.is_empty());
+        assert!(report.taken.is_empty());
+        for address in &addresses {
+            assert_eq!(again.proof(address), run.proof(address));
+        }
+        // One of its records was then dropped to be paid again.
+        let mut dropped = run.clone();
+        dropped.mark_paid_again(addresses[0]);
+        dropped.drop_proof(&addresses[0]);
+        let (again, report) =
+            starting_state(Some(dropped), nothing_local, Some(&bytes), &upload, PAYER).unwrap();
+        assert!(again.pending_payment.is_none());
+        assert!(report.unwrap().reconciled.is_empty());
+        // This machine's receipts prove one of its records.
+        let (c, local) = paid(b"settled c");
+        let receipts = || {
+            Ok(UploadState::from_proofs(HashMap::from([(
+                c,
+                local.clone(),
+            )])))
+        };
+        let (state, report) = starting_state(None, receipts, Some(&bytes), &upload, PAYER).unwrap();
+        assert!(state.pending_payment.is_none());
+        assert_eq!(state.proof(&c), Some(&local));
+        assert!(report.unwrap().reconciled.is_empty());
+    }
+
+    /// A run that took a carried payment not yet confirmed, and stopped
+    /// before it was settled, keeps it in its checkpoint. Run again with the
+    /// same carried state, the upload settles that saved payment and is not
+    /// refused.
+    #[test]
+    fn a_retry_with_the_carried_attempt_it_already_took_is_not_refused() {
+        let (carried, addresses) = carried_attempt(&[b"retry c", b"retry d"]);
+        let bytes = carried.checkpoint().unwrap();
+        let upload = records(&[b"attempt proven", b"retry c", b"retry d"]);
+        let (run, _) = starting_state(None, nothing_local, Some(&bytes), &upload, PAYER).unwrap();
+        let quotes = |state: &UploadState| {
+            state
+                .pending_plans()
+                .unwrap()
+                .iter()
+                .flat_map(|plan| plan.payment.quotes.iter().map(|q| q.quote_hash))
+                .collect::<HashSet<_>>()
+        };
+        let (again, report) = starting_state(
+            Some(run.clone()),
+            nothing_local,
+            Some(&bytes),
+            &upload,
+            PAYER,
+        )
+        .expect("the same payment is not refused");
+        assert_eq!(again.pending_payment.as_ref().unwrap().addresses, addresses);
+        assert_eq!(quotes(&again), quotes(&run));
+        let report = report.unwrap();
+        assert_eq!(report.reconciled, addresses.iter().copied().collect());
+        assert!(report.taken.is_empty());
+        // Another payment, of other records, beside the saved one is still
+        // refused.
+        let (other, _) = carried_attempt(&[b"retry f"]);
+        assert_refused(
+            starting_state(
+                Some(run),
+                nothing_local,
+                Some(&other.checkpoint().unwrap()),
+                &records(&[b"attempt proven", b"retry c", b"retry d", b"retry f"]),
+                PAYER,
+            ),
+            BOTH_PENDING,
+        );
+    }
+
+    /// A carried payment not yet confirmed is paid as it is, without new
+    /// quotes, so its paid quotes are checked against this client's price
+    /// ceiling before it is taken.
+    #[test]
+    fn a_carried_attempt_above_this_clients_price_ceiling_is_refused() {
+        // One quote at price 10.
+        let carried = pending(&[b"priced c"], PaymentVault::V2)
+            .checkpoint()
+            .unwrap();
+        let upload = records(&[b"priced c"]);
+        let capped = |ceiling: u64| CarriedCaller::Payer {
+            root_waves: false,
+            ceiling: Some(Amount::from(ceiling)),
+        };
+        let error = starting_state(None, nothing_local, Some(&carried), &upload, capped(9))
+            .expect_err("above the ceiling");
+        assert_eq!(
+            reason(&error),
+            format!(
+                "invalid data: {CARRIED_STATE_REFUSED}: {PENDING_ABOVE_CEILING}: price 10 is \
+                 above the price ceiling 9"
+            )
+        );
+        let (state, report) =
+            starting_state(None, nothing_local, Some(&carried), &upload, capped(10)).unwrap();
+        assert!(state.pending_payment.is_some());
+        assert_eq!(report.unwrap().reconciled, upload);
     }
 
     #[test]

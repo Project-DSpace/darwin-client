@@ -4307,6 +4307,7 @@ impl Client {
         let caller = match payer {
             Some(payer) => crate::data::client::carried::CarriedCaller::Payer {
                 root_waves: payer.pays_root_waves(),
+                ceiling: self.config().max_chunk_price,
             },
             None => crate::data::client::carried::CarriedCaller::Wallet,
         };
@@ -7112,7 +7113,10 @@ mod payer_tests {
     }
 
     const PAYER: crate::data::client::carried::CarriedCaller =
-        crate::data::client::carried::CarriedCaller::Payer { root_waves: false };
+        crate::data::client::carried::CarriedCaller::Payer {
+            root_waves: false,
+            ceiling: None,
+        };
 
     fn no_receipts() -> Result<crate::data::client::upload_state::UploadState> {
         Ok(crate::data::client::upload_state::UploadState::default())

@@ -4857,8 +4857,14 @@ mod tests {
             let bytes = state.checkpoint().unwrap();
             for caller in [
                 CarriedCaller::Wallet,
-                CarriedCaller::Payer { root_waves: false },
-                CarriedCaller::Payer { root_waves: true },
+                CarriedCaller::Payer {
+                    root_waves: false,
+                    ceiling: None,
+                },
+                CarriedCaller::Payer {
+                    root_waves: true,
+                    ceiling: None,
+                },
             ] {
                 let error = starting_state(
                     None,
