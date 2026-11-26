@@ -167,7 +167,7 @@ pub(crate) fn pays_root(testnet: &MiniTestnet, address: &[u8; 32]) -> bool {
 
 /// Whether a node without the root vault is among `address`'s
 /// [`UNAWARE_NEAR`] nearest.
-fn pays_per_quote(testnet: &MiniTestnet, address: &[u8; 32]) -> bool {
+pub(crate) fn pays_per_quote(testnet: &MiniTestnet, address: &[u8; 32]) -> bool {
     let unaware = testnet.root_unaware_peers();
     nearest(testnet, address)
         .iter()

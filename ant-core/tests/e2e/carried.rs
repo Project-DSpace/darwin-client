@@ -5,6 +5,7 @@
 
 use crate::support::runner::Case;
 use crate::support::{test_client_config, MiniTestnet};
+use ant_core::ant_listings::Envelope;
 use ant_core::data::client::upload::{MerkleUploadPayment, UploadPayment};
 use ant_core::data::client::upload_state::{UploadState, CHECKPOINT_FORMAT_ROOT};
 use ant_core::data::{
@@ -265,11 +266,23 @@ fn input(len: usize) -> NamedTempFile {
     file
 }
 
-/// A file of its own whose content records can all pay the root vault
-/// (`root_payment::pays_root`): at least 3, so a payer that pays root
-/// waves pays them in one.
-async fn root_file(testnet: &MiniTestnet) -> NamedTempFile {
-    for _ in 0..10_000 {
+/// A file of its own, and a readable envelope for it, that a payer paying
+/// root waves pays first in a root wave: each content record pays a known
+/// vault, at least two the root vault (`root_payment::pays_root`) and the
+/// rest the per-quote vault (`root_payment::pays_per_quote`), and the
+/// envelope, its name picked for this, pays the root vault. So at least 3
+/// records pay the root vault, and the envelope is never alone at the
+/// per-quote vault, where a payment would not leave it: with it there and
+/// only 3 records paying the root vault, the split moves them all to the
+/// per-quote vault (`root_payment::split_vaults`) and no root proof is made.
+///
+/// A readable envelope's address comes from the data map and its choices,
+/// so the name, not the file, puts it where the root vault is paid; files
+/// whose content records and envelope all pay it are too rare in some
+/// networks.
+async fn root_file(testnet: &MiniTestnet) -> (NamedTempFile, Visibility) {
+    let mut found = None;
+    for _ in 0..100_000 {
         let file = input(20_000);
         let map = ant_core::data::file_data_map(file.path())
             .await
@@ -279,15 +292,36 @@ async fn root_file(testnet: &MiniTestnet) -> NamedTempFile {
             .iter()
             .map(|info| info.dst_hash.0)
             .collect::<Vec<_>>();
-        if addresses.len() >= 3
-            && addresses
-                .iter()
-                .all(|address| crate::root_payment::pays_root(testnet, address))
-        {
-            return file;
+        let roots = addresses
+            .iter()
+            .filter(|address| crate::root_payment::pays_root(testnet, address))
+            .count();
+        let per_quote = addresses
+            .iter()
+            .filter(|address| crate::root_payment::pays_per_quote(testnet, address))
+            .count();
+        if roots >= 2 && roots + per_quote == addresses.len() {
+            found = Some((file, map));
+            break;
         }
     }
-    panic!("no file whose content records all pay the root vault");
+    let (file, map) = found
+        .expect("a file whose content records each pay a known vault, two of them the root vault");
+    let mut options = EnvelopeOptions::unlisted();
+    for n in 0u32..100_000 {
+        options.metadata.name = Some(format!("carried-{n}.bin"));
+        let envelope = Envelope::readable(
+            &map,
+            options.metadata.clone(),
+            options.shown,
+            options.in_index,
+        )
+        .expect("the readable envelope");
+        if crate::root_payment::pays_root(testnet, &envelope.address()) {
+            return (file, Visibility::Envelope(options));
+        }
+    }
+    panic!("no name whose readable envelope pays the root vault");
 }
 
 /// A client as an operator runs one: it names the devnet's root vault and
@@ -384,23 +418,19 @@ async fn vault_record(testnet: &MiniTestnet, hash: QuoteHash) -> ([u8; 16], u128
 /// readable envelope every record is carried; with the default private
 /// envelope, whose salt stays with the first client, the second pays only
 /// its own envelope, in one payment of one plan; with a payer that pays
-/// root waves, the root proofs are carried. The same file encrypts to the
-/// same records on the second client.
+/// root waves and a file and envelope picked so that its first payment is a
+/// root wave ([`root_file`]), the root proofs are carried. The same file
+/// encrypts to the same records on the second client.
 async fn a_second_client_with_the_carried_state_stores_the_paid_records_and_asks_its_payer_for_no_payment_for_them(
     testnet: Arc<MiniTestnet>,
 ) {
-    for (visibility, root) in [
-        (readable(), false),
-        (Visibility::default(), false),
-        (readable(), true),
-    ] {
-        let private = visibility == Visibility::default();
-        // A file whose records can pay the root vault, for a payer that pays
-        // root waves.
-        let file = if root {
+    for (private, root) in [(false, false), (true, false), (false, true)] {
+        let (file, visibility) = if root {
             root_file(&testnet).await
+        } else if private {
+            (input(200_000), Visibility::default())
         } else {
-            input(200_000)
+            (input(200_000), readable())
         };
         let first = CarryPayer {
             root,
@@ -413,9 +443,19 @@ async fn a_second_client_with_the_carried_state_stores_the_paid_records_and_asks
             visibility.clone(),
         )
         .await;
-        let paid = first.asked_addresses();
+        // The carried state is the one saved when the first payment was
+        // confirmed: it proves that payment's records.
+        let first_request = first.asked.lock().unwrap()[0].clone();
+        let paid = first_request
+            .iter()
+            .map(|plan| plan.address)
+            .collect::<Vec<_>>();
         assert!(!paid.is_empty());
         if root {
+            assert!(
+                first_request.iter().all(|plan| !plan.vault.is_v2()),
+                "the first payment is the root wave"
+            );
             assert_eq!(bytes[4], CHECKPOINT_FORMAT_ROOT, "root proofs are carried");
         }
 
@@ -445,9 +485,9 @@ async fn a_second_client_with_the_carried_state_stores_the_paid_records_and_asks
             assert_eq!(requests.len(), 1, "one payment");
             assert_eq!(requests[0].len(), 1, "of the new envelope alone");
         } else if root {
-            // The root wave is paid first; a record that pays the per-quote
-            // vault, in a payment the first payer had not made yet, is
-            // quoted afresh.
+            // The root wave is paid first; a content record that pays the
+            // per-quote vault, in a payment not yet confirmed when the state
+            // was saved, is quoted afresh.
             assert_eq!(carried.taken, paid.len());
             assert_eq!(
                 carried.quoted_again,
