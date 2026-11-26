@@ -27,3 +27,4 @@ See [`TOOLING.md`](./TOOLING.md) for `adrs`, `adr-kit`, and AI harness setup.
 - [ADR-0005: Bootstrap multiaddresses and portable network defaults](./ADR-0005-bootstrap-multiaddresses.md)
 - [ADR-0006: File manifests and manifest links](./ADR-0006-file-manifests-and-links.md)
 - [ADR-0007: Browser manifest creation and pointer payment recovery](./ADR-0007-browser-api-completion.md) (Proposed)
+- [ADR-0008: Carried upload state](./ADR-0008-carried-upload-state.md) (Proposed)

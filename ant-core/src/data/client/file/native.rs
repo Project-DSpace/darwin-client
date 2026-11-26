@@ -2214,6 +2214,10 @@ pub trait UploadPayer: Send + Sync {
     /// machines cannot see each other, so give a state to one client at a
     /// time, and give the newest state [`Self::state_saved`] gave.
     /// `None` by default.
+    ///
+    /// Give a carried state to one client, once, and carry the newest state:
+    /// a client that ran with a carried state and stopped holds newer proofs
+    /// and marks in its own checkpoint, which `state_saved` handed out.
     fn carried_state(&self) -> Option<Vec<u8>> {
         None
     }
@@ -4078,7 +4082,9 @@ impl Client {
     /// [`Client::file_upload_with_visibility_and_progress`] describes. The
     /// upload's checkpoint, and an envelope upload's kept record, belong to
     /// the payer ([`UploadPayer::checkpoint_scope`]), so a payer serving
-    /// several accounts must name each.
+    /// several accounts must name each. A payer hands out the upload's paid
+    /// state through [`UploadPayer::state_saved`], and another client's
+    /// upload adds it through [`UploadPayer::carried_state`].
     ///
     /// # Errors
     ///

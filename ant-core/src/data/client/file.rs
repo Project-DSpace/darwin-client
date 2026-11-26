@@ -317,6 +317,10 @@ pub struct CarriedOutcome {
 
 /// What a wallet upload that starts from a carried state is given
 /// (`Client::file_upload_carried`).
+///
+/// Give a carried state to one client, once, and carry the newest state: a
+/// client that ran with a carried state and stopped holds newer proofs and
+/// marks in its own checkpoint, which `state_saved` handed out.
 #[cfg(feature = "native")]
 #[derive(Debug, Clone)]
 #[non_exhaustive]

@@ -128,6 +128,7 @@ const COMMANDS: &[Reviewed] = &[
             "store_timeout",
             "store_concurrency",
             "overwrite",
+            "carried",
         ],
     ),
     (

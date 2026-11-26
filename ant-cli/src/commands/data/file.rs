@@ -12,10 +12,11 @@ use ant_core::ant_listings::{EnvelopeProof, Metadata, PaymentField, ShownFields}
 use ant_core::data::manifest::path::portable_component;
 use ant_core::data::{
     file_data_map, forget_upload_record, parse_link, proof_data_map, shown_after_hiding,
-    spawn_download_diagnostics_writer, Client, CollisionPolicy, ContentRef, CostEstimateConfidence,
-    DownloadEvent, EnvelopeOptions, Error as DataError, EvmAddress, FileChunkPeerReport,
-    FileChunkPeerReportPeer, FileChunkPeerStatus, FileChunkPeerSweepReport, Link, ListingChain,
-    Manifest, ManifestEntry, PaymentMode, UploadEvent,
+    spawn_download_diagnostics_writer, CarriedOutcome, CarriedUploadOptions, Client,
+    CollisionPolicy, ContentRef, CostEstimateConfidence, DownloadEvent, EnvelopeOptions,
+    Error as DataError, EvmAddress, FileChunkPeerReport, FileChunkPeerReportPeer,
+    FileChunkPeerStatus, FileChunkPeerSweepReport, FileUploadResult, Link, ListingChain, Manifest,
+    ManifestEntry, PaymentMode, UploadEvent, Visibility,
 };
 use ant_core::datamap_file::{
     original_name_from_datamap, read_datamap, read_record, record_path_for, write_record,
@@ -164,6 +165,13 @@ pub enum FileAction {
         /// the file like the `.datamap`: keep a copy first.
         #[arg(long)]
         overwrite: bool,
+        /// Add the paid proofs of a carried upload state: the bytes
+        /// UploadState::checkpoint writes, as another client hands them out.
+        /// Not a .msgpack file from the data directory, which holds no
+        /// proofs. Records it holds paid proofs for are stored without a new
+        /// payment.
+        #[arg(long, value_name = "FILE")]
+        carried: Option<PathBuf>,
     },
     /// Download a file from the network.
     ///
@@ -371,15 +379,16 @@ impl FileAction {
                 store_timeout: _,
                 store_concurrency: _,
                 overwrite,
+                carried,
             } => {
-                let mode = payment_mode(merkle)?;
+                let (mode, carried) = upload_payment(merkle, carried.as_deref())?;
                 let policy = if overwrite {
                     CollisionPolicy::Overwrite
                 } else {
                     CollisionPolicy::NumericSuffix
                 };
                 let options = choices.options()?;
-                handle_file_upload(client, &path, options, mode, policy, json, token).await
+                handle_file_upload(client, &path, options, mode, carried, policy, json, token).await
             }
             FileAction::Download {
                 address,
@@ -483,11 +492,66 @@ pub(super) fn payment_mode(merkle: bool) -> anyhow::Result<PaymentMode> {
     Ok(PaymentMode::Single)
 }
 
+/// The payment mode and the carried state `darwin file upload` is given.
+/// `--merkle` is refused before the carried file is read, and the file is
+/// read whole before any upload starts: the raw bytes
+/// `UploadState::checkpoint` writes, with no wrapper.
+fn upload_payment(
+    merkle: bool,
+    carried: Option<&Path>,
+) -> anyhow::Result<(PaymentMode, Option<Vec<u8>>)> {
+    let mode = payment_mode(merkle)?;
+    let carried = carried
+        .map(|path| {
+            std::fs::read(path).map_err(|e| {
+                anyhow::anyhow!("cannot read the carried state {}: {e}", path.display())
+            })
+        })
+        .transpose()?;
+    Ok((mode, carried))
+}
+
+/// Start the upload: as any wallet upload, or, with a carried state, through
+/// [`Client::file_upload_carried`] with the same choices.
+async fn run_upload(
+    client: &Client,
+    path: &Path,
+    mode: PaymentMode,
+    visibility: Visibility,
+    carried: Option<Vec<u8>>,
+    progress: Option<mpsc::Sender<UploadEvent>>,
+) -> Result<FileUploadResult, DataError> {
+    match carried {
+        None => {
+            client
+                .file_upload_with_visibility_and_progress(path, mode, visibility, progress)
+                .await
+        }
+        Some(state) => {
+            let mut options = CarriedUploadOptions::new(state);
+            options.visibility = visibility;
+            options.mode = mode;
+            options.progress = progress;
+            client.file_upload_carried(path, options).await
+        }
+    }
+}
+
+/// The line said when the upload was given a carried state.
+fn carried_line(outcome: &CarriedOutcome) -> String {
+    format!(
+        "Carried state: {} proofs added, {} settled, {} paid again, {} quoted again",
+        outcome.taken, outcome.reconciled, outcome.paid_again, outcome.quoted_again
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn handle_file_upload(
     client: &Client,
     path: &Path,
     options: EnvelopeOptions,
     mode: PaymentMode,
+    carried: Option<Vec<u8>>,
     collision_policy: CollisionPolicy,
     json_output: bool,
     token: &str,
@@ -512,9 +576,7 @@ async fn handle_file_upload(
 
     let upload_outcome = if json_output {
         // No progress bars in JSON mode.
-        client
-            .file_upload_with_visibility_and_progress(path, mode, visibility, None)
-            .await
+        run_upload(client, path, mode, visibility, carried, None).await
     } else {
         // Set up progress channel and drive progress bars
         let (tx, rx) = mpsc::channel(64);
@@ -524,9 +586,7 @@ async fn handle_file_upload(
             file_size,
         ));
 
-        let upload_result = client
-            .file_upload_with_visibility_and_progress(path, mode, visibility, Some(tx))
-            .await;
+        let upload_result = run_upload(client, path, mode, visibility, carried, Some(tx)).await;
 
         // Wait for progress display to finish (sender dropped → receiver exits)
         let _ = pb_handle.await;
@@ -690,6 +750,7 @@ async fn handle_file_upload(
                 warnings,
             ),
             manifest_id,
+            carried: result.carried.clone(),
         };
         println!("{}", serde_json::to_string(&out)?);
         return Ok(());
@@ -739,6 +800,9 @@ async fn handle_file_upload(
     println!("  SHA-256:  {}", hex::encode(result.sha256));
     println!("  Cost:     {cost_display}");
     println!("  Time:     {:.1}s", elapsed.as_secs_f64());
+    if let Some(outcome) = &result.carried {
+        println!("{}", carried_line(outcome));
+    }
     println!();
     if let Some(address) = &address {
         println!("Anyone can download this file with:");
@@ -1633,6 +1697,9 @@ struct UploadJsonResult {
     /// Id of the upload-history record, when it could be written.
     #[serde(skip_serializing_if = "Option::is_none")]
     manifest_id: Option<String>,
+    /// What the upload did with a carried state, when one was given.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    carried: Option<CarriedOutcome>,
 }
 
 /// Tell the user where the upload was recorded.
@@ -2023,7 +2090,6 @@ fn format_cost(storage_cost_atto: &str, gas_cost_wei: u128, token: &str) -> Stri
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ant_core::data::Visibility;
     use clap::Parser;
 
     #[derive(Debug, Parser)]
@@ -2747,6 +2813,92 @@ mod tests {
                 help.contains("--merkle") && !help.contains("--no-merkle"),
                 "{help}"
             );
+        }
+    }
+
+    /// `--carried FILE` parses to the file's path, and is absent by default.
+    /// The file is read whole, as raw bytes, before the upload starts; a
+    /// file that cannot be read stops the command with its path.
+    #[test]
+    fn upload_takes_a_carried_state_file() {
+        let carried = |flags: &[&str]| {
+            let mut argv = vec!["test", "upload", "notes.txt"];
+            argv.extend_from_slice(flags);
+            match TestFileCli::try_parse_from(argv).unwrap().action {
+                FileAction::Upload { carried, .. } => carried,
+                _ => panic!("expected upload"),
+            }
+        };
+        assert_eq!(carried(&[]), None);
+        assert_eq!(carried(&["--carried", "x"]), Some(PathBuf::from("x")));
+
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("state");
+        let bytes = b"DSCK\x01raw".to_vec();
+        std::fs::write(&file, &bytes).unwrap();
+        let (mode, state) = upload_payment(false, Some(&file)).unwrap();
+        assert!(matches!(mode, PaymentMode::Single));
+        assert_eq!(state, Some(bytes));
+        assert!(matches!(
+            upload_payment(false, None),
+            Ok((PaymentMode::Single, None))
+        ));
+
+        let missing = dir.path().join("missing");
+        let refused = upload_payment(false, Some(&missing)).expect_err("no such file");
+        assert!(
+            refused.to_string().starts_with(&format!(
+                "cannot read the carried state {}: ",
+                missing.display()
+            )),
+            "{refused}"
+        );
+    }
+
+    /// `--merkle` with `--carried` is still refused, before the carried file
+    /// is read: the refusal is the merkle one even when the file is missing.
+    #[test]
+    fn carried_with_merkle_is_still_refused() {
+        let cli = TestFileCli::try_parse_from([
+            "test",
+            "upload",
+            "notes.txt",
+            "--carried",
+            "no-such-carried-state",
+            "--merkle",
+        ])
+        .unwrap();
+        let FileAction::Upload {
+            merkle, carried, ..
+        } = cli.action
+        else {
+            panic!("expected upload");
+        };
+        assert!(merkle);
+        let refused = upload_payment(merkle, carried.as_deref()).expect_err("--merkle is refused");
+        assert!(
+            refused.to_string().contains("Leave out --merkle"),
+            "{refused}"
+        );
+    }
+
+    /// The human line and the JSON field said for a carried state.
+    #[test]
+    fn the_carried_outcome_is_said_and_serialised() {
+        let outcome = CarriedOutcome::default();
+        assert_eq!(
+            carried_line(&outcome),
+            "Carried state: 0 proofs added, 0 settled, 0 paid again, 0 quoted again"
+        );
+        let json = serde_json::to_value(&outcome).unwrap();
+        for field in [
+            "proofs",
+            "taken",
+            "reconciled",
+            "paid_again",
+            "quoted_again",
+        ] {
+            assert_eq!(json[field], 0, "{json}");
         }
     }
 

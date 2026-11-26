@@ -185,6 +185,9 @@ const ERASES: Counting = &[
 
 const ENVELOPE_CLI: &str = "darwin's own upload command: every file gets an envelope from \
     EnvelopeOptions, private by default with all five payment fields shown, paid per chunk.";
+const ENVELOPE_CLI_CARRIED: &str = "darwin file upload --carried: the same envelope choices and \
+    payment mode as any upload of the command, with a carried state's paid proofs added where \
+    the upload's checkpoint holds none; --merkle is refused before the file is read.";
 const ENVELOPE_LIB: &str = "The library's file shortcuts: an envelope from EnvelopeOptions, \
     private by default with all five payment fields shown, paid per chunk.";
 const FINALIZE: &str = "Finishes a prepared file upload with the envelope chosen when it was \
@@ -337,9 +340,16 @@ const STORE_SITES: &[Site] = &[
     ),
     (
         "ant-cli/src/commands/data/file.rs",
-        "handle_file_upload",
+        "run_upload",
+        "file_upload_carried",
+        1,
+        ENVELOPE_CLI_CARRIED,
+    ),
+    (
+        "ant-cli/src/commands/data/file.rs",
+        "run_upload",
         "file_upload_with_visibility_and_progress",
-        2,
+        1,
         ENVELOPE_CLI,
     ),
     (

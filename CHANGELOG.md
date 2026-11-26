@@ -12,6 +12,25 @@ upstream 0.3.11 (ant-core 0.13.0) before it. Releases are tagged `vX.Y.Z+ds.N`, 
 version set to match; other builds are told apart by the commit `darwin --version` prints.
 Upstream's entries follow.
 
+- Unreleased, after `v0.3.13+ds.13`: an upload can add the paid proofs of a carried upload state,
+  so an upload that one client paid for and did not finish can be finished by another client with
+  no second payment. The engine hands a payer the upload's state each time it saves its checkpoint,
+  through `UploadPayer::state_saved`; that is the only source of carried bytes
+  (`UploadState::checkpoint` writes them). A payer gives a carried state through
+  `UploadPayer::carried_state`, the wallet through `Client::file_upload_carried`
+  (`CarriedUploadOptions`), and the command line through `darwin file upload <path> --carried
+  <file>`. Proofs for this upload's records are added only where its own checkpoint holds none, so
+  a saved checkpoint is never replaced and payment recovery is unchanged, and those records are
+  stored with no new payment, after every check a resumed record passes. A payer's payment not yet
+  confirmed in the state is settled through the new payer, as on any resume. A state that fails its
+  checks, that is a checkpoint's main file without its proofs, that names none of the upload's
+  records, or that holds a wallet's unconfirmed payment, a Merkle proof or a pending Merkle batch,
+  is refused whole with an error that starts with `CARRIED_STATE_REFUSED`, and nothing is paid.
+  Unpaid quotes in it are quoted again, a proof no storer accepts is paid again once, under the
+  price ceiling and through the occupied-quote checks, and `FileUploadResult::carried` counts both
+  (`darwin file upload` prints the counts, and `--json` gives them as `carried`). A private
+  envelope gets a new salt, so its record is paid once more, alone in its payment. A carried state
+  goes to one client at a time; carry the newest state the engine handed out. See ADR-0008.
 - Unreleased, after `v0.3.13+ds.13`: the bundled network's last payment-read fallback is Tenderly's
   public gateway (`https://robinhood-chain.gateway.tenderly.co`) in place of ordofi's
   (`https://rpc.ordofi.network`), which had refused every connection for 7 days up to 2026-11-24

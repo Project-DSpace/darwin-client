@@ -56,8 +56,8 @@ pub const PROOFS_EXTENSION: &str = "proofs";
 
 /// The extensions of every file a checkpoint may have, beside its 64-hex
 /// stem: the checkpoint, its proofs, a private upload's salt, and its lock.
-/// A server that removes what ended uploads left (dspace-gateway's
-/// `remove_ended`) removes these, the lock last.
+/// A server that removes what ended uploads left removes these, the lock
+/// last.
 pub const UPLOAD_CHECKPOINT_EXTENSIONS: [&str; 4] =
     [CHECKPOINT_EXTENSION, PROOFS_EXTENSION, "salt", "lock"];
 
