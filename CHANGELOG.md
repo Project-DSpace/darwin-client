@@ -12,27 +12,37 @@ upstream 0.3.11 (ant-core 0.13.0) before it. Releases are tagged `vX.Y.Z+ds.N`, 
 version set to match; other builds are told apart by the commit `darwin --version` prints.
 Upstream's entries follow.
 
-- Unreleased, after `v0.3.13+ds.13`: an upload can add the paid proofs of a carried upload state,
-  so an upload that one client paid for and did not finish can be finished by another client with
-  no second payment. The engine hands a payer the upload's state each time it saves its checkpoint,
-  through `UploadPayer::state_saved`; that is the only source of carried bytes
-  (`UploadState::checkpoint` writes them). A payer gives a carried state through
-  `UploadPayer::carried_state`, the wallet through `Client::file_upload_carried`
-  (`CarriedUploadOptions`), and the command line through `darwin file upload <path> --carried
-  <file>`. Proofs for this upload's records are added only where its own checkpoint holds none, so
-  a saved checkpoint is never replaced and payment recovery is unchanged, and those records are
-  stored with no new payment, after every check a resumed record passes. A payer's payment not yet
-  confirmed in the state is settled through the new payer, as on any resume, unless the upload
-  already took, settled or proves part of it. A state that fails its checks, that is a
-  checkpoint's main file without its proofs, that names none of the upload's records, or that
-  holds a wallet's unconfirmed payment, a payer's unconfirmed payment above the client's price
-  ceiling, a Merkle proof or a pending Merkle batch, is refused whole with an error that starts with `CARRIED_STATE_REFUSED`, and nothing is paid.
-  Unpaid quotes in it are quoted again, a proof no storer accepts is paid again once, under the
-  price ceiling and through the occupied-quote checks, and `FileUploadResult::carried` counts both
-  (`darwin file upload` prints the counts, and `--json` gives them as `carried`). A private
-  envelope gets a new salt, so its record is paid once more, alone in its payment. A carried state
-  goes to one client at a time; carry the newest state the engine handed out. See ADR-0008.
-- Unreleased, after `v0.3.13+ds.13`: the bundled network's last payment-read fallback is Tenderly's
+- `v0.3.13+ds.14`, a carried upload state: ant-cli's version is 0.3.13+ds.14 (ant-core stays
+  0.15.0). An upload can add the paid proofs of a carried upload state, so an upload that one
+  client paid to store and did not finish can be completed by another client without a second
+  payment. The engine passes the upload's state to a payer on each checkpoint save through
+  `UploadPayer::state_saved`; that is the only source of carried bytes (`UploadState::checkpoint`
+  writes them). A payer supplies a carried state through `UploadPayer::carried_state`, a wallet
+  through `Client::file_upload_carried` (`CarriedUploadOptions`), and the CLI through `darwin file
+  upload <path> --carried <file>`. Proofs of this upload's records are added only where its
+  checkpoint contains none (and not where a record was marked as paid again and dropped), so a
+  saved checkpoint is never replaced and payment recovery is unchanged; those records are stored
+  without a new payment after every check a resumed record passes. A payer's unconfirmed payment is
+  settled through the new payer, as on any resume, unless the local state already contains that
+  same payment, proves, has paid again or has pending every record of it, or proves one of its
+  records with the quote that payment paid (this upload already settled it). A carried state is
+  refused whole with `Error::InvalidData` starting with `CARRIED_STATE_REFUSED`, and nothing is
+  paid, if it fails `UploadState::restore` checks, is a checkpoint's main file without proofs,
+  names none of the upload's records, or contains a Merkle proof, a pending Merkle batch, a
+  wallet's unconfirmed payment, a payer's unconfirmed payment passed to a wallet upload, a payer's
+  unconfirmed root-vault payment passed to a payer that does not pay root waves, or an unconfirmed
+  payment that names records outside the upload, appears beside another pending payment already in
+  the checkpoint, pays a quote above `ClientConfig::max_chunk_price`, or has only some of its
+  records present locally without this upload having settled it. Unpaid quotes are quoted again,
+  and a proof no storer accepts is paid again once under the price ceiling and through the
+  occupied-quote checks. `FileUploadResult::carried` (`CarriedOutcome`) records five counts: proofs
+  in the state (`proofs`), proofs taken (`taken`), records settled through the payer
+  (`reconciled`), records paid again (`paid_again`), and records quoted again (`quoted_again`);
+  `darwin file upload` prints the counts, and `--json` outputs them as `carried`. A private
+  envelope uses a new salt, so its record is paid once more, alone in its payment. Pass a carried
+  state to one client at a time, and carry the newest state from `UploadPayer::state_saved`. See
+  ADR-0008.
+- `v0.3.13+ds.14`: the bundled network's last payment-read fallback is Tenderly's
   public gateway (`https://robinhood-chain.gateway.tenderly.co`) in place of ordofi's
   (`https://rpc.ordofi.network`), which had refused every connection for 7 days up to 2026-11-24
   (Dan, 2026-11-24: "yes please replace ordofi in every single instance in the entire project where
