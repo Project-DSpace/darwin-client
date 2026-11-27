@@ -1017,10 +1017,11 @@ impl UploadState {
     ///   and a mark never lands on a local proof that was not paid again;
     /// - the carried payment not yet confirmed, whole, with the plans it
     ///   names, so this upload's payer settles it as on any resume. The
-    ///   caller leaves it out when this state already holds it or holds,
-    ///   proves or has paid again every one of its records, and refuses one
-    ///   beside another payment this state holds, or when this state holds
-    ///   some of its records and not the others.
+    ///   caller leaves it out when this state already holds it, holds,
+    ///   proves or has paid again every one of its records, or proves one
+    ///   of its records with the quote it paid (this state settled it), and
+    ///   otherwise refuses one beside another payment this state holds, or
+    ///   when this state holds some of its records and not the others.
     ///
     /// Unpaid carried plans and failed payments are left out: those records
     /// are quoted afresh. `planned` are the records the carried state held

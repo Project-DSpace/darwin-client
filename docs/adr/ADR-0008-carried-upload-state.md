@@ -77,7 +77,10 @@ payer, which is asked for exactly its plans, as on any resume; a wallet's is ref
 the wallet that made it can settle it. A payer's attempt is left out when the upload's own state
 already holds it (an earlier run took it from the same state) or proves, has paid again or holds
 pending every one of its records, so a payer is never asked again for a payment the upload settled.
-When the upload's own state holds some of its records and not the others, the state is refused:
+It is also left out when the upload's own state proves one of its records with the quote that
+attempt paid: an earlier run settled it, confirming the records whose quote was free and releasing
+those whose quote another payment holds, and the released records are quoted again. Otherwise,
+when the upload's own state holds some of its records and not the others, the state is refused:
 a payment is settled whole, and left out, its other records would be paid again under new quotes. A
 proof is not taken for a record the upload marked as paid again and dropped. A state that fails
 `UploadState::restore`'s checks, that is a checkpoint's main file without its proofs, that names

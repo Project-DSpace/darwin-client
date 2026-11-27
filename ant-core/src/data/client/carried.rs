@@ -37,7 +37,7 @@
 //! normal quoting, the price ceiling and the occupied-quote read-back.
 
 use super::root_payment::PaymentVault;
-use super::upload_state::{PaymentAttempt, TakeReport, UploadState};
+use super::upload_state::{paid_quote, PaymentAttempt, TakeReport, UploadState};
 use crate::data::client::file::{CarriedOutcome, CARRIED_STATE_REFUSED};
 use crate::data::error::{Error, Result};
 use ant_protocol::evm::Amount;
@@ -362,12 +362,15 @@ fn read(bytes: &[u8], records: &HashSet<XorName>, caller: CarriedCaller) -> Resu
 /// refusal comes before anything is saved, so a saved checkpoint is left as
 /// it was. A carried payment not yet confirmed is left out when the base
 /// already holds it (an earlier run of this upload took it from the same
-/// state, and it is counted as settled this run), or when the base proves,
-/// has paid again or holds pending every one of its records; beside another
-/// payment the base holds, or when the base holds some of its records and
-/// not the others, it is refused; otherwise it is taken only if its paid
-/// quotes are within the payer's client's price ceiling. Then the base
-/// takes from it only what it lacks ([`UploadState::take_carried`]).
+/// state, and it is counted as settled this run), when the base proves,
+/// has paid again or holds pending every one of its records, or when the
+/// base proves one of its records with the quote it paid (an earlier run of
+/// this upload settled it, and released the records whose quote another
+/// payment holds: they are quoted afresh); beside another payment the base
+/// holds, or when the base holds some of its records and not the others,
+/// it is refused; otherwise it is taken only if its paid quotes are within
+/// the payer's client's price ceiling. Then the base takes from it only
+/// what it lacks ([`UploadState::take_carried`]).
 pub(crate) fn starting_state(
     saved: Option<UploadState>,
     receipts: impl FnOnce() -> Result<UploadState>,
@@ -396,6 +399,12 @@ pub(crate) fn starting_state(
             // This upload already took, settled or is paying every one of
             // its records itself: the payer is never asked to pay a record
             // this upload proves, and no record of it is quoted afresh.
+            state.pending_payment = None;
+        } else if settled_here(&base, &state) {
+            // This upload settled that very payment: it confirmed the
+            // records whose paid quote was free and released those whose
+            // quote another payment holds. The released ones are quoted
+            // afresh, as that settling left them.
             state.pending_payment = None;
         } else if base.pending_payment.is_some() || base.pending_merkle.is_some() {
             return Err(refused(BOTH_PENDING));
@@ -426,6 +435,30 @@ fn held(base: &UploadState, address: &XorName) -> bool {
             .pending_payment
             .as_ref()
             .is_some_and(|attempt| attempt.addresses.contains(address))
+}
+
+/// Whether `base` proves a record of `carried`'s payment not yet confirmed
+/// with the quote that payment paid for it: that payment was settled into
+/// this upload's state. Settling confirms each of its records whose paid
+/// quote was free and releases each whose quote another payment holds
+/// ([`UploadState::release_occupied`]), so a record of it that `base` does
+/// not hold was released, and its carried quote is not used.
+fn settled_here(base: &UploadState, carried: &UploadState) -> bool {
+    let Ok(plans) = carried.pending_plans() else {
+        return false;
+    };
+    plans.iter().any(|plan| {
+        let paid = plan
+            .payment
+            .quotes
+            .iter()
+            .find(|quote| !quote.amount.is_zero())
+            .map(|quote| quote.quote_hash);
+        base.proof(&plan.address)
+            .map(Vec::as_slice)
+            .and_then(paid_quote)
+            .is_some_and(|(_, hash, _)| Some(hash) == paid)
+    })
 }
 
 /// Whether `base`'s payment not yet confirmed is the one `carried` holds:
@@ -1189,6 +1222,87 @@ mod tests {
         assert_eq!(state.pending_payment.as_ref().unwrap().addresses, vec![d]);
         assert_eq!(state.proof(&c), Some(&local));
         assert!(report.unwrap().reconciled.is_empty());
+    }
+
+    /// A run that took a carried payment not yet confirmed settled it and
+    /// found one record's paid quote occupied by another payment: that
+    /// record was released to be quoted again, and the others confirmed
+    /// (`reconcile_upload_payment`). Run again with the same carried state
+    /// before the released record is paid, the upload is not refused: the
+    /// carried payment is left out, as it is settled, and the released
+    /// record is quoted again, since its carried quote is another's.
+    #[test]
+    fn a_retry_after_a_carried_attempt_released_an_occupied_quote_is_not_refused() {
+        use crate::data::client::occupied::{OccupiedQuote, VaultRecord};
+        use ant_protocol::evm::EncodedPeerId;
+
+        let (carried, _) = carried_attempt(&[b"occupied c", b"occupied d"]);
+        let bytes = carried.checkpoint().unwrap();
+        let upload = records(&[b"attempt proven", b"occupied c", b"occupied d"]);
+        let (c, d) = (address(b"occupied c"), address(b"occupied d"));
+        let (mut run, _) =
+            starting_state(None, nothing_local, Some(&bytes), &upload, PAYER).unwrap();
+        // Settled: c's paid quote is occupied, so c is released, and d is
+        // confirmed.
+        let plans = run.pending_plans().unwrap();
+        let quote_c = plans
+            .iter()
+            .find(|plan| plan.address == c)
+            .unwrap()
+            .payment
+            .quotes
+            .iter()
+            .find(|quote| !quote.amount.is_zero())
+            .unwrap()
+            .clone();
+        let occupied = OccupiedQuote {
+            address: c,
+            quote_hash: quote_c.quote_hash,
+            issuer: EncodedPeerId::new([0; 32]),
+            rewards_address: quote_c.rewards_address,
+            amount: quote_c.amount,
+            recorded: VaultRecord {
+                rewards_prefix: [9; 16],
+                amount: quote_c.amount,
+            },
+        };
+        assert_eq!(run.release_occupied(&[occupied]), vec![c]);
+        let mut paid_with = HashMap::new();
+        for plan in &plans {
+            paid_with.extend(transactions(plan));
+        }
+        run.confirm(&[d], &paid_with, now()).unwrap();
+        assert!(run.pending_payment.is_none());
+        assert!(run.proof(&c).is_none() && !run.was_paid_again(&c));
+        let (again, report) = starting_state(
+            Some(run.clone()),
+            nothing_local,
+            Some(&bytes),
+            &upload,
+            PAYER,
+        )
+        .expect("a carried payment this upload settled is not refused");
+        assert!(
+            again.pending_payment.is_none(),
+            "the payer is not asked again"
+        );
+        assert_eq!(again.proof(&d), run.proof(&d));
+        assert!(again.proof(&c).is_none());
+        assert!(
+            !again.plan_addresses().contains(&c),
+            "the occupied quote is not used"
+        );
+        let report = report.unwrap();
+        assert!(report.reconciled.is_empty());
+        assert!(report.unpaid.contains(&c), "c is quoted again");
+        // A proof of d from other quotes than the carried payment's is not
+        // this upload's settling of it: still refused.
+        let (_, other) = paid(b"occupied d");
+        let foreign = UploadState::from_proofs(HashMap::from([(d, other)]));
+        assert_refused(
+            starting_state(Some(foreign), nothing_local, Some(&bytes), &upload, PAYER),
+            PENDING_PARTLY_HELD,
+        );
     }
 
     /// A run that took a carried payment not yet confirmed, and stopped
